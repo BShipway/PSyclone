@@ -4,47 +4,87 @@
 # Copyright (c) 2026, Science and Technology Facilities Council.
 # All rights reserved.
 # -----------------------------------------------------------------------------
-"""Capture the first supported LFRic loop as a Kokkos launch."""
+"""Capture a supported LFRic loop as a Kokkos launch."""
 
+import re
+import textwrap
+
+from psyclone.configuration import Config
 from psyclone.core import AccessType
-from psyclone.domain.lfric import KernCallArgList, LFRicLoop
+from psyclone.domain.lfric import KernCallArgList, LFRicConstants, LFRicLoop
 from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosView, KokkosWriter)
+from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Call, CodeBlock, Reference, Routine)
+    ArrayReference, Call, CodeBlock, IntrinsicCall, Loop, Reference, Routine)
 from psyclone.psyir.symbols import (
-    ArrayType, ContainerSymbol, DataSymbol, ImportInterface, RoutineSymbol,
-    ScalarType, UnsupportedFortranType, UnresolvedType)
+    ArgumentInterface, ArrayType, ContainerSymbol, DataSymbol,
+    ImportInterface, RoutineSymbol, ScalarType, UnsupportedFortranType,
+    UnresolvedType)
 from psyclone.psyir.transformations import TransformationError
 
 
 class LFRicKokkosTrans(Transformation):
-    """Replace one supported ``moist_dyn_gas`` loop with a C ABI call.
+    """Replace one supported LFRic cell-column loop with a C ABI call.
 
-    This initial transformation intentionally recognises one exact kernel
-    shape. It captures all information needed by the Kokkos backend before
-    lowering the LFRic loop. The LFRic loop is then lowered so that its bound
-    setup and halo-dirty calls are retained, and only the resulting generic
-    loop is replaced.
+    The transformation recognises a kernel shape rather than a named kernel:
+    an uncoloured owned-cell loop over a single kernel whose arguments are
+    fields and scalars, whose written fields are on discontinuous spaces, and
+    whose formals and referenced module constants all map onto the fixed
+    ``int``/``double`` ABI the Kokkos backend emits. Every part of the
+    generated region -- its name, its C signature, its Views and the
+    ``bind(C)`` interface the PSy layer calls through -- is derived from that
+    kernel, so a second kernel needs no change here.
+
+    It captures all information needed by the Kokkos backend before lowering
+    the LFRic loop. The LFRic loop is then lowered so that its bound setup and
+    halo-dirty calls are retained, and only the resulting generic loop is
+    replaced.
     """
 
-    _REGION_NAME = "moist_dyn_gas_kokkos"
-    _FORMAL_NAMES = (
-        "nlayers", "moist_dyn_gas", "mr_v", "ndf_wtheta",
-        "undf_wtheta", "map_wtheta")
+    #: The region's iteration count, and the second extent of every per-cell
+    #: array. Named by the PSy layer, not by the kernel.
+    _CELL_COUNT = "ncells"
+
+    #: The two C types the Kokkos backend emits, by what LFRic says a kind
+    #: actually is. Widths come from PSyclone's own precision map rather than
+    #: from a list of kind names, so ``r_tran`` and ``r_bl`` are accepted or
+    #: refused on the same evidence as ``r_def``. Anything else -- ``l_def``,
+    #: a 4-byte ``r_solver``, an undeclared precision -- has no place here and
+    #: fails closed rather than being guessed at.
+    _C_TYPES = {
+        (ScalarType.Intrinsic.INTEGER, 4): "int",
+        (ScalarType.Intrinsic.REAL, 8): "double",
+    }
+
+    _FORTRAN_TYPES = {"int": "integer(c_int)", "double": "real(c_double)"}
+
+    #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
+    #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
+    _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE)
 
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
 
     def validate(self, node, options=None, **kwargs):
-        """Check that ``node`` has the exact first-prototype contract."""
-        # pylint: disable=too-many-branches,too-many-locals
+        """Check that ``node`` matches the capture contract."""
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
                 "LFRicKokkosTrans expects an LFRicLoop but found "
                 f"'{type(node).__name__}'.")
 
+        self._validate_loop(node)
+        kernel = node.kernels()[0]
+        self._validate_kernel_metadata(kernel)
+        schedule = self._schedule(kernel)
+        self._validate_body(schedule)
+        self._validate_formals(schedule)
+        self._constants(schedule)
+
+    @staticmethod
+    def _validate_loop(node):
+        """Check the loop's own iteration contract."""
         if node.loop_type or node.iteration_space != "cell_column":
             raise TransformationError(
                 "LFRicKokkosTrans supports only an uncoloured cell-column "
@@ -58,16 +98,13 @@ class LFRicKokkosTrans(Transformation):
                 node.upper_bound_name != "ncells"):
             raise TransformationError(
                 "LFRicKokkosTrans supports only owned-cell bounds.")
-
-        kernels = node.kernels()
-        if len(kernels) != 1:
+        if len(node.kernels()) != 1:
             raise TransformationError(
                 "LFRicKokkosTrans requires exactly one kernel in the loop.")
-        kernel = kernels[0]
-        if kernel.name.lower() != "moist_dyn_gas_code":
-            raise TransformationError(
-                "LFRicKokkosTrans currently supports only "
-                "moist_dyn_gas_code.")
+
+    @classmethod
+    def _validate_kernel_metadata(cls, kernel):
+        """Check the LFRic metadata of the kernel to be captured."""
         if kernel.qr_required or kernel.eval_shapes:
             raise TransformationError(
                 "LFRicKokkosTrans does not support quadrature or evaluator "
@@ -79,49 +116,82 @@ class LFRicKokkosTrans(Transformation):
             raise TransformationError(
                 "LFRicKokkosTrans does not support inter-grid kernels.")
 
-        arguments = kernel.arguments.args
-        if len(arguments) != 2 or any(
-                argument.argument_type != "gh_field"
-                for argument in arguments):
-            raise TransformationError(
-                "LFRicKokkosTrans requires exactly two field arguments.")
-        expected = ((AccessType.WRITE, "wtheta"),
-                    (AccessType.READ, "wtheta"))
-        for argument, (access, space) in zip(arguments, expected):
-            if argument.intrinsic_type != "real" or argument.access != access:
+        discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
+        for argument in kernel.arguments.args:
+            if argument.argument_type not in ("gh_field", "gh_scalar"):
                 raise TransformationError(
-                    "LFRicKokkosTrans field argument metadata is unsupported.")
-            if argument.function_space.orig_name.lower() != space:
+                    "LFRicKokkosTrans supports only gh_field and gh_scalar "
+                    f"arguments, found '{argument.argument_type}'.")
+            if argument.access not in cls._SAFE_ACCESSES:
                 raise TransformationError(
-                    "LFRicKokkosTrans requires a discontinuous Wtheta "
-                    "write and read.")
+                    f"LFRicKokkosTrans cannot capture the '{argument.access}' "
+                    f"access of '{argument.name}': a cell-parallel launch "
+                    "would need colouring or atomics.")
+            if argument.argument_type != "gh_field":
+                continue
+            if argument.intrinsic_type != "real":
+                raise TransformationError(
+                    f"LFRicKokkosTrans supports only real fields, but "
+                    f"'{argument.name}' is {argument.intrinsic_type}.")
             if argument.stencil:
                 raise TransformationError(
                     "LFRicKokkosTrans does not support stencil accesses.")
+            if argument.access == AccessType.READ:
+                continue
+            space = argument.function_space.orig_name.lower()
+            if space not in discontinuous:
+                raise TransformationError(
+                    f"LFRicKokkosTrans requires a discontinuous space for "
+                    f"the written field '{argument.name}', but found "
+                    f"'{space}': one cell's contribution could overwrite "
+                    "another's.")
 
+    @staticmethod
+    def _schedule(kernel):
+        """Return the single PSyIR schedule of the kernel to be captured."""
         schedules = kernel.get_callees()
         if len(schedules) != 1:
             raise TransformationError(
                 "LFRicKokkosTrans requires exactly one kernel schedule.")
-        schedule = schedules[0]
+        return schedules[0]
+
+    @staticmethod
+    def _validate_body(schedule):
+        """Check that nothing in the body escapes the generated region."""
         if schedule.walk(CodeBlock):
             raise TransformationError(
                 "LFRicKokkosTrans cannot capture a CodeBlock.")
-        formal_names = tuple(
-            symbol.name for symbol in schedule.symbol_table.argument_list)
-        if formal_names != self._FORMAL_NAMES:
+        for call in schedule.walk(Call):
+            if isinstance(call, IntrinsicCall):
+                continue
+            routine = call.routine
+            name = routine.symbol.name if routine else "an unnamed routine"
             raise TransformationError(
-                "LFRicKokkosTrans kernel formal arguments have changed: "
-                f"{formal_names}.")
-        expected_kinds = (
-            "i_def", "r_def", "r_def", "i_def", "i_def", "i_def")
-        actual_kinds = tuple(
-            self._kind_name(symbol)
-            for symbol in schedule.symbol_table.argument_list)
-        if actual_kinds != expected_kinds:
+                f"LFRicKokkosTrans cannot capture the call to '{name}': the "
+                "generated region has no Fortran to call into.")
+
+    @classmethod
+    def _validate_formals(cls, schedule):
+        """Check that every kernel formal has a place on the C ABI."""
+        table = schedule.symbol_table
+        formals = table.argument_list
+        names = {symbol.name for symbol in formals}
+        if cls._CELL_COUNT in names:
             raise TransformationError(
-                "LFRicKokkosTrans kernel argument kinds have changed: "
-                f"{actual_kinds}.")
+                f"LFRicKokkosTrans adds '{cls._CELL_COUNT}' to the generated "
+                "signature, but the kernel already declares it.")
+        for symbol in formals:
+            if cls._c_type(symbol) is None:
+                raise TransformationError(
+                    "LFRicKokkosTrans supports 4-byte integer and 8-byte real "
+                    f"argument kinds only, but '{symbol.name}' has "
+                    f"'{cls._kind_name(symbol)}'.")
+            for extent in cls._extents(symbol):
+                if extent not in names:
+                    raise TransformationError(
+                        f"LFRicKokkosTrans needs the extent '{extent}' of "
+                        f"'{symbol.name}' to be a kernel argument, so that "
+                        "the generated View can be sized.")
 
     @staticmethod
     def _kind_name(symbol):
@@ -136,106 +206,302 @@ class LFRicKokkosTrans(Transformation):
             return None
         return precision.symbol.name
 
+    @classmethod
+    def _c_type(cls, symbol):
+        """Return the C type of a symbol, or ``None`` if it has no mapping."""
+        datatype = symbol.datatype
+        if isinstance(datatype, ArrayType):
+            datatype = datatype.elemental_type
+        if not isinstance(datatype, ScalarType):
+            return None
+        return cls._map_kind(datatype.intrinsic, cls._kind_name(symbol))
+
+    @classmethod
+    def _map_kind(cls, intrinsic, kind):
+        """Return the C type for one LFRic kind name, or ``None``.
+
+        :param intrinsic: the Fortran intrinsic type the kind qualifies.
+        :param str kind: the LFRic kind parameter, such as ``r_tran``.
+        """
+        if kind is None:
+            return None
+        precision = Config.get().api_conf("lfric").precision_map
+        return cls._C_TYPES.get((intrinsic, precision.get(kind)))
+
+    @staticmethod
+    def _extents(symbol):
+        """Return the declared extents of an array formal, in order.
+
+        :returns: one name per dimension, empty for a scalar.
+        :rtype: tuple[str]
+        """
+        datatype = symbol.datatype
+        if not isinstance(datatype, ArrayType):
+            return ()
+        extents = []
+        for dimension in datatype.shape:
+            upper = getattr(dimension, "upper", None)
+            if not isinstance(upper, Reference) or upper.children:
+                raise TransformationError(
+                    f"LFRicKokkosTrans requires '{symbol.name}' to be "
+                    "declared with simple named extents.")
+            extents.append(upper.symbol.name)
+        return tuple(extents)
+
+    @classmethod
+    def _constants(cls, schedule):
+        """Return the module constants the kernel body reads.
+
+        These are not kernel arguments, so the PSy layer has to import each
+        one and pass it by value into the region.
+
+        :returns: ``(name, container, c_type)`` per constant, name-ordered.
+        :rtype: list[tuple[str, str, str]]
+        """
+        table = schedule.symbol_table
+        local = {symbol.name for symbol in table.argument_list}
+        local |= {symbol.name for symbol in table.automatic_datasymbols}
+        constants = {}
+        for reference in schedule.walk(Reference):
+            symbol = reference.symbol
+            if symbol.name in local or isinstance(symbol, RoutineSymbol):
+                continue
+            if symbol.name in constants:
+                continue
+            constants[symbol.name] = cls._describe_constant(symbol)
+        return [constants[name] for name in sorted(constants)]
+
+    @classmethod
+    def _describe_constant(cls, symbol):
+        """Resolve one non-local symbol onto the generated C ABI."""
+        if not isinstance(symbol.interface, ImportInterface):
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}': it is "
+                "neither a kernel argument nor imported from a module.")
+        container = symbol.interface.container_symbol.name
+        try:
+            symbol.resolve_type()
+        except Exception as err:                 # pylint: disable=W0703
+            # The kind is only stated in the module, so guessing here would
+            # put a silently wrong type on the C ABI. Say what is missing
+            # instead: the caller decides what PSyclone may read.
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot type '{symbol.name}' without the "
+                f"source of '{container}'. Add its directory to PSyclone's "
+                f"module search path. ({err})") from err
+        c_type = cls._c_type(symbol)
+        if c_type is None:
+            c_type = cls._declared_c_type(symbol)
+        if c_type is None:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot pass '{symbol.name}' from "
+                f"'{container}' by value: only 4-byte integer and 8-byte real "
+                "scalars have a place on the generated C ABI.")
+        return (symbol.name, container, c_type)
+
+    @classmethod
+    def _declared_c_type(cls, symbol):
+        """Recover a C type from a declaration PSyIR could not model.
+
+        LFRic module constants routinely carry attributes -- ``PROTECTED``,
+        an initialiser -- that leave the frontend with an
+        :py:class:`UnsupportedFortranType` holding the original text. The kind
+        is still stated there, so read it rather than give up; anything with a
+        shape is refused, because only scalars are passed by value.
+        """
+        datatype = getattr(symbol, "datatype", None)
+        if not isinstance(datatype, UnsupportedFortranType):
+            return None
+        attributes = datatype.declaration.split("::")[0]
+        if "DIMENSION" in attributes.upper():
+            return None
+        match = re.match(
+            r"\s*(REAL|INTEGER)\s*\(\s*KIND\s*=\s*(\w+)\s*\)",
+            attributes, re.IGNORECASE)
+        if not match:
+            return None
+        intrinsic = {
+            "real": ScalarType.Intrinsic.REAL,
+            "integer": ScalarType.Intrinsic.INTEGER,
+        }[match.group(1).lower()]
+        return cls._map_kind(intrinsic, match.group(2).lower())
+
     def apply(self, node, options=None, **kwargs):
         """Generate C++ and replace ``node`` with the typed launch call.
 
         :returns: the generated Kokkos C++ translation unit.
         :rtype: str
         """
-        # pylint: disable=too-many-locals
         self.validate(node, options=options, **kwargs)
         kernel = node.kernels()[0]
-        schedule = kernel.get_callees()[0]
+        schedule = self._schedule(kernel)
 
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.
         node.ancestor(InvokeSchedule).invoke.setup_psy_layer_symbols()
         argument_builder = KernCallArgList(kernel)
         argument_builder.generate()
-        if len(argument_builder.psyir_arglist) != 6:
-            raise TransformationError(
-                "LFRicKokkosTrans requires the six-argument Wtheta call "
-                "contract.")
+        formals = schedule.symbol_table.argument_list
         actuals = [argument.copy()
                    for argument in argument_builder.psyir_arglist]
-        map_argument = actuals[5]
-        if not isinstance(map_argument, ArrayReference):
+        if len(actuals) != len(formals):
             raise TransformationError(
-                "LFRicKokkosTrans expected a sliced dofmap argument.")
-        actuals[5] = Reference(map_argument.symbol)
+                f"LFRicKokkosTrans expected {len(formals)} actual arguments "
+                f"for '{kernel.name}' but the PSy layer supplies "
+                f"{len(actuals)}.")
 
-        region = self._region(schedule)
-        cpp = KokkosWriter()(region)
+        # An actual that indexes into PSy-layer storage -- a dofmap sliced as
+        # map(:,cell) -- is passed whole instead, and the region takes the
+        # cell index itself. Everything else is already a plain reference.
+        per_cell = set()
+        for index, (formal, actual) in enumerate(zip(formals, actuals)):
+            if not isinstance(actual, ArrayReference):
+                continue
+            per_cell.add(formal.name)
+            actuals[index] = Reference(actual.symbol)
+
+        constants = self._constants(schedule)
+        region = KokkosRegion(
+            name=self._region_name(kernel),
+            schedule=schedule,
+            cell_count=self._CELL_COUNT,
+            arguments=self._region_arguments(schedule, per_cell, constants))
+        try:
+            cpp = KokkosWriter()(region)
+        except (VisitorError, ValueError, TypeError) as err:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot express '{kernel.name}' in the "
+                f"Kokkos backend: {err}") from err
 
         lowered_loop = node.lower_to_language_level()
         cell_count = lowered_loop.stop_expr.copy()
         routine = lowered_loop.ancestor(Routine)
         symbol_table = routine.symbol_table
-        recip_epsilon = self._import_recip_epsilon(symbol_table)
-        launch = self._launch_symbol(symbol_table)
-        actuals.extend([cell_count, Reference(recip_epsilon)])
+        launch = self._launch_symbol(symbol_table, region)
+        actuals.append(cell_count)
+        actuals.extend(
+            Reference(self._import_constant(symbol_table, name, container))
+            for name, container, _ in constants)
+        counter = lowered_loop.variable
         lowered_loop.replace_with(Call.create(launch, actuals))
+        self._drop_unused_counter(routine, counter)
         return cpp
 
-    @classmethod
-    def _region(cls, schedule):
-        """Create the backend description for the captured schedule."""
-        return KokkosRegion(
-            name=cls._REGION_NAME,
-            schedule=schedule,
-            cell_count="ncells",
-            arguments=(
-                KokkosScalar("nlayers", "int"),
-                KokkosView(
-                    "moist_dyn_gas", "moist_dyn_gas_data", "double",
-                    ("undf_wtheta",), index_offsets=(1,)),
-                KokkosView(
-                    "mr_v", "mr_v_data", "double", ("undf_wtheta",),
-                    index_offsets=(1,), read_only=True, random_access=True),
-                KokkosScalar("ndf_wtheta", "int"),
-                KokkosScalar("undf_wtheta", "int"),
-                KokkosView(
-                    "map_wtheta", "map_wtheta_data", "int",
-                    ("ndf_wtheta", "ncells"), index_offsets=(1,),
-                    extra_indices=("cell",), read_only=True,
-                    random_access=True),
-                KokkosScalar("ncells", "int"),
-                KokkosScalar("recip_epsilon", "double")))
+    @staticmethod
+    def _drop_unused_counter(routine, symbol):
+        """Undeclare the replaced loop's counter if nothing else counts with it.
+
+        The PSy layer declares one counter per iteration space, so an invoke
+        whose only cell loop is captured is left declaring a variable it never
+        mentions again -- which LFRic compiles with ``-Werror=unused-variable``.
+        An invoke with a second cell loop keeps it, which is why this asks
+        rather than assumes.
+        """
+        table = routine.symbol_table
+        if table.lookup(symbol.name, otherwise=None) is not symbol:
+            return
+        if symbol in table.argument_list:
+            return
+        if any(reference.symbol is symbol
+               for reference in routine.walk(Reference)):
+            return
+        # A Loop holds its control variable as an attribute rather than as a
+        # Reference, so the walk above would not see a sibling loop still
+        # counting with it.
+        if any(loop.variable is symbol for loop in routine.walk(Loop)):
+            return
+        table.remove(symbol)
 
     @staticmethod
-    def _import_recip_epsilon(symbol_table):
-        """Return the PSy-layer import for the kernel module constant."""
-        existing = symbol_table.lookup("recip_epsilon", otherwise=None)
+    def _region_name(kernel):
+        """Name the generated region after the kernel it captures."""
+        name = kernel.name.lower()
+        if name.endswith("_code"):
+            name = name[:-len("_code")]
+        return f"{name}_kokkos"
+
+    @classmethod
+    def _region_arguments(cls, schedule, per_cell, constants):
+        """Describe the generated signature for the backend.
+
+        :param schedule: the kernel schedule being captured.
+        :param set[str] per_cell: formals the PSy layer slices by cell.
+        :param constants: the module constants passed by value.
+
+        :returns: one description per generated C argument, in call order.
+        :rtype: tuple
+        """
+        arguments = []
+        for symbol in schedule.symbol_table.argument_list:
+            c_type = cls._c_type(symbol)
+            extents = cls._extents(symbol)
+            if not extents:
+                arguments.append(KokkosScalar(symbol.name, c_type))
+                continue
+            sliced = symbol.name in per_cell
+            read_only = (
+                symbol.interface.access == ArgumentInterface.Access.READ)
+            arguments.append(KokkosView(
+                symbol.name, f"{symbol.name}_data", c_type,
+                extents + ((cls._CELL_COUNT,) if sliced else ()),
+                index_offsets=(1,) * len(extents),
+                extra_indices=("cell",) if sliced else (),
+                read_only=read_only, random_access=read_only))
+        arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
+        arguments.extend(
+            KokkosScalar(name, c_type) for name, _, c_type in constants)
+        return tuple(arguments)
+
+    @staticmethod
+    def _import_constant(symbol_table, name, container):
+        """Return the PSy-layer import for one kernel module constant."""
+        existing = symbol_table.lookup(name, otherwise=None)
         if existing:
             return existing
         module = symbol_table.find_or_create(
-            "planet_config_mod", symbol_type=ContainerSymbol)
+            container, symbol_type=ContainerSymbol)
         return symbol_table.find_or_create(
-            "recip_epsilon", symbol_type=DataSymbol,
-            datatype=UnresolvedType(), interface=ImportInterface(module))
+            name, symbol_type=DataSymbol, datatype=UnresolvedType(),
+            interface=ImportInterface(module))
 
     @classmethod
-    def _launch_symbol(cls, symbol_table):
+    def _launch_symbol(cls, symbol_table, region):
         """Create or return the explicit interoperable launch interface."""
-        existing = symbol_table.lookup(cls._REGION_NAME, otherwise=None)
+        existing = symbol_table.lookup(region.name, otherwise=None)
         if existing:
             return existing
-        declaration = f"""interface
-  subroutine {cls._REGION_NAME}(nlayers, moist_dyn_gas, mr_v, &
-      ndf_wtheta, undf_wtheta, map_wtheta, ncells, &
-      recip_epsilon) bind(C)
-    use iso_c_binding, only : c_int, c_double
-    integer(c_int), value :: nlayers, ndf_wtheta, undf_wtheta, ncells
-    real(c_double), dimension(*), intent(inout) :: moist_dyn_gas
-    real(c_double), dimension(*), intent(in) :: mr_v
-    integer(c_int), dimension(*), intent(in) :: map_wtheta
-    real(c_double), value :: recip_epsilon
-  end subroutine {cls._REGION_NAME}
-end interface"""
         symbol = RoutineSymbol(
-            cls._REGION_NAME, UnsupportedFortranType(declaration))
+            region.name, UnsupportedFortranType(cls._interface(region)))
         symbol_table.add(symbol)
         return symbol
+
+    @classmethod
+    def _interface(cls, region):
+        """Write the ``bind(C)`` interface the PSy layer calls through."""
+        names = [argument.name for argument in region.arguments]
+        signature = textwrap.wrap(
+            ", ".join(names), width=58, break_long_words=False)
+        header = f"  subroutine {region.name}({signature[0]}"
+        for line in signature[1:]:
+            header += " &\n      " + line
+        declarations = []
+        for argument in region.arguments:
+            fortran = cls._FORTRAN_TYPES[argument.c_type]
+            if isinstance(argument, KokkosScalar):
+                declarations.append(f"    {fortran}, value :: {argument.name}")
+            else:
+                intent = "in" if argument.read_only else "inout"
+                declarations.append(
+                    f"    {fortran}, dimension(*), intent({intent}) :: "
+                    f"{argument.name}")
+        body = "\n".join(declarations)
+        return (
+            "interface\n"
+            f"{header}) bind(C)\n"
+            "    use iso_c_binding, only : c_int, c_double\n"
+            f"{body}\n"
+            f"  end subroutine {region.name}\n"
+            "end interface")
 
 
 __all__ = ["LFRicKokkosTrans"]
