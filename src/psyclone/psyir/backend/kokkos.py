@@ -94,6 +94,15 @@ class KokkosWriter(CWriter):
             "#include <Kokkos_Core.hpp>\n\n"
             f'extern "C" void {region.name}(\n'
             f"    {signature}) {{\n"
+            # Kokkos does not treat an uninitialised runtime as an error: the
+            # region prints a diagnostic to stderr and then runs correctly but
+            # single-threaded, so the omission survives every build and every
+            # answer-based test, and shows up only as lost performance. Naming
+            # the region here turns that into an immediate, attributable stop.
+            "  if (!Kokkos::is_initialized()) {\n"
+            f'    Kokkos::abort("{region.name}: Kokkos region entered before '
+            'Kokkos::initialize()");\n'
+            "  }\n\n"
             "  using MemorySpace = "
             "Kokkos::DefaultExecutionSpace::memory_space;\n"
             "  using Unmanaged = "

@@ -95,11 +95,30 @@ def test_kokkos_writer_translation_unit():
     assert "KOKKOS_LAMBDA(const int cell)" in code
     assert "Kokkos::fence();" in code
 
-    # A View constructed with a string label owns an allocation. The only
-    # string literal in generated executable code is the parallel-for label.
+    # A View constructed with a string label owns an allocation. No View may be
+    # given one; the generated string literals are the parallel-for label and
+    # the uninitialised-runtime message, neither of which constructs a View.
     assert 'moist_dyn_gas("' not in code
     assert 'mr_v("' not in code
     assert 'map_wtheta("' not in code
+
+
+def test_kokkos_writer_requires_an_initialised_runtime():
+    """A region entered before Kokkos::initialize() stops, and says which.
+
+    Kokkos itself does not treat this as an error: the region warns on stderr
+    and then runs correctly but single-threaded. Both the build and any
+    answer-based test would therefore pass, leaving only lost performance to
+    give it away, so the generated code has to raise the alarm itself.
+    """
+    code = KokkosWriter()(_region())
+
+    guard = code.index("if (!Kokkos::is_initialized()) {")
+    assert 'Kokkos::abort("moist_dyn_gas_kokkos: Kokkos region entered ' \
+        'before Kokkos::initialize()");' in code
+
+    # Before the parallel dispatch, or the diagnosis arrives after the damage.
+    assert guard < code.index("Kokkos::parallel_for(")
 
 
 def test_kokkos_writer_indices_and_imported_constant():
