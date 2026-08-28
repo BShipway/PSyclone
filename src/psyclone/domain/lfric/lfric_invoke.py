@@ -73,8 +73,8 @@ class LFRicInvoke(Invoke):
     :raises InternalError: if an unrecognised global reduction operation
                            is encountered.
     '''
-    # pylint: disable=too-many-instance-attributes
-    # pylint: disable=too-many-locals
+    # pylint: disable=too-many-instance-attributes,too-many-locals
+    # pylint: disable=too-many-branches,too-many-statements
     def __init__(self,
                  alg_invocation: InvokeCall,
                  idx: int,
@@ -296,6 +296,12 @@ class LFRicInvoke(Invoke):
         PSy-layer Invoke subroutine.
 
         '''
+        # Some transformations must materialise these declarations before
+        # removing domain-specific kernel nodes. Store the state on the tree
+        # (rather than the Invoke) because code generation operates on a copy.
+        # pylint: disable=protected-access
+        if getattr(self.schedule, "_psy_layer_symbols_setup", False):
+            return
         # Declare all quantities required by this PSy routine (Invoke)
         for entities in [self.scalar_args, self. scalar_array_args,
                          self.fields, self.lma_ops,
@@ -353,6 +359,7 @@ class LFRicInvoke(Invoke):
 
         # Deallocate any basis arrays
         self.evaluators.deallocate()
+        self.schedule._psy_layer_symbols_setup = True
 
 
 # ---------- Documentation utils -------------------------------------------- #
