@@ -17,12 +17,14 @@ from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosView, KokkosWriter)
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Call, CodeBlock, IntrinsicCall, Loop, Reference, Routine)
+    ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Loop, Range,
+    Reference, Routine)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ArrayType, ContainerSymbol, DataSymbol,
     ImportInterface, RoutineSymbol, ScalarType, UnsupportedFortranType,
     UnresolvedType)
-from psyclone.psyir.transformations import TransformationError
+from psyclone.psyir.transformations import (
+    ArrayAssignment2LoopsTrans, TransformationError)
 
 
 class LFRicKokkosTrans(Transformation):
@@ -36,6 +38,16 @@ class LFRicKokkosTrans(Transformation):
     generated region -- its name, its C signature, its Views and the
     ``bind(C)`` interface the PSy layer calls through -- is derived from that
     kernel, so a second kernel needs no change here.
+
+    A whole-column array section such as ``a(i:j)``, which the finite-volume
+    kernels use to assign a column as a unit, is accepted and lowered to an
+    explicit loop by
+    :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
+    before the region is described. The generated region has no way to say
+    ``a(i:j)``, so a section that transformation refuses -- one carrying a
+    loop-carried dependency, for instance -- is refused here too, with its
+    reason quoted. A section outside an assignment altogether is beyond what
+    lowering can reach and is refused before the backend sees it.
 
     It captures all information needed by the Kokkos backend before lowering
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
@@ -68,7 +80,22 @@ class LFRicKokkosTrans(Transformation):
         return "Capture a supported LFRic loop as a Kokkos launch"
 
     def validate(self, node, options=None, **kwargs):
-        """Check that ``node`` matches the capture contract."""
+        """Check that ``node`` matches the capture contract.
+
+        The check is side-effect free: it predicts what :py:meth:`apply`
+        would do, including whether each array section could be lowered,
+        without altering the kernel schedule.
+
+        :param node: the loop that is to be captured as a Kokkos region.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: a dictionary with options for transformations.
+        :type options: Optional[Dict[str, Any]]
+
+        :raises TransformationError: if ``node`` is not an LFRicLoop, or if
+            its bounds, its kernel's metadata, its body, its array sections,
+            its formal arguments or the module constants it reads fall
+            outside the contract stated in this class's description.
+        """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
                 "LFRicKokkosTrans expects an LFRicLoop but found "
@@ -79,6 +106,7 @@ class LFRicKokkosTrans(Transformation):
         self._validate_kernel_metadata(kernel)
         schedule = self._schedule(kernel)
         self._validate_body(schedule)
+        self._validate_sections(schedule)
         self._validate_formals(schedule)
         self._constants(schedule)
 
@@ -169,6 +197,58 @@ class LFRicKokkosTrans(Transformation):
             raise TransformationError(
                 f"LFRicKokkosTrans cannot capture the call to '{name}': the "
                 "generated region has no Fortran to call into.")
+
+    @staticmethod
+    def _validate_sections(schedule):
+        """Check that every whole-column section can be lowered to a loop.
+
+        The generated region has no way to say ``a(i:j)``, so a section is
+        rewritten as an explicit loop before the backend sees it. This
+        predicts that rewrite rather than performing it, because
+        :py:meth:`validate` must leave the schedule as it found it.
+
+        :param schedule: the kernel schedule to be captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if a section is not part of an
+            assignment, and so is beyond what lowering can reach.
+        :raises TransformationError: if a section's own assignment cannot be
+            lowered, in which case the reason is the one PSyclone gives.
+        """
+        for section in schedule.walk(Range):
+            if section.ancestor(Assignment) is None:
+                raise TransformationError(
+                    "LFRicKokkosTrans cannot capture an array section outside "
+                    "an assignment: only a whole-column assignment can be "
+                    "lowered to a loop the generated region can express.")
+        lowering = ArrayAssignment2LoopsTrans()
+        for assignment in schedule.walk(Assignment):
+            if not assignment.walk(Range):
+                continue
+            try:
+                lowering.validate(assignment)
+            except TransformationError as err:
+                raise TransformationError(
+                    "LFRicKokkosTrans cannot lower an array section to a "
+                    f"loop: {err}") from err
+
+    @staticmethod
+    def _lower_sections(schedule):
+        """Replace every whole-column section with an explicit loop.
+
+        Applied to the schedule :py:meth:`_schedule` returns, which
+        :py:meth:`~psyclone.domain.lfric.LFRicKern.get_callees` caches so that
+        transformations applied to a kernel persist. That is the intended
+        idiom, so the lowering is done once here rather than repeated for
+        every consumer of the schedule.
+
+        :param schedule: the kernel schedule to be captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        """
+        lowering = ArrayAssignment2LoopsTrans()
+        for assignment in schedule.walk(Assignment):
+            if assignment.walk(Range):
+                lowering.apply(assignment)
 
     @classmethod
     def _validate_formals(cls, schedule):
@@ -329,12 +409,27 @@ class LFRicKokkosTrans(Transformation):
     def apply(self, node, options=None, **kwargs):
         """Generate C++ and replace ``node`` with the typed launch call.
 
+        Unlike :py:meth:`validate`, this alters the kernel schedule: any
+        array section it holds is lowered to an explicit loop before the
+        region is described.
+
+        :param node: the loop to capture as a Kokkos region.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: a dictionary with options for transformations.
+        :type options: Optional[Dict[str, Any]]
+
         :returns: the generated Kokkos C++ translation unit.
         :rtype: str
+
+        :raises TransformationError: if ``node`` fails :py:meth:`validate`,
+            if the PSy layer supplies a different number of actual arguments
+            than the kernel has formals, or if the Kokkos backend cannot
+            generate the region that validation predicted it could.
         """
         self.validate(node, options=options, **kwargs)
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
+        self._lower_sections(schedule)
 
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.
@@ -389,13 +484,18 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _drop_unused_counter(routine, symbol):
-        """Undeclare the replaced loop's counter if nothing else counts with it.
+        """Undeclare the replaced loop's counter if nothing else counts by it.
 
         The PSy layer declares one counter per iteration space, so an invoke
-        whose only cell loop is captured is left declaring a variable it never
-        mentions again -- which LFRic compiles with ``-Werror=unused-variable``.
-        An invoke with a second cell loop keeps it, which is why this asks
-        rather than assumes.
+        whose only cell loop is captured is left declaring a variable it
+        never mentions again -- which LFRic compiles with
+        ``-Werror=unused-variable``. An invoke with a second cell loop keeps
+        it, which is why this asks rather than assumes.
+
+        :param routine: the PSy-layer routine holding the replaced loop.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param symbol: the counter the replaced loop was counting with.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
         """
         table = routine.symbol_table
         if table.lookup(symbol.name, otherwise=None) is not symbol:

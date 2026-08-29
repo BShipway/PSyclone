@@ -17,7 +17,8 @@ from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.parse import ModuleManager
 from psyclone.parse.algorithm import parse
 from psyclone.psyGen import PSyFactory
-from psyclone.psyir.nodes import CodeBlock, Literal
+from psyclone.psyir.nodes import (
+    ArrayReference, CodeBlock, IntrinsicCall, Literal, Range)
 from psyclone.psyir.symbols import ScalarType
 from psyclone.psyir.transformations import TransformationError
 
@@ -144,6 +145,67 @@ end program kokkos_paired_test
 """
 
 
+# A whole-column section in the shape the finite-volume family uses, reduced
+# to the part that matters: a slice assigned as a unit, with a different lower
+# bound on each side so that a lowering which ignored the offsets would give a
+# visibly wrong answer rather than an accidentally right one.
+_SECTION_ALGORITHM = """
+program kokkos_section_test
+  use field_mod, only : field_type
+  use fv_difference_kernel_mod, only : fv_difference_kernel_type
+  implicit none
+  type(field_type) :: difference, mass_flux
+  call invoke(fv_difference_kernel_type(difference, mass_flux))
+end program kokkos_section_test
+"""
+
+
+_SECTION_KERNEL = """
+module fv_difference_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_readwrite, &
+                           gh_read, cell_column
+  use constants_mod, only : i_def, r_tran
+  use fs_continuity_mod, only : w3, w2v
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: fv_difference_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_readwrite, w3),              &
+         arg_type(gh_field, gh_real, gh_read,      w2v) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: fv_difference_code
+  end type fv_difference_kernel_type
+contains
+  subroutine fv_difference_code(nlayers, difference, mass_flux, &
+                                ndf_w3, undf_w3, map_w3,        &
+                                ndf_w2v, undf_w2v, map_w2v)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_w2v, undf_w2v
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_w2v), intent(in) :: map_w2v
+    real(kind=r_tran), dimension(undf_w3), intent(inout) :: difference
+    real(kind=r_tran), dimension(undf_w2v), intent(in) :: mass_flux
+    integer(kind=i_def) :: nl, w3_idx, b_idx
+    w3_idx = map_w3(1)
+    b_idx = map_w2v(1)
+    nl = nlayers - 1
+    difference(w3_idx : w3_idx + nl) = &
+        mass_flux(b_idx + 1 : b_idx + nl + 1) - mass_flux(b_idx : b_idx + nl)
+  end subroutine fv_difference_code
+end module fv_difference_kernel_mod
+"""
+
+
+# The same kernel with the written field read back at a shifted offset. In
+# Fortran the right-hand side is evaluated before any of it is assigned, so
+# the statement is well defined; a loop written naively over the column is
+# not. The lowering refuses it, and so the capture must.
+_DEPENDENT_SECTION_KERNEL = _SECTION_KERNEL.replace(
+    "mass_flux(b_idx + 1 : b_idx + nl + 1) - mass_flux(b_idx : b_idx + nl)",
+    "difference(w3_idx + 1 : w3_idx + nl + 1) - mass_flux(b_idx : b_idx + nl)")
+
+
 # The kind of a module constant is stated only in its own module, so the
 # transformation reads it there rather than guessing. A real run reaches it
 # because generate() puts the kernel search path on the ModuleManager; these
@@ -195,6 +257,98 @@ def paired_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose captured loop has a cell loop beside it."""
     return _invoke(
         tmp_path, "scaled_copy", _PAIRED_ALGORITHM, _SECOND_KERNEL)
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="section_target")
+def section_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel assigns a whole-column section."""
+    return _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM, _SECTION_KERNEL)
+
+
+def test_lfric_kokkos_trans_captures_an_array_section(section_target):
+    """A whole-column section is lowered to a loop and then generated.
+
+    The finite-volume family writes a column as one assignment, which the C
+    writer has no Range handler for. The section is therefore lowered before
+    the region is described, using PSyclone's own
+    ArrayAssignment2LoopsTrans, rather than teaching the Kokkos backend a
+    second way to say the same thing.
+    """
+    psy, loop, _ = section_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert 'extern "C" void fv_difference_kokkos(' in cpp
+    # The section became a counted loop over the column, keeping each side's
+    # own lower bound as an offset from the assigned range's start.
+    assert "for(idx=w3_idx; idx<=(w3_idx + nl); idx+=1)" in cpp
+    assert "difference((idx - 1)) = " in cpp
+    assert "mass_flux(((idx + ((b_idx + 1) - w3_idx)) - 1))" in cpp
+    assert "mass_flux(((idx + (b_idx - w3_idx)) - 1))" in cpp
+    # The counter the lowering introduced is declared inside the lambda.
+    assert "int idx;" in cpp
+    assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
+
+    assert "call fv_difference_kokkos(" in fortran
+    assert "call fv_difference_code(" not in fortran
+
+
+def test_lfric_kokkos_trans_refuses_an_unlowerable_section(
+        tmp_path, clear_module_manager_instance):
+    """A section the lowering will not touch stays a refusal.
+
+    Widening a capture is only safe if the thing it delegates to keeps its
+    own refusals, so this asserts that PSyclone's reason is carried out
+    rather than swallowed.
+    """
+    # pylint: disable-next=unused-variable
+    _, loop, _ = _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM,
+        _DEPENDENT_SECTION_KERNEL)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert "cannot lower an array section to a loop" in str(error.value)
+    assert "loop-carried dependencies" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_section_outside_an_assignment(
+        section_target):
+    """Only a whole-column assignment is within reach of the lowering.
+
+    An intrinsic called as a statement can hold a section that no assignment
+    encloses, which the lowering has no way to rewrite. Validation says so
+    itself rather than letting the backend fail later on a bare Range.
+    """
+    _, loop, kernel = section_target
+    schedule = kernel.get_callees()[0]
+    field = schedule.symbol_table.lookup("difference")
+    integer = ScalarType.integer_type()
+    section = ArrayReference.create(field, [Range.create(
+        Literal("1", integer), Literal("2", integer))])
+    schedule.addchild(IntrinsicCall.create(
+        IntrinsicCall.Intrinsic.RANDOM_NUMBER, [section]))
+
+    with pytest.raises(TransformationError, match="outside an assignment"):
+        LFRicKokkosTrans().validate(loop)
+
+
+def test_lfric_kokkos_trans_validate_leaves_sections_alone(section_target):
+    """Validation predicts the lowering; it must not perform it.
+
+    validate() is public and callable on its own, so a caller deciding
+    whether a loop is capturable would otherwise silently rewrite the
+    kernel it was only asking about.
+    """
+    _, loop, kernel = section_target
+    schedule = kernel.get_callees()[0]
+
+    LFRicKokkosTrans().validate(loop)
+
+    assert len(schedule.walk(Range)) == 3
 
 
 def test_lfric_kokkos_trans_splices_one_loop(target):
