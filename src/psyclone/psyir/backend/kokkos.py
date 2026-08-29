@@ -11,7 +11,9 @@ import re
 from typing import Tuple, Union
 
 from psyclone.psyir.backend.c import CWriter
-from psyclone.psyir.nodes import ArrayReference, CodeBlock, KernelSchedule
+from psyclone.psyir.nodes import (
+    ArrayReference, CodeBlock, KernelSchedule, Reference)
+from psyclone.psyir.symbols import ArrayType
 
 
 @dataclass(frozen=True)
@@ -49,29 +51,53 @@ class KokkosRegion:
     # every module variable as a literal block and Sphinx then appends its
     # own "alias of" line unindented, which fails the ``-W`` doc build.
     arguments: Tuple[Union[KokkosScalar, KokkosView], ...]
+    #: One ``(Fortran kind name, C type)`` pair per kind the region's body
+    #: mentions, such as ``("r_solver", "float")``. The region's arguments
+    #: carry their own C types, but its locals and its literals cross no
+    #: interface and would otherwise be generated at the C writer's default
+    #: width -- silently promoting a single-precision kernel to double.
+    #: Empty means "generate as the C writer would", which is what every
+    #: region built before this field existed did.
+    kind_types: Tuple[Tuple[str, str], ...] = ()
 
 
 class KokkosWriter(CWriter):
     """Generate a C++/Kokkos translation unit for a captured region."""
 
-    _SUPPORTED_TYPES = ("double", "int")
+    _SUPPORTED_TYPES = ("double", "float", "int")
 
     def __init__(self, **kwargs):
+        """Create a writer holding no region.
+
+        :param kwargs: additional keyword arguments for
+            :py:class:`~psyclone.psyir.backend.c.CWriter`.
+        :type kwargs: unwrapped dict
+        """
         super().__init__(**kwargs)
         self._views = {}
+        self._kind_types = {}
 
     def __call__(self, region: KokkosRegion) -> str:
         """Generate code for ``region``.
 
+        The region's :py:attr:`KokkosRegion.kind_types` are in force for the
+        duration of the call and cleared afterwards, so that a writer reused
+        for a second region does not carry the first one's widths into it.
+
         :param region: the captured region to generate.
 
         :returns: a complete C++ translation unit.
+
+        :raises TypeError: as :py:meth:`_validate` does.
+        :raises ValueError: as :py:meth:`_validate` does, and if the body
+            indexes an array for which the region described no View.
         """
         self._validate(region)
         self._views = {
             argument.name: argument for argument in region.arguments
             if isinstance(argument, KokkosView)
         }
+        self._kind_types = dict(region.kind_types)
 
         signature = ",\n    ".join(
             self._argument_declaration(argument)
@@ -88,7 +114,7 @@ class KokkosWriter(CWriter):
         body = "".join(
             self._visit(child) for child in region.schedule.children)
         self._depth = 0
-        self._views = {}
+        self._views, self._kind_types = {}, {}
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
@@ -120,12 +146,38 @@ class KokkosWriter(CWriter):
 
     @staticmethod
     def _is_identifier(value):
-        """Return whether ``value`` is a C++ identifier."""
+        """Return whether ``value`` is a C++ identifier.
+
+        :param value: the candidate name, which need not be a string.
+
+        :returns: whether it can be written into generated C++ as a name.
+        :rtype: bool
+        """
         return isinstance(value, str) and bool(
             re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value))
 
     def _validate(self, region):
-        """Reject incomplete or unsupported region descriptions."""
+        """Reject incomplete or unsupported region descriptions.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :raises TypeError: if ``region`` is not a
+            :py:class:`KokkosRegion`, if its schedule is not a
+            :py:class:`~psyclone.psyir.nodes.KernelSchedule`, if an argument
+            is neither a :py:class:`KokkosScalar` nor a
+            :py:class:`KokkosView`, if an argument's or a kind's C type is not
+            in :py:attr:`_SUPPORTED_TYPES`, or if a View's index offsets are
+            not integers.
+        :raises ValueError: if the region's name, its cell count, an argument
+            name, a kind name or a View's data name, extents or region indices
+            are not C++ identifiers; if the schedule contains a
+            :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
+            share a C ABI name; if the cell count is not itself a scalar
+            argument; if a kernel argument has no description; or if a View
+            breaks the ownership or dimensional contract
+            :py:meth:`_validate_view` states.
+        """
         # pylint: disable=too-many-branches
         if not isinstance(region, KokkosRegion):
             raise TypeError(
@@ -141,6 +193,15 @@ class KokkosWriter(CWriter):
                 f"Cell count '{region.cell_count}' is not a C++ identifier.")
         if region.schedule.walk(CodeBlock):
             raise ValueError("Kokkos regions cannot contain a CodeBlock.")
+
+        for kind, c_type in region.kind_types:
+            if not self._is_identifier(kind):
+                raise ValueError(
+                    f"Kokkos kind name '{kind}' is not a C++ identifier.")
+            if c_type not in self._SUPPORTED_TYPES:
+                raise TypeError(
+                    f"Kokkos kind '{kind}' has unsupported C type "
+                    f"'{c_type}'.")
 
         abi_names = set()
         view_names = set()
@@ -185,7 +246,18 @@ class KokkosWriter(CWriter):
                 f"{', '.join(sorted(missing))}.")
 
     def _validate_view(self, view):
-        """Validate the ownership and dimensional contract for one View."""
+        """Validate the ownership and dimensional contract for one View.
+
+        :param view: the View description to check.
+        :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
+
+        :raises ValueError: if the View is managed, so would own LFRic
+            storage; if its data name, extents or region indices are not C++
+            identifiers; if its rank does not match the kernel and region
+            indices supplied for it; or if it is writable while asking for
+            ``RandomAccess``.
+        :raises TypeError: if its index offsets are not integers.
+        """
         if view.managed:
             raise ValueError(f"Kokkos View '{view.name}' must be unmanaged.")
         if not self._is_identifier(view.data_name):
@@ -214,7 +286,17 @@ class KokkosWriter(CWriter):
 
     @staticmethod
     def _argument_declaration(argument):
-        """Return one declaration in the generated C ABI."""
+        """Return one declaration in the generated C ABI.
+
+        :param argument: the scalar or View to declare.
+        :type argument: Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`]
+
+        :returns: the C declaration, a value for a scalar and a pointer to
+            caller-owned storage for a View.
+        :rtype: str
+        """
         if isinstance(argument, KokkosScalar):
             return f"const {argument.c_type} {argument.name}"
         const = "const " if argument.read_only else ""
@@ -222,7 +304,14 @@ class KokkosWriter(CWriter):
 
     @staticmethod
     def _view_declaration(view):
-        """Return an unmanaged View declaration."""
+        """Return an unmanaged View declaration.
+
+        :param view: the View to declare over storage the caller owns.
+        :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
+
+        :returns: the declaration, indented for the region body.
+        :rtype: str
+        """
         const = "const " if view.read_only else ""
         rank = "*" * len(view.extents)
         traits = "ReadOnly" if view.random_access else "Unmanaged"
@@ -232,8 +321,74 @@ class KokkosWriter(CWriter):
             f"Kokkos::LayoutLeft, MemorySpace, {traits}> {view.name}("
             f"{view.data_name}, {extents});")
 
+    def _kind_c_type(self, datatype):
+        """Return the C type this region generates for a datatype's kind.
+
+        :param datatype: the datatype whose kind is to be resolved.
+        :type datatype: :py:class:`psyclone.psyir.symbols.DataType`
+
+        :returns: the C type, or ``None`` if the datatype names no kind that
+            the region described.
+        :rtype: Optional[str]
+        """
+        if isinstance(datatype, ArrayType):
+            datatype = datatype.elemental_type
+        precision = getattr(datatype, "precision", None)
+        if not isinstance(precision, Reference):
+            return None
+        return self._kind_types.get(precision.symbol.name)
+
+    def gen_declaration(self, symbol) -> str:
+        """Declare a symbol at the width its Fortran kind actually has.
+
+        The C writer maps every real onto ``double``, which would promote a
+        single-precision kernel's locals without saying so. A symbol whose
+        kind the region did not describe is left to it: the counter
+        :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
+        introduces for a lowered array section has no named kind, and must
+        still be generated as ``int``.
+
+        :param symbol: the symbol to declare.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the C declaration, without indentation or punctuation.
+        :rtype: str
+        """
+        c_type = self._kind_c_type(symbol.datatype)
+        if c_type is None:
+            return super().gen_declaration(symbol)
+        pointer = "* restrict " if symbol.is_array else ""
+        return f"{c_type} {pointer}{symbol.name}"
+
+    def literal_node(self, node) -> str:
+        """Write a literal at the width its own Fortran kind has.
+
+        ``2.0_r_solver`` is a ``float`` in a single-precision build, and C++
+        would otherwise read the generated ``2.0`` as a ``double`` and promote
+        the whole expression around it.
+
+        :param node: the literal to write.
+        :type node: :py:class:`psyclone.psyir.nodes.Literal`
+
+        :returns: the C representation of the literal.
+        :rtype: str
+        """
+        text = super().literal_node(node)
+        if self._kind_c_type(node.datatype) == "float":
+            return f"{text}f"
+        return text
+
     def arrayreference_node(self, node: ArrayReference) -> str:
-        """Emit an indexed View access with Fortran lower bounds removed."""
+        """Emit an indexed View access with Fortran lower bounds removed.
+
+        :param node: the array reference in the captured body.
+
+        :returns: the equivalent zero-based View access.
+
+        :raises ValueError: if the region described no View for the array, or
+            if it supplied a different number of index offsets than the
+            reference has indices.
+        """
         try:
             view = self._views[node.name]
         except KeyError as err:
