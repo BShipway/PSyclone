@@ -88,6 +88,15 @@ class LFRicKokkosTrans(Transformation):
         "double": ("real(c_double)", "c_double"),
     }
 
+    #: A literal of each intrinsic, usable as the argument of
+    #: ``storage_size``. Only the intrinsics :py:attr:`_C_TYPES` admits need
+    #: an entry, and the probe is built from this rather than special-cased
+    #: per kind name.
+    _KIND_PROBES = {
+        ScalarType.Intrinsic.INTEGER: "1",
+        ScalarType.Intrinsic.REAL: "1.0",
+    }
+
     #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
     #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
     _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE)
@@ -659,6 +668,48 @@ class LFRicKokkosTrans(Transformation):
         return symbol
 
     @classmethod
+    def _kind_assertions(cls, kind_types):
+        """Write the compile-time width checks for one region's kinds.
+
+        The compiler already checks the arguments, because the interface names
+        an ``iso_c_binding`` kind where the PSy layer names an LFRic one. It
+        cannot check what the generated body assumed about a local or a
+        literal, and it cannot check anything at all if the two kinds happen to
+        agree today and stop agreeing when LFRic is rebuilt at another
+        precision. These assertions close both gaps in the one place the
+        generated Fortran and the generated C++ meet.
+
+        Each is the standard Fortran static assert: ``merge`` selects the kind
+        ``4`` when the widths match and ``-1`` when they do not, and ``-1`` is
+        not a supported integer kind, so a mismatch is a hard compile error
+        naming the parameter and therefore the kind.
+
+        :param kind_types: one ``(kind name, C type)`` pair per kind, as
+            :py:meth:`_kind_types` returns them.
+        :type kind_types: tuple[tuple[str, str], ...]
+
+        :returns: the ``use`` line and one assertion per pair, each line
+            already indented for an interface body, or the empty string when
+            there are no kinds to assert.
+        :rtype: str
+        """
+        if not kind_types:
+            return ""
+        intrinsics = {c_type: intrinsic
+                      for (intrinsic, _), c_type in cls._C_TYPES.items()}
+        names = ", ".join(kind for kind, _ in kind_types)
+        lines = [f"    use constants_mod, only : {names}"]
+        for kind, c_type in kind_types:
+            probe = cls._KIND_PROBES[intrinsics[c_type]]
+            c_kind = cls._FORTRAN_TYPES[c_type][1]
+            lines.append(
+                f"    integer(kind=merge(4, -1, "
+                f"storage_size({probe}_{kind}) == &\n"
+                f"        storage_size({probe}_{c_kind}))), parameter :: "
+                f"assert_kind_{kind} = 0")
+        return "\n".join(lines) + "\n"
+
+    @classmethod
     def _interface(cls, region):
         """Write the ``bind(C)`` interface the PSy layer calls through."""
         names = [argument.name for argument in region.arguments]
@@ -668,7 +719,10 @@ class LFRicKokkosTrans(Transformation):
         for line in signature[1:]:
             header += " &\n      " + line
         declarations = []
+        # The assertions name an iso_c_binding kind too, and a body-only kind
+        # can have a C type no argument carries, so both sources are counted.
         used = {argument.c_type for argument in region.arguments}
+        used |= {c_type for _, c_type in region.kind_types}
         for argument in region.arguments:
             fortran = cls._FORTRAN_TYPES[argument.c_type][0]
             if isinstance(argument, KokkosScalar):
@@ -683,10 +737,16 @@ class LFRicKokkosTrans(Transformation):
         kinds = ", ".join(kind for c_type, (_, kind)
                           in cls._FORTRAN_TYPES.items() if c_type in used)
         body = "\n".join(declarations)
+        # A `use` must precede every other specification statement, so the
+        # assertions follow both of them; and they sit inside the interface
+        # body so that the generated interface stays self-contained and needs
+        # nothing added to the PSy layer around it.
+        assertions = cls._kind_assertions(region.kind_types)
         return (
             "interface\n"
             f"{header}) bind(C)\n"
             f"    use iso_c_binding, only : {kinds}\n"
+            f"{assertions}"
             f"{body}\n"
             f"  end subroutine {region.name}\n"
             "end interface")

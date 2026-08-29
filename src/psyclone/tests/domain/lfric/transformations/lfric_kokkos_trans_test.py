@@ -17,6 +17,7 @@ from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.parse import ModuleManager
 from psyclone.parse.algorithm import parse
 from psyclone.psyGen import PSyFactory
+from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosScalar
 from psyclone.psyir.nodes import (
     ArrayReference, CodeBlock, IntrinsicCall, Literal, Range)
 from psyclone.psyir.symbols import ScalarType
@@ -549,6 +550,15 @@ def test_lfric_kokkos_trans_splices_one_loop(target):
     # others, so widening the ABI leaves an int/double region untouched.
     assert "use iso_c_binding, only : c_int, c_double" in fortran
     assert "c_float" not in fortran
+    # The widths the C++ body assumed, asserted where the two languages meet.
+    # The double-precision region needs this as much as the single-precision
+    # one does: it is only correct while r_def really is 8 bytes.
+    assert "use constants_mod, only : i_def, r_def" in fortran
+    assert ("storage_size(1_i_def) == &\n        storage_size(1_c_int))), "
+            "parameter :: assert_kind_i_def = 0" in fortran)
+    assert ("storage_size(1.0_r_def) == &\n        "
+            "storage_size(1.0_c_double))), parameter :: assert_kind_r_def = 0"
+            in fortran)
     assert "dimension(*), intent(inout) :: moist_dyn_gas" in fortran
     assert "call moist_dyn_gas_kokkos(" in fortran
     assert "map_wtheta, loop0_stop, recip_epsilon)" in fortran
@@ -802,3 +812,33 @@ def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
     assert "real(c_float), dimension(*), intent(in) :: field_in" in fortran
     assert "real(c_float), value :: scaling" in fortran
     assert "c_double" not in fortran
+
+    # The compiler checks the arguments, because the interface names a C kind
+    # and the PSy layer names an LFRic one. It cannot check what the body
+    # assumed, so the interface says so itself.
+    assert "use constants_mod, only : i_def, r_single, r_solver" in fortran
+    assert ("storage_size(1.0_r_solver) == &\n        "
+            "storage_size(1.0_c_float))), parameter :: assert_kind_r_solver "
+            "= 0" in fortran)
+    assert ("storage_size(1.0_r_single) == &\n        "
+            "storage_size(1.0_c_float))), parameter :: assert_kind_r_single "
+            "= 0" in fortran)
+
+
+def test_lfric_kokkos_trans_asserts_nothing_about_an_unkinded_region():
+    """A region naming no resolvable kind grows no use and no assertion.
+
+    Every LFRic kernel names kinds, so ``apply`` cannot reach this; it is the
+    guard that stops an empty table generating ``use constants_mod, only :``
+    with nothing after it, which is a syntax error rather than a harmless
+    no-op. ``_interface`` reads only the fields set here, so the schedule the
+    region would otherwise carry is left out.
+    """
+    region = KokkosRegion(
+        name="unkinded_kokkos", schedule=None, cell_count="ncells",
+        arguments=(KokkosScalar("ncells", "int"),))
+    interface = LFRicKokkosTrans._interface(region)
+
+    assert "use iso_c_binding, only : c_int" in interface
+    assert "constants_mod" not in interface
+    assert "assert_kind" not in interface
