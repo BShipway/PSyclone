@@ -206,6 +206,24 @@ _DEPENDENT_SECTION_KERNEL = _SECTION_KERNEL.replace(
     "difference(w3_idx + 1 : w3_idx + nl + 1) - mass_flux(b_idx : b_idx + nl)")
 
 
+# The same kernel with the column floored at a constant imported from a module
+# that is not on the search path, so its symbol stays unresolved. The lowering
+# has to expand every reference in the statement to decide whether it is an
+# array, and cannot do that for a symbol whose declaration it has never seen.
+# The argument of an intrinsic is where the two answers part company:
+# ArrayAssignment2LoopsTrans.validate() skips references a Call encloses, and
+# its apply() expands them like any other. A kernel of this shape, in
+# solver_moist_correction_alg_mod, is what showed the difference.
+_UNRESOLVED_SECTION_KERNEL = _SECTION_KERNEL.replace(
+    "  use fs_continuity_mod, only : w3, w2v",
+    "  use fs_continuity_mod, only : w3, w2v\n"
+    "  use unresolvable_constants_mod, only : eps").replace(
+    "difference(w3_idx : w3_idx + nl) = &",
+    "difference(w3_idx : w3_idx + nl) = max(eps, &").replace(
+    "- mass_flux(b_idx : b_idx + nl)",
+    "- mass_flux(b_idx : b_idx + nl))")
+
+
 # The kind of a module constant is stated only in its own module, so the
 # transformation reads it there rather than guessing. A real run reaches it
 # because generate() puts the kernel search path on the ModuleManager; these
@@ -313,6 +331,33 @@ def test_lfric_kokkos_trans_refuses_an_unlowerable_section(
         LFRicKokkosTrans().validate(loop)
     assert "cannot lower an array section to a loop" in str(error.value)
     assert "loop-carried dependencies" in str(error.value)
+
+
+def test_lfric_kokkos_trans_section_check_predicts_the_lowering(
+        tmp_path, clear_module_manager_instance):
+    """The section check answers for the lowering, not for its validate.
+
+    ArrayAssignment2LoopsTrans.validate() accepts this assignment and its
+    apply() then refuses it: validate() skips the references a Call encloses
+    and apply() expands them like any other. Asking the weaker question left
+    _validate_sections() promising a prediction it did not make, so a caller
+    using the two helpers in turn -- as the coverage survey does -- got an
+    exception out of the lowering instead of a refusal.
+
+    Asserted through the public validate(), which reports the section reason
+    because the section check is complete on its own. Other checks would
+    refuse this kernel too, for its unresolved import; that they run later is
+    what makes the message evidence about this one.
+    """
+    # pylint: disable-next=unused-variable
+    _, loop, _ = _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM,
+        _UNRESOLVED_SECTION_KERNEL)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert "cannot lower an array section to a loop" in str(error.value)
+    assert "eps" in str(error.value)
 
 
 def test_lfric_kokkos_trans_refuses_a_section_outside_an_assignment(

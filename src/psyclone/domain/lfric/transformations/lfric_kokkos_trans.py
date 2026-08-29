@@ -198,14 +198,23 @@ class LFRicKokkosTrans(Transformation):
                 f"LFRicKokkosTrans cannot capture the call to '{name}': the "
                 "generated region has no Fortran to call into.")
 
-    @staticmethod
-    def _validate_sections(schedule):
+    @classmethod
+    def _validate_sections(cls, schedule):
         """Check that every whole-column section can be lowered to a loop.
 
         The generated region has no way to say ``a(i:j)``, so a section is
         rewritten as an explicit loop before the backend sees it. This
         predicts that rewrite rather than performing it, because
         :py:meth:`validate` must leave the schedule as it found it.
+
+        The prediction is made by lowering a **copy** of the schedule rather
+        than by asking ``ArrayAssignment2LoopsTrans.validate``, whose answer is
+        weaker than its own ``apply``: it skips the references a ``Call``
+        encloses, and ``apply`` expands them like any other, so an unresolved
+        import used as an intrinsic's argument is accepted and then refused.
+        Restating that rule here would leave two copies of it to keep in step,
+        so the lowering itself is the predicate and the copy is what keeps it
+        side-effect free.
 
         :param schedule: the kernel schedule to be captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
@@ -221,16 +230,14 @@ class LFRicKokkosTrans(Transformation):
                     "LFRicKokkosTrans cannot capture an array section outside "
                     "an assignment: only a whole-column assignment can be "
                     "lowered to a loop the generated region can express.")
-        lowering = ArrayAssignment2LoopsTrans()
-        for assignment in schedule.walk(Assignment):
-            if not assignment.walk(Range):
-                continue
-            try:
-                lowering.validate(assignment)
-            except TransformationError as err:
-                raise TransformationError(
-                    "LFRicKokkosTrans cannot lower an array section to a "
-                    f"loop: {err}") from err
+        if not schedule.walk(Range):
+            return
+        try:
+            cls._lower_sections(schedule.copy())
+        except TransformationError as err:
+            raise TransformationError(
+                "LFRicKokkosTrans cannot lower an array section to a "
+                f"loop: {err}") from err
 
     @staticmethod
     def _lower_sections(schedule):
@@ -244,6 +251,11 @@ class LFRicKokkosTrans(Transformation):
 
         :param schedule: the kernel schedule to be captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if an assignment holding a section
+            cannot be lowered. :py:meth:`_validate_sections` predicts this by
+            running this method over a copy, so reaching it from
+            :py:meth:`apply` would mean that prediction had been skipped.
         """
         lowering = ArrayAssignment2LoopsTrans()
         for assignment in schedule.walk(Assignment):
