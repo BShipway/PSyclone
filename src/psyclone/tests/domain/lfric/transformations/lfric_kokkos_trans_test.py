@@ -365,12 +365,15 @@ _POLYMORPHIC_MEMBER = """
 """
 
 
-def _polymorphic_kernel(name, first, second):
+def _polymorphic_kernel(name, first, second, stencil=False):
     """Build a kernel module whose code is an interface over two kinds.
 
     :param str name: the kernel's base name, without ``_kernel_mod``.
     :param str first: the kind of the first specific procedure.
     :param str second: the kind of the second.
+    :param bool stencil: whether the read field carries a cross stencil. It
+        changes nothing about the precisions; it puts the metadata outside
+        what ``KernelInterface`` builds, which is a separate refusal.
 
     :returns: Fortran source for the module.
     :rtype: str
@@ -378,10 +381,15 @@ def _polymorphic_kernel(name, first, second):
     members = "".join(
         _POLYMORPHIC_MEMBER.format(name=name, kind=kind)
         for kind in (first, second))
+    imports = "gh_read, cell_column"
+    read_arg = "arg_type(gh_field,  gh_real, gh_read,  w3)"
+    if stencil:
+        imports = "gh_read, cell_column, stencil, cross"
+        read_arg = "arg_type(gh_field,  gh_real, gh_read,  w3, stencil(cross))"
     return f"""
 module {name}_kernel_mod
   use argument_mod, only : arg_type, gh_field, gh_scalar, gh_real, gh_write, &
-                           gh_read, cell_column
+                           {imports}
   use constants_mod, only : i_def, r_def, r_single, r_double, r_solver, r_quad
   use fs_continuity_mod, only : w3
   use kernel_mod, only : kernel_type
@@ -389,7 +397,7 @@ module {name}_kernel_mod
   type, public, extends(kernel_type) :: {name}_kernel_type
     type(arg_type) :: meta_args(3) = (/                              &
          arg_type(gh_field,  gh_real, gh_write, w3),                 &
-         arg_type(gh_field,  gh_real, gh_read,  w3),                 &
+         {read_arg},                 &
          arg_type(gh_scalar, gh_real, gh_read) /)
     integer :: operates_on = cell_column
   end type {name}_kernel_type
@@ -402,7 +410,8 @@ contains
 """
 
 
-def _polymorphic_algorithm(name, field_module, field_type, kind):
+def _polymorphic_algorithm(name, field_module, field_type, kind,
+                           stencil=False):
     """Build an algorithm invoking one polymorphic kernel.
 
     :param str name: the kernel's base name, without ``_kernel_mod``.
@@ -410,10 +419,17 @@ def _polymorphic_algorithm(name, field_module, field_type, kind):
     :param str field_type: the LFRic field type, whose precision selects the
         specific procedure.
     :param str kind: the kind of the scalar argument.
+    :param bool stencil: whether the kernel's read field carries a stencil, in
+        which case the invoke passes its extent as well.
 
     :returns: Fortran source for the program.
     :rtype: str
     """
+    extent_declaration = ""
+    extent_actual = ""
+    if stencil:
+        extent_declaration = "\n  integer :: extent = 1"
+        extent_actual = ", extent"
     return f"""
 program kokkos_{name}_test
   use constants_mod, only : {kind}
@@ -421,8 +437,8 @@ program kokkos_{name}_test
   use {name}_kernel_mod, only : {name}_kernel_type
   implicit none
   type({field_type}) :: out_field, in_field
-  real(kind={kind}) :: scaling
-  call invoke({name}_kernel_type(out_field, in_field, scaling))
+  real(kind={kind}) :: scaling{extent_declaration}
+  call invoke({name}_kernel_type(out_field, in_field{extent_actual}, scaling))
 end program kokkos_{name}_test
 """
 
@@ -552,6 +568,25 @@ def ambiguous_target_fixture(tmp_path, clear_module_manager_instance):
             "dual_scale", "r_solver_field_mod", "r_solver_field_type",
             "r_solver"),
         _polymorphic_kernel("dual_scale", "r_single", "r_solver"))
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="unmodelled_target")
+def unmodelled_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke of an interface the matcher cannot be asked about.
+
+    The precisions are the matching fixture's, so nothing about the kinds
+    stops selection. What stops it is the stencil: ``KernelInterface`` builds
+    the interface the metadata implies before comparing anything, and issue
+    #928 leaves stencils among the parts it does not build.
+    """
+    return _invoke(
+        tmp_path, "stencil_scale",
+        _polymorphic_algorithm(
+            "stencil_scale", "r_solver_field_mod", "r_solver_field_type",
+            "r_solver", stencil=True),
+        _polymorphic_kernel("stencil_scale", "r_double", "r_single",
+                            stencil=True))
 
 
 def test_lfric_kokkos_trans_captures_an_array_section(section_target):
@@ -1033,6 +1068,35 @@ def test_lfric_kokkos_trans_refuses_an_ambiguous_interface(ambiguous_target):
     assert "dual_scale_code_r_single, dual_scale_code_r_solver" in str(
         error.value)
     assert "will not choose between them" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_when_the_matcher_cannot_answer(
+        unmodelled_target):
+    """A matcher that cannot be asked has not answered "no".
+
+    ``KernelInterface`` builds the interface the metadata implies before it
+    compares any precision, and PSyclone's issue #928 leaves stencils,
+    evaluator shapes, CMA and inter-grid kernels among the parts it does not
+    build, raising ``NotImplementedError``. Letting that be read as a mismatch
+    would report a kind disagreement about a kernel whose kinds were never
+    looked at; letting it escape would make a private helper of a
+    transformation raise something other than ``TransformationError``.
+
+    This calls ``_schedule`` rather than ``validate`` on purpose.
+    ``_validate_kernel_metadata`` refuses a stencil first, so through
+    ``validate`` this case is unreachable today -- which is exactly why the
+    guard cannot rely on it. The survey in psy-ir-aidev calls ``_schedule``
+    with no metadata check in front of it, because it reports every blocker of
+    a loop rather than stopping at the first, and it is what found this.
+    """
+    _, _, kernel = unmodelled_target
+    with pytest.raises(TransformationError) as error:
+        # pylint: disable-next=protected-access
+        LFRicKokkosTrans._schedule(kernel)
+    assert ("cannot tell which of the 2 implementations of "
+            "'stencil_scale_code'" in str(error.value))
+    assert "outside what PSyclone's own matcher models" in str(error.value)
+    assert "TODO #928" in str(error.value)
 
 
 def test_lfric_kokkos_trans_asserts_nothing_about_an_unkinded_region():

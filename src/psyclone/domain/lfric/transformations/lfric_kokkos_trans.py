@@ -257,13 +257,28 @@ class LFRicKokkosTrans(Transformation):
         :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
         :raises TransformationError: if no schedule matches the precisions the
-            algorithm layer passes, or if more than one does.
+            algorithm layer passes, if more than one does, or if the matcher
+            cannot model the kernel's metadata and so cannot answer at all.
         """
         schedules = kernel.get_callees()
         if len(schedules) == 1:
             return schedules[0]
-        matches = [schedule for schedule in schedules
-                   if cls._matches(kernel, schedule)]
+        try:
+            matches = [schedule for schedule in schedules
+                       if cls._matches(kernel, schedule)]
+        except NotImplementedError as err:
+            # The matcher builds the interface the metadata implies before it
+            # compares anything, and PSyclone's issue #928 leaves parts of that
+            # unbuilt -- evaluator shapes, stencils, CMA and inter-grid
+            # kernels. Not being able to ask the question is a third outcome,
+            # distinct from asking it and getting no match: reading it as one
+            # would report a kind mismatch about a kernel whose kinds were
+            # never examined.
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot tell which of the "
+                f"{len(schedules)} implementations of '{kernel.name}' the "
+                f"algorithm layer calls: the metadata is outside what "
+                f"PSyclone's own matcher models ({err}).") from err
         if not matches:
             raise TransformationError(
                 f"LFRicKokkosTrans found no implementation of "
@@ -301,6 +316,11 @@ class LFRicKokkosTrans(Transformation):
 
         :returns: whether the algorithm layer could have called this one.
         :rtype: bool
+
+        :raises NotImplementedError: if the matcher cannot build the interface
+            the kernel's metadata implies. Deliberately not caught here:
+            :py:meth:`_schedule` turns it into a refusal, because a matcher
+            that cannot answer has not answered "no".
         """
         try:
             kernel.validate_kernel_code_args(schedule.symbol_table)
