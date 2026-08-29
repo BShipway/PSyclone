@@ -54,7 +54,7 @@ class KokkosRegion:
 class KokkosWriter(CWriter):
     """Generate a C++/Kokkos translation unit for a captured region."""
 
-    _SUPPORTED_TYPES = ("double", "int")
+    _SUPPORTED_TYPES = ("double", "float", "int")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

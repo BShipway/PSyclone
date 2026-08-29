@@ -160,6 +160,20 @@ def test_kokkos_writer_rejects_unsupported_type():
         KokkosWriter()(replace(region, arguments=arguments))
 
 
+def test_kokkos_writer_rejects_a_widened_neighbour_type():
+    """Admitting float did not admit every C type that resembles one.
+
+    ``complex`` is refused above because nothing in the prototype could ever
+    produce it; ``long`` is the harder case, being an ordinary C type of a
+    kind LFRic really has, and it stays refused because the ABI names what it
+    carries rather than excluding what it does not.
+    """
+    region = _region()
+    arguments = region.arguments + (KokkosScalar("wide_count", "long"),)
+    with pytest.raises(TypeError, match="unsupported C type 'long'"):
+        KokkosWriter()(replace(region, arguments=arguments))
+
+
 def test_kokkos_writer_rejects_codeblocks():
     """Opaque Fortran cannot silently enter generated Kokkos code."""
     region = _region()

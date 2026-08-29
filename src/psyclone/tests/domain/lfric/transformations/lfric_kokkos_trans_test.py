@@ -224,6 +224,120 @@ _UNRESOLVED_SECTION_KERNEL = _SECTION_KERNEL.replace(
     "- mass_flux(b_idx : b_idx + nl))")
 
 
+# Single precision, in the shape the solver family uses. The fields are
+# r_solver and the scalar is r_single -- two different 4-byte kinds, so a
+# widening that hardcoded one of them would not generate this. The local and
+# the literal are the point: neither crosses the C ABI, so nothing but the
+# generated declaration and the generated literal decides what precision the
+# region computes in.
+_SOLVER_ALGORITHM = """
+program kokkos_solver_test
+  use constants_mod, only : r_single
+  use r_solver_field_mod, only : r_solver_field_type
+  use scaled_solver_kernel_mod, only : scaled_solver_kernel_type
+  implicit none
+  type(r_solver_field_type) :: out_field, in_field
+  real(kind=r_single) :: scaling
+  call invoke(scaled_solver_kernel_type(out_field, in_field, scaling))
+end program kokkos_solver_test
+"""
+
+
+_SOLVER_KERNEL = """
+module scaled_solver_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_scalar, gh_real, gh_write, &
+                           gh_read, cell_column
+  use constants_mod, only : i_def, r_single, r_solver
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: scaled_solver_kernel_type
+    type(arg_type) :: meta_args(3) = (/                              &
+         arg_type(gh_field,  gh_real, gh_write, w3),                 &
+         arg_type(gh_field,  gh_real, gh_read,  w3),                 &
+         arg_type(gh_scalar, gh_real, gh_read) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: scaled_solver_code
+  end type scaled_solver_kernel_type
+contains
+  subroutine scaled_solver_code(nlayers, field_out, field_in, scaling, &
+                                ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    real(kind=r_solver), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_solver), dimension(undf_w3), intent(in) :: field_in
+    real(kind=r_single), intent(in) :: scaling
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    real(kind=r_solver) :: scaled
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        scaled = 2.0_r_solver * field_in(map_w3(df) + k)
+        field_out(map_w3(df) + k) = scaling * scaled
+      end do
+    end do
+  end subroutine scaled_solver_code
+end module scaled_solver_kernel_mod
+"""
+
+
+# The same shape with the scalar made logical, so that the refusal stage 2
+# deliberately leaves in place has a test of its own. LFRic's l_def is
+# kind(.false.), which measures 4 bytes, but PSyclone's precision map records
+# l_def as 1. Admitting it would generate logical(c_bool) against a logical(4)
+# actual, which does not compile, so the ABI widening stops at float. See
+# stage 2 of psy-ir-aidev/docs/plans/2026-08-29-phase-3-coverage.md.
+_LOGICAL_ALGORITHM = """
+program kokkos_logical_test
+  use constants_mod, only : l_def
+  use r_solver_field_mod, only : r_solver_field_type
+  use masked_solver_kernel_mod, only : masked_solver_kernel_type
+  implicit none
+  type(r_solver_field_type) :: out_field, in_field
+  logical(kind=l_def) :: masked
+  call invoke(masked_solver_kernel_type(out_field, in_field, masked))
+end program kokkos_logical_test
+"""
+
+
+_LOGICAL_KERNEL = """
+module masked_solver_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_scalar, gh_real, &
+                           gh_logical, gh_write, gh_read, cell_column
+  use constants_mod, only : i_def, l_def, r_solver
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: masked_solver_kernel_type
+    type(arg_type) :: meta_args(3) = (/                              &
+         arg_type(gh_field,  gh_real,    gh_write, w3),              &
+         arg_type(gh_field,  gh_real,    gh_read,  w3),              &
+         arg_type(gh_scalar, gh_logical, gh_read) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: masked_solver_code
+  end type masked_solver_kernel_type
+contains
+  subroutine masked_solver_code(nlayers, field_out, field_in, masked, &
+                                ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    real(kind=r_solver), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_solver), dimension(undf_w3), intent(in) :: field_in
+    logical(kind=l_def), intent(in) :: masked
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        if (masked) then
+          field_out(map_w3(df) + k) = field_in(map_w3(df) + k)
+        end if
+      end do
+    end do
+  end subroutine masked_solver_code
+end module masked_solver_kernel_mod
+"""
+
+
 # The kind of a module constant is stated only in its own module, so the
 # transformation reads it there rather than guessing. A real run reaches it
 # because generate() puts the kernel search path on the ModuleManager; these
@@ -283,6 +397,22 @@ def section_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel assigns a whole-column section."""
     return _invoke(
         tmp_path, "fv_difference", _SECTION_ALGORITHM, _SECTION_KERNEL)
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="solver_target")
+def solver_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel computes in single precision."""
+    return _invoke(
+        tmp_path, "scaled_solver", _SOLVER_ALGORITHM, _SOLVER_KERNEL)
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="logical_target")
+def logical_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes an l_def logical scalar."""
+    return _invoke(
+        tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_KERNEL)
 
 
 def test_lfric_kokkos_trans_captures_an_array_section(section_target):
@@ -412,6 +542,10 @@ def test_lfric_kokkos_trans_splices_one_loop(target):
 
     assert "subroutine moist_dyn_gas_kokkos(" in fortran
     assert "bind(C)" in fortran
+    # The interface imports the kinds its own arguments declare and no
+    # others, so widening the ABI leaves an int/double region untouched.
+    assert "use iso_c_binding, only : c_int, c_double" in fortran
+    assert "c_float" not in fortran
     assert "dimension(*), intent(inout) :: moist_dyn_gas" in fortran
     assert "call moist_dyn_gas_kokkos(" in fortran
     assert "map_wtheta, loop0_stop, recip_epsilon)" in fortran
@@ -587,13 +721,75 @@ def test_lfric_kokkos_trans_types_kinds_by_width(target, monkeypatch):
 
     Transport kernels are written in r_tran and dynamics kernels in r_def,
     which is a distinction about what the model may reconfigure rather than
-    about what reaches C. Narrowing r_def here is the same question asked
-    from the other side: the name is unchanged and the capture must stop.
+    about what reaches C. Narrowing r_def here is the same question asked from
+    the other side: the name is unchanged, and what the ABI carries follows the
+    width rather than the name.
     """
     _, loop, _ = target
     api_config = Config.get().api_conf("lfric")
     narrowed = dict(api_config.precision_map)
     narrowed["r_def"] = 4
     monkeypatch.setattr(api_config, "_precision_map", narrowed)
-    with pytest.raises(TransformationError, match="argument kinds"):
+    cpp = LFRicKokkosTrans().apply(loop)
+    assert "float *moist_dyn_gas_data" in cpp
+    assert "const float *mr_v_data" in cpp
+    assert "const float recip_epsilon" in cpp
+
+
+def test_lfric_kokkos_trans_fails_closed_on_an_unsupported_width(
+        target, monkeypatch):
+    """Widening the ABI to float did not make it accept every kind.
+
+    r_quad is a 16-byte real and is in the LFRic precision map, so the map
+    resolves it and the C type table then has no entry for it. Asked through
+    the same route as the test above, so that the two read as one question
+    with two answers.
+    """
+    _, loop, _ = target
+    api_config = Config.get().api_conf("lfric")
+    widened = dict(api_config.precision_map)
+    widened["r_def"] = widened["r_quad"]
+    monkeypatch.setattr(api_config, "_precision_map", widened)
+    with pytest.raises(TransformationError, match="argument kinds") as err:
         LFRicKokkosTrans().validate(loop)
+    assert "4-byte integer, 4-byte real and 8-byte real" in str(err.value)
+
+
+def test_lfric_kokkos_trans_still_refuses_a_logical_kind(logical_target):
+    """A logical scalar stays refused after the ABI admits single precision.
+
+    LFRic's l_def is kind(.false.) and measures 4 bytes; PSyclone's precision
+    map records it as 1. Generating logical(c_bool) against a logical(4)
+    actual would not compile, so the widening deliberately stops at float.
+    """
+    _, loop, _ = logical_target
+    with pytest.raises(TransformationError, match="argument kinds") as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "masked" in str(err.value)
+
+
+def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
+    """An r_solver kernel reaches C as float on both sides of the ABI.
+
+    The fields are r_solver and the scalar is r_single -- two different 4-byte
+    kinds -- so a widening that hardcoded one kind name would not generate
+    this. What matters is that neither side promotes: the C++ says float and
+    the bind(C) interface says real(c_float), so a single-precision build is
+    honoured rather than silently widened to double.
+    """
+    psy, loop, _ = solver_target
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "float *field_out_data" in cpp
+    assert "const float *field_in_data" in cpp
+    assert "const float scaling" in cpp
+    assert "Kokkos::View<float*, Kokkos::LayoutLeft" in cpp
+    assert "Kokkos::View<const float*, Kokkos::LayoutLeft" in cpp
+
+    assert "use iso_c_binding, only : c_int, c_float" in fortran
+    assert ("real(c_float), dimension(*), intent(inout) :: field_out"
+            in fortran)
+    assert "real(c_float), dimension(*), intent(in) :: field_in" in fortran
+    assert "real(c_float), value :: scaling" in fortran
+    assert "c_double" not in fortran

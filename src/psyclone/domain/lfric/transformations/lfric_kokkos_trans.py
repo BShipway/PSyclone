@@ -33,8 +33,9 @@ class LFRicKokkosTrans(Transformation):
     The transformation recognises a kernel shape rather than a named kernel:
     an uncoloured owned-cell loop over a single kernel whose arguments are
     fields and scalars, whose written fields are on discontinuous spaces, and
-    whose formals and referenced module constants all map onto the fixed
-    ``int``/``double`` ABI the Kokkos backend emits. Every part of the
+    whose formals and referenced module constants all map onto the
+    ``int``/``float``/``double`` ABI the Kokkos backend emits. Every part of
+    the
     generated region -- its name, its C signature, its Views and the
     ``bind(C)`` interface the PSy layer calls through -- is derived from that
     kernel, so a second kernel needs no change here.
@@ -59,18 +60,33 @@ class LFRicKokkosTrans(Transformation):
     #: array. Named by the PSy layer, not by the kernel.
     _CELL_COUNT = "ncells"
 
-    #: The two C types the Kokkos backend emits, by what LFRic says a kind
+    #: The C types the Kokkos backend emits, by what LFRic says a kind
     #: actually is. Widths come from PSyclone's own precision map rather than
     #: from a list of kind names, so ``r_tran`` and ``r_bl`` are accepted or
-    #: refused on the same evidence as ``r_def``. Anything else -- ``l_def``,
-    #: a 4-byte ``r_solver``, an undeclared precision -- has no place here and
-    #: fails closed rather than being guessed at.
+    #: refused on the same evidence as ``r_def``, and a single-precision
+    #: ``r_solver`` build is honoured rather than silently promoted.
+    #:
+    #: There is deliberately no ``BOOLEAN`` entry. The precision map records
+    #: ``l_def: 1``, but LFRic defines ``l_def = kind(.false.)``, which
+    #: measures 4 bytes; mapping it would emit ``logical(c_bool)`` against a
+    #: ``logical(4)`` actual and the model build would fail. A kind this table
+    #: does not name -- ``l_def``, a 16-byte ``r_quad``, an undeclared
+    #: precision -- fails closed rather than being guessed at.
     _C_TYPES = {
         (ScalarType.Intrinsic.INTEGER, 4): "int",
+        (ScalarType.Intrinsic.REAL, 4): "float",
         (ScalarType.Intrinsic.REAL, 8): "double",
     }
 
-    _FORTRAN_TYPES = {"int": "integer(c_int)", "double": "real(c_double)"}
+    #: Per C type, the Fortran declaration the ``bind(C)`` interface uses and
+    #: the ``iso_c_binding`` kind that declaration needs imported. One table
+    #: rather than two, so the interface's ``use`` line and its declarations
+    #: cannot disagree.
+    _FORTRAN_TYPES = {
+        "int": ("integer(c_int)", "c_int"),
+        "float": ("real(c_float)", "c_float"),
+        "double": ("real(c_double)", "c_double"),
+    }
 
     #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
     #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
@@ -275,7 +291,7 @@ class LFRicKokkosTrans(Transformation):
         for symbol in formals:
             if cls._c_type(symbol) is None:
                 raise TransformationError(
-                    "LFRicKokkosTrans supports 4-byte integer and 8-byte real "
+                    f"LFRicKokkosTrans supports {cls._supported_kinds()} "
                     f"argument kinds only, but '{symbol.name}' has "
                     f"'{cls._kind_name(symbol)}'.")
             for extent in cls._extents(symbol):
@@ -284,6 +300,21 @@ class LFRicKokkosTrans(Transformation):
                         f"LFRicKokkosTrans needs the extent '{extent}' of "
                         f"'{symbol.name}' to be a kernel argument, so that "
                         "the generated View can be sized.")
+
+    @classmethod
+    def _supported_kinds(cls):
+        """Name the widths on the ABI, in the order :py:attr:`_C_TYPES` has.
+
+        Derived from the table rather than spelt out, so the two refusal
+        messages that quote it cannot drift from what is actually accepted.
+
+        :returns: a phrase such as ``4-byte integer, 4-byte real and 8-byte
+            real``.
+        :rtype: str
+        """
+        widths = [f"{width}-byte {intrinsic.name.lower()}"
+                  for intrinsic, width in cls._C_TYPES]
+        return " and ".join([", ".join(widths[:-1]), widths[-1]])
 
     @staticmethod
     def _kind_name(symbol):
@@ -387,7 +418,7 @@ class LFRicKokkosTrans(Transformation):
         if c_type is None:
             raise TransformationError(
                 f"LFRicKokkosTrans cannot pass '{symbol.name}' from "
-                f"'{container}' by value: only 4-byte integer and 8-byte real "
+                f"'{container}' by value: only {cls._supported_kinds()} "
                 "scalars have a place on the generated C ABI.")
         return (symbol.name, container, c_type)
 
@@ -597,8 +628,9 @@ class LFRicKokkosTrans(Transformation):
         for line in signature[1:]:
             header += " &\n      " + line
         declarations = []
+        used = {argument.c_type for argument in region.arguments}
         for argument in region.arguments:
-            fortran = cls._FORTRAN_TYPES[argument.c_type]
+            fortran = cls._FORTRAN_TYPES[argument.c_type][0]
             if isinstance(argument, KokkosScalar):
                 declarations.append(f"    {fortran}, value :: {argument.name}")
             else:
@@ -606,11 +638,15 @@ class LFRicKokkosTrans(Transformation):
                 declarations.append(
                     f"    {fortran}, dimension(*), intent({intent}) :: "
                     f"{argument.name}")
+        # Only the kinds this region's arguments declare, in table order, so
+        # that a region using none of a kind does not import it unused.
+        kinds = ", ".join(kind for c_type, (_, kind)
+                          in cls._FORTRAN_TYPES.items() if c_type in used)
         body = "\n".join(declarations)
         return (
             "interface\n"
             f"{header}) bind(C)\n"
-            "    use iso_c_binding, only : c_int, c_double\n"
+            f"    use iso_c_binding, only : {kinds}\n"
             f"{body}\n"
             f"  end subroutine {region.name}\n"
             "end interface")
