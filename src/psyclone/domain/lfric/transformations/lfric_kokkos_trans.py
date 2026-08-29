@@ -17,8 +17,8 @@ from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosView, KokkosWriter)
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Loop, Range,
-    Reference, Routine)
+    ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Literal, Loop,
+    Range, Reference, Routine)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ArrayType, ContainerSymbol, DataSymbol,
     ImportInterface, RoutineSymbol, ScalarType, UnsupportedFortranType,
@@ -351,6 +351,45 @@ class LFRicKokkosTrans(Transformation):
         precision = Config.get().api_conf("lfric").precision_map
         return cls._C_TYPES.get((intrinsic, precision.get(kind)))
 
+    @classmethod
+    def _kind_types(cls, schedule):
+        """Return the C type of every kind the captured body names.
+
+        The region's arguments carry their own C types, but its locals and
+        its literals cross no interface: nothing outside the generated file
+        constrains them, so a kind the backend cannot resolve is silently
+        generated at the C writer's default width. This is what stops that.
+
+        A kind :py:meth:`_map_kind` cannot resolve is left out rather than
+        refused, because the argument checks have already refused every kind
+        that reaches the ABI; what is left is a local or a literal whose width
+        the C writer's own default is free to choose.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: one ``(kind name, C type)`` pair per resolvable kind,
+            name-ordered.
+        :rtype: tuple[tuple[str, str], ...]
+        """
+        table = schedule.symbol_table
+        kinds = {}
+        for symbol in list(table.argument_list) + list(
+                table.automatic_datasymbols):
+            kind = cls._kind_name(symbol)
+            if kind is not None:
+                kinds[kind] = cls._c_type(symbol)
+        for literal in schedule.walk(Literal):
+            datatype = literal.datatype
+            precision = getattr(datatype, "precision", None)
+            if not isinstance(precision, Reference):
+                continue
+            kind = precision.symbol.name
+            kinds[kind] = cls._map_kind(datatype.intrinsic, kind)
+        return tuple(
+            (kind, kinds[kind]) for kind in sorted(kinds)
+            if kinds[kind] is not None)
+
     @staticmethod
     def _extents(symbol):
         """Return the declared extents of an array formal, in order.
@@ -503,7 +542,8 @@ class LFRicKokkosTrans(Transformation):
             name=self._region_name(kernel),
             schedule=schedule,
             cell_count=self._CELL_COUNT,
-            arguments=self._region_arguments(schedule, per_cell, constants))
+            arguments=self._region_arguments(schedule, per_cell, constants),
+            kind_types=self._kind_types(schedule))
         try:
             cpp = KokkosWriter()(region)
         except (VisitorError, ValueError, TypeError) as err:

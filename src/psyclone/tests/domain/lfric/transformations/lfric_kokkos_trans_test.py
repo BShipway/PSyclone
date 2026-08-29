@@ -436,7 +436,10 @@ def test_lfric_kokkos_trans_captures_an_array_section(section_target):
     assert "difference((idx - 1)) = " in cpp
     assert "mass_flux(((idx + ((b_idx + 1) - w3_idx)) - 1))" in cpp
     assert "mass_flux(((idx + (b_idx - w3_idx)) - 1))" in cpp
-    # The counter the lowering introduced is declared inside the lambda.
+    # The counter the lowering introduced is declared inside the lambda. It
+    # names no Fortran kind, so it reaches the C writer's own default rather
+    # than a kind the region described -- which is the fallback in
+    # KokkosWriter.gen_declaration, load-bearing rather than defensive.
     assert "int idx;" in cpp
     assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
 
@@ -786,6 +789,12 @@ def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
     assert "const float scaling" in cpp
     assert "Kokkos::View<float*, Kokkos::LayoutLeft" in cpp
     assert "Kokkos::View<const float*, Kokkos::LayoutLeft" in cpp
+
+    # Nothing but these two lines decides what precision the region computes
+    # in: the local and the literal cross no interface, so the compiler
+    # cannot check them and a promotion here would be silent.
+    assert "float scaled;" in cpp
+    assert "2.0f" in cpp
 
     assert "use iso_c_binding, only : c_int, c_float" in fortran
     assert ("real(c_float), dimension(*), intent(inout) :: field_out"

@@ -11,7 +11,9 @@ import re
 from typing import Tuple, Union
 
 from psyclone.psyir.backend.c import CWriter
-from psyclone.psyir.nodes import ArrayReference, CodeBlock, KernelSchedule
+from psyclone.psyir.nodes import (
+    ArrayReference, CodeBlock, KernelSchedule, Reference)
+from psyclone.psyir.symbols import ArrayType
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,14 @@ class KokkosRegion:
     # every module variable as a literal block and Sphinx then appends its
     # own "alias of" line unindented, which fails the ``-W`` doc build.
     arguments: Tuple[Union[KokkosScalar, KokkosView], ...]
+    #: One ``(Fortran kind name, C type)`` pair per kind the region's body
+    #: mentions, such as ``("r_solver", "float")``. The region's arguments
+    #: carry their own C types, but its locals and its literals cross no
+    #: interface and would otherwise be generated at the C writer's default
+    #: width -- silently promoting a single-precision kernel to double.
+    #: Empty means "generate as the C writer would", which is what every
+    #: region built before this field existed did.
+    kind_types: Tuple[Tuple[str, str], ...] = ()
 
 
 class KokkosWriter(CWriter):
@@ -59,6 +69,7 @@ class KokkosWriter(CWriter):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._views = {}
+        self._kind_types = {}
 
     def __call__(self, region: KokkosRegion) -> str:
         """Generate code for ``region``.
@@ -72,6 +83,7 @@ class KokkosWriter(CWriter):
             argument.name: argument for argument in region.arguments
             if isinstance(argument, KokkosView)
         }
+        self._kind_types = dict(region.kind_types)
 
         signature = ",\n    ".join(
             self._argument_declaration(argument)
@@ -88,7 +100,7 @@ class KokkosWriter(CWriter):
         body = "".join(
             self._visit(child) for child in region.schedule.children)
         self._depth = 0
-        self._views = {}
+        self._views, self._kind_types = {}, {}
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
@@ -141,6 +153,15 @@ class KokkosWriter(CWriter):
                 f"Cell count '{region.cell_count}' is not a C++ identifier.")
         if region.schedule.walk(CodeBlock):
             raise ValueError("Kokkos regions cannot contain a CodeBlock.")
+
+        for kind, c_type in region.kind_types:
+            if not self._is_identifier(kind):
+                raise ValueError(
+                    f"Kokkos kind name '{kind}' is not a C++ identifier.")
+            if c_type not in self._SUPPORTED_TYPES:
+                raise TypeError(
+                    f"Kokkos kind '{kind}' has unsupported C type "
+                    f"'{c_type}'.")
 
         abi_names = set()
         view_names = set()
@@ -231,6 +252,63 @@ class KokkosWriter(CWriter):
             f"  Kokkos::View<{const}{view.c_type}{rank}, "
             f"Kokkos::LayoutLeft, MemorySpace, {traits}> {view.name}("
             f"{view.data_name}, {extents});")
+
+    def _kind_c_type(self, datatype):
+        """Return the C type this region generates for a datatype's kind.
+
+        :param datatype: the datatype whose kind is to be resolved.
+        :type datatype: :py:class:`psyclone.psyir.symbols.DataType`
+
+        :returns: the C type, or ``None`` if the datatype names no kind that
+            the region described.
+        :rtype: Optional[str]
+        """
+        if isinstance(datatype, ArrayType):
+            datatype = datatype.elemental_type
+        precision = getattr(datatype, "precision", None)
+        if not isinstance(precision, Reference):
+            return None
+        return self._kind_types.get(precision.symbol.name)
+
+    def gen_declaration(self, symbol) -> str:
+        """Declare a symbol at the width its Fortran kind actually has.
+
+        The C writer maps every real onto ``double``, which would promote a
+        single-precision kernel's locals without saying so. A symbol whose
+        kind the region did not describe is left to it: the counter
+        :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
+        introduces for a lowered array section has no named kind, and must
+        still be generated as ``int``.
+
+        :param symbol: the symbol to declare.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the C declaration, without indentation or punctuation.
+        :rtype: str
+        """
+        c_type = self._kind_c_type(symbol.datatype)
+        if c_type is None:
+            return super().gen_declaration(symbol)
+        pointer = "* restrict " if symbol.is_array else ""
+        return f"{c_type} {pointer}{symbol.name}"
+
+    def literal_node(self, node) -> str:
+        """Write a literal at the width its own Fortran kind has.
+
+        ``2.0_r_solver`` is a ``float`` in a single-precision build, and C++
+        would otherwise read the generated ``2.0`` as a ``double`` and promote
+        the whole expression around it.
+
+        :param node: the literal to write.
+        :type node: :py:class:`psyclone.psyir.nodes.Literal`
+
+        :returns: the C representation of the literal.
+        :rtype: str
+        """
+        text = super().literal_node(node)
+        if self._kind_c_type(node.datatype) == "float":
+            return f"{text}f"
+        return text
 
     def arrayreference_node(self, node: ArrayReference) -> str:
         """Emit an indexed View access with Fortran lower bounds removed."""

@@ -6,6 +6,8 @@
 # -----------------------------------------------------------------------------
 """Tests for the deliberately small Kokkos backend."""
 
+# pylint: disable=protected-access
+
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -181,3 +183,75 @@ def test_kokkos_writer_rejects_codeblocks():
         CodeBlock([], structure=CodeBlock.Structure.STATEMENT))
     with pytest.raises(ValueError, match="CodeBlock"):
         KokkosWriter()(region)
+
+
+def test_kokkos_writer_generates_locals_and_literals_at_their_kind():
+    """A described kind decides the width of a local and of a literal.
+
+    Nothing outside the generated file constrains either: the local crosses no
+    interface and the literal is not an argument, so without this the C
+    writer's own default would silently promote a single-precision body to
+    double.
+    """
+    region = replace(_region(), kind_types=(("i_def", "int"),
+                                            ("r_def", "float")))
+    cpp = KokkosWriter()(region)
+    assert "float mr_v_at_dof;" in cpp
+    assert "1.0f" in cpp
+    assert "int k;" in cpp
+    # The table governs the body alone. Each argument still carries its own
+    # C type, so a region whose kinds and whose ABI disagree generates the
+    # disagreement rather than hiding it.
+    assert "double *moist_dyn_gas_data" in cpp
+
+
+def test_kokkos_writer_leaves_an_undescribed_kind_to_the_c_writer():
+    """An empty kind table generates exactly what it did before it existed."""
+    assert KokkosWriter()(_region()) == KokkosWriter()(
+        replace(_region(), kind_types=()))
+    cpp = KokkosWriter()(_region())
+    assert "double mr_v_at_dof;" in cpp
+    assert "1.0" in cpp and "1.0f" not in cpp
+
+
+def test_kokkos_writer_rejects_an_invalid_kind_name():
+    """A kind name reaches generated C++ verbatim, so it must be one."""
+    region = replace(_region(), kind_types=(("r_def kind", "double"),))
+    with pytest.raises(ValueError, match="'r_def kind' is not a C\\+\\+"):
+        KokkosWriter()(region)
+
+
+def test_kokkos_writer_rejects_an_unsupported_kind_type():
+    """The kind table fails closed on the same list the ABI does."""
+    region = replace(_region(), kind_types=(("r_quad", "long double"),))
+    with pytest.raises(TypeError, match="unsupported C type 'long double'"):
+        KokkosWriter()(region)
+
+
+def test_kokkos_writer_declares_an_array_local_at_its_element_kind():
+    """A local array's kind is its element's, as it is for a kernel formal.
+
+    ``gen_declaration`` is reached through ``gen_local_variable`` for every
+    automatic symbol, so it is exercised here directly: a region whose body
+    indexed such an array would be refused later by ``arrayreference_node``,
+    which has no View for it, and the declaration would never be seen.
+    """
+    source = """
+subroutine local_array_code(nlayers)
+  use constants_mod, only : i_def, r_def
+  integer(kind=i_def), intent(in) :: nlayers
+  real(kind=r_def), dimension(3) :: column
+  integer(kind=i_def) :: k
+  do k = 1, 3
+    nlayers = nlayers
+  end do
+end subroutine local_array_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    writer = KokkosWriter()
+    writer._kind_types = {"r_def": "float", "i_def": "int"}
+    declarations = [
+        writer.gen_declaration(symbol)
+        for symbol in routine.symbol_table.automatic_datasymbols]
+    assert "float * restrict column" in declarations
+    assert "int k" in declarations
