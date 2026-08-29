@@ -339,6 +339,94 @@ end module masked_solver_kernel_mod
 """
 
 
+# A kind-polymorphic kernel: one metadata name over several implementations
+# that differ only in the precision of their real arguments. Built from a
+# template rather than written out three times because the three fixtures below
+# differ only in which two kinds the interface carries and which kind the
+# algorithm passes, and that difference is the whole point of each test.
+#
+# The layout is sci_tri_solve_kernel_mod's: a public generic interface beside
+# the metadata type, with the specific procedures named for their kind.
+_POLYMORPHIC_MEMBER = """
+  subroutine {name}_code_{kind}(nlayers, field_out, field_in, scaling, &
+                                ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    real(kind={kind}), dimension(undf_w3), intent(inout) :: field_out
+    real(kind={kind}), dimension(undf_w3), intent(in) :: field_in
+    real(kind={kind}), intent(in) :: scaling
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = scaling * field_in(map_w3(df) + k)
+      end do
+    end do
+  end subroutine {name}_code_{kind}
+"""
+
+
+def _polymorphic_kernel(name, first, second):
+    """Build a kernel module whose code is an interface over two kinds.
+
+    :param str name: the kernel's base name, without ``_kernel_mod``.
+    :param str first: the kind of the first specific procedure.
+    :param str second: the kind of the second.
+
+    :returns: Fortran source for the module.
+    :rtype: str
+    """
+    members = "".join(
+        _POLYMORPHIC_MEMBER.format(name=name, kind=kind)
+        for kind in (first, second))
+    return f"""
+module {name}_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_scalar, gh_real, gh_write, &
+                           gh_read, cell_column
+  use constants_mod, only : i_def, r_def, r_single, r_double, r_solver, r_quad
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: {name}_kernel_type
+    type(arg_type) :: meta_args(3) = (/                              &
+         arg_type(gh_field,  gh_real, gh_write, w3),                 &
+         arg_type(gh_field,  gh_real, gh_read,  w3),                 &
+         arg_type(gh_scalar, gh_real, gh_read) /)
+    integer :: operates_on = cell_column
+  end type {name}_kernel_type
+  public :: {name}_code
+  interface {name}_code
+    module procedure {name}_code_{first}, {name}_code_{second}
+  end interface
+contains
+{members}end module {name}_kernel_mod
+"""
+
+
+def _polymorphic_algorithm(name, field_module, field_type, kind):
+    """Build an algorithm invoking one polymorphic kernel.
+
+    :param str name: the kernel's base name, without ``_kernel_mod``.
+    :param str field_module: the module the field type comes from.
+    :param str field_type: the LFRic field type, whose precision selects the
+        specific procedure.
+    :param str kind: the kind of the scalar argument.
+
+    :returns: Fortran source for the program.
+    :rtype: str
+    """
+    return f"""
+program kokkos_{name}_test
+  use constants_mod, only : {kind}
+  use {field_module}, only : {field_type}
+  use {name}_kernel_mod, only : {name}_kernel_type
+  implicit none
+  type({field_type}) :: out_field, in_field
+  real(kind={kind}) :: scaling
+  call invoke({name}_kernel_type(out_field, in_field, scaling))
+end program kokkos_{name}_test
+"""
+
+
 # The kind of a module constant is stated only in its own module, so the
 # transformation reads it there rather than guessing. A real run reaches it
 # because generate() puts the kernel search path on the ModuleManager; these
@@ -414,6 +502,56 @@ def logical_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical scalar."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_KERNEL)
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="polymorphic_target")
+def polymorphic_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke of an interface exactly one member of which matches.
+
+    The r_double member is declared first, so a selection that returned
+    ``schedules[0]`` would return the wrong one and every assertion about the
+    generated types would fail. The algorithm passes r_solver fields, which
+    ``precision_map`` gives 4 bytes, so the r_single member is the match.
+    """
+    return _invoke(
+        tmp_path, "tri_scale",
+        _polymorphic_algorithm(
+            "tri_scale", "r_solver_field_mod", "r_solver_field_type",
+            "r_solver"),
+        _polymorphic_kernel("tri_scale", "r_double", "r_single"))
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="unmatched_target")
+def unmatched_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke of an interface no member of which matches.
+
+    r_single is 4 bytes and r_quad is 16; the algorithm's ``field_type`` is
+    r_def at 8. No monkeypatching: the widths are ``psyclone.cfg``'s.
+    """
+    return _invoke(
+        tmp_path, "quad_scale",
+        _polymorphic_algorithm(
+            "quad_scale", "field_mod", "field_type", "r_def"),
+        _polymorphic_kernel("quad_scale", "r_single", "r_quad"))
+
+
+# pylint: disable-next=unused-argument
+@pytest.fixture(name="ambiguous_target")
+def ambiguous_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke of an interface every member of which matches.
+
+    ``precision_map`` gives r_single and r_solver the same 4 bytes, so a
+    matcher working in widths cannot separate them. Fortran can, because it
+    resolves by name.
+    """
+    return _invoke(
+        tmp_path, "dual_scale",
+        _polymorphic_algorithm(
+            "dual_scale", "r_solver_field_mod", "r_solver_field_type",
+            "r_solver"),
+        _polymorphic_kernel("dual_scale", "r_single", "r_solver"))
 
 
 def test_lfric_kokkos_trans_captures_an_array_section(section_target):
@@ -823,6 +961,78 @@ def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
     assert ("storage_size(1.0_r_single) == &\n        "
             "storage_size(1.0_c_float))), parameter :: assert_kind_r_single "
             "= 0" in fortran)
+
+
+def test_lfric_kokkos_trans_selects_the_matching_schedule(polymorphic_target):
+    """The member the algorithm's precisions pick is the one captured.
+
+    Before stage 3 this refused with "LFRicKokkosTrans requires exactly one
+    kernel schedule."
+
+    The interface declares its r_double member first, so returning
+    ``schedules[0]`` would pass every test that only checked a region was
+    generated. The assertions below are therefore about the *width*: the
+    algorithm passes r_solver fields, which ``precision_map`` gives 4 bytes,
+    so the match is r_single and the region is float throughout.
+    """
+    _, loop, kernel = polymorphic_target
+    assert len(kernel.get_callees()) == 2
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert schedule.name == "tri_scale_code_r_single"
+    assert schedule is not kernel.get_callees()[0]
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    assert "double" not in cpp
+    assert "Kokkos::View<float*" in cpp
+    assert "const float scaling" in cpp
+
+
+def test_lfric_kokkos_trans_names_the_region_after_the_schedule(
+        polymorphic_target):
+    """One interface's members generate two differently named regions.
+
+    What this protects is a build in which one interface is invoked at two
+    precisions: naming both regions after the kernel would emit two launch
+    symbols called ``tri_scale_kokkos`` whose arguments are float in one
+    translation unit and double in the other.
+    """
+    _, loop, _ = polymorphic_target
+    cpp = LFRicKokkosTrans().apply(loop)
+    assert "tri_scale_r_single_kokkos" in cpp
+    assert "tri_scale_kokkos" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_when_no_schedule_matches(unmatched_target):
+    """An interface no member of which the algorithm could have called.
+
+    r_single is 4 bytes and r_quad is 16, against a ``field_type`` algorithm
+    argument at r_def's 8. Nothing is monkeypatched: the widths are the ones
+    ``psyclone.cfg`` records, so this is a case the matcher really rejects
+    rather than one arranged to look rejected.
+    """
+    _, loop, _ = unmatched_target
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert "found no implementation of 'quad_scale_code'" in str(error.value)
+    assert "out of 2" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_an_ambiguous_interface(ambiguous_target):
+    """An interface every member of which the algorithm could have called.
+
+    ``precision_map`` gives r_single and r_solver the same 4 bytes, so the
+    matcher cannot separate them; Fortran can, because it resolves by name.
+    Refusing is deliberate. Picking either would be right only by coincidence,
+    and the survey in psy-ir-aidev measures whether any GungHo kernel reaches
+    this at all.
+    """
+    _, loop, _ = ambiguous_target
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert "found 2 implementations of 'dual_scale_code'" in str(error.value)
+    assert "dual_scale_code_r_single, dual_scale_code_r_solver" in str(
+        error.value)
+    assert "will not choose between them" in str(error.value)
 
 
 def test_lfric_kokkos_trans_asserts_nothing_about_an_unkinded_region():
