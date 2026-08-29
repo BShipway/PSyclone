@@ -38,9 +38,6 @@ class KokkosView:
     managed: bool = False
 
 
-KokkosArgument = Union[KokkosScalar, KokkosView]
-
-
 @dataclass(frozen=True)
 class KokkosRegion:
     """All information required to generate one Kokkos translation unit."""
@@ -48,7 +45,10 @@ class KokkosRegion:
     name: str
     schedule: KernelSchedule
     cell_count: str
-    arguments: Tuple[KokkosArgument, ...]
+    # Spelt out rather than given a module-level alias: ``autoapi`` renders
+    # every module variable as a literal block and Sphinx then appends its
+    # own "alias of" line unindented, which fails the ``-W`` doc build.
+    arguments: Tuple[Union[KokkosScalar, KokkosView], ...]
 
 
 class KokkosWriter(CWriter):
@@ -255,6 +255,4 @@ class KokkosWriter(CWriter):
         return f"{node.name}({', '.join(indices)})"
 
 
-__all__ = [
-    "KokkosArgument", "KokkosRegion", "KokkosScalar", "KokkosView",
-    "KokkosWriter"]
+__all__ = ["KokkosRegion", "KokkosScalar", "KokkosView", "KokkosWriter"]

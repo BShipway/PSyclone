@@ -329,12 +329,38 @@ code (a KernelSchedule with all its children), these are:
 - `FortranWriter()` in `psyclone.psyir.backend.fortran`
 - `OpenCLWriter()` in `psyclone.psyir.backend.opencl`
 
-Additionally, there are two partially-implemented back-ends
+Additionally, there are three partially-implemented back-ends
 
-- `psyclone.psyir.backend.c` which is currently limited to processing
-  partial PSyIR expressions.
+- `CWriter()` in `psyclone.psyir.backend.c` which handles assignments,
+  literals, references, if-blocks, loops, unary and binary operations, a
+  subset of intrinsics, and directives. It has no handler for a `Routine`,
+  so it generates the statements and expressions of a body rather than a
+  whole kernel.
+- `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
+  `CWriter` to generate a complete C++/Kokkos translation unit. It is not
+  called on a PSyIR node: it is called on a `KokkosRegion` holding the
+  region's name, its scalar arguments and its unmanaged Views, and it
+  visits the loop body through `CWriter`. The description is built by the
+  LFRic transformation `LFRicKokkosTrans` (see the Transformations section
+  of the LFRic chapter in the User Guide), which also fixes the C ABI the
+  region is generated against.
 - `SIRWriter()` in `psyclone.psyir.backend.sir` which can generate
   valid SIR from simple Fortran code conforming to the NEMO API.
+
+Kokkos back-end
++++++++++++++++
+
+The Kokkos back-end is limited in the same way as the transformation that
+drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `int` and
+`double` -- may appear in a region's signature, every array becomes an
+unmanaged `LayoutLeft` View over storage the caller owns, and the region is
+entered through an `extern "C"` function so that Fortran can call it with a
+`bind(C)` interface. A region description that breaks those rules raises a
+`ValueError` before any code is generated, and a node in the body that
+`CWriter` has no handler for raises the usual `VisitorError`. Either
+reaching a caller means the driving transformation's own validation was
+too weak, since it is that validation, not this back-end, which decides
+what may be captured.
 
 SIR back-end
 ++++++++++++
