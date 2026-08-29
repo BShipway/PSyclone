@@ -339,11 +339,17 @@ Additionally, there are three partially-implemented back-ends
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
-  region's name, its scalar arguments and its unmanaged Views, and it
-  visits the loop body through `CWriter`. The description is built by the
-  LFRic transformation `LFRicKokkosTrans` (see the Transformations section
-  of the LFRic chapter in the User Guide), which also fixes the C ABI the
-  region is generated against.
+  region's name, its scalar arguments, its unmanaged Views and its
+  `kind_types`, and it visits the loop body through `CWriter`. The
+  description is built by the LFRic transformation `LFRicKokkosTrans` (see
+  the Transformations section of the LFRic chapter in the User Guide), which
+  also fixes the C ABI the region is generated against. `kind_types` is
+  there because the back-end cannot resolve an LFRic kind to a width: a
+  kernel names `r_solver`, and only the LFRic configuration's precision map
+  says whether that is 4 bytes or 8. The transformation resolves each kind
+  once and hands the answer over as `(kind name, C type)` pairs; an empty
+  tuple means "generate as `CWriter` would", which is what every region
+  built before the field existed did.
 - `SIRWriter()` in `psyclone.psyir.backend.sir` which can generate
   valid SIR from simple Fortran code conforming to the NEMO API.
 
@@ -351,16 +357,34 @@ Kokkos back-end
 +++++++++++++++
 
 The Kokkos back-end is limited in the same way as the transformation that
-drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `int` and
-`double` -- may appear in a region's signature, every array becomes an
-unmanaged `LayoutLeft` View over storage the caller owns, and the region is
-entered through an `extern "C"` function so that Fortran can call it with a
-`bind(C)` interface. A region description that breaks those rules raises a
-`ValueError` before any code is generated, and a node in the body that
-`CWriter` has no handler for raises the usual `VisitorError`. Either
-reaching a caller means the driving transformation's own validation was
-too weak, since it is that validation, not this back-end, which decides
-what may be captured.
+drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `int`,
+`float` and `double` -- may appear in a region's signature or in its
+`kind_types`, every array becomes an unmanaged `LayoutLeft` View over
+storage the caller owns, and the region is entered through an `extern "C"`
+function so that Fortran can call it with a `bind(C)` interface. A region
+description that breaks those rules raises a `ValueError` before any code is
+generated, and a node in the body that `CWriter` has no handler for raises
+the usual `VisitorError`. Either reaching a caller means the driving
+transformation's own validation was too weak, since it is that validation,
+not this back-end, which decides what may be captured.
+
+`kind_types` governs the body alone: `gen_declaration` declares a local at
+its own kind's width and `literal_node` suffixes a `float` literal, so a
+single-precision kernel is not promoted by `CWriter`'s default of `double`.
+Each argument keeps the C type its own description carries, so a region
+whose ABI and whose kinds disagree generates the disagreement rather than
+hiding it.
+
+That split follows the division of labour the generated code relies on.
+Arguments cross the ABI, so the Fortran compiler already checks them: the
+`bind(C)` interface names an `iso_c_binding` kind where the PSy layer names
+an LFRic one, and a mismatch is a compile error without anything being
+generated to make it so. Locals and literals cross nothing, so no compiler
+can check them -- which is why they are generated from `kind_types`, and why
+`LFRicKokkosTrans` emits a compile-time width assertion per kind into the
+interface. The assertion is a `parameter` whose kind is a `merge` over a
+`storage_size` comparison, so a false comparison asks for kind `-1` and the
+declaration itself is the error.
 
 SIR back-end
 ++++++++++++

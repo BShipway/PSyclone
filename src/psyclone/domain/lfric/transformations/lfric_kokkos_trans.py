@@ -35,10 +35,27 @@ class LFRicKokkosTrans(Transformation):
     fields and scalars, whose written fields are on discontinuous spaces, and
     whose formals and referenced module constants all map onto the
     ``int``/``float``/``double`` ABI the Kokkos backend emits. Every part of
-    the
-    generated region -- its name, its C signature, its Views and the
+    the generated region -- its name, its C signature, its Views and the
     ``bind(C)`` interface the PSy layer calls through -- is derived from that
     kernel, so a second kernel needs no change here.
+
+    **Precision is carried, not chosen.** A kind is placed on the ABI by the
+    width LFRic's precision map gives it, so an ``r_solver`` kernel reaches
+    C++ as ``float`` in a single-precision build and as ``double`` in a
+    double-precision one, from the same source and with no option to set. The
+    region computes at that width throughout: its locals are declared at their
+    own kind and its literals are suffixed, because neither crosses an
+    interface and both would otherwise be generated at the C writer's default
+    of ``double``, silently promoting the kernel. The generated ``bind(C)``
+    interface then asserts, at compile time, that each kind really has the
+    width the C++ was generated for, so a rebuild at another precision is a
+    compile error naming the kind rather than a wrong answer.
+
+    A kind the ABI does not name is refused rather than guessed at. That
+    includes every ``logical`` kind: LFRic's ``l_def`` is ``kind(.false.)``,
+    which is 4 bytes, so passing it as ``logical(c_bool)`` would put a 1-byte
+    formal against a 4-byte actual. Admitting logicals needs that mismatch
+    resolved, not a table entry.
 
     A whole-column array section such as ``a(i:j)``, which the finite-volume
     kernels use to assign a column as a unit, is accepted and lowered to an
@@ -115,6 +132,9 @@ class LFRicKokkosTrans(Transformation):
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations.
         :type options: Optional[Dict[str, Any]]
+        :param kwargs: additional keyword arguments for the base
+            :py:meth:`~psyclone.psyGen.Transformation.validate`.
+        :type kwargs: unwrapped dict
 
         :raises TransformationError: if ``node`` is not an LFRicLoop, or if
             its bounds, its kernel's metadata, its body, its array sections,
@@ -137,7 +157,15 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _validate_loop(node):
-        """Check the loop's own iteration contract."""
+        """Check the loop's own iteration contract.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :raises TransformationError: if the loop is coloured, is not over
+            cell columns, carries a halo depth, is not bounded by the owned
+            cells, or does not hold exactly one kernel.
+        """
         if node.loop_type or node.iteration_space != "cell_column":
             raise TransformationError(
                 "LFRicKokkosTrans supports only an uncoloured cell-column "
@@ -157,7 +185,17 @@ class LFRicKokkosTrans(Transformation):
 
     @classmethod
     def _validate_kernel_metadata(cls, kernel):
-        """Check the LFRic metadata of the kernel to be captured."""
+        """Check the LFRic metadata of the kernel to be captured.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :raises TransformationError: if the kernel needs quadrature or
+            evaluator data, is a CMA or inter-grid kernel, takes an argument
+            that is neither a field nor a scalar, takes an access a
+            cell-parallel launch cannot honour, takes a non-real field, uses a
+            stencil, or writes to a field on a continuous space.
+        """
         if kernel.qr_required or kernel.eval_shapes:
             raise TransformationError(
                 "LFRicKokkosTrans does not support quadrature or evaluator "
@@ -201,7 +239,19 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _schedule(kernel):
-        """Return the single PSyIR schedule of the kernel to be captured."""
+        """Return the single PSyIR schedule of the kernel to be captured.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :returns: the kernel's schedule, which
+            :py:meth:`~psyclone.domain.lfric.LFRicKern.get_callees` caches so
+            that transformations applied to it persist.
+        :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if the kernel resolves to any number of
+            schedules other than one.
+        """
         schedules = kernel.get_callees()
         if len(schedules) != 1:
             raise TransformationError(
@@ -210,7 +260,16 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _validate_body(schedule):
-        """Check that nothing in the body escapes the generated region."""
+        """Check that nothing in the body escapes the generated region.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if the body holds a
+            :py:class:`~psyclone.psyir.nodes.CodeBlock`, or a call to
+            anything other than an intrinsic, neither of which the generated
+            region has any way to express.
+        """
         if schedule.walk(CodeBlock):
             raise TransformationError(
                 "LFRicKokkosTrans cannot capture a CodeBlock.")
@@ -289,7 +348,17 @@ class LFRicKokkosTrans(Transformation):
 
     @classmethod
     def _validate_formals(cls, schedule):
-        """Check that every kernel formal has a place on the C ABI."""
+        """Check that every kernel formal has a place on the C ABI.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if the kernel already declares the name
+            the generated signature adds for the cell count.
+        :raises TransformationError: if a formal's kind is not one
+            :py:attr:`_C_TYPES` maps, or if an array formal's extent is not
+            itself a formal, so the generated View could not be sized.
+        """
         table = schedule.symbol_table
         formals = table.argument_list
         names = {symbol.name for symbol in formals}
@@ -327,7 +396,16 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _kind_name(symbol):
-        """Return the name of a scalar or array element's kind symbol."""
+        """Return the name of a scalar or array element's kind symbol.
+
+        :param symbol: the symbol whose kind is wanted.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the kind parameter's name, such as ``r_solver``, or ``None``
+            if the symbol is not of a scalar type or its precision is not
+            named by a symbol.
+        :rtype: Optional[str]
+        """
         datatype = symbol.datatype
         if isinstance(datatype, ArrayType):
             datatype = datatype.elemental_type
@@ -340,7 +418,16 @@ class LFRicKokkosTrans(Transformation):
 
     @classmethod
     def _c_type(cls, symbol):
-        """Return the C type of a symbol, or ``None`` if it has no mapping."""
+        """Return the C type of a symbol, or ``None`` if it has no mapping.
+
+        :param symbol: the symbol to place on the C ABI.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the C type name, such as ``float``, or ``None`` if the
+            symbol is not of a scalar or array-of-scalar type or its kind is
+            not one :py:attr:`_C_TYPES` maps.
+        :rtype: Optional[str]
+        """
         datatype = symbol.datatype
         if isinstance(datatype, ArrayType):
             datatype = datatype.elemental_type
@@ -352,8 +439,17 @@ class LFRicKokkosTrans(Transformation):
     def _map_kind(cls, intrinsic, kind):
         """Return the C type for one LFRic kind name, or ``None``.
 
+        The width comes from the LFRic configuration's precision map rather
+        than from the kernel source, which only ever names the kind.
+
         :param intrinsic: the Fortran intrinsic type the kind qualifies.
+        :type intrinsic:
+            :py:class:`psyclone.psyir.symbols.ScalarType.Intrinsic`
         :param str kind: the LFRic kind parameter, such as ``r_tran``.
+
+        :returns: the C type name, such as ``float``, or ``None`` if the
+            intrinsic and width together are not on the ABI.
+        :rtype: Optional[str]
         """
         if kind is None:
             return None
@@ -403,8 +499,15 @@ class LFRicKokkosTrans(Transformation):
     def _extents(symbol):
         """Return the declared extents of an array formal, in order.
 
+        :param symbol: the formal whose shape is wanted.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
         :returns: one name per dimension, empty for a scalar.
         :rtype: tuple[str]
+
+        :raises TransformationError: if a dimension's upper bound is anything
+            but a plain named symbol, which the generated View could not use
+            as an extent.
         """
         datatype = symbol.datatype
         if not isinstance(datatype, ArrayType):
@@ -426,8 +529,14 @@ class LFRicKokkosTrans(Transformation):
         These are not kernel arguments, so the PSy layer has to import each
         one and pass it by value into the region.
 
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
         :returns: ``(name, container, c_type)`` per constant, name-ordered.
         :rtype: list[tuple[str, str, str]]
+
+        :raises TransformationError: as :py:meth:`_describe_constant` does,
+            for any constant that has no place on the generated C ABI.
         """
         table = schedule.symbol_table
         local = {symbol.name for symbol in table.argument_list}
@@ -444,7 +553,23 @@ class LFRicKokkosTrans(Transformation):
 
     @classmethod
     def _describe_constant(cls, symbol):
-        """Resolve one non-local symbol onto the generated C ABI."""
+        """Resolve one non-local symbol onto the generated C ABI.
+
+        :param symbol: the imported symbol the captured body reads.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the symbol's name, the container it is imported from, and
+            the C type it is passed by value as.
+        :rtype: tuple[str, str, str]
+
+        :raises TransformationError: if the symbol is neither a kernel
+            argument nor imported from a module.
+        :raises TransformationError: if its type cannot be resolved, which
+            means the source of its container is not on the module search
+            path.
+        :raises TransformationError: if its kind is not one
+            :py:attr:`_C_TYPES` maps.
+        """
         if not isinstance(symbol.interface, ImportInterface):
             raise TransformationError(
                 f"LFRicKokkosTrans cannot capture '{symbol.name}': it is "
@@ -479,6 +604,15 @@ class LFRicKokkosTrans(Transformation):
         :py:class:`UnsupportedFortranType` holding the original text. The kind
         is still stated there, so read it rather than give up; anything with a
         shape is refused, because only scalars are passed by value.
+
+        :param symbol: the imported symbol whose declaration is to be read.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the C type named by the declaration text, or ``None`` if
+            the declaration is not one PSyIR failed to model, has a shape, is
+            of no intrinsic the ABI carries, or names a kind
+            :py:attr:`_C_TYPES` does not map.
+        :rtype: Optional[str]
         """
         datatype = getattr(symbol, "datatype", None)
         if not isinstance(datatype, UnsupportedFortranType):
@@ -508,6 +642,9 @@ class LFRicKokkosTrans(Transformation):
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations.
         :type options: Optional[Dict[str, Any]]
+        :param kwargs: additional keyword arguments for the base
+            :py:meth:`~psyclone.psyGen.Transformation.apply`.
+        :type kwargs: unwrapped dict
 
         :returns: the generated Kokkos C++ translation unit.
         :rtype: str
@@ -606,7 +743,15 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _region_name(kernel):
-        """Name the generated region after the kernel it captures."""
+        """Name the generated region after the kernel it captures.
+
+        :param kernel: the kernel being captured.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :returns: the region's name, the kernel's with any ``_code`` suffix
+            replaced by ``_kokkos``.
+        :rtype: str
+        """
         name = kernel.name.lower()
         if name.endswith("_code"):
             name = name[:-len("_code")]
@@ -617,11 +762,16 @@ class LFRicKokkosTrans(Transformation):
         """Describe the generated signature for the backend.
 
         :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
         :param set[str] per_cell: formals the PSy layer slices by cell.
-        :param constants: the module constants passed by value.
+        :param constants: the module constants passed by value, as
+            :py:meth:`_constants` returns them.
+        :type constants: list[tuple[str, str, str]]
 
         :returns: one description per generated C argument, in call order.
-        :rtype: tuple
+        :rtype: tuple[Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
         """
         arguments = []
         for symbol in schedule.symbol_table.argument_list:
@@ -646,7 +796,17 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _import_constant(symbol_table, name, container):
-        """Return the PSy-layer import for one kernel module constant."""
+        """Return the PSy-layer import for one kernel module constant.
+
+        :param symbol_table: the PSy-layer table the import is added to.
+        :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+        :param str name: the constant's name in its own module.
+        :param str container: the module it is imported from.
+
+        :returns: the existing symbol if the PSy layer already has one, and a
+            new imported symbol otherwise.
+        :rtype: :py:class:`psyclone.psyir.symbols.DataSymbol`
+        """
         existing = symbol_table.lookup(name, otherwise=None)
         if existing:
             return existing
@@ -658,7 +818,18 @@ class LFRicKokkosTrans(Transformation):
 
     @classmethod
     def _launch_symbol(cls, symbol_table, region):
-        """Create or return the explicit interoperable launch interface."""
+        """Create or return the explicit interoperable launch interface.
+
+        :param symbol_table: the PSy-layer table the interface is added to.
+        :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+        :param region: the captured region the interface declares.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :returns: the symbol the generated call is made through, carrying the
+            ``interface`` block as an
+            :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType`.
+        :rtype: :py:class:`psyclone.psyir.symbols.RoutineSymbol`
+        """
         existing = symbol_table.lookup(region.name, otherwise=None)
         if existing:
             return existing
@@ -711,7 +882,15 @@ class LFRicKokkosTrans(Transformation):
 
     @classmethod
     def _interface(cls, region):
-        """Write the ``bind(C)`` interface the PSy layer calls through."""
+        """Write the ``bind(C)`` interface the PSy layer calls through.
+
+        :param region: the captured region the interface declares.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :returns: a complete ``interface`` block, for the PSy layer to carry
+            as an :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType`.
+        :rtype: str
+        """
         names = [argument.name for argument in region.arguments]
         signature = textwrap.wrap(
             ", ".join(names), width=58, break_long_words=False)

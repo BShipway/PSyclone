@@ -67,6 +67,12 @@ class KokkosWriter(CWriter):
     _SUPPORTED_TYPES = ("double", "float", "int")
 
     def __init__(self, **kwargs):
+        """Create a writer holding no region.
+
+        :param kwargs: additional keyword arguments for
+            :py:class:`~psyclone.psyir.backend.c.CWriter`.
+        :type kwargs: unwrapped dict
+        """
         super().__init__(**kwargs)
         self._views = {}
         self._kind_types = {}
@@ -74,9 +80,17 @@ class KokkosWriter(CWriter):
     def __call__(self, region: KokkosRegion) -> str:
         """Generate code for ``region``.
 
+        The region's :py:attr:`KokkosRegion.kind_types` are in force for the
+        duration of the call and cleared afterwards, so that a writer reused
+        for a second region does not carry the first one's widths into it.
+
         :param region: the captured region to generate.
 
         :returns: a complete C++ translation unit.
+
+        :raises TypeError: as :py:meth:`_validate` does.
+        :raises ValueError: as :py:meth:`_validate` does, and if the body
+            indexes an array for which the region described no View.
         """
         self._validate(region)
         self._views = {
@@ -132,12 +146,38 @@ class KokkosWriter(CWriter):
 
     @staticmethod
     def _is_identifier(value):
-        """Return whether ``value`` is a C++ identifier."""
+        """Return whether ``value`` is a C++ identifier.
+
+        :param value: the candidate name, which need not be a string.
+
+        :returns: whether it can be written into generated C++ as a name.
+        :rtype: bool
+        """
         return isinstance(value, str) and bool(
             re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value))
 
     def _validate(self, region):
-        """Reject incomplete or unsupported region descriptions."""
+        """Reject incomplete or unsupported region descriptions.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :raises TypeError: if ``region`` is not a
+            :py:class:`KokkosRegion`, if its schedule is not a
+            :py:class:`~psyclone.psyir.nodes.KernelSchedule`, if an argument
+            is neither a :py:class:`KokkosScalar` nor a
+            :py:class:`KokkosView`, if an argument's or a kind's C type is not
+            in :py:attr:`_SUPPORTED_TYPES`, or if a View's index offsets are
+            not integers.
+        :raises ValueError: if the region's name, its cell count, an argument
+            name, a kind name or a View's data name, extents or region indices
+            are not C++ identifiers; if the schedule contains a
+            :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
+            share a C ABI name; if the cell count is not itself a scalar
+            argument; if a kernel argument has no description; or if a View
+            breaks the ownership or dimensional contract
+            :py:meth:`_validate_view` states.
+        """
         # pylint: disable=too-many-branches
         if not isinstance(region, KokkosRegion):
             raise TypeError(
@@ -206,7 +246,18 @@ class KokkosWriter(CWriter):
                 f"{', '.join(sorted(missing))}.")
 
     def _validate_view(self, view):
-        """Validate the ownership and dimensional contract for one View."""
+        """Validate the ownership and dimensional contract for one View.
+
+        :param view: the View description to check.
+        :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
+
+        :raises ValueError: if the View is managed, so would own LFRic
+            storage; if its data name, extents or region indices are not C++
+            identifiers; if its rank does not match the kernel and region
+            indices supplied for it; or if it is writable while asking for
+            ``RandomAccess``.
+        :raises TypeError: if its index offsets are not integers.
+        """
         if view.managed:
             raise ValueError(f"Kokkos View '{view.name}' must be unmanaged.")
         if not self._is_identifier(view.data_name):
@@ -235,7 +286,17 @@ class KokkosWriter(CWriter):
 
     @staticmethod
     def _argument_declaration(argument):
-        """Return one declaration in the generated C ABI."""
+        """Return one declaration in the generated C ABI.
+
+        :param argument: the scalar or View to declare.
+        :type argument: Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`]
+
+        :returns: the C declaration, a value for a scalar and a pointer to
+            caller-owned storage for a View.
+        :rtype: str
+        """
         if isinstance(argument, KokkosScalar):
             return f"const {argument.c_type} {argument.name}"
         const = "const " if argument.read_only else ""
@@ -243,7 +304,14 @@ class KokkosWriter(CWriter):
 
     @staticmethod
     def _view_declaration(view):
-        """Return an unmanaged View declaration."""
+        """Return an unmanaged View declaration.
+
+        :param view: the View to declare over storage the caller owns.
+        :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
+
+        :returns: the declaration, indented for the region body.
+        :rtype: str
+        """
         const = "const " if view.read_only else ""
         rank = "*" * len(view.extents)
         traits = "ReadOnly" if view.random_access else "Unmanaged"
@@ -311,7 +379,16 @@ class KokkosWriter(CWriter):
         return text
 
     def arrayreference_node(self, node: ArrayReference) -> str:
-        """Emit an indexed View access with Fortran lower bounds removed."""
+        """Emit an indexed View access with Fortran lower bounds removed.
+
+        :param node: the array reference in the captured body.
+
+        :returns: the equivalent zero-based View access.
+
+        :raises ValueError: if the region described no View for the array, or
+            if it supplied a different number of index offsets than the
+            reference has indices.
+        """
         try:
             view = self._views[node.name]
         except KeyError as err:
