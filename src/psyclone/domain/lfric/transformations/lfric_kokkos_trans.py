@@ -52,6 +52,27 @@ class LFRicKokkosTrans(Transformation):
     width the C++ was generated for, so a rebuild at another precision is a
     compile error naming the kind rather than a wrong answer.
 
+    **A kind-polymorphic kernel is resolved, not refused.** LFRic writes such
+    a kernel as a generic interface over specific procedures differing only in
+    the precision of their real arguments, and PSyclone presents one schedule
+    per procedure. The one captured is the one the algorithm layer's
+    precisions select, which is
+    :py:meth:`~psyclone.domain.lfric.LFRicKern.validate_kernel_code_args`'s
+    question rather than this transformation's -- it exists to identify the
+    right subroutine of a mixed-precision kernel, and matches in byte widths
+    through the same precision map. The region takes the name of the selected
+    procedure rather than of the interface, so two invokes of one kernel at
+    different precisions generate two regions instead of colliding on one.
+
+    Matching in widths is what makes the ABI right and the choice sometimes
+    impossible. ``r_single`` and ``r_solver`` are both 4 bytes, so an
+    interface offering both is refused rather than resolved by coincidence,
+    as is one no algorithm precision selects at all. Metadata the matcher
+    cannot model -- a stencil, an evaluator shape, a CMA or inter-grid kernel,
+    which PSyclone's issue #928 leaves unbuilt -- is a third refusal, kept
+    distinct from finding no match because a question that cannot be asked has
+    not been answered "no".
+
     A kind the ABI does not name is refused rather than guessed at. That
     includes every ``logical`` kind: LFRic's ``l_def`` is ``kind(.false.)``,
     which is 4 bytes, so passing it as ``logical(c_bool)`` would put a 1-byte

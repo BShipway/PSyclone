@@ -473,55 +473,55 @@ def _invoke(tmp_path, name, algorithm_source, kernel_source):
     return psy, loop, loop.kernels()[0]
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="target")
+# pylint: disable-next=unused-argument
 def target_fixture(tmp_path, clear_module_manager_instance):
     """Create the production metadata/body in a minimal LFRic invoke."""
     return _invoke(tmp_path, "moist_dyn_gas", _ALGORITHM, _KERNEL)
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="second_target")
+# pylint: disable-next=unused-argument
 def second_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an unrelated supported kernel in a minimal LFRic invoke."""
     return _invoke(
         tmp_path, "scaled_copy", _SECOND_ALGORITHM, _SECOND_KERNEL)
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="paired_target")
+# pylint: disable-next=unused-argument
 def paired_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose captured loop has a cell loop beside it."""
     return _invoke(
         tmp_path, "scaled_copy", _PAIRED_ALGORITHM, _SECOND_KERNEL)
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="section_target")
+# pylint: disable-next=unused-argument
 def section_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel assigns a whole-column section."""
     return _invoke(
         tmp_path, "fv_difference", _SECTION_ALGORITHM, _SECTION_KERNEL)
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="solver_target")
+# pylint: disable-next=unused-argument
 def solver_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel computes in single precision."""
     return _invoke(
         tmp_path, "scaled_solver", _SOLVER_ALGORITHM, _SOLVER_KERNEL)
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="logical_target")
+# pylint: disable-next=unused-argument
 def logical_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical scalar."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_KERNEL)
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="polymorphic_target")
+# pylint: disable-next=unused-argument
 def polymorphic_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke of an interface exactly one member of which matches.
 
@@ -538,8 +538,8 @@ def polymorphic_target_fixture(tmp_path, clear_module_manager_instance):
         _polymorphic_kernel("tri_scale", "r_double", "r_single"))
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="unmatched_target")
+# pylint: disable-next=unused-argument
 def unmatched_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke of an interface no member of which matches.
 
@@ -553,8 +553,8 @@ def unmatched_target_fixture(tmp_path, clear_module_manager_instance):
         _polymorphic_kernel("quad_scale", "r_single", "r_quad"))
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="ambiguous_target")
+# pylint: disable-next=unused-argument
 def ambiguous_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke of an interface every member of which matches.
 
@@ -570,8 +570,8 @@ def ambiguous_target_fixture(tmp_path, clear_module_manager_instance):
         _polymorphic_kernel("dual_scale", "r_single", "r_solver"))
 
 
-# pylint: disable-next=unused-argument
 @pytest.fixture(name="unmodelled_target")
+# pylint: disable-next=unused-argument
 def unmodelled_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke of an interface the matcher cannot be asked about.
 
@@ -629,6 +629,7 @@ def test_lfric_kokkos_trans_refuses_an_unlowerable_section(
     own refusals, so this asserts that PSyclone's reason is carried out
     rather than swallowed.
     """
+    # pylint: disable=unused-argument
     # pylint: disable-next=unused-variable
     _, loop, _ = _invoke(
         tmp_path, "fv_difference", _SECTION_ALGORITHM,
@@ -656,6 +657,7 @@ def test_lfric_kokkos_trans_section_check_predicts_the_lowering(
     refuse this kernel too, for its unresolved import; that they run later is
     what makes the message evidence about this one.
     """
+    # pylint: disable=unused-argument
     # pylint: disable-next=unused-variable
     _, loop, _ = _invoke(
         tmp_path, "fv_difference", _SECTION_ALGORITHM,

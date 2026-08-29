@@ -4123,9 +4123,13 @@ rather than a named kernel, and refuses anything it cannot express in the
 narrow C ABI that the back-end emits. That ABI is a fixed set of C types,
 but not a fixed precision: the width a kind reaches C++ at is the width
 LFRic's precision map gives it, so an ``r_solver`` kernel is generated in
-single or double precision according to how LFRic was configured. The
-contract it accepts, and the reasons it refuses, are given in its
-documentation below.
+single or double precision according to how LFRic was configured. The same
+precision map decides which implementation of a kind-polymorphic kernel is
+captured: a kernel written as a generic interface over specific procedures
+that differ only in precision is resolved to the one the algorithm layer's
+arguments select, and the generated region is named after that procedure
+rather than after the interface. The contract it accepts, and the reasons it
+refuses, are given in its documentation below.
 
 The LFRic API-specific transformations currently available
 are given below. Early transformations include "Dynamo0p3" or "Dynamo"
