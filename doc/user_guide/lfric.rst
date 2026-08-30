@@ -4148,7 +4148,9 @@ default and the PSy layer could not import the name; a constant imported from
 elsewhere is passed by value, which needs the source of its module on
 PSyclone's search path so that its kind can be read rather than guessed; and
 a name appearing only as an intrinsic's ``kind`` argument, as the ``r_def``
-of ``real(x, r_def)``, is neither, being a type rather than data. The
+of ``real(x, r_def)``, is neither, being a type rather than data -- it is
+the width the cast is generated at, so it joins the precisions the region
+records rather than its arguments. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 

@@ -464,7 +464,11 @@ counterparts do.
 A cast is generated at the width `kind_types` gives, so `real(x, r_solver)`
 becomes `(float)x` in a region that describes `r_solver` as `float` where
 `CWriter` would write `(double)x`. Two things have to hold before the kind is
-honoured: it has to resolve through `kind_types` at all, and its C type has
+honoured: it has to resolve through `kind_types` at all -- which for a kind
+no declaration in the body repeats means the transformation collected it from
+the cast itself, reading the intrinsic from the call's own datatype since
+`i_def` and `r_def` are alike until the cast says integer or real -- and its
+C type has
 to be one the intrinsic could cast to, which `_KOKKOS_CAST_TYPES` records as
 `double` or `float` for `REAL` and `int` for `INT`. The second test is not
 redundant. A kindless `real(i)` over an integer `i` has a PSyIR datatype of
