@@ -421,12 +421,36 @@ the scratch request.
 A `KokkosScratch` is described separately from the region's arguments, and
 deliberately so. It crosses no interface, so it must not appear in the C ABI
 or in the generated `bind(C)` interface, and it is not a kernel formal that
-the region has to account for. Its extents must name scalar arguments of the
-region, which is what lets the generated C++ size it. It does carry
-`index_offsets` and an always-empty `extra_indices`, so that
-`arrayreference_node` can resolve Views and scratch through one table
-without a type test; a scratch symbol is skipped when the kernel's locals
-are declared, since it is already declared as its View.
+the region has to account for. It does carry `index_offsets` and an
+always-empty `extra_indices`, so that `arrayreference_node` can resolve Views
+and scratch through one table without a type test; a scratch symbol is
+skipped when the kernel's locals are declared, since it is already declared
+as its View.
+
+Extents
+~~~~~~~
+
+A View's and a scratch array's `extents` are strings written into the
+generated C++ verbatim, one per dimension. An extent may be an integer
+expression over named sizes: `nlayers`, `4` and `(nlayers + 1)` are all
+accepted, built from identifiers, decimal literals, `+`, `-`, `*` and
+balanced parentheses. `KokkosWriter._is_extent` is the predicate, and
+`KokkosWriter._extent_names` reports the identifiers an extent is sized
+from.
+
+Division is refused rather than merely unsupported. Fortran and C++ can
+disagree about the rounding of an integer division, and an extent is one of
+the few places where that disagreement would produce a wrongly sized
+allocation instead of a compile error.
+
+A scratch array is restricted further than a View: every name in its extents
+must be a scalar argument of the region. A scratch size is computed on the
+host before the launch, where only the region's scalars are in scope.
+
+Both shapes still assume a lower bound of 1, because `index_offsets` are
+integers and every caller supplies 1. A Fortran local declared
+`dimension(0:nlayers-1)` therefore cannot be described here; the driving
+transformation refuses it rather than passing it through.
 
 SIR back-end
 ++++++++++++
