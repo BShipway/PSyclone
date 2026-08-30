@@ -4150,7 +4150,14 @@ PSyclone's search path so that its kind can be read rather than guessed; and
 a name appearing only as an intrinsic's ``kind`` argument, as the ``r_def``
 of ``real(x, r_def)``, is neither, being a type rather than data -- it is
 the width the cast is generated at, so it joins the precisions the region
-records rather than its arguments. The
+records rather than its arguments. A ``logical`` scalar -- an argument or an
+imported constant -- is the one thing on that ABI whose width is never
+consulted: it is declared ``logical(c_bool), value`` on the interface and the
+call site wraps the actual in ``LOGICAL(..., c_bool)``, so the compiler
+converts it whatever kind LFRic gave it, and no width assertion is generated
+for it because there is none to make. A ``logical`` *array* is still refused,
+because an array crosses by reference and would be reinterpreted rather than
+converted. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 

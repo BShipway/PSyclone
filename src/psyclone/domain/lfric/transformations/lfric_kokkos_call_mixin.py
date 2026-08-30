@@ -80,7 +80,10 @@ class LFRicKokkosCallMixin:
     #: the ``iso_c_binding`` kind that declaration needs imported. One table
     #: rather than two, so the interface's ``use`` line and its declarations
     #: cannot disagree.
+    #: ``bool`` is first so that the ``use iso_c_binding`` line an interface
+    #: writes stays in this table's order whichever types it carries.
     _FORTRAN_TYPES = {
+        "bool": ("logical(c_bool)", "c_bool"),
         "int": ("integer(c_int)", "c_int"),
         "float": ("real(c_float)", "c_float"),
         "double": ("real(c_double)", "c_double"),
@@ -283,13 +286,20 @@ class LFRicKokkosCallMixin:
             there are no kinds to assert.
         :rtype: str
         """
-        if not kind_types:
-            return ""
         intrinsics = {c_type: intrinsic
                       for (intrinsic, _), c_type in cls._C_TYPES.items()}
-        names = ", ".join(kind for kind, _ in kind_types)
+        # A logical kind has no width to assert -- it crosses the ABI by
+        # conversion, as LFRicKokkosTypesMixin._C_LOGICAL_TYPE explains -- so
+        # it is dropped before anything is written, the `use` line included. A
+        # region whose only body kind is logical therefore emits no assertion
+        # block at all rather than an empty one.
+        asserted = [(kind, c_type) for kind, c_type in kind_types
+                    if c_type in intrinsics]
+        if not asserted:
+            return ""
+        names = ", ".join(kind for kind, _ in asserted)
         lines = [f"    use constants_mod, only : {names}"]
-        for kind, c_type in kind_types:
+        for kind, c_type in asserted:
             probe = cls._KIND_PROBES[intrinsics[c_type]]
             c_kind = cls._FORTRAN_TYPES[c_type][1]
             lines.append(

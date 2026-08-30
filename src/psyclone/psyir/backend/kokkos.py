@@ -167,7 +167,11 @@ class KokkosRegion:
 class KokkosWriter(CWriter):
     """Generate a C++/Kokkos translation unit for a captured region."""
 
-    _SUPPORTED_TYPES = ("double", "float", "int")
+    #: The C types this writer will declare. ``bool`` is the one with no
+    #: width behind it: the driving transformation puts a Fortran ``logical``
+    #: on the ABI by conversion rather than by matching kinds, so nothing here
+    #: has to know what ``l_def`` measures.
+    _SUPPORTED_TYPES = ("bool", "double", "float", "int")
 
     #: Intrinsics that become a plain ``Kokkos::`` function call, by the name
     #: Kokkos gives them. Qualification is required for device code -- an

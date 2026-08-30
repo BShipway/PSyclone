@@ -180,6 +180,23 @@ def test_kokkos_writer_rejects_a_widened_neighbour_type():
         KokkosWriter()(replace(region, arguments=arguments))
 
 
+def test_kokkos_writer_accepts_a_bool_argument():
+    """``bool`` is on the ABI, and is written as an ordinary scalar.
+
+    It is the one supported type carrying no width, which is what lets the
+    driving transformation admit a logical whatever ``l_def`` measures. The
+    writer needs to know nothing about that: a ``bool`` scalar is declared and
+    passed like an ``int`` one, and the conversion happens on the Fortran
+    side.
+    """
+    region = _region()
+    arguments = region.arguments + (KokkosScalar("flag", "bool"),)
+
+    code = KokkosWriter()(replace(region, arguments=arguments))
+
+    assert "const bool flag" in code
+
+
 def test_kokkos_writer_rejects_codeblocks():
     """Opaque Fortran cannot silently enter generated Kokkos code."""
     region = _region()

@@ -76,17 +76,33 @@ class LFRicKokkosTypesMixin:
     #: refused on the same evidence as ``r_def``, and a single-precision
     #: ``r_solver`` build is honoured rather than silently promoted.
     #:
-    #: There is deliberately no ``BOOLEAN`` entry. The precision map records
-    #: ``l_def: 1``, but LFRic defines ``l_def = kind(.false.)``, which
-    #: measures 4 bytes; mapping it would emit ``logical(c_bool)`` against a
-    #: ``logical(4)`` actual and the model build would fail. A kind this table
-    #: does not name -- ``l_def``, a 16-byte ``r_quad``, an undeclared
+    #: There is deliberately no ``BOOLEAN`` entry, and there must not be one:
+    #: this table is keyed by width, and a logical is admitted precisely
+    #: because its width is never consulted. See :py:attr:`_C_LOGICAL_TYPE`.
+    #: A kind this table does not name -- a 16-byte ``r_quad``, an undeclared
     #: precision -- fails closed rather than being guessed at.
     _C_TYPES = {
         (ScalarType.Intrinsic.INTEGER, 4): "int",
         (ScalarType.Intrinsic.REAL, 4): "float",
         (ScalarType.Intrinsic.REAL, 8): "double",
     }
+
+    #: The one C type admitted without consulting the precision map. A logical
+    #: crosses this interface by conversion rather than reinterpretation --
+    #: the dummy is ``logical(c_bool), value`` and the call site wraps the
+    #: actual in ``LOGICAL(..., c_bool)`` -- so the two widths need not agree
+    #: and there is no width to assert.
+    #:
+    #: PSyclone issue #1941 records LFRic's ``l_def`` as 1 byte where it is 4,
+    #: and this attribute exists so that entry is never reached rather than
+    #: worked around: a corrected #1941 would not change what is generated
+    #: here. It is a separate attribute rather than a :py:attr:`_C_TYPES` row
+    #: for the same reason -- a row would have to name a width, and both
+    #: :py:meth:`_supported_kinds` and
+    #: :py:meth:`~psyclone.domain.lfric.transformations.\
+    #: lfric_kokkos_call_mixin.LFRicKokkosCallMixin._kind_assertions` read
+    #: that table as widths.
+    _C_LOGICAL_TYPE = "bool"
 
     #: A literal of each intrinsic, usable as the argument of
     #: ``storage_size``. Only the intrinsics :py:attr:`_C_TYPES` admits need
@@ -112,14 +128,18 @@ class LFRicKokkosTypesMixin:
 
         Derived from the table rather than spelt out, so the two refusal
         messages that quote it cannot drift from what is actually accepted.
+        The logical clause is appended rather than derived, because a logical
+        is on the ABI without a width and so cannot come from a table keyed by
+        one; see :py:attr:`_C_LOGICAL_TYPE`.
 
         :returns: a phrase such as ``4-byte integer, 4-byte real and 8-byte
-            real``.
+            real, and logical of any kind``.
         :rtype: str
         """
         widths = [f"{width}-byte {intrinsic.name.lower()}"
                   for intrinsic, width in cls._C_TYPES]
-        return " and ".join([", ".join(widths[:-1]), widths[-1]])
+        return " and ".join(
+            [", ".join(widths[:-1]), widths[-1]]) + ", and logical of any kind"
 
     @staticmethod
     def _kind_name(symbol):
@@ -255,14 +275,22 @@ class LFRicKokkosTypesMixin:
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
 
         :returns: the C type name, such as ``float``, or ``None`` if the
-            symbol is not of a scalar or array-of-scalar type or its kind is
-            not one :py:attr:`_C_TYPES` maps.
+            symbol is not of a scalar or array-of-scalar type, or its kind is
+            not one :py:attr:`_C_TYPES` maps, or it is a ``logical`` array.
         :rtype: Optional[str]
         """
         datatype = symbol.datatype
-        if isinstance(datatype, ArrayType):
+        array = isinstance(datatype, ArrayType)
+        if array:
             datatype = datatype.elemental_type
         if not isinstance(datatype, ScalarType):
+            return None
+        if array and datatype.intrinsic is ScalarType.Intrinsic.BOOLEAN:
+            # A logical is on the ABI by conversion, which is per value. An
+            # array crosses by reference: a View<bool*> over logical(l_def)
+            # storage would reinterpret 4-byte elements as 1-byte ones rather
+            # than convert them, which is the very failure conversion removes
+            # for a scalar. See _C_LOGICAL_TYPE.
             return None
         return cls._map_kind(datatype.intrinsic, cls._kind_name(symbol))
 
@@ -278,12 +306,18 @@ class LFRicKokkosTypesMixin:
             :py:class:`psyclone.psyir.symbols.ScalarType.Intrinsic`
         :param str kind: the LFRic kind parameter, such as ``r_tran``.
 
-        :returns: the C type name, such as ``float``, or ``None`` if the
-            intrinsic and width together are not on the ABI.
+        :returns: the C type name, such as ``float``, or
+            :py:attr:`_C_LOGICAL_TYPE` for any ``logical`` kind, or ``None``
+            if the intrinsic and width together are not on the ABI.
         :rtype: Optional[str]
         """
         if kind is None:
             return None
+        if intrinsic is ScalarType.Intrinsic.BOOLEAN:
+            # Answered before the precision map is opened, not merely without
+            # using the answer: the map's l_def entry is wrong (#1941) and
+            # this is what makes that irrelevant rather than survivable.
+            return cls._C_LOGICAL_TYPE
         precision = Config.get().api_conf("lfric").precision_map
         return cls._C_TYPES.get((intrinsic, precision.get(kind)))
 

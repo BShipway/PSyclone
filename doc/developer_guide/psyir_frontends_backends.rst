@@ -402,8 +402,8 @@ Kokkos back-end
 +++++++++++++++
 
 The Kokkos back-end is limited in the same way as the transformation that
-drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `int`,
-`float` and `double` -- may appear in a region's signature or in its
+drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `bool`,
+`int`, `float` and `double` -- may appear in a region's signature or in its
 `kind_types`, every array becomes an unmanaged `LayoutLeft` View over
 storage the caller owns, and the region is entered through an `extern "C"`
 function so that Fortran can call it with a `bind(C)` interface. A region
@@ -430,6 +430,19 @@ can check them -- which is why they are generated from `kind_types`, and why
 interface. The assertion is a `parameter` whose kind is a `merge` over a
 `storage_size` comparison, so a false comparison asks for kind `-1` and the
 declaration itself is the error.
+
+`bool` is the exception, and is the only supported type with no assertion
+behind it. A Fortran `logical` reaches the ABI by conversion rather than by
+matching widths: `LFRicKokkosTrans` declares the dummy `logical(c_bool),
+value` and wraps the actual in `LOGICAL(..., c_bool)`, which the compiler
+performs. There is therefore no width to assert, and asserting one would fail
+on exactly the builds this admits -- LFRic's `l_def` is `kind(.false.)` and
+measures 4 bytes where PSyclone's precision map records 1, which is issue
+#1941. `LFRicKokkosCallMixin._kind_assertions` filters a logical kind out of
+both the assertions and their `use constants_mod` line for that reason, and
+`_C_LOGICAL_TYPE` is deliberately a separate attribute rather than a
+`_C_TYPES` row, since that table is keyed by width and a row would have to
+name one.
 
 Intrinsics
 ~~~~~~~~~~

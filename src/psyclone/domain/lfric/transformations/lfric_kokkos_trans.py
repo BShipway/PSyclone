@@ -70,11 +70,25 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     distinct from finding no match because a question that cannot be asked has
     not been answered "no".
 
-    A kind the ABI does not name is refused rather than guessed at. That
-    includes every ``logical`` kind: LFRic's ``l_def`` is ``kind(.false.)``,
-    which is 4 bytes, so passing it as ``logical(c_bool)`` would put a 1-byte
-    formal against a 4-byte actual. Admitting logicals needs that mismatch
-    resolved, not a table entry.
+    A kind the ABI does not name is refused rather than guessed at -- a
+    16-byte ``r_quad``, an undeclared precision, a module constant whose width
+    the precision map does not carry.
+
+    **A logical scalar is not one of them, because it crosses by conversion
+    rather than by width.** The dummy is ``logical(c_bool), value`` and the
+    call site wraps the actual in ``LOGICAL(..., c_bool)``, which is a
+    conversion the compiler performs; the two kinds therefore need not agree,
+    and no width assertion is generated for a logical because there is no
+    width to assert. This matters beyond tidiness: LFRic's ``l_def`` is
+    ``kind(.false.)`` and measures 4 bytes where PSyclone's precision map
+    records 1, which is issue #1941. Nothing here reads that entry, so the
+    prototype is correct at either value and a corrected #1941 would not
+    change a line of what it generates.
+
+    A logical **array** stays refused. Conversion is per value, and an array
+    crosses by reference: a ``View<bool*>`` laid over ``logical(l_def)``
+    storage would reinterpret 4-byte elements as 1-byte ones rather than
+    convert them, which is the very failure conversion removes for a scalar.
 
     A whole-column array section such as ``a(i:j)``, which the finite-volume
     kernels use to assign a column as a unit, is accepted and lowered to an
@@ -625,6 +639,34 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                         "kernel argument, so that the generated scratch can "
                         "be sized.")
 
+    @classmethod
+    def _as_c_bool(cls, actual, symbol_table):
+        """Wrap one actual argument in a conversion to ``logical(c_bool)``.
+
+        This is what puts a Fortran ``logical`` on the C ABI without either
+        side knowing the other's width. The dummy is ``logical(c_bool),
+        value``; the actual is whatever kind LFRic declared, typically
+        ``l_def``; and ``LOGICAL(x, c_bool)`` is a standard conversion the
+        compiler performs, not a reinterpretation of storage. Neither side
+        consults the precision map, which is why PSyclone issue #1941 --
+        recording ``l_def`` as 1 byte where it is 4 -- cannot affect the
+        result.
+
+        :param actual: the argument expression to convert, already detached
+            from the tree or freshly built.
+        :type actual: :py:class:`psyclone.psyir.nodes.DataNode`
+        :param symbol_table: the PSy-layer routine's table, which gains the
+            ``c_bool`` import if it does not already carry one.
+        :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+
+        :returns: the conversion, ready to stand in the actual's place.
+        :rtype: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+        """
+        c_bool = cls._import_constant(symbol_table, "c_bool", "iso_c_binding")
+        return IntrinsicCall.create(
+            IntrinsicCall.Intrinsic.LOGICAL,
+            [actual, ("kind", Reference(c_bool))])
+
     @staticmethod
     def _lower_halo_exchanges(node):
         """Lower every halo exchange in ``node``'s invoke, before ``node`` is.
@@ -746,6 +788,15 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         actuals.extend(
             Reference(self._import_constant(symbol_table, name, container))
             for name, container, _ in constants)
+        # region.arguments is the formals, then the cell count, then the
+        # constants -- which is exactly the order 'actuals' is in once both
+        # appends above have run. The two are therefore index-aligned, and one
+        # loop covers a logical formal and an imported logical constant alike.
+        # That alignment is what makes this correct and it is not visible from
+        # the loop itself.
+        for index, argument in enumerate(region.arguments):
+            if argument.c_type == self._C_LOGICAL_TYPE:
+                actuals[index] = self._as_c_bool(actuals[index], symbol_table)
         counter = lowered_loop.variable
         lowered_loop.replace_with(Call.create(launch, actuals))
         self._drop_unused_counter(routine, counter)

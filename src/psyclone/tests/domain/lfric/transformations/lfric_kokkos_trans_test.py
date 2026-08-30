@@ -349,12 +349,14 @@ end module scaled_solver_kernel_mod
 """
 
 
-# The same shape with the scalar made logical, so that the refusal stage 2
-# deliberately leaves in place has a test of its own. LFRic's l_def is
-# kind(.false.), which measures 4 bytes, but PSyclone's precision map records
-# l_def as 1. Admitting it would generate logical(c_bool) against a logical(4)
-# actual, which does not compile, so the ABI widening stops at float. See
-# stage 2 of psy-ir-aidev/docs/plans/2026-08-29-phase-3-coverage.md.
+# The same shape with the scalar made logical. Stage 2 refused this, because
+# LFRic's l_def is kind(.false.) and measures 4 bytes where PSyclone's
+# precision map records it as 1 (issue #1941), so a logical(c_bool) dummy would
+# have sat against a logical(4) actual. Stage 5 admits it by conversion
+# instead: the dummy is logical(c_bool), value and the call site wraps the
+# actual in LOGICAL(..., c_bool), which is correct at either width. Neither
+# side reads the precision map for it, so #1941 is bypassed rather than
+# depended on.
 _LOGICAL_ALGORITHM = """
 program kokkos_logical_test
   use constants_mod, only : l_def
@@ -404,6 +406,20 @@ contains
   end subroutine masked_solver_code
 end module masked_solver_kernel_mod
 """
+
+
+# The same kernel with the logical made an array. A scalar crosses the ABI by
+# conversion, value by value, which is what makes the two widths irrelevant.
+# An array crosses by reference: a View<bool*> laid over logical(l_def) storage
+# reinterprets 4-byte elements as 1-byte ones and reads every fourth byte, so
+# the conversion that fixes the scalar has nothing to act on. The metadata is
+# unchanged -- gh_scalar/gh_logical -- because it is the Fortran declaration
+# that makes it an array; a real LFRic kernel could not declare it this way,
+# and the refusal is checked from the declaration rather than the metadata.
+_LOGICAL_ARRAY_KERNEL = _LOGICAL_KERNEL.replace(
+    "    logical(kind=l_def), intent(in) :: masked",
+    "    logical(kind=l_def), dimension(ndf_w3), intent(in) :: masked"
+    ).replace("        if (masked) then", "        if (masked(df)) then")
 
 
 # A column solve reduced to its shape: two automatic arrays over nlayers, a
@@ -680,15 +696,32 @@ _UNDECLARED_CAST_KIND_KERNEL = _LOCAL_KERNEL.replace(
     "      field_out(map_w3(1) + k - 1) = swept(k) + real(k, r_second)")
 
 
-# A kernel importing a constant whose kind is off the generated C ABI. The
-# module is readable and the constant resolves; a 1-byte logical simply has no
-# place on an interface carrying 4-byte integers and 4- and 8-byte reals.
+# A kernel importing a logical constant. It was named for being off the ABI,
+# which stage 5 made false: a logical scalar now crosses by conversion, and an
+# imported constant crosses as an argument rather than a literal because its
+# value is known only where the PSy layer runs. The name is kept so that the
+# fixture's history is legible against the plans that refer to it.
 _OFF_ABI_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
     "  use kernel_mod, only : kernel_type",
     "  use kernel_mod, only : kernel_type\n"
     "  use planet_config_mod, only : rehabilitate").replace(
     "      swept(k) = swept(k + 1) - partial(k)",
     "      if (rehabilitate) swept(k) = swept(k + 1) - partial(k)")
+
+
+# A kernel importing a module datum whose kind the ABI does not carry.
+# 'unmapped_width' is an r_quad real, 16 bytes and so off a C ABI carrying 4-
+# and 8-byte ones, and it is declared with no attributes so that PSyIR models
+# it rather
+# than leaving the text to be re-read. Stage 5 needs this because the case used
+# to be carried by an l_def logical constant, which is now admitted: the
+# refusal is unchanged, so it keeps a witness.
+_UNMAPPED_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : unmapped_width").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) * unmapped_width")
 
 
 # A kernel importing a constant from a module PSyclone cannot read. Its kind
@@ -875,11 +908,12 @@ end program kokkos_{name}_test
 # tests drive parse() and PSyFactory directly, so they say so themselves.
 _PLANET_CONFIG = """
 module planet_config_mod
-  use constants_mod, only : i_def, l_def, r_def
+  use constants_mod, only : i_def, l_def, r_def, r_quad
   implicit none
   real(kind=r_def), public, protected :: recip_epsilon = 1.0_r_def
   integer(kind=i_def), public, parameter :: n_moist = 3
   logical(kind=l_def), public, parameter :: rehabilitate = .false.
+  real(kind=r_quad) :: unmapped_width
 end module planet_config_mod
 """
 
@@ -971,6 +1005,14 @@ def logical_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical scalar."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_KERNEL)
+
+
+@pytest.fixture(name="logical_array_target")
+# pylint: disable-next=unused-argument
+def logical_array_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes an l_def logical array."""
+    return _invoke(
+        tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_ARRAY_KERNEL)
 
 
 @pytest.fixture(name="local_target")
@@ -1176,6 +1218,14 @@ def off_abi_constant_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke importing a constant of a kind off the C ABI."""
     return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
                    _OFF_ABI_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="unmapped_constant_target")
+# pylint: disable-next=unused-argument
+def unmapped_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke importing a datum of a kind the ABI does not map."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _UNMAPPED_CONSTANT_KERNEL)
 
 
 @pytest.fixture(name="unreadable_constant_target")
@@ -1696,17 +1746,55 @@ def test_lfric_kokkos_trans_fails_closed_on_an_unsupported_width(
     assert "4-byte integer, 4-byte real and 8-byte real" in str(err.value)
 
 
-def test_lfric_kokkos_trans_still_refuses_a_logical_kind(logical_target):
-    """A logical scalar stays refused after the ABI admits single precision.
+def test_lfric_kokkos_trans_passes_a_logical_by_conversion(logical_target):
+    """A logical scalar crosses the ABI as a converted value, not a width.
 
-    LFRic's l_def is kind(.false.) and measures 4 bytes; PSyclone's precision
-    map records it as 1. Generating logical(c_bool) against a logical(4)
-    actual would not compile, so the widening deliberately stops at float.
+    Stage 2 refused this because LFRic's l_def is kind(.false.) and measures 4
+    bytes where PSyclone's precision map records it as 1 -- issue #1941 -- so a
+    logical(c_bool) dummy against a logical(l_def) actual would not have
+    compiled. Conversion dissolves the question rather than answering it: the
+    dummy is logical(c_bool), value, the call site wraps the actual in
+    LOGICAL(..., c_bool), and the compiler converts whatever width l_def turns
+    out to be. Nothing here reads the precision map for a logical, so a
+    corrected #1941 would not change what is generated -- which is why no
+    width assertion is emitted for it either.
     """
-    _, loop, _ = logical_target
-    with pytest.raises(TransformationError, match="argument kinds") as err:
+    psy, loop, _ = logical_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const bool masked" in cpp
+    assert "logical(c_bool), value :: masked" in fortran
+    assert "use iso_c_binding, only : c_bool" in fortran
+    assert "LOGICAL(masked, kind=c_bool)" in fortran
+    # The whole point: no width is asserted for a kind that does not have to
+    # match. An assertion here would fail on the very build this admits.
+    assert "assert_kind_l_def" not in fortran
+    assert "storage_size(.true._l_def)" not in fortran
+    # l_def is dropped from the assertion block's own use line too, not only
+    # from the assertions it would have fed. LFRic builds with
+    # -Werror=unused-dummy-argument and friends, so importing a kind and then
+    # not naming it is not a harmless extra line.
+    assert "use constants_mod, only : i_def, r_solver" in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_logical_array(logical_array_target):
+    """A logical array stays refused, because it would cross by reference.
+
+    Conversion is per value, so it is the scalar case that it fixes. A
+    View<bool*> laid over logical(l_def) storage reinterprets rather than
+    converts: it reads 1 byte where the Fortran wrote 4, so three quarters of
+    the elements it returns are bytes from the middle of their neighbours.
+    That is the failure the scalar's conversion removes and that an array
+    cannot have removed by the same means, so the array is refused.
+    """
+    _, loop, _ = logical_array_target
+
+    with pytest.raises(TransformationError, match="argument kinds") as error:
         LFRicKokkosTrans().validate(loop)
-    assert "masked" in str(err.value)
+
+    assert "masked" in str(error.value)
 
 
 def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
@@ -2452,22 +2540,47 @@ def test_lfric_kokkos_trans_casts_at_a_kind_no_declaration_repeats(
     assert "(float)k" not in cpp
 
 
-def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
+def test_lfric_kokkos_trans_passes_a_logical_constant_by_conversion(
         off_abi_constant_target):
+    """An imported logical constant crosses by the same conversion.
+
+    ``rehabilitate`` is an ``l_def`` logical in ``planet_config_mod``, read by
+    the kernel in an ``if``. It reaches the region as an argument rather than a
+    literal, because its value is only known where the PSy layer runs, so the
+    same wrapping applies to it as to a formal -- which is the point of doing
+    the wrapping over ``region.arguments`` rather than over the formals alone.
+    """
+    psy, loop, _ = off_abi_constant_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const bool rehabilitate" in cpp
+    assert "if (rehabilitate)" in cpp
+    assert "use planet_config_mod, only : rehabilitate" in fortran
+    assert "LOGICAL(rehabilitate, kind=c_bool)" in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
+        unmapped_constant_target):
     """A constant that resolves can still have no place on the interface.
 
-    ``rehabilitate`` is an ``l_def`` logical: the module is readable and the
-    kind is known, and one byte of logical is still not something the
-    generated C interface carries. The refusal names the kinds it does.
+    This case used to be carried by ``rehabilitate``, an ``l_def`` logical,
+    which stage 5 admits. The refusal itself did not change, so it keeps a
+    witness of a kind that is still off the ABI: ``unmapped_width`` is an
+    ``r_quad`` real, 16 bytes where the ABI carries 4 and 8. The
+    message names the kinds the ABI does carry, which now includes the
+    logical clause.
     """
-    _, loop, _ = off_abi_constant_target
+    _, loop, _ = unmapped_constant_target
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
-    assert ("cannot pass 'rehabilitate' from 'planet_config_mod' by value"
+    assert ("cannot pass 'unmapped_width' from 'planet_config_mod' by value"
             in str(error.value))
     assert "4-byte integer" in str(error.value)
+    assert "and logical of any kind" in str(error.value)
 
 
 def test_lfric_kokkos_trans_names_the_module_it_could_not_read(
