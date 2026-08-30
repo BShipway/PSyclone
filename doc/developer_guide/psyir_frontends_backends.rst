@@ -338,7 +338,9 @@ Additionally, there are three partially-implemented back-ends
   whole kernel. A loop's continuation test follows the sign of its step
   where that sign is visible in the tree, so a Fortran countdown such as
   `do k = n, 1, -1` becomes `for(k=n; k>=1; k+=-1)`; a step that is a
-  runtime value is taken to be positive.
+  runtime value is taken to be positive. Which intrinsics that subset
+  contains, and why four of them depend on their argument's type, is set out
+  in the C back-end section below.
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
@@ -356,6 +358,45 @@ Additionally, there are three partially-implemented back-ends
   built before the field existed did.
 - `SIRWriter()` in `psyclone.psyir.backend.sir` which can generate
   valid SIR from simple Fortran code conforming to the NEMO API.
+
+C back-end
+++++++++++
+
+`CWriter.intrinsiccall_node` translates an `IntrinsicCall` through a table
+that gives each supported intrinsic a C spelling and one of five formatters:
+an infix operator, a function call, a cast, a cast wrapped round a function
+call, and a right-to-left fold. `NINT` and `FLOOR` need the fourth, because
+both return an integer in Fortran while neither `round` nor `floor` does in
+C; without the cast, `FLOOR(x)` would silently stay a real.
+
+Four intrinsics have no single right spelling, because Fortran overloads them
+on their argument's type and C does not. `REAL_INTRINSIC_ALTERNATIVES` gives
+the real spelling of each -- `ABS` becomes `fabs`, `MOD` becomes `fmod`,
+`MAX` and `MIN` become `fmax` and `fmin` -- and the module-level helper
+`_is_real_argument` chooses between that and the table entry. Choosing wrongly
+is silent in one direction and loud in the other: `abs` binds `::abs(int)` and
+truncates a real, while `%` does not compile for one.
+
+`_is_real_argument` answers "no" for every reason it might not know, including
+an `UnresolvedType` and a `datatype` property that raises on a tree assembled
+by hand. A caller probing the writer with synthetic arguments is asking which
+intrinsics it supports rather than what one particular expression is, so the
+kind-blind path has to stay reachable rather than becoming an error.
+
+Integer `MAX` and `MIN` are refused rather than translated, which is why
+neither has a table entry and both are reachable only through the real
+dispatch. C has no standard integer maximum, `fmax` returns a double, and a
+conditional expression would evaluate its arguments twice. The refusal is
+this writer's alone: `Kokkos::max` and `Kokkos::min` are type-generic, so
+`KokkosWriter` overrides `intrinsiccall_node` and generates both.
+
+A cast accepts a second argument and discards it. That argument is a Fortran
+kind, so `real(x, r_solver)` and `real(x, r_def)` are both `(double)x` here.
+Discarding it is safe only because each cast target is the widest of its
+intrinsic, so the value is never narrowed below what was asked for. Honouring
+it needs a writer that has been told what each kind's width is, which is what
+`kind_types` gives the Kokkos back-end below; that back-end overrides this
+method and casts at the width the Fortran asked for.
 
 Kokkos back-end
 +++++++++++++++
@@ -389,6 +430,59 @@ can check them -- which is why they are generated from `kind_types`, and why
 interface. The assertion is a `parameter` whose kind is a `merge` over a
 `storage_size` comparison, so a false comparison asks for kind `-1` and the
 declaration itself is the error.
+
+Intrinsics
+~~~~~~~~~~
+
+`KokkosWriter.intrinsiccall_node` overrides `CWriter`'s and tries three
+handlers in turn -- a cast, a numeric limit, a function -- falling through to
+`CWriter` when none of them recognises the intrinsic. Anything it does write
+is qualified `Kokkos::`, because the body becomes a device lambda and the
+unqualified `<cmath>` names are host functions; `Kokkos::` picks the device
+implementation on a GPU and forwards to `<cmath>` on a host build.
+
+`_KOKKOS_FUNCTIONS` gives the eleven intrinsics whose spelling depends on
+nothing: `ACOS`, `ASIN`, `ATAN`, `ATAN2`, `COS`, `EXP`, `LOG`, `SIN`, `SQRT`
+and `TAN` keep their names, and `SIGN` becomes `copysign`. `ABS` and `MOD`
+are not in it, because they are the two that `CWriter` already spells by
+their argument's type: this writer reuses `_is_real_argument` and generates
+`Kokkos::fabs` or `Kokkos::abs`, and `Kokkos::fmod` for a real `MOD` while
+leaving an integer one to `CWriter`'s `%`.
+
+`MAX` and `MIN` are folded right to left into nested two-argument calls, so
+`max(a, b, c)` becomes `Kokkos::max(a, Kokkos::max(b, c))`. This is where the
+integer refusal described in the C back-end section above stops applying:
+`Kokkos::max` and `Kokkos::min` are templates, so one spelling serves both
+types and neither needs a table entry per type. A fold over fewer than two
+arguments raises a `VisitorError` rather than generating a call Kokkos has no
+overload for.
+
+`FLOOR` and `NINT` keep the cast that `CWriter` wraps round them, since
+`Kokkos::floor` and `Kokkos::round` return a real just as their C
+counterparts do.
+
+A cast is generated at the width `kind_types` gives, so `real(x, r_solver)`
+becomes `(float)x` in a region that describes `r_solver` as `float` where
+`CWriter` would write `(double)x`. Two things have to hold before the kind is
+honoured: it has to resolve through `kind_types` at all -- which for a kind
+no declaration in the body repeats means the transformation collected it from
+the cast itself, reading the intrinsic from the call's own datatype since
+`i_def` and `r_def` are alike until the cast says integer or real -- and its
+C type has
+to be one the intrinsic could cast to, which `_KOKKOS_CAST_TYPES` records as
+`double` or `float` for `REAL` and `int` for `INT`. The second test is not
+redundant. A kindless `real(i)` over an integer `i` has a PSyIR datatype of
+`Scalar<REAL, Reference[i_def]>` -- the precision is inherited from the
+argument rather than defaulted -- so resolving that kind and using it would
+generate `(int)i` and discard the conversion the Fortran asked for. A kind
+failing either test is treated as undescribed and the cast is left to
+`CWriter`, whose target is the widest of the intrinsic and so never narrows.
+
+`EPSILON` becomes `Kokkos::Experimental::epsilon_v<T>` at the argument's own
+width, and is the one intrinsic here that refuses instead of falling through.
+There is no kind-blind spelling to fall back to: the trait is a template over
+the type, so a region that does not describe the argument's kind raises a
+`VisitorError` naming `kind_types` rather than guessing at `double`.
 
 Two launch shapes
 ~~~~~~~~~~~~~~~~~
