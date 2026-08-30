@@ -15,8 +15,11 @@ import pytest
 from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
     extent_names, is_extent)
+from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
-from psyclone.psyir.nodes import CodeBlock, KernelSchedule, Routine
+from psyclone.psyir.nodes import (
+    Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Reference, Routine)
+from psyclone.psyir.symbols import DataSymbol, ScalarType
 
 
 def _kernel_schedule():
@@ -576,4 +579,171 @@ def test_kokkos_writer_rejects_two_scratch_arrays_sharing_a_name():
     with pytest.raises(ValueError) as error:
         KokkosWriter()(region)
     assert "Kokkos scratch 'x_new' collides with an existing region name." \
+        in str(error.value)
+
+
+#: The three kinds the intrinsic tests describe, as a region would.
+_INTRINSIC_KINDS = (("r_def", "double"), ("r_solver", "float"),
+                    ("i_def", "int"))
+
+
+def _written_expressions(body, kind_types=_INTRINSIC_KINDS):
+    """Write the right-hand side of each assignment in ``body``.
+
+    The writer is driven directly rather than through a region, because an
+    intrinsic's spelling depends only on the kinds in force and on the
+    argument types the frontend resolved -- neither of which the launch
+    shape, the View descriptions or the ABI can change.
+
+    :param str body: assignments, indented, over the names declared below.
+    :param kind_types: the ``(kind name, C type)`` pairs in force.
+    :type kind_types: tuple[tuple[str, str], ...]
+
+    :returns: what the writer made of each right-hand side, in order.
+    :rtype: list[str]
+    """
+    source = f"""
+subroutine intrinsic_probe(i, j, a, b, c, s)
+  use constants_mod, only : i_def, r_def, r_solver
+  integer(kind=i_def) :: i, j
+  real(kind=r_def) :: a, b, c
+  real(kind=r_solver) :: s
+{body}
+end subroutine intrinsic_probe
+"""
+    writer = KokkosWriter()
+    writer._kind_types = dict(kind_types)
+    return [writer._visit(assignment.rhs)
+            for assignment
+            in FortranReader().psyir_from_source(source).walk(Assignment)]
+
+
+def test_kokkos_writer_qualifies_intrinsic_functions():
+    """Every maths function is ``Kokkos::``-qualified, one per shape.
+
+    Qualification is what makes the call legal in device code, where an
+    unqualified ``sqrt`` is a host function. One intrinsic is taken from each
+    shape the C writer knows: a one-argument function, a two-argument one, a
+    two-argument one whose C name differs from its Fortran name, and the two
+    that need an integer cast around a floating-point function.
+    """
+    assert _written_expressions("""
+  a = sqrt(a)
+  a = atan2(a, b)
+  a = sign(a, b)
+  i = nint(a)
+  i = floor(a)
+""") == ["Kokkos::sqrt(a)", "Kokkos::atan2(a, b)", "Kokkos::copysign(a, b)",
+         "(int)Kokkos::round(a)", "(int)Kokkos::floor(a)"]
+
+
+def test_kokkos_writer_spells_an_intrinsic_by_its_argument_type():
+    """``ABS`` and ``MOD`` are spelt by their argument's type.
+
+    ``Kokkos::abs`` truncates a real and ``Kokkos::fabs`` returns a double
+    for an integer, so neither is right for both. Integer ``MOD`` has no
+    function at all: it is the ``%`` operator, which the C writer already
+    writes and which needs no qualification.
+    """
+    assert _written_expressions("""
+  a = abs(a)
+  i = abs(i)
+  a = mod(a, b)
+  i = mod(i, j)
+""") == ["Kokkos::fabs(a)", "Kokkos::abs(i)", "Kokkos::fmod(a, b)", "(i % j)"]
+
+
+def test_kokkos_writer_folds_max_and_min():
+    """``MAX`` and ``MIN`` fold right to left, for integers as well.
+
+    ``Kokkos::max`` is type-generic where ``fmax`` is not, so the integer
+    case the C writer refuses -- for want of a standard C spelling -- is
+    generated here.
+    """
+    assert _written_expressions("""
+  a = max(a, b, c)
+  i = max(i, j)
+  i = min(i, j)
+""") == ["Kokkos::max(a, Kokkos::max(b, c))", "Kokkos::max(i, j)",
+         "Kokkos::min(i, j)"]
+
+
+def test_kokkos_writer_refuses_a_fold_over_one_argument():
+    """A ``MAX`` with one argument is no Fortran, and is refused as such."""
+    call = IntrinsicCall(IntrinsicCall.Intrinsic.MAX)
+    call.addchild(Reference(DataSymbol("i", ScalarType.integer_type())))
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()._visit(call)
+    assert ("The Kokkos back-end can only fold 'MAX' over 2 or more "
+            "arguments, but found 1." in str(error.value))
+
+
+def test_kokkos_writer_casts_at_the_kind_that_was_asked_for():
+    """A cast takes its target from the kind the Fortran named."""
+    assert _written_expressions("""
+  a = real(i, r_def)
+  s = real(a, r_solver)
+  i = int(a, i_def)
+""") == ["(double)i", "(float)a", "(int)a"]
+
+
+def test_kokkos_writer_leaves_an_undescribed_cast_kind_to_the_c_writer():
+    """A kind the region did not describe falls back rather than raising.
+
+    The same ``real(a, r_solver)`` is a ``float`` where the region says
+    ``r_solver`` is single precision and the C writer's ``double`` where the
+    region says nothing about it. Raising instead would report a region
+    unsupported for a kind that is merely undescribed, which is the normal
+    case for the probe a caller uses to ask what is supported.
+    """
+    assert _written_expressions(
+        "  s = real(a, r_solver)\n",
+        (("r_solver", "float"),)) == ["(float)a"]
+    assert _written_expressions(
+        "  s = real(a, r_solver)\n", ()) == ["(double)a"]
+
+
+def test_kokkos_writer_ignores_a_kind_belonging_to_another_intrinsic():
+    """A kindless ``real(i)`` is a default real, whatever ``i``'s kind is.
+
+    PSyIR infers the precision of ``real(i)`` from its argument, reporting
+    ``Scalar<REAL, Reference['i_def']>``. Resolving that kind would cast to
+    ``int`` and lose the value, so a kind whose C type does not belong to the
+    intrinsic being cast to is treated as unresolved.
+    """
+    assert _written_expressions("  a = real(i)\n") == ["(double)i"]
+
+
+def test_kokkos_writer_writes_epsilon_as_a_numeric_trait():
+    """``EPSILON`` is a question about a type, answered by a Kokkos trait.
+
+    Its argument is consumed for its type and never visited, so the trait
+    carries the width of the argument's kind and the argument itself does not
+    appear in the generated code.
+    """
+    assert _written_expressions("""
+  a = epsilon(a)
+  s = epsilon(s)
+""") == ["Kokkos::Experimental::epsilon_v<double>",
+         "Kokkos::Experimental::epsilon_v<float>"]
+
+
+def test_kokkos_writer_refuses_epsilon_of_an_undescribed_kind():
+    """``EPSILON`` has no answer to fall back on, so it refuses.
+
+    Unlike a cast, there is no kind-blind spelling: the trait has to be
+    instantiated at some width, and guessing one would be a wrong answer
+    rather than a wide one.
+    """
+    with pytest.raises(VisitorError) as error:
+        _written_expressions("  a = epsilon(a)\n", ())
+    assert ("EPSILON needs the width of its argument's kind, which this "
+            "region does not describe." in str(error.value))
+
+
+def test_kokkos_writer_leaves_an_unknown_intrinsic_to_the_c_writer():
+    """An intrinsic neither writer knows raises the C writer's own error."""
+    with pytest.raises(VisitorError) as error:
+        _written_expressions("  a = tiny(a)\n")
+    assert "The C backend does not support the 'TINY' intrinsic." \
         in str(error.value)

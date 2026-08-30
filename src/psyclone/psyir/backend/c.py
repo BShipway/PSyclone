@@ -454,9 +454,9 @@ class CWriter(LanguageWriter):
             # particular width. A kind-blind writer cannot honour it, and
             # discarding it is only safe because each cast target here is
             # the widest of its intrinsic, so the result is never narrowed
-            # below what was asked for. Honouring it needs a writer that has
-            # been told what each kind's width is, which is why KokkosWriter
-            # is handed the region's kind_types.
+            # below what was asked for. KokkosWriter overrides this method
+            # and casts at the width the region's kind_types give, which is
+            # where a caller needing the requested width should look.
             return "(" + type_str + ")" + expr_str[0]
 
         def cast_function_format(spec, expr_str):
@@ -506,7 +506,7 @@ class CWriter(LanguageWriter):
         # no standard integer maximum, fmax returns a double, and a
         # conditional expression would evaluate its arguments twice. The
         # refusal is this writer's alone: Kokkos::max and Kokkos::min are
-        # type-generic, so a subclass generating C++ need not make it.
+        # type-generic, so KokkosWriter generates both.
         intrinsic_map = {
             IntrinsicCall.Intrinsic.MOD: ("%", binary_operator_format),
             IntrinsicCall.Intrinsic.SIGN: ("copysign", function_format),

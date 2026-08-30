@@ -387,15 +387,16 @@ Integer `MAX` and `MIN` are refused rather than translated, which is why
 neither has a table entry and both are reachable only through the real
 dispatch. C has no standard integer maximum, `fmax` returns a double, and a
 conditional expression would evaluate its arguments twice. The refusal is
-this writer's: `Kokkos::max` and `Kokkos::min` are type-generic, so a
-subclass generating C++ need not make it.
+this writer's alone: `Kokkos::max` and `Kokkos::min` are type-generic, so
+`KokkosWriter` overrides `intrinsiccall_node` and generates both.
 
 A cast accepts a second argument and discards it. That argument is a Fortran
 kind, so `real(x, r_solver)` and `real(x, r_def)` are both `(double)x` here.
 Discarding it is safe only because each cast target is the widest of its
 intrinsic, so the value is never narrowed below what was asked for. Honouring
 it needs a writer that has been told what each kind's width is, which is what
-`kind_types` gives the Kokkos back-end below.
+`kind_types` gives the Kokkos back-end below; that back-end overrides this
+method and casts at the width the Fortran asked for.
 
 Kokkos back-end
 +++++++++++++++
@@ -429,6 +430,55 @@ can check them -- which is why they are generated from `kind_types`, and why
 interface. The assertion is a `parameter` whose kind is a `merge` over a
 `storage_size` comparison, so a false comparison asks for kind `-1` and the
 declaration itself is the error.
+
+Intrinsics
+~~~~~~~~~~
+
+`KokkosWriter.intrinsiccall_node` overrides `CWriter`'s and tries three
+handlers in turn -- a cast, a numeric limit, a function -- falling through to
+`CWriter` when none of them recognises the intrinsic. Anything it does write
+is qualified `Kokkos::`, because the body becomes a device lambda and the
+unqualified `<cmath>` names are host functions; `Kokkos::` picks the device
+implementation on a GPU and forwards to `<cmath>` on a host build.
+
+`_KOKKOS_FUNCTIONS` gives the eleven intrinsics whose spelling depends on
+nothing: `ACOS`, `ASIN`, `ATAN`, `ATAN2`, `COS`, `EXP`, `LOG`, `SIN`, `SQRT`
+and `TAN` keep their names, and `SIGN` becomes `copysign`. `ABS` and `MOD`
+are not in it, because they are the two that `CWriter` already spells by
+their argument's type: this writer reuses `_is_real_argument` and generates
+`Kokkos::fabs` or `Kokkos::abs`, and `Kokkos::fmod` for a real `MOD` while
+leaving an integer one to `CWriter`'s `%`.
+
+`MAX` and `MIN` are folded right to left into nested two-argument calls, so
+`max(a, b, c)` becomes `Kokkos::max(a, Kokkos::max(b, c))`. This is where the
+integer refusal described in the C back-end section above stops applying:
+`Kokkos::max` and `Kokkos::min` are templates, so one spelling serves both
+types and neither needs a table entry per type. A fold over fewer than two
+arguments raises a `VisitorError` rather than generating a call Kokkos has no
+overload for.
+
+`FLOOR` and `NINT` keep the cast that `CWriter` wraps round them, since
+`Kokkos::floor` and `Kokkos::round` return a real just as their C
+counterparts do.
+
+A cast is generated at the width `kind_types` gives, so `real(x, r_solver)`
+becomes `(float)x` in a region that describes `r_solver` as `float` where
+`CWriter` would write `(double)x`. Two things have to hold before the kind is
+honoured: it has to resolve through `kind_types` at all, and its C type has
+to be one the intrinsic could cast to, which `_KOKKOS_CAST_TYPES` records as
+`double` or `float` for `REAL` and `int` for `INT`. The second test is not
+redundant. A kindless `real(i)` over an integer `i` has a PSyIR datatype of
+`Scalar<REAL, Reference[i_def]>` -- the precision is inherited from the
+argument rather than defaulted -- so resolving that kind and using it would
+generate `(int)i` and discard the conversion the Fortran asked for. A kind
+failing either test is treated as undescribed and the cast is left to
+`CWriter`, whose target is the widest of the intrinsic and so never narrows.
+
+`EPSILON` becomes `Kokkos::Experimental::epsilon_v<T>` at the argument's own
+width, and is the one intrinsic here that refuses instead of falling through.
+There is no kind-blind spelling to fall back to: the trait is a template over
+the type, so a region that does not describe the argument's kind raises a
+`VisitorError` naming `kind_types` rather than guessing at `double`.
 
 Two launch shapes
 ~~~~~~~~~~~~~~~~~
