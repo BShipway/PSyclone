@@ -12,6 +12,7 @@ import textwrap
 from psyclone.configuration import Config
 from psyclone.core import AccessType
 from psyclone.domain.lfric import KernCallArgList, LFRicConstants, LFRicLoop
+from psyclone.errors import GenerationError
 from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosView, KokkosWriter)
@@ -50,6 +51,27 @@ class LFRicKokkosTrans(Transformation):
     interface then asserts, at compile time, that each kind really has the
     width the C++ was generated for, so a rebuild at another precision is a
     compile error naming the kind rather than a wrong answer.
+
+    **A kind-polymorphic kernel is resolved, not refused.** LFRic writes such
+    a kernel as a generic interface over specific procedures differing only in
+    the precision of their real arguments, and PSyclone presents one schedule
+    per procedure. The one captured is the one the algorithm layer's
+    precisions select, which is
+    :py:meth:`~psyclone.domain.lfric.LFRicKern.validate_kernel_code_args`'s
+    question rather than this transformation's -- it exists to identify the
+    right subroutine of a mixed-precision kernel, and matches in byte widths
+    through the same precision map. The region takes the name of the selected
+    procedure rather than of the interface, so two invokes of one kernel at
+    different precisions generate two regions instead of colliding on one.
+
+    Matching in widths is what makes the ABI right and the choice sometimes
+    impossible. ``r_single`` and ``r_solver`` are both 4 bytes, so an
+    interface offering both is refused rather than resolved by coincidence,
+    as is one no algorithm precision selects at all. Metadata the matcher
+    cannot model -- a stencil, an evaluator shape, a CMA or inter-grid kernel,
+    which PSyclone's issue #928 leaves unbuilt -- is a third refusal, kept
+    distinct from finding no match because a question that cannot be asked has
+    not been answered "no".
 
     A kind the ABI does not name is refused rather than guessed at. That
     includes every ``logical`` kind: LFRic's ``l_def`` is ``kind(.false.)``,
@@ -237,9 +259,15 @@ class LFRicKokkosTrans(Transformation):
                     f"'{space}': one cell's contribution could overwrite "
                     "another's.")
 
-    @staticmethod
-    def _schedule(kernel):
-        """Return the single PSyIR schedule of the kernel to be captured.
+    @classmethod
+    def _schedule(cls, kernel):
+        """Return the PSyIR schedule of the kernel to be captured.
+
+        A kind-polymorphic kernel resolves to one schedule per specific
+        procedure of its generic interface, and the one to capture is the one
+        Fortran would have resolved the call to. That question is
+        :py:meth:`~psyclone.domain.lfric.LFRicKern.validate_kernel_code_args`'s
+        rather than this transformation's; see :py:meth:`_matches`.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
@@ -249,14 +277,77 @@ class LFRicKokkosTrans(Transformation):
             that transformations applied to it persist.
         :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
-        :raises TransformationError: if the kernel resolves to any number of
-            schedules other than one.
+        :raises TransformationError: if no schedule matches the precisions the
+            algorithm layer passes, if more than one does, or if the matcher
+            cannot model the kernel's metadata and so cannot answer at all.
         """
         schedules = kernel.get_callees()
-        if len(schedules) != 1:
+        if len(schedules) == 1:
+            return schedules[0]
+        try:
+            matches = [schedule for schedule in schedules
+                       if cls._matches(kernel, schedule)]
+        except NotImplementedError as err:
+            # The matcher builds the interface the metadata implies before it
+            # compares anything, and PSyclone's issue #928 leaves parts of that
+            # unbuilt -- evaluator shapes, stencils, CMA and inter-grid
+            # kernels. Not being able to ask the question is a third outcome,
+            # distinct from asking it and getting no match: reading it as one
+            # would report a kind mismatch about a kernel whose kinds were
+            # never examined.
             raise TransformationError(
-                "LFRicKokkosTrans requires exactly one kernel schedule.")
-        return schedules[0]
+                f"LFRicKokkosTrans cannot tell which of the "
+                f"{len(schedules)} implementations of '{kernel.name}' the "
+                f"algorithm layer calls: the metadata is outside what "
+                f"PSyclone's own matcher models ({err}).") from err
+        if not matches:
+            raise TransformationError(
+                f"LFRicKokkosTrans found no implementation of "
+                f"'{kernel.name}' matching the precisions the algorithm layer "
+                f"passes, out of {len(schedules)}.")
+        if len(matches) > 1:
+            names = ", ".join(sorted(schedule.name for schedule in matches))
+            raise TransformationError(
+                f"LFRicKokkosTrans found {len(matches)} implementations of "
+                f"'{kernel.name}' matching the precisions the algorithm layer "
+                f"passes ({names}), and will not choose between them.")
+        return matches[0]
+
+    @staticmethod
+    def _matches(kernel, schedule):
+        """Say whether one implementation matches the algorithm's precisions.
+
+        The question is PSyclone's own, not this transformation's:
+        :py:meth:`~psyclone.domain.lfric.LFRicKern.validate_kernel_code_args`
+        exists, by its own comment, "to identify the correct kernel subroutine
+        for a mixed-precision kernel". It converts both the formal and the
+        algorithm-layer kinds to byte widths through the LFRic configuration's
+        ``precision_map`` and raises when they disagree.
+
+        Matching in widths rather than in kind names is right for a back-end
+        that emits a width, and is why two implementations can both match:
+        ``precision_map`` gives ``r_single`` and ``r_solver`` the same 4 bytes
+        where Fortran, resolving by name, keeps them apart.
+        :py:meth:`_schedule` refuses that case rather than picking one.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param schedule: one of the kernel's candidate implementations.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: whether the algorithm layer could have called this one.
+        :rtype: bool
+
+        :raises NotImplementedError: if the matcher cannot build the interface
+            the kernel's metadata implies. Deliberately not caught here:
+            :py:meth:`_schedule` turns it into a refusal, because a matcher
+            that cannot answer has not answered "no".
+        """
+        try:
+            kernel.validate_kernel_code_args(schedule.symbol_table)
+        except GenerationError:
+            return False
+        return True
 
     @staticmethod
     def _validate_body(schedule):
@@ -685,7 +776,7 @@ class LFRicKokkosTrans(Transformation):
 
         constants = self._constants(schedule)
         region = KokkosRegion(
-            name=self._region_name(kernel),
+            name=self._region_name(schedule),
             schedule=schedule,
             cell_count=self._CELL_COUNT,
             arguments=self._region_arguments(schedule, per_cell, constants),
@@ -742,19 +833,29 @@ class LFRicKokkosTrans(Transformation):
         table.remove(symbol)
 
     @staticmethod
-    def _region_name(kernel):
-        """Name the generated region after the kernel it captures.
+    def _region_name(schedule):
+        """Name the generated region after the implementation it captures.
 
-        :param kernel: the kernel being captured.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        After the *implementation*, not after the kernel: a kind-polymorphic
+        kernel has one name and several implementations, so naming the region
+        ``kernel.name`` would give both members of one interface the same
+        region name with different C types. Two invokes at different precisions
+        in one build would then collide. For a kernel that is not polymorphic
+        the schedule carries the kernel's own name, so nothing else moves.
 
-        :returns: the region's name, the kernel's with any ``_code`` suffix
-            replaced by ``_kokkos``.
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: the region's name, the implementation's with its ``_code``
+            component dropped and ``_kokkos`` appended.
         :rtype: str
         """
-        name = kernel.name.lower()
+        name = schedule.name.lower()
         if name.endswith("_code"):
             name = name[:-len("_code")]
+        elif "_code_" in name:
+            # LFRic names an interface's members '<kernel>_code_<kind>'.
+            name = name.replace("_code_", "_", 1)
         return f"{name}_kokkos"
 
     @classmethod
