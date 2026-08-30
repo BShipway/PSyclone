@@ -13,6 +13,7 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.errors import GenerationError
+from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
@@ -624,6 +625,38 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                         "kernel argument, so that the generated scratch can "
                         "be sized.")
 
+    @staticmethod
+    def _lower_halo_exchanges(node):
+        """Lower every halo exchange in ``node``'s invoke, before ``node`` is.
+
+        A halo exchange does not know its own depth: it computes one by
+        walking forward for the accesses that read the field it exchanges, and
+        those accesses are LFRic kernel arguments carrying LFRic metadata.
+        :py:meth:`apply` is about to replace the loop holding them with a
+        plain :py:class:`~psyclone.psyir.nodes.Call`, which carries none, so
+        an exchange lowered afterwards finds no reader at all and PSyclone
+        raises :py:class:`~psyclone.errors.InternalError` rather than
+        generating a wrong depth.
+
+        Lowering the exchanges first is the order whole-container lowering
+        would have used anyway -- an exchange precedes the loop it feeds, and
+        lowering runs in schedule order -- so this restores that order rather
+        than choosing a new one. It does nothing for a schedule that has no
+        exchange, which is every region captured before stencils.
+
+        :param node: the loop about to be captured, used only to reach the
+            invoke schedule containing it. A node with no
+            :py:class:`~psyclone.psyGen.InvokeSchedule` ancestor, as a unit
+            test's bare schedule has, is left alone.
+        :type node: :py:class:`~psyclone.domain.lfric.LFRicLoop`
+
+        """
+        schedule = node.ancestor(InvokeSchedule)
+        if schedule is None:
+            return
+        for exchange in schedule.walk(LFRicHaloExchange):
+            exchange.lower_to_language_level()
+
     def apply(self, node, options=None, **kwargs):
         """Generate C++ and replace ``node`` with the typed launch call.
 
@@ -703,6 +736,7 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                 f"LFRicKokkosTrans cannot express '{kernel.name}' in the "
                 f"Kokkos backend: {err}") from err
 
+        self._lower_halo_exchanges(node)
         lowered_loop = node.lower_to_language_level()
         cell_count = lowered_loop.stop_expr.copy()
         routine = lowered_loop.ancestor(Routine)

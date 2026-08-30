@@ -89,6 +89,57 @@ _CELL_LOCAL_KERNEL = _KERNEL.replace(
     "      do df = 1, ndf_wtheta", "      do df = 1, cell")
 
 
+_HALO_ALGORITHM = """
+program kokkos_halo_test
+  use field_mod, only : field_type
+  use halo_read_kernel_mod, only : halo_read_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(halo_read_kernel_type(out_field, in_field))
+end program kokkos_halo_test
+"""
+
+
+# A kernel reading a field on a continuous space. Reading one is allowed --
+# only writing one is refused -- and it is what makes distributed memory put a
+# halo exchange in front of the loop, which none of the regions captured
+# before this stage has. The stencil this stage's target uses puts one there
+# too, for the same reason and by a different route.
+_HALO_KERNEL = """
+module halo_read_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w1, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: halo_read_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_write, w3),                  &
+         arg_type(gh_field, gh_real, gh_read,  w1) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: halo_read_code
+  end type halo_read_kernel_type
+contains
+  subroutine halo_read_code(nlayers, field_out, field_in, &
+                            ndf_w3, undf_w3, map_w3, &
+                            ndf_w1, undf_w1, map_w1)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_w1, undf_w1
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w1), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_w1), intent(in) :: map_w1
+    integer(kind=i_def) :: k
+    do k = 0, nlayers - 1
+      field_out(map_w3(1) + k) = field_in(map_w1(1) + k)
+    end do
+  end subroutine halo_read_code
+end module halo_read_kernel_mod
+"""
+
+
 _SECOND_ALGORITHM = """
 program kokkos_second_test
   use constants_mod, only : r_tran
@@ -882,6 +933,14 @@ def second_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "scaled_copy", _SECOND_ALGORITHM, _SECOND_KERNEL)
 
 
+@pytest.fixture(name="halo_target")
+# pylint: disable-next=unused-argument
+def halo_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose loop is preceded by a halo exchange."""
+    return _invoke(
+        tmp_path, "halo_read", _HALO_ALGORITHM, _HALO_KERNEL)
+
+
 @pytest.fixture(name="paired_target")
 # pylint: disable-next=unused-argument
 def paired_target_fixture(tmp_path, clear_module_manager_instance):
@@ -1243,6 +1302,44 @@ def test_lfric_kokkos_trans_renames_the_index_a_kernel_declares(
     assert "int cell;" in cpp
     assert "map_wtheta((df - 1), cell_1)" in cpp
     assert "map_wtheta((df - 1), cell)" not in cpp
+
+
+def test_lfric_kokkos_trans_keeps_a_preceding_halo_exchange(halo_target):
+    """A halo exchange feeding the captured loop still resolves its depth.
+
+    The exchange computes its depth by walking forward for the accesses that
+    read its field, and those accesses live on the LFRic loop that ``apply``
+    is about to replace with a plain ``Call``. Lowering the exchanges before
+    the loop rather than after it is what keeps that walk able to find them;
+    without it PSyclone raises ``InternalError`` from
+    ``_compute_halo_read_info`` when the PSy layer is generated.
+    """
+    psy, loop, _ = halo_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert 'extern "C" void halo_read_kokkos(' in cpp
+    assert "halo_exchange(depth=" in fortran
+    assert "call halo_read_kokkos(" in fortran
+    assert "call halo_read_code(" not in fortran
+    # The exchange fills the halo the loop then reads, so it has to stay in
+    # front of the launch rather than merely survive.
+    assert fortran.index("halo_exchange(depth=") < \
+        fortran.index("call halo_read_kokkos(")
+
+
+def test_lfric_kokkos_trans_lowers_no_exchange_outside_an_invoke(target):
+    """A loop with no invoke schedule above it is left alone.
+
+    The exchanges are reached through the loop's ``InvokeSchedule`` ancestor,
+    and a detached loop has none. Returning rather than walking from ``None``
+    is what lets the helper be called on a loop held outside the tree it was
+    parsed into, as a unit test does.
+    """
+    _, loop, _ = target
+
+    assert LFRicKokkosTrans._lower_halo_exchanges(loop.detach()) is None
 
 
 def test_lfric_kokkos_trans_captures_an_array_section(section_target):

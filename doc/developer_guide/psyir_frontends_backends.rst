@@ -558,6 +558,28 @@ integers and every caller supplies 1. A Fortran local declared
 `dimension(0:nlayers-1)` therefore cannot be described here; the driving
 transformation refuses it rather than passing it through.
 
+Lowering order
+~~~~~~~~~~~~~~
+
+`LFRicKokkosTrans` replaces an `LFRicLoop` with a plain `Call`, and that is a
+constraint on more than the loop. A domain node that resolves part of itself by
+walking the tree for other domain nodes can only do so while they are still
+there, so anything whose lowering depends on the loop has to be lowered before
+the loop is replaced rather than after.
+
+`LFRicHaloExchange` is the case that arises. It does not know its own depth: it
+computes one from the accesses that read the field it exchanges, and those are
+LFRic kernel arguments on the loop. Lowered after the replacement it finds no
+reader at all and PSyclone raises `InternalError` from
+`_compute_halo_read_info`. `LFRicKokkosTrans._lower_halo_exchanges` therefore
+lowers every exchange in the invoke first, which is the order whole-container
+lowering would have used anyway since an exchange precedes the loop it feeds.
+
+A transformation that introduces a new such dependency has the same obligation.
+The symptom is an `InternalError` from a node the transformation never touched,
+which is easy to read as a bug in that node rather than as an ordering
+constraint on this one.
+
 SIR back-end
 ++++++++++++
 
