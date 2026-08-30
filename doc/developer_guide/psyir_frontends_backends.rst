@@ -402,8 +402,8 @@ Kokkos back-end
 +++++++++++++++
 
 The Kokkos back-end is limited in the same way as the transformation that
-drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `int`,
-`float` and `double` -- may appear in a region's signature or in its
+drives it. Only the types in `KokkosWriter._SUPPORTED_TYPES` -- `bool`,
+`int`, `float` and `double` -- may appear in a region's signature or in its
 `kind_types`, every array becomes an unmanaged `LayoutLeft` View over
 storage the caller owns, and the region is entered through an `extern "C"`
 function so that Fortran can call it with a `bind(C)` interface. A region
@@ -430,6 +430,19 @@ can check them -- which is why they are generated from `kind_types`, and why
 interface. The assertion is a `parameter` whose kind is a `merge` over a
 `storage_size` comparison, so a false comparison asks for kind `-1` and the
 declaration itself is the error.
+
+`bool` is the exception, and is the only supported type with no assertion
+behind it. A Fortran `logical` reaches the ABI by conversion rather than by
+matching widths: `LFRicKokkosTrans` declares the dummy `logical(c_bool),
+value` and wraps the actual in `LOGICAL(..., c_bool)`, which the compiler
+performs. There is therefore no width to assert, and asserting one would fail
+on exactly the builds this admits -- LFRic's `l_def` is `kind(.false.)` and
+measures 4 bytes where PSyclone's precision map records 1, which is issue
+#1941. `LFRicKokkosCallMixin._kind_assertions` filters a logical kind out of
+both the assertions and their `use constants_mod` line for that reason, and
+`_C_LOGICAL_TYPE` is deliberately a separate attribute rather than a
+`_C_TYPES` row, since that table is keyed by width and a row would have to
+name one.
 
 Intrinsics
 ~~~~~~~~~~
@@ -495,6 +508,18 @@ with a `KOKKOS_LAMBDA(const int cell)`. This is the shape every region had
 before scratch existed and it is generated unchanged, because a kernel with
 no local arrays has nothing to place.
 
+The index is the region's `cell_index` rather than a fixed `cell`. It
+defaults to `cell`, which is what the paragraph above describes, but a
+caller renames it when the kernel declares that name itself: the lambda
+parameter and the kernel's own declarations share one C++ scope, so a
+kernel with an `integer :: cell` local would produce a `conflicting
+declaration` error rather than a wrong answer. `LFRicKokkosTrans` chooses
+the name with `next_available_name` against the kernel's symbol table, which
+gives `cell_1` in that case and `cell` otherwise. Renaming the index alone
+is not enough: the per-cell Views' `extra_indices` name it too, and the
+back-end takes them as given rather than rewriting them, so whatever builds
+the region has to use one name for both.
+
 A region with scratch launches over `Kokkos::TeamPolicy<>`. A Fortran
 automatic local such as `real(r_def), dimension(nlayers) :: x_new` has an
 extent that is a runtime value, so it cannot become a C++ local; it becomes
@@ -545,6 +570,28 @@ Both shapes still assume a lower bound of 1, because `index_offsets` are
 integers and every caller supplies 1. A Fortran local declared
 `dimension(0:nlayers-1)` therefore cannot be described here; the driving
 transformation refuses it rather than passing it through.
+
+Lowering order
+~~~~~~~~~~~~~~
+
+`LFRicKokkosTrans` replaces an `LFRicLoop` with a plain `Call`, and that is a
+constraint on more than the loop. A domain node that resolves part of itself by
+walking the tree for other domain nodes can only do so while they are still
+there, so anything whose lowering depends on the loop has to be lowered before
+the loop is replaced rather than after.
+
+`LFRicHaloExchange` is the case that arises. It does not know its own depth: it
+computes one from the accesses that read the field it exchanges, and those are
+LFRic kernel arguments on the loop. Lowered after the replacement it finds no
+reader at all and PSyclone raises `InternalError` from
+`_compute_halo_read_info`. `LFRicKokkosTrans._lower_halo_exchanges` therefore
+lowers every exchange in the invoke first, which is the order whole-container
+lowering would have used anyway since an exchange precedes the loop it feeds.
+
+A transformation that introduces a new such dependency has the same obligation.
+The symptom is an `InternalError` from a node the transformation never touched,
+which is easy to read as a bug in that node rather than as an ordering
+constraint on this one.
 
 SIR back-end
 ++++++++++++

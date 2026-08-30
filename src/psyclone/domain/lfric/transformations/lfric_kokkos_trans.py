@@ -13,6 +13,7 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.errors import GenerationError
+from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
@@ -69,11 +70,40 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     distinct from finding no match because a question that cannot be asked has
     not been answered "no".
 
-    A kind the ABI does not name is refused rather than guessed at. That
-    includes every ``logical`` kind: LFRic's ``l_def`` is ``kind(.false.)``,
-    which is 4 bytes, so passing it as ``logical(c_bool)`` would put a 1-byte
-    formal against a 4-byte actual. Admitting logicals needs that mismatch
-    resolved, not a table entry.
+    A kind the ABI does not name is refused rather than guessed at -- a
+    16-byte ``r_quad``, an undeclared precision, a module constant whose width
+    the precision map does not carry.
+
+    **A logical scalar is not one of them, because it crosses by conversion
+    rather than by width.** The dummy is ``logical(c_bool), value`` and the
+    call site wraps the actual in ``LOGICAL(..., c_bool)``, which is a
+    conversion the compiler performs; the two kinds therefore need not agree,
+    and no width assertion is generated for a logical because there is no
+    width to assert. This matters beyond tidiness: LFRic's ``l_def`` is
+    ``kind(.false.)`` and measures 4 bytes where PSyclone's precision map
+    records 1, which is issue #1941. Nothing here reads that entry, so the
+    prototype is correct at either value and a corrected #1941 would not
+    change a line of what it generates.
+
+    A logical **array** stays refused. Conversion is per value, and an array
+    crosses by reference: a ``View<bool*>`` laid over ``logical(l_def)``
+    storage would reinterpret 4-byte elements as 1-byte ones rather than
+    convert them, which is the very failure conversion removes for a scalar.
+
+    **A stencil is accepted by shape**, and the accepted shapes are
+    :py:attr:`_SUPPORTED_STENCILS` -- ``cross2d`` alone. A 2-D stencil needs
+    no argument machinery of its own: LFRic hands the kernel a sliced dofmap
+    and a sliced size array, both of them array formals, so both become Views
+    with the cell index appended exactly as the dofmap ``map_w3(:,cell)``
+    already does. A 1-D or region stencil hands the size over as a *scalar*
+    formal fed from ``field_stencil_size(cell)``, which would need a per-cell
+    scalar argument kind that does not exist here, so those shapes are refused
+    by name. A stencil also makes the PSy layer emit a halo exchange in front
+    of the loop, which is lowered before the loop is replaced rather than
+    after; see :py:meth:`_lower_halo_exchanges`. The matcher refusal above is
+    unaffected: PSyclone's issue #928 leaves every stencil shape unbuilt, so a
+    stencil kernel written as a generic interface is still refused there
+    whatever its shape.
 
     A whole-column array section such as ``a(i:j)``, which the finite-volume
     kernels use to assign a column as a unit, is accepted and lowered to an
@@ -126,6 +156,18 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     is not. Every one of these is refused by :py:meth:`validate` rather than
     discovered by :py:meth:`apply`.
 
+    **A local is also read for its name, not only its type.** The generated
+    launch declares identifiers of its own in the scope the kernel body is
+    generated into, and a kernel-local of the same name would shadow one and
+    then overwrite it -- a wrong answer rather than a compile error. The cell
+    count is one, and the team launch adds ``body``, ``league_size``,
+    ``probe``, ``rank``, ``scratch_bytes``, ``team`` and ``team_size``, which
+    are checked only for a kernel that has an automatic array to place. The
+    launch *index* is the exception: it is renamed rather than refused,
+    because a kernel declaring ``cell`` is a real GungHo shape and the fix is
+    one name in two places rather than seven threaded through two launch
+    shapes.
+
     **A constant the body reads reaches the region one of three ways.** A
     module-level ``parameter`` declared beside the kernel with a literal value
     -- ``integer(kind=i_def), parameter :: nfaces = 4`` -- is written into the
@@ -150,6 +192,32 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
     #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
     _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE)
+
+    #: Identifiers the generated launch declares in the scope the kernel
+    #: body is generated into. A kernel-local of the same name would
+    #: shadow the launch's own and then overwrite it, which is a wrong
+    #: answer rather than a compile error. The cell index is absent
+    #: because it is renamed instead; see
+    #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`.
+    #: These seven belong to the team launch only, so they are checked only
+    #: for a kernel that has an automatic array to place;
+    #: :py:attr:`_CELL_COUNT` is declared by both shapes and is always
+    #: checked.
+    _GENERATED_NAMES = ("body", "league_size", "probe", "rank",
+                        "scratch_bytes", "team", "team_size")
+
+    #: Stencil shapes whose PSy-layer arguments :py:meth:`apply`'s generic
+    #: per-cell rule already passes correctly. A 2-D stencil hands the kernel
+    #: a sliced dofmap and a sliced size array, both of them array formals, so
+    #: both become Views with the cell index appended -- which is what
+    #: ``map_w3(:,cell)`` already does and needs nothing new.
+    #:
+    #: A 1-D or region stencil hands the size to the kernel as a *scalar*
+    #: formal, fed from ``x_stencil_size(cell)``. That rule would pass the
+    #: whole sliced expression against a by-value dummy, so admitting those
+    #: shapes needs a per-cell scalar argument kind that does not exist here.
+    #: No executed GungHo loop asks for one, so they are refused by name.
+    _SUPPORTED_STENCILS = ("cross2d",)
 
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
@@ -230,7 +298,8 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
             evaluator data, is a CMA or inter-grid kernel, takes an argument
             that is neither a field nor a scalar, takes an access a
             cell-parallel launch cannot honour, takes a non-real field, uses a
-            stencil, or writes to a field on a continuous space.
+            stencil shape outside :py:attr:`_SUPPORTED_STENCILS`, or writes to
+            a field on a continuous space.
         """
         if kernel.qr_required or kernel.eval_shapes:
             raise TransformationError(
@@ -261,8 +330,12 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
                     f"LFRicKokkosTrans supports only real fields, but "
                     f"'{argument.name}' is {argument.intrinsic_type}.")
             if argument.stencil:
-                raise TransformationError(
-                    "LFRicKokkosTrans does not support stencil accesses.")
+                shape = str(argument.stencil.name).lower()
+                if shape not in cls._SUPPORTED_STENCILS:
+                    raise TransformationError(
+                        f"LFRicKokkosTrans supports the "
+                        f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shape "
+                        f"only, but '{argument.name}' has '{shape}'.")
             if argument.access == AccessType.READ:
                 continue
             space = argument.function_space.orig_name.lower()
@@ -546,15 +619,43 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         :py:meth:`_constants` could import one, because the launch computes
         its scratch size before it enters the region.
 
+        A local is also refused for its *name* alone, where that name is one
+        the generated launch declares in the scope the kernel body is
+        generated into. The kernel's declaration would shadow the launch's
+        and then be assigned to, so the region would run with a value the
+        kernel had overwritten -- a wrong answer, where the launch index's
+        collision is a compile error. The launch index is renamed around that
+        collision rather than refused because it is one name in two places;
+        these are threaded through both launch shapes and the scratch sizing,
+        and no GungHo kernel declares one.
+
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
+        :raises TransformationError: if the kernel declares a local named
+            :py:attr:`_CELL_COUNT`, which both launch shapes declare.
+        :raises TransformationError: if the kernel has an automatic array and
+            declares a local named in :py:attr:`_GENERATED_NAMES`, which the
+            team launch that array selects declares.
         :raises TransformationError: if a local array's kind is not one
             :py:attr:`_C_TYPES` maps, or if one of its extents is not a
             kernel argument, so the scratch View could not be sized.
         """
         table = schedule.symbol_table
         names = {symbol.name for symbol in table.argument_list}
+
+        locals_ = list(table.automatic_datasymbols)
+        generated = {cls._CELL_COUNT}
+        if any(symbol.is_array for symbol in locals_):
+            generated.update(cls._GENERATED_NAMES)
+        # Sorted so that a kernel colliding with two of them names the same
+        # one on every run.
+        for name in sorted(generated.intersection(
+                symbol.name for symbol in locals_)):
+            raise TransformationError(
+                f"LFRicKokkosTrans' generated launch declares '{name}', but "
+                "the kernel declares a local of that name.")
+
         for symbol in table.automatic_datasymbols:
             if not symbol.is_array:
                 continue
@@ -570,6 +671,66 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                         f"the kernel-local array '{symbol.name}' to be a "
                         "kernel argument, so that the generated scratch can "
                         "be sized.")
+
+    @classmethod
+    def _as_c_bool(cls, actual, symbol_table):
+        """Wrap one actual argument in a conversion to ``logical(c_bool)``.
+
+        This is what puts a Fortran ``logical`` on the C ABI without either
+        side knowing the other's width. The dummy is ``logical(c_bool),
+        value``; the actual is whatever kind LFRic declared, typically
+        ``l_def``; and ``LOGICAL(x, c_bool)`` is a standard conversion the
+        compiler performs, not a reinterpretation of storage. Neither side
+        consults the precision map, which is why PSyclone issue #1941 --
+        recording ``l_def`` as 1 byte where it is 4 -- cannot affect the
+        result.
+
+        :param actual: the argument expression to convert, already detached
+            from the tree or freshly built.
+        :type actual: :py:class:`psyclone.psyir.nodes.DataNode`
+        :param symbol_table: the PSy-layer routine's table, which gains the
+            ``c_bool`` import if it does not already carry one.
+        :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+
+        :returns: the conversion, ready to stand in the actual's place.
+        :rtype: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+        """
+        c_bool = cls._import_constant(symbol_table, "c_bool", "iso_c_binding")
+        return IntrinsicCall.create(
+            IntrinsicCall.Intrinsic.LOGICAL,
+            [actual, ("kind", Reference(c_bool))])
+
+    @staticmethod
+    def _lower_halo_exchanges(node):
+        """Lower every halo exchange in ``node``'s invoke, before ``node`` is.
+
+        A halo exchange does not know its own depth: it computes one by
+        walking forward for the accesses that read the field it exchanges, and
+        those accesses are LFRic kernel arguments carrying LFRic metadata.
+        :py:meth:`apply` is about to replace the loop holding them with a
+        plain :py:class:`~psyclone.psyir.nodes.Call`, which carries none, so
+        an exchange lowered afterwards finds no reader at all and PSyclone
+        raises :py:class:`~psyclone.errors.InternalError` rather than
+        generating a wrong depth.
+
+        Lowering the exchanges first is the order whole-container lowering
+        would have used anyway -- an exchange precedes the loop it feeds, and
+        lowering runs in schedule order -- so this restores that order rather
+        than choosing a new one. It does nothing for a schedule that has no
+        exchange, which is every region captured before stencils.
+
+        :param node: the loop about to be captured, used only to reach the
+            invoke schedule containing it. A node with no
+            :py:class:`~psyclone.psyGen.InvokeSchedule` ancestor, as a unit
+            test's bare schedule has, is left alone.
+        :type node: :py:class:`~psyclone.domain.lfric.LFRicLoop`
+
+        """
+        schedule = node.ancestor(InvokeSchedule)
+        if schedule is None:
+            return
+        for exchange in schedule.walk(LFRicHaloExchange):
+            exchange.lower_to_language_level()
 
     def apply(self, node, options=None, **kwargs):
         """Generate C++ and replace ``node`` with the typed launch call.
@@ -628,11 +789,19 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
             actuals[index] = Reference(actual.symbol)
 
         constants = self._constants(schedule)
+        # The launch index shares a C++ scope with the kernel's own
+        # declarations, so a kernel declaring 'cell' would collide with it.
+        # Spelt from the dataclass default so the two cannot drift: a kernel
+        # that has not taken the name still generates 'cell'.
+        cell_index = schedule.symbol_table.next_available_name(
+            KokkosRegion.cell_index)
         region = KokkosRegion(
             name=self._region_name(schedule),
             schedule=schedule,
             cell_count=self._CELL_COUNT,
-            arguments=self._region_arguments(schedule, per_cell, constants),
+            cell_index=cell_index,
+            arguments=self._region_arguments(
+                schedule, per_cell, constants, cell_index),
             kind_types=self._kind_types(schedule),
             scratch=self._local_arrays(schedule))
         try:
@@ -642,6 +811,7 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                 f"LFRicKokkosTrans cannot express '{kernel.name}' in the "
                 f"Kokkos backend: {err}") from err
 
+        self._lower_halo_exchanges(node)
         lowered_loop = node.lower_to_language_level()
         cell_count = lowered_loop.stop_expr.copy()
         routine = lowered_loop.ancestor(Routine)
@@ -651,6 +821,15 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         actuals.extend(
             Reference(self._import_constant(symbol_table, name, container))
             for name, container, _ in constants)
+        # region.arguments is the formals, then the cell count, then the
+        # constants -- which is exactly the order 'actuals' is in once both
+        # appends above have run. The two are therefore index-aligned, and one
+        # loop covers a logical formal and an imported logical constant alike.
+        # That alignment is what makes this correct and it is not visible from
+        # the loop itself.
+        for index, argument in enumerate(region.arguments):
+            if argument.c_type == self._C_LOGICAL_TYPE:
+                actuals[index] = self._as_c_bool(actuals[index], symbol_table)
         counter = lowered_loop.variable
         lowered_loop.replace_with(Call.create(launch, actuals))
         self._drop_unused_counter(routine, counter)

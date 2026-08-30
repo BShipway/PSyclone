@@ -180,6 +180,23 @@ def test_kokkos_writer_rejects_a_widened_neighbour_type():
         KokkosWriter()(replace(region, arguments=arguments))
 
 
+def test_kokkos_writer_accepts_a_bool_argument():
+    """``bool`` is on the ABI, and is written as an ordinary scalar.
+
+    It is the one supported type carrying no width, which is what lets the
+    driving transformation admit a logical whatever ``l_def`` measures. The
+    writer needs to know nothing about that: a ``bool`` scalar is declared and
+    passed like an ``int`` one, and the conversion happens on the Fortran
+    side.
+    """
+    region = _region()
+    arguments = region.arguments + (KokkosScalar("flag", "bool"),)
+
+    code = KokkosWriter()(replace(region, arguments=arguments))
+
+    assert "const bool flag" in code
+
+
 def test_kokkos_writer_rejects_codeblocks():
     """Opaque Fortran cannot silently enter generated Kokkos code."""
     region = _region()
@@ -358,6 +375,53 @@ def test_kokkos_writer_places_locals_in_team_scratch():
     assert code.rstrip().endswith("Kokkos::fence();\n}")
 
 
+def _renamed(region):
+    """Return ``region`` with its cell index, and every slice, called cell_1.
+
+    :param region: the region to rename the launch index of.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the same region indexed by ``cell_1`` rather than ``cell``.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    arguments = tuple(
+        replace(argument, extra_indices=("cell_1",))
+        if isinstance(argument, KokkosView) and argument.extra_indices
+        else argument
+        for argument in region.arguments)
+    return replace(region, cell_index="cell_1", arguments=arguments)
+
+
+def test_kokkos_region_renames_a_colliding_cell_index():
+    """A range launch names its index from the region, not from a literal.
+
+    A kernel that declares ``cell`` itself shares a scope with the lambda
+    parameter, so C++ rejects the translation unit outright rather than
+    quietly reading the wrong index. The region carries the name so that its
+    caller can choose one the kernel has not taken.
+    """
+    code = KokkosWriter()(_renamed(_region()))
+
+    assert "KOKKOS_LAMBDA(const int cell_1)" in code
+    assert "KOKKOS_LAMBDA(const int cell)" not in code
+
+    # Every per-cell View is sliced by the same renamed index.
+    assert ", cell_1)" in code
+    assert ", cell)" not in code
+
+
+def test_kokkos_team_region_renames_a_colliding_cell_index():
+    """A team launch renames the index it computes from the league rank."""
+    code = KokkosWriter()(_renamed(_scratch_region()))
+
+    assert "const int cell_1 = team.league_rank() * team.team_size() + rank;" \
+        in code
+    assert "if (cell_1 >= ncells) {" in code
+    assert ", cell_1)" in code
+    assert "const int cell =" not in code
+    assert "if (cell >= ncells) {" not in code
+
+
 def test_kokkos_writer_sizes_and_builds_every_scratch_array():
     """Two scratch arrays are both sized into the request and both built."""
     code = KokkosWriter()(_scratch_region())
@@ -491,6 +555,24 @@ def test_kokkos_writer_rejects_invalid_scratch(scratch, message):
     region = _scratch_region(scratch=(scratch,))
     with pytest.raises((ValueError, TypeError)) as error:
         KokkosWriter()(region)
+    assert message in str(error.value)
+
+
+@pytest.mark.parametrize("field, message", [
+    ("name", "Kokkos region name 'not a name' is not a C++ identifier."),
+    ("cell_count", "Cell count 'not a name' is not a C++ identifier."),
+    ("cell_index", "Cell index 'not a name' is not a C++ identifier."),
+])
+def test_kokkos_writer_rejects_a_name_that_is_not_an_identifier(
+        field, message):
+    """Each name the writer emits verbatim is checked before it is emitted.
+
+    All three reach the generated source as a declaration or a label, so a
+    value that is not a C++ identifier produces a translation unit that does
+    not compile. The refusal names which of the three it was.
+    """
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(replace(_region(), **{field: "not a name"}))
     assert message in str(error.value)
 
 

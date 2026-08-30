@@ -80,7 +80,10 @@ class LFRicKokkosCallMixin:
     #: the ``iso_c_binding`` kind that declaration needs imported. One table
     #: rather than two, so the interface's ``use`` line and its declarations
     #: cannot disagree.
+    #: ``bool`` is first so that the ``use iso_c_binding`` line an interface
+    #: writes stays in this table's order whichever types it carries.
     _FORTRAN_TYPES = {
+        "bool": ("logical(c_bool)", "c_bool"),
         "int": ("integer(c_int)", "c_int"),
         "float": ("real(c_float)", "c_float"),
         "double": ("real(c_double)", "c_double"),
@@ -143,7 +146,7 @@ class LFRicKokkosCallMixin:
         return f"{name}_kokkos"
 
     @classmethod
-    def _region_arguments(cls, schedule, per_cell, constants):
+    def _region_arguments(cls, schedule, per_cell, constants, cell_index):
         """Describe the generated signature for the backend.
 
         :param schedule: the kernel schedule being captured.
@@ -152,6 +155,11 @@ class LFRicKokkosCallMixin:
         :param constants: the module constants passed by value, as
             :py:meth:`_constants` returns them.
         :type constants: list[tuple[str, str, str]]
+        :param str cell_index: the name the launch gives its own cell index,
+            which every sliced View is indexed by. It is the region's
+            :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
+            and is passed rather than assumed because the kernel may declare
+            ``cell`` itself.
 
         :returns: one description per generated C argument, in call order.
         :rtype: tuple[Union[
@@ -172,7 +180,7 @@ class LFRicKokkosCallMixin:
                 symbol.name, f"{symbol.name}_data", c_type,
                 extents + ((cls._CELL_COUNT,) if sliced else ()),
                 index_offsets=(1,) * len(extents),
-                extra_indices=("cell",) if sliced else (),
+                extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
         arguments.extend(
@@ -278,13 +286,20 @@ class LFRicKokkosCallMixin:
             there are no kinds to assert.
         :rtype: str
         """
-        if not kind_types:
-            return ""
         intrinsics = {c_type: intrinsic
                       for (intrinsic, _), c_type in cls._C_TYPES.items()}
-        names = ", ".join(kind for kind, _ in kind_types)
+        # A logical kind has no width to assert -- it crosses the ABI by
+        # conversion, as LFRicKokkosTypesMixin._C_LOGICAL_TYPE explains -- so
+        # it is dropped before anything is written, the `use` line included. A
+        # region whose only body kind is logical therefore emits no assertion
+        # block at all rather than an empty one.
+        asserted = [(kind, c_type) for kind, c_type in kind_types
+                    if c_type in intrinsics]
+        if not asserted:
+            return ""
+        names = ", ".join(kind for kind, _ in asserted)
         lines = [f"    use constants_mod, only : {names}"]
-        for kind, c_type in kind_types:
+        for kind, c_type in asserted:
             probe = cls._KIND_PROBES[intrinsics[c_type]]
             c_kind = cls._FORTRAN_TYPES[c_type][1]
             lines.append(

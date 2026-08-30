@@ -14,6 +14,7 @@ from psyclone.configuration import Config
 from psyclone.core import AccessType
 from psyclone.domain.lfric import LFRicLoop
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
+from psyclone.lfric import LFRicArgStencil
 from psyclone.parse import ModuleManager
 from psyclone.parse.algorithm import parse
 from psyclone.psyGen import PSyFactory
@@ -71,6 +72,72 @@ contains
     end do
   end subroutine moist_dyn_gas_code
 end module moist_dyn_gas_kernel_mod
+"""
+
+
+# The production kernel with 'cell' declared as one of its own locals and
+# genuinely used. GungHo has such kernels -- apply_helmholtz_operator_code
+# counts a stencil branch with one -- and the name is the launch index's, so
+# the generated declaration and the lambda parameter would share a C++ scope.
+# That is a compile error rather than a wrong answer, which is why the
+# transformation renames its index instead of leaving the collision to the
+# compiler.
+_CELL_LOCAL_KERNEL = _KERNEL.replace(
+    "integer(kind=i_def) :: k, df",
+    "integer(kind=i_def) :: k, df, cell").replace(
+    "    do k = 0, nlayers - 1",
+    "    cell = ndf_wtheta\n    do k = 0, nlayers - 1").replace(
+    "      do df = 1, ndf_wtheta", "      do df = 1, cell")
+
+
+_HALO_ALGORITHM = """
+program kokkos_halo_test
+  use field_mod, only : field_type
+  use halo_read_kernel_mod, only : halo_read_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(halo_read_kernel_type(out_field, in_field))
+end program kokkos_halo_test
+"""
+
+
+# A kernel reading a field on a continuous space. Reading one is allowed --
+# only writing one is refused -- and it is what makes distributed memory put a
+# halo exchange in front of the loop, which none of the regions captured
+# before this stage has. The stencil this stage's target uses puts one there
+# too, for the same reason and by a different route.
+_HALO_KERNEL = """
+module halo_read_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w1, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: halo_read_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_write, w3),                  &
+         arg_type(gh_field, gh_real, gh_read,  w1) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: halo_read_code
+  end type halo_read_kernel_type
+contains
+  subroutine halo_read_code(nlayers, field_out, field_in, &
+                            ndf_w3, undf_w3, map_w3, &
+                            ndf_w1, undf_w1, map_w1)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_w1, undf_w1
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w1), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_w1), intent(in) :: map_w1
+    integer(kind=i_def) :: k
+    do k = 0, nlayers - 1
+      field_out(map_w3(1) + k) = field_in(map_w1(1) + k)
+    end do
+  end subroutine halo_read_code
+end module halo_read_kernel_mod
 """
 
 
@@ -283,12 +350,14 @@ end module scaled_solver_kernel_mod
 """
 
 
-# The same shape with the scalar made logical, so that the refusal stage 2
-# deliberately leaves in place has a test of its own. LFRic's l_def is
-# kind(.false.), which measures 4 bytes, but PSyclone's precision map records
-# l_def as 1. Admitting it would generate logical(c_bool) against a logical(4)
-# actual, which does not compile, so the ABI widening stops at float. See
-# stage 2 of psy-ir-aidev/docs/plans/2026-08-29-phase-3-coverage.md.
+# The same shape with the scalar made logical. Stage 2 refused this, because
+# LFRic's l_def is kind(.false.) and measures 4 bytes where PSyclone's
+# precision map records it as 1 (issue #1941), so a logical(c_bool) dummy would
+# have sat against a logical(4) actual. Stage 5 admits it by conversion
+# instead: the dummy is logical(c_bool), value and the call site wraps the
+# actual in LOGICAL(..., c_bool), which is correct at either width. Neither
+# side reads the precision map for it, so #1941 is bypassed rather than
+# depended on.
 _LOGICAL_ALGORITHM = """
 program kokkos_logical_test
   use constants_mod, only : l_def
@@ -337,6 +406,142 @@ contains
     end do
   end subroutine masked_solver_code
 end module masked_solver_kernel_mod
+"""
+
+
+# The same kernel with the logical made an array. A scalar crosses the ABI by
+# conversion, value by value, which is what makes the two widths irrelevant.
+# An array crosses by reference: a View<bool*> laid over logical(l_def) storage
+# reinterprets 4-byte elements as 1-byte ones and reads every fourth byte, so
+# the conversion that fixes the scalar has nothing to act on. The metadata is
+# unchanged -- gh_scalar/gh_logical -- because it is the Fortran declaration
+# that makes it an array; a real LFRic kernel could not declare it this way,
+# and the refusal is checked from the declaration rather than the metadata.
+_LOGICAL_ARRAY_KERNEL = _LOGICAL_KERNEL.replace(
+    "    logical(kind=l_def), intent(in) :: masked",
+    "    logical(kind=l_def), dimension(ndf_w3), intent(in) :: masked"
+    ).replace("        if (masked) then", "        if (masked(df)) then")
+
+
+_STENCIL_ALGORITHM = """
+program kokkos_stencil_test
+  use constants_mod, only : i_def
+  use field_mod, only : field_type
+  use stencil_sum_kernel_mod, only : stencil_sum_kernel_type
+  implicit none
+  type(field_type) :: field_out, field_in
+  integer(kind=i_def) :: extent = 1
+  call invoke(stencil_sum_kernel_type(field_out, field_in, extent))
+end program kokkos_stencil_test
+"""
+
+
+# apply_helmholtz_operator_code's stencil access with its algebra removed: a
+# CROSS2D branch loop over a sliced dofmap, bounded by a sliced size array.
+# The three formals the stencil adds are all used, because the point of the
+# fixture is what 'apply' does with each of them -- 'smap_sizes' and 'smap'
+# become Views with the cell index appended, 'max_length' stays a scalar --
+# and an unused formal would still be declared but would not be indexed.
+#
+# The branch counter is 'step' rather than the production kernel's 'cell'.
+# That collision is real and is Task 5.3's subject, tested by
+# '_CELL_LOCAL_KERNEL'; repeating it here would make a stencil failure and a
+# naming failure indistinguishable.
+_STENCIL_KERNEL = """
+module stencil_sum_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column, stencil, cross2d
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: stencil_sum_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                 &
+         arg_type(gh_field, gh_real, gh_write, w3),                     &
+         arg_type(gh_field, gh_real, gh_read,  w3, stencil(cross2d)) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: stencil_sum_code
+  end type stencil_sum_kernel_type
+contains
+  subroutine stencil_sum_code(nlayers, field_out, field_in, &
+                              smap_sizes, max_length, smap, &
+                              ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: max_length
+    integer(kind=i_def), dimension(4), intent(in) :: smap_sizes
+    integer(kind=i_def), dimension(ndf_w3, max_length, 4), intent(in) :: smap
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df, branch, step
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = 0.0_r_def
+        do branch = 1, 4
+          do step = 1, smap_sizes(branch)
+            field_out(map_w3(df) + k) = field_out(map_w3(df) + k) + &
+                field_in(smap(df, step, branch) + k)
+          end do
+        end do
+      end do
+    end do
+  end subroutine stencil_sum_code
+end module stencil_sum_kernel_mod
+"""
+
+
+_STENCIL_1D_ALGORITHM = _STENCIL_ALGORITHM.replace(
+    "stencil_sum", "stencil_line").replace(
+    "kokkos_stencil_test", "kokkos_stencil_line_test")
+
+
+# The same kernel through a 1-D CROSS stencil, which is the shape the
+# transformation refuses. The refusal is not a matter of taste: LFRic gives a
+# 1-D stencil's size to the kernel as a *scalar* formal, fed per cell from
+# 'field_in_stencil_size(cell)', where CROSS2D gives an array formal fed from
+# a whole array. 'apply''s per-cell rule appends the cell index to an array
+# actual, so the array form needs nothing new and the scalar form would need
+# a per-cell scalar argument kind that does not exist. The dofmap loses its
+# branch dimension for the same reason. Both differences are visible below.
+_STENCIL_1D_KERNEL = """
+module stencil_line_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column, stencil, cross
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: stencil_line_kernel_type
+    type(arg_type) :: meta_args(2) = (/                               &
+         arg_type(gh_field, gh_real, gh_write, w3),                   &
+         arg_type(gh_field, gh_real, gh_read,  w3, stencil(cross)) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: stencil_line_code
+  end type stencil_line_kernel_type
+contains
+  subroutine stencil_line_code(nlayers, field_out, field_in, &
+                               smap_size, smap, &
+                               ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: smap_size
+    integer(kind=i_def), dimension(ndf_w3, smap_size), intent(in) :: smap
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df, step
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = 0.0_r_def
+        do step = 1, smap_size
+          field_out(map_w3(df) + k) = field_out(map_w3(df) + k) + &
+              field_in(smap(df, step) + k)
+        end do
+      end do
+    end do
+  end subroutine stencil_line_code
+end module stencil_line_kernel_mod
 """
 
 
@@ -397,6 +602,29 @@ contains
   end subroutine column_solve_code
 end module column_solve_kernel_mod
 """
+
+
+# The same kernel with a scalar local named after one of the identifiers the
+# team launch declares around the kernel body. The kernel's declaration would
+# shadow the launch's and then be assigned to, which C++ accepts: the region
+# would run with a team size the kernel had overwritten. That is a wrong answer
+# rather than a compile error, which is why it is refused.
+_TEAM_NAME_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k, team_size\n").replace(
+    "    partial(1) = field_in(map_w3(1))",
+    "    team_size = nlayers\n    partial(1) = field_in(map_w3(1))").replace(
+    "    do k = 2, nlayers", "    do k = 2, team_size")
+
+
+# A kernel with no local arrays and a scalar local named 'ncells'. The cell
+# count is declared by both launch shapes, not only the team one, so this
+# refusal does not depend on there being scratch to place.
+_NCELLS_LOCAL_KERNEL = _KERNEL.replace(
+    "integer(kind=i_def) :: k, df",
+    "integer(kind=i_def) :: k, df, ncells").replace(
+    "    do k = 0, nlayers - 1",
+    "    ncells = nlayers\n    do k = 0, ncells - 1")
 
 
 # The same kernel with one array sized by a module constant instead of by a
@@ -591,15 +819,32 @@ _UNDECLARED_CAST_KIND_KERNEL = _LOCAL_KERNEL.replace(
     "      field_out(map_w3(1) + k - 1) = swept(k) + real(k, r_second)")
 
 
-# A kernel importing a constant whose kind is off the generated C ABI. The
-# module is readable and the constant resolves; a 1-byte logical simply has no
-# place on an interface carrying 4-byte integers and 4- and 8-byte reals.
+# A kernel importing a logical constant. It was named for being off the ABI,
+# which stage 5 made false: a logical scalar now crosses by conversion, and an
+# imported constant crosses as an argument rather than a literal because its
+# value is known only where the PSy layer runs. The name is kept so that the
+# fixture's history is legible against the plans that refer to it.
 _OFF_ABI_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
     "  use kernel_mod, only : kernel_type",
     "  use kernel_mod, only : kernel_type\n"
     "  use planet_config_mod, only : rehabilitate").replace(
     "      swept(k) = swept(k + 1) - partial(k)",
     "      if (rehabilitate) swept(k) = swept(k + 1) - partial(k)")
+
+
+# A kernel importing a module datum whose kind the ABI does not carry.
+# 'unmapped_width' is an r_quad real, 16 bytes and so off a C ABI carrying 4-
+# and 8-byte ones, and it is declared with no attributes so that PSyIR models
+# it rather
+# than leaving the text to be re-read. Stage 5 needs this because the case used
+# to be carried by an l_def logical constant, which is now admitted: the
+# refusal is unchanged, so it keeps a witness.
+_UNMAPPED_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : unmapped_width").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) * unmapped_width")
 
 
 # A kernel importing a constant from a module PSyclone cannot read. Its kind
@@ -786,11 +1031,12 @@ end program kokkos_{name}_test
 # tests drive parse() and PSyFactory directly, so they say so themselves.
 _PLANET_CONFIG = """
 module planet_config_mod
-  use constants_mod, only : i_def, l_def, r_def
+  use constants_mod, only : i_def, l_def, r_def, r_quad
   implicit none
   real(kind=r_def), public, protected :: recip_epsilon = 1.0_r_def
   integer(kind=i_def), public, parameter :: n_moist = 3
   logical(kind=l_def), public, parameter :: rehabilitate = .false.
+  real(kind=r_quad) :: unmapped_width
 end module planet_config_mod
 """
 
@@ -828,12 +1074,28 @@ def target_fixture(tmp_path, clear_module_manager_instance):
     return _invoke(tmp_path, "moist_dyn_gas", _ALGORITHM, _KERNEL)
 
 
+@pytest.fixture(name="cell_local_target")
+# pylint: disable-next=unused-argument
+def cell_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares 'cell' as a local of its own."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _CELL_LOCAL_KERNEL)
+
+
 @pytest.fixture(name="second_target")
 # pylint: disable-next=unused-argument
 def second_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an unrelated supported kernel in a minimal LFRic invoke."""
     return _invoke(
         tmp_path, "scaled_copy", _SECOND_ALGORITHM, _SECOND_KERNEL)
+
+
+@pytest.fixture(name="halo_target")
+# pylint: disable-next=unused-argument
+def halo_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose loop is preceded by a halo exchange."""
+    return _invoke(
+        tmp_path, "halo_read", _HALO_ALGORITHM, _HALO_KERNEL)
 
 
 @pytest.fixture(name="paired_target")
@@ -868,12 +1130,52 @@ def logical_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_KERNEL)
 
 
+@pytest.fixture(name="logical_array_target")
+# pylint: disable-next=unused-argument
+def logical_array_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes an l_def logical array."""
+    return _invoke(
+        tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_ARRAY_KERNEL)
+
+
+@pytest.fixture(name="stencil_target")
+# pylint: disable-next=unused-argument
+def stencil_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads through a CROSS2D stencil."""
+    return _invoke(
+        tmp_path, "stencil_sum", _STENCIL_ALGORITHM, _STENCIL_KERNEL)
+
+
+@pytest.fixture(name="stencil_1d_target")
+# pylint: disable-next=unused-argument
+def stencil_1d_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads through a 1-D CROSS stencil."""
+    return _invoke(
+        tmp_path, "stencil_line", _STENCIL_1D_ALGORITHM, _STENCIL_1D_KERNEL)
+
+
 @pytest.fixture(name="local_target")
 # pylint: disable-next=unused-argument
 def local_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel holds two automatic column arrays."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOCAL_KERNEL)
+
+
+@pytest.fixture(name="team_name_target")
+# pylint: disable-next=unused-argument
+def team_name_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local named 'team_size'."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _TEAM_NAME_KERNEL)
+
+
+@pytest.fixture(name="ncells_local_target")
+# pylint: disable-next=unused-argument
+def ncells_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local named 'ncells'."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _NCELLS_LOCAL_KERNEL)
 
 
 @pytest.fixture(name="unsized_local_target")
@@ -1057,6 +1359,14 @@ def off_abi_constant_target_fixture(tmp_path, clear_module_manager_instance):
                    _OFF_ABI_CONSTANT_KERNEL)
 
 
+@pytest.fixture(name="unmapped_constant_target")
+# pylint: disable-next=unused-argument
+def unmapped_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke importing a datum of a kind the ABI does not map."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _UNMAPPED_CONSTANT_KERNEL)
+
+
 @pytest.fixture(name="unreadable_constant_target")
 # pylint: disable-next=unused-argument
 def unreadable_constant_target_fixture(
@@ -1158,6 +1468,67 @@ def unmodelled_target_fixture(tmp_path, clear_module_manager_instance):
             "r_solver", stencil=True),
         _polymorphic_kernel("stencil_scale", "r_double", "r_single",
                             stencil=True))
+
+
+def test_lfric_kokkos_trans_renames_the_index_a_kernel_declares(
+        cell_local_target):
+    """A kernel declaring 'cell' pushes the launch index off that name.
+
+    The lambda parameter and the kernel's own declaration share one C++
+    scope, so leaving both called 'cell' does not produce a subtly wrong
+    answer -- it produces a translation unit the compiler rejects with
+    'conflicting declaration'. The index is therefore named from the kernel's
+    symbol table rather than fixed.
+    """
+    _, loop, _ = cell_local_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "KOKKOS_LAMBDA(const int cell_1)" in cpp
+    assert "KOKKOS_LAMBDA(const int cell)" not in cpp
+    # The kernel's own 'cell' keeps its name, and every sliced View follows
+    # the launch index rather than the local.
+    assert "int cell;" in cpp
+    assert "map_wtheta((df - 1), cell_1)" in cpp
+    assert "map_wtheta((df - 1), cell)" not in cpp
+
+
+def test_lfric_kokkos_trans_keeps_a_preceding_halo_exchange(halo_target):
+    """A halo exchange feeding the captured loop still resolves its depth.
+
+    The exchange computes its depth by walking forward for the accesses that
+    read its field, and those accesses live on the LFRic loop that ``apply``
+    is about to replace with a plain ``Call``. Lowering the exchanges before
+    the loop rather than after it is what keeps that walk able to find them;
+    without it PSyclone raises ``InternalError`` from
+    ``_compute_halo_read_info`` when the PSy layer is generated.
+    """
+    psy, loop, _ = halo_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert 'extern "C" void halo_read_kokkos(' in cpp
+    assert "halo_exchange(depth=" in fortran
+    assert "call halo_read_kokkos(" in fortran
+    assert "call halo_read_code(" not in fortran
+    # The exchange fills the halo the loop then reads, so it has to stay in
+    # front of the launch rather than merely survive.
+    assert fortran.index("halo_exchange(depth=") < \
+        fortran.index("call halo_read_kokkos(")
+
+
+def test_lfric_kokkos_trans_lowers_no_exchange_outside_an_invoke(target):
+    """A loop with no invoke schedule above it is left alone.
+
+    The exchanges are reached through the loop's ``InvokeSchedule`` ancestor,
+    and a detached loop has none. Returning rather than walking from ``None``
+    is what lets the helper be called on a loop held outside the tree it was
+    parsed into, as a unit test does.
+    """
+    _, loop, _ = target
+
+    assert LFRicKokkosTrans._lower_halo_exchanges(loop.detach()) is None
 
 
 def test_lfric_kokkos_trans_captures_an_array_section(section_target):
@@ -1440,10 +1811,76 @@ def test_lfric_kokkos_trans_rejects_incremented_field(target):
         LFRicKokkosTrans().validate(loop)
 
 
+def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
+    """A CROSS2D stencil needs no argument machinery of its own.
+
+    Its three PSy-layer actuals are a cell-sliced rank-2 size array, a plain
+    integer and a cell-sliced rank-4 dofmap, and 'apply''s existing per-cell
+    rule already passes each of them correctly: the two slices are
+    ArrayReferences, so they are passed whole with the cell index appended,
+    exactly as 'map_w3(:,cell)' already is, and 'max_length' is a scalar that
+    stays one. The test asserts the shapes rather than the mere absence of a
+    refusal, because it is the shapes that carry that claim.
+    """
+    psy, loop, _ = stencil_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap_sizes(smap_sizes_data, 4, ncells);" in cpp)
+    assert ("Kokkos::View<const int****, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap(smap_data, ndf_w3, max_length, 4, ncells);" in cpp)
+    assert "const int max_length" in cpp
+    assert "max_length_data" not in cpp
+    assert "smap((df - 1), (step - 1), (branch - 1), cell)" in cpp
+    assert "smap_sizes((branch - 1), cell)" in cpp
+
+    # The three actuals are passed whole, the cell index having moved into the
+    # Views' last extent, and the halo exchange the stencil puts in front of
+    # the loop is still there and still ahead of the launch.
+    fortran = str(psy.gen)
+    assert "integer(c_int), dimension(*), intent(in) :: smap_sizes" in fortran
+    assert "integer(c_int), value :: max_length" in fortran
+    assert "integer(c_int), dimension(*), intent(in) :: smap" in fortran
+    assert ("call stencil_sum_kokkos(nlayers_field_out, field_out_data, "
+            "field_in_data, field_in_stencil_size, "
+            "field_in_max_branch_length, field_in_stencil_dofmap, ndf_w3, "
+            "undf_w3, map_w3, loop0_stop)" in fortran)
+    assert fortran.index("halo_exchange(depth=extent)") < fortran.index(
+        "call stencil_sum_kokkos(")
+
+
+def test_lfric_kokkos_trans_refuses_a_one_dimensional_stencil(
+        stencil_1d_target):
+    """A 1-D stencil hands the kernel its size as a scalar, not an array.
+
+    That is the difference the shape list is drawn along, and the fixture is a
+    real CROSS kernel rather than a patched CROSS2D one so that the difference
+    is the parser's rather than the test's. 'apply''s per-cell rule appends
+    the cell index to an array actual; a 1-D stencil's size arrives instead as
+    'field_in_stencil_size(cell)' against a by-value dummy, which would need a
+    per-cell scalar argument kind that does not exist. No executed GungHo loop
+    asks for one, so the shape is refused by name rather than mishandled.
+    """
+    _, loop, _ = stencil_1d_target
+
+    with pytest.raises(TransformationError, match="cross2d") as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'cross'" in str(error.value)
+    assert "'field_in'" in str(error.value)
+
+
 def test_lfric_kokkos_trans_rejects_stencil(target):
-    """Stencil storage and halo requirements are not silently captured."""
+    """Stencil storage and halo requirements are not silently captured.
+
+    The refusal is shape-specific rather than blanket from stage 5 on:
+    'cross2d' is accepted, and every other shape -- 'xory1d' here, which has a
+    direction argument on top of a 1-D size -- is named in the message that
+    refuses it.
+    """
     _, loop, kernel = target
-    kernel.arguments.args[1].stencil = {"type": "xory1d"}
+    kernel.arguments.args[1].stencil = LFRicArgStencil(name="xory1d")
     with pytest.raises(TransformationError, match="stencil"):
         LFRicKokkosTrans().validate(loop)
 
@@ -1514,17 +1951,55 @@ def test_lfric_kokkos_trans_fails_closed_on_an_unsupported_width(
     assert "4-byte integer, 4-byte real and 8-byte real" in str(err.value)
 
 
-def test_lfric_kokkos_trans_still_refuses_a_logical_kind(logical_target):
-    """A logical scalar stays refused after the ABI admits single precision.
+def test_lfric_kokkos_trans_passes_a_logical_by_conversion(logical_target):
+    """A logical scalar crosses the ABI as a converted value, not a width.
 
-    LFRic's l_def is kind(.false.) and measures 4 bytes; PSyclone's precision
-    map records it as 1. Generating logical(c_bool) against a logical(4)
-    actual would not compile, so the widening deliberately stops at float.
+    Stage 2 refused this because LFRic's l_def is kind(.false.) and measures 4
+    bytes where PSyclone's precision map records it as 1 -- issue #1941 -- so a
+    logical(c_bool) dummy against a logical(l_def) actual would not have
+    compiled. Conversion dissolves the question rather than answering it: the
+    dummy is logical(c_bool), value, the call site wraps the actual in
+    LOGICAL(..., c_bool), and the compiler converts whatever width l_def turns
+    out to be. Nothing here reads the precision map for a logical, so a
+    corrected #1941 would not change what is generated -- which is why no
+    width assertion is emitted for it either.
     """
-    _, loop, _ = logical_target
-    with pytest.raises(TransformationError, match="argument kinds") as err:
+    psy, loop, _ = logical_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const bool masked" in cpp
+    assert "logical(c_bool), value :: masked" in fortran
+    assert "use iso_c_binding, only : c_bool" in fortran
+    assert "LOGICAL(masked, kind=c_bool)" in fortran
+    # The whole point: no width is asserted for a kind that does not have to
+    # match. An assertion here would fail on the very build this admits.
+    assert "assert_kind_l_def" not in fortran
+    assert "storage_size(.true._l_def)" not in fortran
+    # l_def is dropped from the assertion block's own use line too, not only
+    # from the assertions it would have fed. LFRic builds with
+    # -Werror=unused-dummy-argument and friends, so importing a kind and then
+    # not naming it is not a harmless extra line.
+    assert "use constants_mod, only : i_def, r_solver" in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_logical_array(logical_array_target):
+    """A logical array stays refused, because it would cross by reference.
+
+    Conversion is per value, so it is the scalar case that it fixes. A
+    View<bool*> laid over logical(l_def) storage reinterprets rather than
+    converts: it reads 1 byte where the Fortran wrote 4, so three quarters of
+    the elements it returns are bytes from the middle of their neighbours.
+    That is the failure the scalar's conversion removes and that an array
+    cannot have removed by the same means, so the array is refused.
+    """
+    _, loop, _ = logical_array_target
+
+    with pytest.raises(TransformationError, match="argument kinds") as error:
         LFRicKokkosTrans().validate(loop)
-    assert "masked" in str(err.value)
+
+    assert "masked" in str(error.value)
 
 
 def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
@@ -1749,6 +2224,41 @@ def test_lfric_kokkos_trans_describes_each_local_array(local_target):
     assert all(item.extents == ("nlayers",) for item in scratch)
     # Fortran declares from 1 and C indexes from 0, as for a formal.
     assert all(item.index_offsets == (1,) for item in scratch)
+
+
+def test_lfric_kokkos_trans_refuses_a_local_named_after_the_launch(
+        team_name_target):
+    """A local shadowing a name the team launch declares is refused.
+
+    The launch index is renamed around such a collision instead, because a
+    lambda parameter and a body declaration are a compile error and the fix
+    is one name in two places. These seven are threaded through two launch
+    shapes and through the scratch sizing, so they are refused rather than
+    renamed; no GungHo kernel declares any of them.
+    """
+    _, loop, _ = team_name_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "generated launch declares 'team_size'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_local_named_ncells(
+        ncells_local_target):
+    """A local named for the cell count is refused whatever the launch shape.
+
+    ``_validate_formals`` already refuses a *formal* of this name. The cell
+    count is declared by the range launch as well as the team one, so this
+    kernel has no local arrays: the refusal must not be conditional on there
+    being scratch to place.
+    """
+    _, loop, _ = ncells_local_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "generated launch declares 'ncells'" in str(error.value)
 
 
 def test_lfric_kokkos_trans_refuses_an_unsizable_local(unsized_local_target):
@@ -2235,22 +2745,47 @@ def test_lfric_kokkos_trans_casts_at_a_kind_no_declaration_repeats(
     assert "(float)k" not in cpp
 
 
-def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
+def test_lfric_kokkos_trans_passes_a_logical_constant_by_conversion(
         off_abi_constant_target):
+    """An imported logical constant crosses by the same conversion.
+
+    ``rehabilitate`` is an ``l_def`` logical in ``planet_config_mod``, read by
+    the kernel in an ``if``. It reaches the region as an argument rather than a
+    literal, because its value is only known where the PSy layer runs, so the
+    same wrapping applies to it as to a formal -- which is the point of doing
+    the wrapping over ``region.arguments`` rather than over the formals alone.
+    """
+    psy, loop, _ = off_abi_constant_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const bool rehabilitate" in cpp
+    assert "if (rehabilitate)" in cpp
+    assert "use planet_config_mod, only : rehabilitate" in fortran
+    assert "LOGICAL(rehabilitate, kind=c_bool)" in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
+        unmapped_constant_target):
     """A constant that resolves can still have no place on the interface.
 
-    ``rehabilitate`` is an ``l_def`` logical: the module is readable and the
-    kind is known, and one byte of logical is still not something the
-    generated C interface carries. The refusal names the kinds it does.
+    This case used to be carried by ``rehabilitate``, an ``l_def`` logical,
+    which stage 5 admits. The refusal itself did not change, so it keeps a
+    witness of a kind that is still off the ABI: ``unmapped_width`` is an
+    ``r_quad`` real, 16 bytes where the ABI carries 4 and 8. The
+    message names the kinds the ABI does carry, which now includes the
+    logical clause.
     """
-    _, loop, _ = off_abi_constant_target
+    _, loop, _ = unmapped_constant_target
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
-    assert ("cannot pass 'rehabilitate' from 'planet_config_mod' by value"
+    assert ("cannot pass 'unmapped_width' from 'planet_config_mod' by value"
             in str(error.value))
     assert "4-byte integer" in str(error.value)
+    assert "and logical of any kind" in str(error.value)
 
 
 def test_lfric_kokkos_trans_names_the_module_it_could_not_read(

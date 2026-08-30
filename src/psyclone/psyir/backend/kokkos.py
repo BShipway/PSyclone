@@ -137,6 +137,16 @@ class KokkosRegion:
     # every module variable as a literal block and Sphinx then appends its
     # own "alias of" line unindented, which fails the ``-W`` doc build.
     arguments: Tuple[Union[KokkosScalar, KokkosView], ...]
+    #: The name the launch gives its own cell index: the ``RangePolicy``
+    #: lambda's parameter, or the value the team launch computes from the
+    #: league rank. It defaults to ``cell``, so a region built before this
+    #: field existed generates exactly the source it generated then. A caller
+    #: renames it when the kernel already declares ``cell`` itself, because a
+    #: lambda parameter and a body declaration share one C++ scope, so the
+    #: collision is rejected by the compiler rather than silently miscompiled.
+    #: The per-cell Views' ``extra_indices`` have to name it too; the writer
+    #: does not rewrite them.
+    cell_index: str = "cell"
     #: One ``(Fortran kind name, C type)`` pair per kind the region's body
     #: mentions, such as ``("r_solver", "float")``. The region's arguments
     #: carry their own C types, but its locals and its literals cross no
@@ -157,7 +167,11 @@ class KokkosRegion:
 class KokkosWriter(CWriter):
     """Generate a C++/Kokkos translation unit for a captured region."""
 
-    _SUPPORTED_TYPES = ("double", "float", "int")
+    #: The C types this writer will declare. ``bool`` is the one with no
+    #: width behind it: the driving transformation puts a Fortran ``logical``
+    #: on the ABI by conversion rather than by matching kinds, so nothing here
+    #: has to know what ``l_def`` measures.
+    _SUPPORTED_TYPES = ("bool", "double", "float", "int")
 
     #: Intrinsics that become a plain ``Kokkos::`` function call, by the name
     #: Kokkos gives them. Qualification is required for device code -- an
@@ -337,7 +351,7 @@ class KokkosWriter(CWriter):
         return (
             f'  Kokkos::parallel_for("{region.name}", '
             f"Kokkos::RangePolicy<>(0, {region.cell_count}),\n"
-            "      KOKKOS_LAMBDA(const int cell) {\n"
+            f"      KOKKOS_LAMBDA(const int {region.cell_index}) {{\n"
             f"{local_declarations}{body}"
             "      });\n")
 
@@ -387,12 +401,12 @@ class KokkosWriter(CWriter):
             "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
             "team.team_size()),\n"
             "        [&](const int rank) {\n"
-            "      const int cell = team.league_rank() * team.team_size() "
-            "+ rank;\n"
+            f"      const int {region.cell_index} = team.league_rank() * "
+            "team.team_size() + rank;\n"
             # The league is sized by rounding up, so the last team runs with
             # ranks that have no cell. Without this they would run the body
             # for a cell past the end of every View.
-            f"      if (cell >= {region.cell_count}) {{\n"
+            f"      if ({region.cell_index} >= {region.cell_count}) {{\n"
             "        return;\n"
             "      }\n"
             f"{constructions}"
@@ -460,6 +474,9 @@ class KokkosWriter(CWriter):
         if not self._is_identifier(region.cell_count):
             raise ValueError(
                 f"Cell count '{region.cell_count}' is not a C++ identifier.")
+        if not self._is_identifier(region.cell_index):
+            raise ValueError(
+                f"Cell index '{region.cell_index}' is not a C++ identifier.")
         if region.schedule.walk(CodeBlock):
             raise ValueError("Kokkos regions cannot contain a CodeBlock.")
 
