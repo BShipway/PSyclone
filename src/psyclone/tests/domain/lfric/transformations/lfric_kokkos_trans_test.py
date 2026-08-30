@@ -552,6 +552,15 @@ def _invoke(tmp_path, name, algorithm_source, kernel_source):
     kernel.write_text(kernel_source, encoding="utf-8")
     (tmp_path / "planet_config_mod.f90").write_text(
         _PLANET_CONFIG, encoding="utf-8")
+    # Assigned rather than appended to. Config is a singleton for the session
+    # and psyclone.tests.utilities.get_invoke() appends an infrastructure path
+    # to it without ever removing one, so a test that ran a GOcean invoke
+    # earlier leaves external/dl_esm_inf/finite_difference/src here -- a
+    # submodule that is not checked out, which get_kernel_filepath() then
+    # refuses to search. That surfaces as the module constant failing to type
+    # rather than as anything about the path, so these tests say what they
+    # need rather than inheriting it.
+    Config.get().include_paths = [str(tmp_path)]
     ModuleManager.get().add_search_path(str(tmp_path))
     _, invoke_info = parse(
         str(algorithm), api="lfric", kernel_paths=[str(tmp_path)])
