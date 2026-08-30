@@ -339,6 +339,92 @@ end module masked_solver_kernel_mod
 """
 
 
+# A column solve reduced to its shape: two automatic arrays over nlayers, a
+# forward sweep and a backward one. It is sci_tri_solve_kernel_mod's structure
+# without its algebra. The arrays are what the region has to place in team
+# scratch -- their extent is a runtime value, so neither can be a C++ local --
+# and the descending loop is what makes a launch that ignored the step sign
+# return the forward sweep's intermediates instead of failing.
+_LOCAL_ALGORITHM = """
+program kokkos_local_test
+  use field_mod, only : field_type
+  use column_solve_kernel_mod, only : column_solve_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(column_solve_kernel_type(out_field, in_field))
+end program kokkos_local_test
+"""
+
+
+_LOCAL_KERNEL = """
+module column_solve_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: column_solve_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_write, w3),                  &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: column_solve_code
+  end type column_solve_kernel_type
+contains
+  subroutine column_solve_code(nlayers, field_out, field_in, &
+                               ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k
+    real(kind=r_def), dimension(nlayers) :: partial
+    real(kind=r_def), dimension(nlayers) :: swept
+    partial(1) = field_in(map_w3(1))
+    do k = 2, nlayers
+      partial(k) = partial(k - 1) + field_in(map_w3(1) + k - 1)
+    end do
+    swept(nlayers) = partial(nlayers)
+    do k = nlayers - 1, 1, -1
+      swept(k) = swept(k + 1) - partial(k)
+    end do
+    do k = 1, nlayers
+      field_out(map_w3(1) + k - 1) = swept(k)
+    end do
+  end subroutine column_solve_code
+end module column_solve_kernel_mod
+"""
+
+
+# The same kernel with one array sized by a module constant instead of by a
+# formal. Fortran allows it -- a module entity is as valid an automatic bound
+# as a dummy -- but the launch computes its scratch size before it enters the
+# region, so an extent it cannot name there cannot be sized.
+_UNSIZED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : n_moist").replace(
+    "dimension(nlayers) :: swept", "dimension(n_moist) :: swept")
+
+
+# The same kernel with a third local of a kind the ABI does not name. The
+# refusal is the one _validate_formals already makes for a formal, asked of a
+# local: the scratch View has to have a C element type.
+_UNMAPPED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, l_def, r_def").replace(
+    "    real(kind=r_def), dimension(nlayers) :: swept",
+    "    real(kind=r_def), dimension(nlayers) :: swept\n"
+    "    logical(kind=l_def), dimension(nlayers) :: rising").replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      rising(k) = swept(k) > partial(k)\n"
+    "      if (rising(k)) then\n"
+    "        field_out(map_w3(1) + k - 1) = swept(k)\n"
+    "      end if")
+
+
 # A kind-polymorphic kernel: one metadata name over several implementations
 # that differ only in the precision of their real arguments. Built from a
 # template rather than written out three times because the three fixtures below
@@ -449,9 +535,10 @@ end program kokkos_{name}_test
 # tests drive parse() and PSyFactory directly, so they say so themselves.
 _PLANET_CONFIG = """
 module planet_config_mod
-  use constants_mod, only : r_def
+  use constants_mod, only : i_def, r_def
   implicit none
   real(kind=r_def), public, protected :: recip_epsilon = 1.0_r_def
+  integer(kind=i_def), public, parameter :: n_moist = 3
 end module planet_config_mod
 """
 
@@ -465,6 +552,15 @@ def _invoke(tmp_path, name, algorithm_source, kernel_source):
     kernel.write_text(kernel_source, encoding="utf-8")
     (tmp_path / "planet_config_mod.f90").write_text(
         _PLANET_CONFIG, encoding="utf-8")
+    # Assigned rather than appended to. Config is a singleton for the session
+    # and psyclone.tests.utilities.get_invoke() appends an infrastructure path
+    # to it without ever removing one, so a test that ran a GOcean invoke
+    # earlier leaves external/dl_esm_inf/finite_difference/src here -- a
+    # submodule that is not checked out, which get_kernel_filepath() then
+    # refuses to search. That surfaces as the module constant failing to type
+    # rather than as anything about the path, so these tests say what they
+    # need rather than inheriting it.
+    Config.get().include_paths = [str(tmp_path)]
     ModuleManager.get().add_search_path(str(tmp_path))
     _, invoke_info = parse(
         str(algorithm), api="lfric", kernel_paths=[str(tmp_path)])
@@ -518,6 +614,30 @@ def logical_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical scalar."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_KERNEL)
+
+
+@pytest.fixture(name="local_target")
+# pylint: disable-next=unused-argument
+def local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel holds two automatic column arrays."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOCAL_KERNEL)
+
+
+@pytest.fixture(name="unsized_local_target")
+# pylint: disable-next=unused-argument
+def unsized_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local by a module constant."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNSIZED_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="unmapped_local_target")
+# pylint: disable-next=unused-argument
+def unmapped_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel holds a local array of a logical kind."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNMAPPED_LOCAL_KERNEL)
 
 
 @pytest.fixture(name="polymorphic_target")
@@ -1118,3 +1238,137 @@ def test_lfric_kokkos_trans_asserts_nothing_about_an_unkinded_region():
     assert "use iso_c_binding, only : c_int" in interface
     assert "constants_mod" not in interface
     assert "assert_kind" not in interface
+
+
+def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
+    """An automatic array becomes one scratch View per team rank.
+
+    Two arrays over ``nlayers``, so the launch has to size both and the region
+    has to build both. The sizing is what distinguishes scratch from a C++
+    local: ``nlayers`` is a runtime value, so the bytes are asked for before
+    the launch and the View is placed in them inside it.
+    """
+    psy, loop, _ = local_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert 'extern "C" void column_solve_kokkos(' in cpp
+    assert ("using ScratchSpace = "
+            "Kokkos::DefaultExecutionSpace::scratch_memory_space;" in cpp)
+    assert "partial_scratch_t::shmem_size(nlayers)" in cpp
+    assert "swept_scratch_t::shmem_size(nlayers)" in cpp
+    assert "partial_scratch_t partial(team.thread_scratch(0), nlayers);" in cpp
+    assert "swept_scratch_t swept(team.thread_scratch(0), nlayers);" in cpp
+
+    # The launch is the team shape, not the flat one, and its team size comes
+    # from a probe of the policy that already carries the scratch request.
+    assert "Kokkos::TeamPolicy" in cpp
+    assert "Kokkos::RangePolicy" not in cpp
+    assert "team_size_max(body, Kokkos::ParallelForTag())" in cpp
+    assert "if (cell >= ncells) {\n        return;\n      }" in cpp
+
+    # Neither local is declared in the body as well: a scratch View and a C++
+    # array of the same name would not compile.
+    assert "double partial[" not in cpp
+    assert "double swept[" not in cpp
+
+    # The backward sweep counts down. Before the CWriter followed the step
+    # sign this read 'k<=1' and ran no iterations, so the region built, linked
+    # and returned the forward sweep's intermediates.
+    assert "for(k=(nlayers - 1); k>=1; k+=(-1))" in cpp
+
+    # Nothing about the scratch reaches the Fortran side: it is allocated by
+    # the launch, so the ABI is the same as any other region's.
+    assert "subroutine column_solve_kokkos(" in fortran
+    assert "partial" not in fortran
+    assert "swept" not in fortran
+    assert "call column_solve_code(" not in fortran
+
+
+def test_lfric_kokkos_trans_describes_each_local_array(local_target):
+    """``_local_arrays`` names, types and sizes every automatic array."""
+    _, _, kernel = local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    scratch = LFRicKokkosTrans._local_arrays(schedule)
+
+    assert [item.name for item in scratch] == ["partial", "swept"]
+    assert all(item.c_type == "double" for item in scratch)
+    assert all(item.extents == ("nlayers",) for item in scratch)
+    # Fortran declares from 1 and C indexes from 0, as for a formal.
+    assert all(item.index_offsets == (1,) for item in scratch)
+
+
+def test_lfric_kokkos_trans_refuses_an_unsizable_local(unsized_local_target):
+    """A local sized by a module constant is refused, with the extent named.
+
+    ``_constants`` could import ``n_moist`` and pass it into the region, so
+    the refusal is a deliberate narrowing rather than an inability: the
+    scratch size is computed by the launch, outside the region that constant
+    would be passed to.
+    """
+    _, loop, _ = unsized_local_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "n_moist" in str(error.value)
+    assert "kernel-local array 'swept'" in str(error.value)
+    assert "kernel argument" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_local_of_an_unmapped_kind(
+        unmapped_local_target):
+    """A local array of a logical kind is refused, with the kind named."""
+    _, loop, _ = unmapped_local_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "kernel-local array kinds" in str(error.value)
+    assert "'rising'" in str(error.value)
+    assert "'l_def'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_keeps_the_flat_launch_for_scalar_locals(
+        solver_target):
+    """A kernel whose only locals are scalars keeps the RangePolicy shape.
+
+    ``scaled_solver_code`` declares ``k``, ``df`` and ``scaled`` and no array,
+    so admitting local arrays must not have made every region a team launch.
+    """
+    _, loop, kernel = solver_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._local_arrays(schedule) == ()
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
+    assert "TeamPolicy" not in cpp
+    assert "thread_scratch" not in cpp
+    # The scalar local is still declared in the body, where it always was.
+    assert "float scaled;" in cpp
+
+
+@pytest.mark.parametrize("fixture_name", [
+    "unsized_local_target", "unmapped_local_target"])
+def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
+        fixture_name, request):
+    """Both refusals are made by ``validate``, not discovered by ``apply``.
+
+    This is the property that was false before local arrays were modelled:
+    ``validate`` accepted a kernel like ``tri_solve`` and ``apply`` then
+    raised from the backend. A caller asking whether a loop is capturable got
+    "yes" and a caller capturing it got an error, about the same loop.
+    """
+    _, loop, _ = request.getfixturevalue(fixture_name)
+    trans = LFRicKokkosTrans()
+
+    with pytest.raises(TransformationError) as predicted:
+        trans.validate(loop)
+    with pytest.raises(TransformationError) as attempted:
+        trans.apply(loop)
+
+    assert str(predicted.value) == str(attempted.value)

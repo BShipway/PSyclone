@@ -4128,7 +4128,11 @@ precision map decides which implementation of a kind-polymorphic kernel is
 captured: a kernel written as a generic interface over specific procedures
 that differ only in precision is resolved to the one the algorithm layer's
 arguments select, and the generated region is named after that procedure
-rather than after the interface. The contract it accepts, and the reasons it
+rather than after the interface. A kernel holding an automatic array -- a
+column temporary whose extent is a runtime value -- is generated over a
+Kokkos ``TeamPolicy`` instead of a ``RangePolicy``, with that array placed
+in team scratch private to the rank running the cell; a kernel with no such
+array keeps the flat launch. The contract it accepts, and the reasons it
 refuses, are given in its documentation below.
 
 The LFRic API-specific transformations currently available

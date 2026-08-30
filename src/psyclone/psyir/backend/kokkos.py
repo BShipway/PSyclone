@@ -41,6 +41,29 @@ class KokkosView:
 
 
 @dataclass(frozen=True)
+class KokkosScratch:
+    """A kernel-local array placed in Kokkos team scratch.
+
+    A Fortran automatic local such as ``real(r_def), dimension(nlayers) ::
+    x_new`` crosses no interface, so it is described here rather than among
+    the region's arguments: it must not appear in the generated C ABI, and it
+    is not a kernel formal the region has to account for. Its extents name
+    scalar arguments of the region, which is what lets the generated C++ size
+    it.
+
+    ``index_offsets`` and ``extra_indices`` are carried, and the latter is
+    always empty, so that one array-reference table can hold both Views and
+    scratch and be read without a type test.
+    """
+
+    name: str
+    c_type: str
+    extents: Tuple[str, ...]
+    index_offsets: Tuple[int, ...] = ()
+    extra_indices: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class KokkosRegion:
     """All information required to generate one Kokkos translation unit."""
 
@@ -59,6 +82,13 @@ class KokkosRegion:
     #: Empty means "generate as the C writer would", which is what every
     #: region built before this field existed did.
     kind_types: Tuple[Tuple[str, str], ...] = ()
+    #: One :py:class:`KokkosScratch` per kernel-local automatic array. This
+    #: field selects the launch shape: empty gives the ``RangePolicy`` region
+    #: generated for every capture before scratch existed, byte for byte,
+    #: while a non-empty tuple gives a ``TeamPolicy`` region carrying
+    #: per-thread scratch. A kernel with no local arrays has no scratch to
+    #: place, so it keeps the simpler launch.
+    scratch: Tuple[KokkosScratch, ...] = ()
 
 
 class KokkosWriter(CWriter):
@@ -84,19 +114,28 @@ class KokkosWriter(CWriter):
         duration of the call and cleared afterwards, so that a writer reused
         for a second region does not carry the first one's widths into it.
 
+        One of two launch shapes is generated, selected by whether the region
+        describes any :py:attr:`KokkosRegion.scratch`. A region without
+        scratch is generated exactly as it was before scratch existed; see
+        :py:meth:`_range_launch` and :py:meth:`_team_launch`.
+
         :param region: the captured region to generate.
 
         :returns: a complete C++ translation unit.
 
         :raises TypeError: as :py:meth:`_validate` does.
         :raises ValueError: as :py:meth:`_validate` does, and if the body
-            indexes an array for which the region described no View.
+            indexes an array for which the region described neither a View nor
+            scratch.
         """
         self._validate(region)
         self._views = {
             argument.name: argument for argument in region.arguments
             if isinstance(argument, KokkosView)
         }
+        # Scratch joins the same table so that ``arrayreference_node`` resolves
+        # ``x_new(k)`` and ``mr_v(df)`` by one lookup.
+        self._views.update({item.name: item for item in region.scratch})
         self._kind_types = dict(region.kind_types)
 
         signature = ",\n    ".join(
@@ -106,15 +145,35 @@ class KokkosWriter(CWriter):
             self._view_declaration(argument)
             for argument in region.arguments
             if isinstance(argument, KokkosView))
+        team_aliases = "".join(
+            f"  {alias}\n" for alias in (
+                "using TeamPolicy = Kokkos::TeamPolicy<>;",
+                "using TeamMember = TeamPolicy::member_type;",
+                "using ScratchSpace = "
+                "Kokkos::DefaultExecutionSpace::scratch_memory_space;",
+            )) if region.scratch else ""
 
-        self._depth = 2
+        # The team shape nests the body one level deeper, inside the
+        # TeamThreadRange lambda.
+        scratch_names = {item.name for item in region.scratch}
+        self._depth = 3 if region.scratch else 2
         local_declarations = "".join(
             self.gen_local_variable(symbol)
-            for symbol in region.schedule.symbol_table.automatic_datasymbols)
+            for symbol in region.schedule.symbol_table.automatic_datasymbols
+            # A scratch array is declared as a View over team scratch, so its
+            # symbol must not also be declared here. ``gen_declaration``
+            # renders an array local as ``double * restrict x_new`` -- a
+            # pointer to nothing, which compiles and would shadow the View.
+            if symbol.name not in scratch_names)
         body = "".join(
             self._visit(child) for child in region.schedule.children)
         self._depth = 0
         self._views, self._kind_types = {}, {}
+
+        launch = (
+            self._team_launch(region, local_declarations, body)
+            if region.scratch
+            else self._range_launch(region, local_declarations, body))
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
@@ -134,15 +193,109 @@ class KokkosWriter(CWriter):
             "  using Unmanaged = "
             "Kokkos::MemoryTraits<Kokkos::Unmanaged>;\n"
             "  using ReadOnly = Kokkos::MemoryTraits<"
-            "Kokkos::Unmanaged | Kokkos::RandomAccess>;\n\n"
+            "Kokkos::Unmanaged | Kokkos::RandomAccess>;\n"
+            f"{team_aliases}"
+            "\n"
             f"{views}\n\n"
+            f"{launch}"
+            "  Kokkos::fence();\n"
+            "}\n")
+
+    @staticmethod
+    def _range_launch(region, local_declarations, body):
+        """Return the ``RangePolicy`` launch, one cell per iteration.
+
+        This is the shape every region had before scratch existed, and it is
+        reproduced here unchanged: the captures already in the model are gated
+        on whole-model checksums and on assertions over this exact text.
+
+        :param region: the region being generated.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+        :param local_declarations: the generated declarations of the kernel's
+            scalar locals, already indented.
+        :type local_declarations: str
+        :param body: the generated kernel body, already indented.
+        :type body: str
+
+        :returns: the ``parallel_for`` and its captured body.
+        :rtype: str
+        """
+        return (
             f'  Kokkos::parallel_for("{region.name}", '
             f"Kokkos::RangePolicy<>(0, {region.cell_count}),\n"
             "      KOKKOS_LAMBDA(const int cell) {\n"
             f"{local_declarations}{body}"
-            "      });\n"
-            "  Kokkos::fence();\n"
-            "}\n")
+            "      });\n")
+
+    @staticmethod
+    def _team_launch(region, local_declarations, body):
+        """Return the ``TeamPolicy`` launch, one cell per team rank.
+
+        Cells are tiled across the ranks of a team so that each rank takes one
+        cell and holds its own per-thread scratch. That keeps the parallelism
+        identical to :py:meth:`_range_launch` -- one cell per worker -- while
+        giving each worker fast, launch-scoped storage; on a GPU that scratch
+        is shared memory rather than global.
+
+        The team size cannot be chosen here, because it depends on how much
+        scratch each rank asks for, so the policy is asked for the largest it
+        supports. The scratch request is set on the probe policy before the
+        query, or the answer is the one for a policy requesting nothing.
+
+        :param region: the region being generated.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+        :param local_declarations: the generated declarations of the kernel's
+            scalar locals, already indented.
+        :type local_declarations: str
+        :param body: the generated kernel body, already indented.
+        :type body: str
+
+        :returns: the scratch type aliases, the size computation, the bound
+            body, the team-size probe and the ``parallel_for``.
+        :rtype: str
+        """
+        aliases = "".join(
+            f"  using {item.name}_scratch_t = Kokkos::View<{item.c_type}"
+            f"{'*' * len(item.extents)}, Kokkos::LayoutLeft, ScratchSpace, "
+            "Unmanaged>;\n"
+            for item in region.scratch)
+        sizes = "\n      + ".join(
+            f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})"
+            for item in region.scratch)
+        constructions = "".join(
+            f"      {item.name}_scratch_t {item.name}("
+            f"team.thread_scratch(0), {', '.join(item.extents)});\n"
+            for item in region.scratch)
+        return (
+            f"{aliases}\n"
+            f"  const size_t scratch_bytes = {sizes};\n\n"
+            "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
+            "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
+            "team.team_size()),\n"
+            "        [&](const int rank) {\n"
+            "      const int cell = team.league_rank() * team.team_size() "
+            "+ rank;\n"
+            # The league is sized by rounding up, so the last team runs with
+            # ranks that have no cell. Without this they would run the body
+            # for a cell past the end of every View.
+            f"      if (cell >= {region.cell_count}) {{\n"
+            "        return;\n"
+            "      }\n"
+            f"{constructions}"
+            f"{local_declarations}{body}"
+            "    });\n"
+            "  };\n\n"
+            "  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)\n"
+            "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes));\n"
+            "  const int team_size = probe.team_size_max(body, "
+            "Kokkos::ParallelForTag());\n"
+            f"  const int league_size = ({region.cell_count} + team_size - 1)"
+            " / team_size;\n"
+            f'  Kokkos::parallel_for("{region.name}",\n'
+            "      TeamPolicy(league_size, team_size)\n"
+            "          .set_scratch_size(0, "
+            "Kokkos::PerThread(scratch_bytes)),\n"
+            "      body);\n")
 
     @staticmethod
     def _is_identifier(value):
@@ -174,9 +327,10 @@ class KokkosWriter(CWriter):
             are not C++ identifiers; if the schedule contains a
             :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
             share a C ABI name; if the cell count is not itself a scalar
-            argument; if a kernel argument has no description; or if a View
+            argument; if a kernel argument has no description; if a View
             breaks the ownership or dimensional contract
-            :py:meth:`_validate_view` states.
+            :py:meth:`_validate_view` states; or if a scratch array breaks the
+            contract :py:meth:`_validate_scratch` states.
         """
         # pylint: disable=too-many-branches
         if not isinstance(region, KokkosRegion):
@@ -244,6 +398,69 @@ class KokkosWriter(CWriter):
             raise ValueError(
                 "Kokkos region does not describe kernel arguments: "
                 f"{', '.join(sorted(missing))}.")
+
+        # Scratch is deliberately not folded into the loop above: it is not a
+        # kernel formal, so it takes no part in the C ABI or in the check
+        # that every formal was described.
+        used_names = abi_names | view_names
+        for item in region.scratch:
+            self._validate_scratch(item, scalar_names, used_names)
+            used_names.add(item.name)
+
+    def _validate_scratch(self, scratch, scalar_names, used_names):
+        """Validate one kernel-local array placed in team scratch.
+
+        :param scratch: the scratch description to check.
+        :type scratch:
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`
+        :param scalar_names: the names of the region's scalar arguments, which
+            are the only extents the generated C++ can name.
+        :type scalar_names: Set[str]
+        :param used_names: every name already taken by an argument, a View or
+            an earlier scratch array.
+        :type used_names: Set[str]
+
+        :raises ValueError: if the scratch is not a
+            :py:class:`KokkosScratch`; if its name is not a C++ identifier or
+            is already taken; if it has no extents, or an extent that is not a
+            scalar argument of the region; or if its rank does not match the
+            index offsets supplied for it.
+        :raises TypeError: if its C type is not in
+            :py:attr:`_SUPPORTED_TYPES`, or its index offsets are not
+            integers.
+        """
+        if not isinstance(scratch, KokkosScratch):
+            raise ValueError(
+                "KokkosRegion scratch must be KokkosScratch instances, found "
+                f"'{type(scratch).__name__}'.")
+        if not self._is_identifier(scratch.name):
+            raise ValueError(
+                f"Kokkos scratch name '{scratch.name}' is invalid.")
+        if scratch.name in used_names:
+            raise ValueError(
+                f"Kokkos scratch '{scratch.name}' collides with an existing "
+                "region name.")
+        if scratch.c_type not in self._SUPPORTED_TYPES:
+            raise TypeError(
+                f"Kokkos scratch '{scratch.name}' has unsupported C type "
+                f"'{scratch.c_type}'.")
+        if not scratch.extents:
+            raise ValueError(
+                f"Kokkos scratch '{scratch.name}' must have named extents.")
+        for extent in scratch.extents:
+            if extent not in scalar_names:
+                raise ValueError(
+                    f"Kokkos scratch '{scratch.name}' has extent '{extent}' "
+                    "which is not a scalar argument.")
+        if len(scratch.extents) != len(scratch.index_offsets):
+            raise ValueError(
+                f"Kokkos scratch '{scratch.name}' dimensions do not match its "
+                "kernel indices.")
+        if not all(isinstance(offset, int)
+                   for offset in scratch.index_offsets):
+            raise TypeError(
+                f"Kokkos scratch '{scratch.name}' index offsets must be "
+                "integers.")
 
     def _validate_view(self, view):
         """Validate the ownership and dimensional contract for one View.
@@ -385,9 +602,9 @@ class KokkosWriter(CWriter):
 
         :returns: the equivalent zero-based View access.
 
-        :raises ValueError: if the region described no View for the array, or
-            if it supplied a different number of index offsets than the
-            reference has indices.
+        :raises ValueError: if the region described neither a View nor scratch
+            for the array, or if it supplied a different number of index
+            offsets than the reference has indices.
         """
         try:
             view = self._views[node.name]
@@ -410,4 +627,5 @@ class KokkosWriter(CWriter):
         return f"{node.name}({', '.join(indices)})"
 
 
-__all__ = ["KokkosRegion", "KokkosScalar", "KokkosView", "KokkosWriter"]
+__all__ = ["KokkosRegion", "KokkosScalar", "KokkosScratch", "KokkosView",
+           "KokkosWriter"]

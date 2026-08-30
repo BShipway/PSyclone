@@ -13,7 +13,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosView, KokkosWriter)
+    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter)
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import CodeBlock, KernelSchedule, Routine
 
@@ -255,3 +255,234 @@ end subroutine local_array_code
         for symbol in routine.symbol_table.automatic_datasymbols]
     assert "float * restrict column" in declarations
     assert "int k" in declarations
+
+
+def _scratch_schedule():
+    """Create a two-sweep body carrying its state in kernel-local arrays.
+
+    This is ``tri_solve_code``'s shape in miniature: a forward sweep filling
+    two automatic arrays sized by ``nlayers``, and a backward sweep reading
+    them out. Nothing smaller exercises scratch, because an array that is
+    written and read within one sweep would not need to survive it.
+    """
+    source = """
+subroutine tri_solve_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only : i_def, r_double
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  real(kind=r_double), dimension(nlayers) :: x_new, tri_plus_new
+  do k = 1, nlayers
+    x_new(k) = x(map(1) + k - 1)
+    tri_plus_new(k) = x_new(k) * 2.0_r_double
+  end do
+  do k = nlayers, 1, -1
+    y(map(1) + k - 1) = tri_plus_new(k)
+  end do
+end subroutine tri_solve_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "tri_solve_code", symbol_table=symbol_table, children=children)
+
+
+def _scratch_region(**overrides):
+    """Return a region whose kernel-local arrays live in team scratch."""
+    region = KokkosRegion(
+        name="tri_solve_kokkos",
+        schedule=_scratch_schedule(),
+        cell_count="ncells",
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosView("y", "y_data", "double", ("undf",), index_offsets=(1,)),
+            KokkosView(
+                "x", "x_data", "double", ("undf",), index_offsets=(1,),
+                read_only=True, random_access=True),
+            KokkosScalar("ndf", "int"),
+            KokkosScalar("undf", "int"),
+            KokkosView(
+                "map", "map_data", "int", ("ndf", "ncells"),
+                index_offsets=(1,), extra_indices=("cell",), read_only=True,
+                random_access=True),
+            KokkosScalar("ncells", "int"),
+        ),
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(
+            KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1,)),
+            KokkosScratch(
+                "tri_plus_new", "double", ("nlayers",), index_offsets=(1,)),
+        ))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_writer_places_locals_in_team_scratch():
+    """A region with kernel-local arrays launches over teams, not a range."""
+    code = KokkosWriter()(_scratch_region())
+
+    assert "using TeamPolicy = Kokkos::TeamPolicy<>;" in code
+    assert "using TeamMember = TeamPolicy::member_type;" in code
+    assert "using ScratchSpace = " \
+        "Kokkos::DefaultExecutionSpace::scratch_memory_space;" in code
+    assert "Kokkos::RangePolicy<>" not in code
+
+    # One cell per team rank, and the tail of the last team does nothing: the
+    # league is sized by rounding up, so without this the body would run for
+    # cells past the end of every View.
+    assert "const int cell = team.league_rank() * team.team_size() + rank;" \
+        in code
+    assert "if (cell >= ncells) {" in code
+
+    # The team size depends on how much scratch a rank asks for, so it is
+    # asked for rather than chosen, from a policy already carrying the
+    # request. A probe without it would answer for a different launch.
+    probe = code.index("TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)")
+    assert ".set_scratch_size(0, Kokkos::PerThread(scratch_bytes));" in \
+        code[probe:]
+    assert "const int team_size = probe.team_size_max(body, " \
+        "Kokkos::ParallelForTag());" in code
+    assert "const int league_size = (ncells + team_size - 1) / team_size;" \
+        in code
+    assert code.index("const int team_size") < code.index(
+        'Kokkos::parallel_for("tri_solve_kokkos"')
+
+    # The runtime guard and the fence belong to both shapes.
+    assert "if (!Kokkos::is_initialized()) {" in code
+    assert code.rstrip().endswith("Kokkos::fence();\n}")
+
+
+def test_kokkos_writer_sizes_and_builds_every_scratch_array():
+    """Two scratch arrays are both sized into the request and both built."""
+    code = KokkosWriter()(_scratch_region())
+
+    for name in ("x_new", "tri_plus_new"):
+        assert f"using {name}_scratch_t = Kokkos::View<double*, " \
+            "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;" in code
+        assert f"{name}_scratch_t {name}(team.thread_scratch(0), nlayers);" \
+            in code
+
+    # Summed, not counted once: a request covering one of two arrays hands
+    # the second one memory the first is already using.
+    assert "const size_t scratch_bytes = " \
+        "x_new_scratch_t::shmem_size(nlayers)\n" \
+        "      + tri_plus_new_scratch_t::shmem_size(nlayers);" in code
+
+    # Per rank, not per team. PerTeam scratch with cells tiled across ranks
+    # would give every cell in a team the same array.
+    assert "Kokkos::PerTeam(" not in code
+    assert "team.team_scratch(0)" not in code
+
+
+def test_kokkos_writer_does_not_declare_a_scratch_symbol():
+    """A scratch array is its View, and must not also be a local pointer.
+
+    ``gen_declaration`` renders an array local as ``double * restrict x_new``,
+    a pointer to nothing. It compiles, so nothing downstream would object; it
+    would simply shadow the View and be dereferenced.
+    """
+    code = KokkosWriter()(_scratch_region())
+
+    assert "restrict x_new" not in code
+    assert "restrict tri_plus_new" not in code
+    # The scalar local is still declared, so the skip is by name and not by
+    # dropping local declarations altogether.
+    assert "int k;" in code
+
+
+def test_kokkos_writer_indexes_scratch_like_a_view():
+    """Scratch resolves through the same table, with Fortran bounds removed."""
+    code = KokkosWriter()(_scratch_region())
+
+    assert "x_new((k - 1)) = " in code
+    assert "tri_plus_new((k - 1)) = (x_new((k - 1)) * 2.0);" in code
+    assert "= tri_plus_new((k - 1));" in code
+
+
+def test_kokkos_writer_counts_a_backward_sweep_down():
+    """The substitution sweep runs, rather than being tested out of existence.
+
+    A Fortran ``do k = nlayers, 1, -1`` generated with C's ``k<=1`` compiles,
+    links and runs zero iterations for any column deeper than one layer. Only
+    the answer gives it away, which is why it is asserted here rather than
+    left to the model.
+    """
+    code = KokkosWriter()(_scratch_region())
+
+    assert "for(k=nlayers; k>=1; k+=(-1))" in code
+    assert "for(k=1; k<=nlayers; k+=1)" in code
+
+
+def test_kokkos_writer_without_scratch_keeps_the_range_launch():
+    """A region with no local arrays generates exactly what it always did.
+
+    The captures already in the model are gated on whole-model checksums and
+    on assertions over this text, so widening the writer must not rewrite
+    them.
+    """
+    code = KokkosWriter()(_region())
+
+    assert 'Kokkos::parallel_for("moist_dyn_gas_kokkos", ' \
+        "Kokkos::RangePolicy<>(0, ncells),\n" \
+        "      KOKKOS_LAMBDA(const int cell) {" in code
+    for absent in ("TeamPolicy", "TeamMember", "ScratchSpace",
+                   "scratch_bytes", "thread_scratch", "team_size_max"):
+        assert absent not in code
+
+
+def test_kokkos_writer_views_are_never_managed():
+    """No View owns storage, in either launch shape.
+
+    ``managed`` exists so that a View claiming ownership is refused rather
+    than silently double-freeing LFRic's memory. Team scratch was chosen over
+    an allocated slab partly to keep that unqualified, so it is asserted
+    rather than left to the absence of a caller setting it.
+    """
+    for region in (_region(), _scratch_region()):
+        for argument in region.arguments:
+            if isinstance(argument, KokkosView):
+                assert argument.managed is False
+
+
+@pytest.mark.parametrize("scratch, message", [
+    (KokkosScratch("x new", "double", ("nlayers",), index_offsets=(1,)),
+     "Kokkos scratch name 'x new' is invalid."),
+    (KokkosScratch("x_new", "half", ("nlayers",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has unsupported C type 'half'."),
+    (KokkosScratch("x_new", "double", ()),
+     "Kokkos scratch 'x_new' must have named extents."),
+    (KokkosScratch("x_new", "double", ("nrows",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent 'nrows' which is not a scalar "
+     "argument."),
+    (KokkosScratch("x_new", "double", ("y",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent 'y' which is not a scalar argument."),
+    (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1, 1)),
+     "Kokkos scratch 'x_new' dimensions do not match its kernel indices."),
+    (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=("1",)),
+     "Kokkos scratch 'x_new' index offsets must be integers."),
+    (KokkosScratch("y", "double", ("nlayers",), index_offsets=(1,)),
+     "Kokkos scratch 'y' collides with an existing region name."),
+    (KokkosScratch("nlayers", "double", ("nlayers",), index_offsets=(1,)),
+     "Kokkos scratch 'nlayers' collides with an existing region name."),
+    ("x_new", "KokkosRegion scratch must be KokkosScratch instances, found "
+     "'str'."),
+])
+def test_kokkos_writer_rejects_invalid_scratch(scratch, message):
+    """Every way of describing scratch wrongly is refused by name."""
+    region = _scratch_region(scratch=(scratch,))
+    with pytest.raises((ValueError, TypeError)) as error:
+        KokkosWriter()(region)
+    assert message in str(error.value)
+
+
+def test_kokkos_writer_rejects_two_scratch_arrays_sharing_a_name():
+    """The second of two scratch arrays cannot reuse the first one's name."""
+    duplicate = KokkosScratch("x_new", "double", ("nlayers",),
+                              index_offsets=(1,))
+    region = _scratch_region(scratch=(duplicate, duplicate))
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(region)
+    assert "Kokkos scratch 'x_new' collides with an existing region name." \
+        in str(error.value)
