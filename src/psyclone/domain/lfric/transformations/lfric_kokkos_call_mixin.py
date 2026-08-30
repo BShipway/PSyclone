@@ -143,7 +143,7 @@ class LFRicKokkosCallMixin:
         return f"{name}_kokkos"
 
     @classmethod
-    def _region_arguments(cls, schedule, per_cell, constants):
+    def _region_arguments(cls, schedule, per_cell, constants, cell_index):
         """Describe the generated signature for the backend.
 
         :param schedule: the kernel schedule being captured.
@@ -152,6 +152,11 @@ class LFRicKokkosCallMixin:
         :param constants: the module constants passed by value, as
             :py:meth:`_constants` returns them.
         :type constants: list[tuple[str, str, str]]
+        :param str cell_index: the name the launch gives its own cell index,
+            which every sliced View is indexed by. It is the region's
+            :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
+            and is passed rather than assumed because the kernel may declare
+            ``cell`` itself.
 
         :returns: one description per generated C argument, in call order.
         :rtype: tuple[Union[
@@ -172,7 +177,7 @@ class LFRicKokkosCallMixin:
                 symbol.name, f"{symbol.name}_data", c_type,
                 extents + ((cls._CELL_COUNT,) if sliced else ()),
                 index_offsets=(1,) * len(extents),
-                extra_indices=("cell",) if sliced else (),
+                extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
         arguments.extend(

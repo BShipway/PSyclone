@@ -74,6 +74,21 @@ end module moist_dyn_gas_kernel_mod
 """
 
 
+# The production kernel with 'cell' declared as one of its own locals and
+# genuinely used. GungHo has such kernels -- apply_helmholtz_operator_code
+# counts a stencil branch with one -- and the name is the launch index's, so
+# the generated declaration and the lambda parameter would share a C++ scope.
+# That is a compile error rather than a wrong answer, which is why the
+# transformation renames its index instead of leaving the collision to the
+# compiler.
+_CELL_LOCAL_KERNEL = _KERNEL.replace(
+    "integer(kind=i_def) :: k, df",
+    "integer(kind=i_def) :: k, df, cell").replace(
+    "    do k = 0, nlayers - 1",
+    "    cell = ndf_wtheta\n    do k = 0, nlayers - 1").replace(
+    "      do df = 1, ndf_wtheta", "      do df = 1, cell")
+
+
 _SECOND_ALGORITHM = """
 program kokkos_second_test
   use constants_mod, only : r_tran
@@ -828,6 +843,14 @@ def target_fixture(tmp_path, clear_module_manager_instance):
     return _invoke(tmp_path, "moist_dyn_gas", _ALGORITHM, _KERNEL)
 
 
+@pytest.fixture(name="cell_local_target")
+# pylint: disable-next=unused-argument
+def cell_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares 'cell' as a local of its own."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _CELL_LOCAL_KERNEL)
+
+
 @pytest.fixture(name="second_target")
 # pylint: disable-next=unused-argument
 def second_target_fixture(tmp_path, clear_module_manager_instance):
@@ -1158,6 +1181,29 @@ def unmodelled_target_fixture(tmp_path, clear_module_manager_instance):
             "r_solver", stencil=True),
         _polymorphic_kernel("stencil_scale", "r_double", "r_single",
                             stencil=True))
+
+
+def test_lfric_kokkos_trans_renames_the_index_a_kernel_declares(
+        cell_local_target):
+    """A kernel declaring 'cell' pushes the launch index off that name.
+
+    The lambda parameter and the kernel's own declaration share one C++
+    scope, so leaving both called 'cell' does not produce a subtly wrong
+    answer -- it produces a translation unit the compiler rejects with
+    'conflicting declaration'. The index is therefore named from the kernel's
+    symbol table rather than fixed.
+    """
+    _, loop, _ = cell_local_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "KOKKOS_LAMBDA(const int cell_1)" in cpp
+    assert "KOKKOS_LAMBDA(const int cell)" not in cpp
+    # The kernel's own 'cell' keeps its name, and every sliced View follows
+    # the launch index rather than the local.
+    assert "int cell;" in cpp
+    assert "map_wtheta((df - 1), cell_1)" in cpp
+    assert "map_wtheta((df - 1), cell)" not in cpp
 
 
 def test_lfric_kokkos_trans_captures_an_array_section(section_target):

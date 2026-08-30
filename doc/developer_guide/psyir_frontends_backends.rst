@@ -495,6 +495,18 @@ with a `KOKKOS_LAMBDA(const int cell)`. This is the shape every region had
 before scratch existed and it is generated unchanged, because a kernel with
 no local arrays has nothing to place.
 
+The index is the region's `cell_index` rather than a fixed `cell`. It
+defaults to `cell`, which is what the paragraph above describes, but a
+caller renames it when the kernel declares that name itself: the lambda
+parameter and the kernel's own declarations share one C++ scope, so a
+kernel with an `integer :: cell` local would produce a `conflicting
+declaration` error rather than a wrong answer. `LFRicKokkosTrans` chooses
+the name with `next_available_name` against the kernel's symbol table, which
+gives `cell_1` in that case and `cell` otherwise. Renaming the index alone
+is not enough: the per-cell Views' `extra_indices` name it too, and the
+back-end takes them as given rather than rewriting them, so whatever builds
+the region has to use one name for both.
+
 A region with scratch launches over `Kokkos::TeamPolicy<>`. A Fortran
 automatic local such as `real(r_def), dimension(nlayers) :: x_new` has an
 extent that is a runtime value, so it cannot become a C++ local; it becomes

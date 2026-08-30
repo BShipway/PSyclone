@@ -628,11 +628,19 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
             actuals[index] = Reference(actual.symbol)
 
         constants = self._constants(schedule)
+        # The launch index shares a C++ scope with the kernel's own
+        # declarations, so a kernel declaring 'cell' would collide with it.
+        # Spelt from the dataclass default so the two cannot drift: a kernel
+        # that has not taken the name still generates 'cell'.
+        cell_index = schedule.symbol_table.next_available_name(
+            KokkosRegion.cell_index)
         region = KokkosRegion(
             name=self._region_name(schedule),
             schedule=schedule,
             cell_count=self._CELL_COUNT,
-            arguments=self._region_arguments(schedule, per_cell, constants),
+            cell_index=cell_index,
+            arguments=self._region_arguments(
+                schedule, per_cell, constants, cell_index),
             kind_types=self._kind_types(schedule),
             scratch=self._local_arrays(schedule))
         try:
