@@ -516,7 +516,9 @@ class KokkosWriter(CWriter):
                 raise ValueError(
                     f"Kokkos scratch '{scratch.name}' has extent '{extent}' "
                     "which is not an integer expression over named sizes.")
-            for name in extent_names(extent):
+            # Sorted for the same reason the transformation sorts: the
+            # refusal names one offender, and a set has no fixed order.
+            for name in sorted(extent_names(extent)):
                 if name not in scalar_names:
                     raise ValueError(
                         f"Kokkos scratch '{scratch.name}' has extent "

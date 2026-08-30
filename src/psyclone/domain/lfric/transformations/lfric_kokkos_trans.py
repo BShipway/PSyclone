@@ -495,7 +495,10 @@ class LFRicKokkosTrans(Transformation):
                     f"LFRicKokkosTrans supports {cls._supported_kinds()} "
                     f"argument kinds only, but '{symbol.name}' has "
                     f"'{cls._kind_name(symbol)}'.")
-            for name in cls._extent_names(symbol):
+            # Sorted because the refusal names one offender and a set does
+            # not iterate in a fixed order, so an unsorted loop would give a
+            # different message run to run for the same kernel.
+            for name in sorted(cls._extent_names(symbol)):
                 if name not in names:
                     raise TransformationError(
                         f"LFRicKokkosTrans needs the extent '{name}' of "
@@ -533,7 +536,7 @@ class LFRicKokkosTrans(Transformation):
                     f"LFRicKokkosTrans supports {cls._supported_kinds()} "
                     f"kernel-local array kinds only, but '{symbol.name}' has "
                     f"'{cls._kind_name(symbol)}'.")
-            for name in cls._extent_names(symbol):
+            for name in sorted(cls._extent_names(symbol)):
                 if name not in names:
                     raise TransformationError(
                         f"LFRicKokkosTrans needs the extent '{name}' of "
