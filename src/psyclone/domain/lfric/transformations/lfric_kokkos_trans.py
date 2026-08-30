@@ -684,9 +684,9 @@ class LFRicKokkosTrans(Transformation):
         :returns: one C extent expression per dimension, empty for a scalar.
         :rtype: tuple[str]
 
-        :raises TransformationError: if a dimension's lower bound is not 1, or
-            if its upper bound is not an integer expression the Kokkos backend
-            can write as an extent.
+        :raises TransformationError: if a dimension carries no declared
+            bounds, if its lower bound is not 1, or if its upper bound is not
+            an integer expression the Kokkos backend can write as an extent.
         """
         datatype = symbol.datatype
         if not isinstance(datatype, ArrayType):
