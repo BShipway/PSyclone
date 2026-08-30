@@ -126,6 +126,21 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     is not. Every one of these is refused by :py:meth:`validate` rather than
     discovered by :py:meth:`apply`.
 
+    **A constant the body reads reaches the region one of three ways.** A
+    module-level ``parameter`` declared beside the kernel with a literal value
+    -- ``integer(kind=i_def), parameter :: nfaces = 4`` -- is written into the
+    region as that value. It has to be: a kernel module is ``private`` by
+    default and publishes only its ``_code`` routine, so importing the name
+    into the PSy layer would not compile. One declared with anything other
+    than a literal, an array ``parameter`` among them, is refused. A constant
+    *imported* from another module is passed by value instead, which needs its
+    kind, and so needs the source of its container on PSyclone's module search
+    path; without that it is refused with a message naming the module to add
+    rather than a guess at its width. Last, a name appearing only as an
+    intrinsic's ``kind`` argument -- the ``r_def`` of ``real(x, r_def)`` -- is
+    neither: it names a type, the cast consumes it, and the region carries the
+    width rather than the name.
+
     It captures all information needed by the Kokkos backend before lowering
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
     halo-dirty calls are retained, and only the resulting generic loop is
@@ -560,9 +575,10 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         """Generate C++ and replace ``node`` with the typed launch call.
 
         Unlike :py:meth:`validate`, this alters the kernel schedule: any
-        array section it holds is lowered to an explicit loop, and every shape
-        enquiry is replaced by the bound its declaration gives, before the
-        region is described.
+        array section it holds is lowered to an explicit loop, every shape
+        enquiry is replaced by the bound its declaration gives, and every
+        module-level ``parameter`` it reads is replaced by its value, before
+        the region is described.
 
         :param node: the loop to capture as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -585,6 +601,7 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         schedule = self._schedule(kernel)
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)
+        self._substitute_constants(schedule)
 
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.

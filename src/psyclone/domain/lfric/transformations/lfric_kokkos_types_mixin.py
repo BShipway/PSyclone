@@ -51,10 +51,10 @@ import re
 from psyclone.configuration import Config
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos import extent_names, is_extent
-from psyclone.psyir.nodes import IntrinsicCall, Literal, Reference
+from psyclone.psyir.nodes import Call, IntrinsicCall, Literal, Reference
 from psyclone.psyir.symbols import (
     ArrayType, DataSymbol, ImportInterface, RoutineSymbol, ScalarType,
-    UnsupportedFortranType)
+    StaticInterface, UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -143,6 +143,110 @@ class LFRicKokkosTypesMixin:
             return None
         return precision.symbol.name
 
+    @staticmethod
+    def _kind_argument(reference):
+        """Return whether a reference names a kind rather than reads data.
+
+        ``real(x, r_def)`` puts ``r_def`` into the tree as a
+        :py:class:`~psyclone.psyir.nodes.Reference` like any other, but it is
+        a type name: the writer consumes it as a cast target and never emits
+        it, so there is nothing for the PSy layer to pass by value. The
+        frontend names that argument ``kind`` whether or not the Fortran
+        spelt ``kind=``, so the test is on the name rather than on the
+        position, and it comes from the intrinsic's own argument list rather
+        than from a list of intrinsics kept here.
+
+        :param reference: the reference the captured body holds.
+        :type reference: :py:class:`psyclone.psyir.nodes.Reference`
+
+        :returns: whether this reference is an intrinsic's ``kind`` argument.
+        :rtype: bool
+        """
+        call = reference.parent
+        if not isinstance(call, IntrinsicCall):
+            return False
+        # children[0] is the reference to the intrinsic itself, so the
+        # reference's position is one past its index in the argument list.
+        index = reference.position - 1
+        names = call.argument_names
+        if not 0 <= index < len(names):
+            return False
+        return (names[index] or "").lower() == "kind"
+
+    @staticmethod
+    def _called_routine(reference):
+        """Return whether a reference names what a call calls.
+
+        A kernel calling a function in a module PSyclone has not read gets a
+        plain :py:class:`~psyclone.psyir.symbols.Symbol`, not a
+        ``RoutineSymbol``: the frontend cannot tell ``f(i)`` from ``a(i)``
+        without the module, and ``resolve_type`` only specialises the symbol
+        once something asks. So the test is where the reference sits rather
+        than what its symbol has been specialised to.
+
+        :param reference: the reference the captured body holds.
+        :type reference: :py:class:`psyclone.psyir.nodes.Reference`
+
+        :returns: whether this reference is the routine of a call.
+        :rtype: bool
+        """
+        call = reference.parent
+        return isinstance(call, Call) and reference is call.routine
+
+    @staticmethod
+    def _static_constant(symbol):
+        """Return the literal value a module-level ``parameter`` was given.
+
+        A kernel module routinely declares its own constants -- ``nfaces = 4``,
+        ``tol = 1.0e-9_r_def`` -- beside the routine that reads them. These
+        are compile-time values, so the region carries the *value* rather than
+        an argument: importing the symbol into the PSy layer would not even
+        compile, since a kernel module is ``private`` by default and makes
+        only its ``_code`` routine public.
+
+        An array ``parameter`` such as ``x_dofs(2) = (/ 1, 3 /)`` has no
+        literal to substitute and is not a scalar the ABI could carry either,
+        so it is left for :py:meth:`_describe_constant` to refuse.
+
+        :param symbol: the symbol the captured body reads.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+
+        :returns: the declared value, or ``None`` if this symbol is not a
+            module-level constant declared with a literal.
+        :rtype: Optional[:py:class:`psyclone.psyir.nodes.Literal`]
+        """
+        if not isinstance(symbol, DataSymbol):
+            return None
+        if not isinstance(symbol.interface, StaticInterface):
+            return None
+        if not symbol.is_constant:
+            return None
+        value = symbol.initial_value
+        return value if isinstance(value, Literal) else None
+
+    @classmethod
+    def _substitute_constants(cls, schedule):
+        """Replace each module-level ``parameter`` by the value it was given.
+
+        The companion of :py:meth:`_substitute_bounds`, and for the same
+        reason: the Fortran has already stated the value, so the region
+        carries it rather than asking for it. :py:meth:`_constants` skips
+        exactly what this replaces, so the two cannot disagree about which
+        symbols reach the ABI.
+
+        :param schedule: the kernel schedule being captured, modified in
+            place.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        """
+        for reference in schedule.walk(Reference):
+            value = cls._static_constant(reference.symbol)
+            if value is None:
+                continue
+            # The initial value is a live piece of the symbol, as a declared
+            # bound is; substituting it without copying would move it out of
+            # the symbol table and into the body.
+            reference.replace_with(value.copy())
+
     @classmethod
     def _c_type(cls, symbol):
         """Return the C type of a symbol, or ``None`` if it has no mapping.
@@ -197,6 +301,15 @@ class LFRicKokkosTypesMixin:
         that reaches the ABI; what is left is a local or a literal whose width
         the C writer's own default is free to choose.
 
+        A kind named only as a cast target -- the ``r_def`` of
+        ``real(x, r_def)``, which no declaration in the body repeats -- is
+        collected too. The backend resolves a cast's width through this table,
+        so leaving it out would silently write ``(float)`` for a cast the
+        Fortran asked to be ``double``: the one case where an unresolved kind
+        changes a value rather than only a local's width. A cast naming a kind
+        the precision map does not carry is still left out, and still written
+        at that default, because there is no width to write instead.
+
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
@@ -218,6 +331,23 @@ class LFRicKokkosTypesMixin:
                 continue
             kind = precision.symbol.name
             kinds[kind] = cls._map_kind(datatype.intrinsic, kind)
+        for reference in schedule.walk(Reference):
+            if not cls._kind_argument(reference):
+                continue
+            # The call's own datatype says which intrinsic the kind qualifies,
+            # which the kind name alone does not: i_def and r_def are both
+            # just names until the cast around them says integer or real.
+            intrinsic = getattr(reference.parent.datatype, "intrinsic", None)
+            kind = reference.symbol.name
+            c_type = (cls._map_kind(intrinsic, kind)
+                      if intrinsic is not None else None)
+            if c_type is None:
+                # Left out rather than written in as None. A declaration above
+                # may already have resolved this kind, and the filter below
+                # drops whatever is left None, so writing it in would lose the
+                # width that declaration found.
+                continue
+            kinds[kind] = c_type
         return tuple(
             (kind, kinds[kind]) for kind in sorted(kinds)
             if kinds[kind] is not None)
@@ -406,6 +536,23 @@ class LFRicKokkosTypesMixin:
         These are not kernel arguments, so the PSy layer has to import each
         one and pass it by value into the region.
 
+        Three kinds of non-local reference are not data the ABI carries, and
+        are skipped rather than described:
+
+        * an intrinsic's ``kind`` argument, which names a type -- see
+          :py:meth:`_kind_argument`;
+        * the routine of a ``Call``, which names something to call. Before
+          ``resolve_type`` is reached these arrive as a plain ``Symbol``
+          rather than a ``RoutineSymbol``, so the check is structural;
+        * a module-level ``parameter`` declared with a literal value, which
+          :py:meth:`_substitute_constants` writes into the body instead.
+
+        The first two are refused by :py:meth:`_validate_body` and by the
+        backend well before this, so skipping them here loses no check. What
+        it buys is that each refusal names one fact: a kernel calling a
+        function was reported both as an uncapturable call and as a module
+        constant that could not be passed by value.
+
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
@@ -423,6 +570,10 @@ class LFRicKokkosTypesMixin:
             symbol = reference.symbol
             if symbol.name in local or isinstance(symbol, RoutineSymbol):
                 continue
+            if cls._called_routine(reference) or cls._kind_argument(reference):
+                continue
+            if cls._static_constant(symbol) is not None:
+                continue
             if symbol.name in constants:
                 continue
             constants[symbol.name] = cls._describe_constant(symbol)
@@ -439,15 +590,26 @@ class LFRicKokkosTypesMixin:
             the C type it is passed by value as.
         :rtype: tuple[str, str, str]
 
+        :raises TransformationError: if the symbol is a module-level
+            ``parameter`` whose value is not a literal, such as an array.
         :raises TransformationError: if the symbol is neither a kernel
             argument nor imported from a module.
         :raises TransformationError: if its type cannot be resolved, which
             means the source of its container is not on the module search
             path.
+        :raises TransformationError: if it turns out to name a routine, which
+            only becomes visible once its container has been read.
         :raises TransformationError: if its kind is not one
             :py:attr:`_C_TYPES` maps.
         """
         if not isinstance(symbol.interface, ImportInterface):
+            if isinstance(symbol.interface, StaticInterface) and getattr(
+                    symbol, "is_constant", False):
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot capture '{symbol.name}': a "
+                    "module-level constant is written into the region as its "
+                    "value, and this one was not declared with a literal "
+                    "value the region could carry.")
             raise TransformationError(
                 f"LFRicKokkosTrans cannot capture '{symbol.name}': it is "
                 "neither a kernel argument nor imported from a module.")
@@ -462,6 +624,15 @@ class LFRicKokkosTypesMixin:
                 f"LFRicKokkosTrans cannot type '{symbol.name}' without the "
                 f"source of '{container}'. Add its directory to PSyclone's "
                 f"module search path. ({err})") from err
+        if isinstance(symbol, RoutineSymbol):
+            # resolve_type specialises the symbol, so a name the frontend
+            # could only guess at is known to be a routine by now even though
+            # _constants could not tell when it walked past it.
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}' from "
+                f"'{container}': it is a routine rather than data, and a "
+                "routine the body calls is refused by the check on calls "
+                "rather than passed by value.")
         c_type = cls._c_type(symbol)
         if c_type is None:
             c_type = cls._declared_c_type(symbol)

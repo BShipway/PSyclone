@@ -4141,8 +4141,16 @@ its shape -- ``LBOUND``, ``UBOUND`` or ``SIZE`` -- is answered from that same
 declaration rather than at run time, so the region carries the declared bound
 instead of querying a View. Most such calls are written by PSyclone rather
 than by the kernel author: lowering a whole-array assignment to an explicit
-loop puts a pair of them into its bounds. The contract it accepts, and the
-reasons it refuses, are given in its documentation below.
+loop puts a pair of them into its bounds. A constant the body reads reaches
+the region one of three ways: a ``parameter`` declared in the kernel's own
+module is written in as its value, since a kernel module is ``private`` by
+default and the PSy layer could not import the name; a constant imported from
+elsewhere is passed by value, which needs the source of its module on
+PSyclone's search path so that its kind can be read rather than guessed; and
+a name appearing only as an intrinsic's ``kind`` argument, as the ``r_def``
+of ``real(x, r_def)``, is neither, being a type rather than data. The
+contract it accepts, and the reasons it refuses, are given in its
+documentation below.
 
 The LFRic API-specific transformations currently available
 are given below. Early transformations include "Dynamo0p3" or "Dynamo"

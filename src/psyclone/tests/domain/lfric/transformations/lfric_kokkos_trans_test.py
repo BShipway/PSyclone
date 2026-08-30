@@ -20,7 +20,8 @@ from psyclone.psyGen import PSyFactory
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosScalar
 from psyclone.psyir.nodes import (
     ArrayReference, CodeBlock, IntrinsicCall, Literal, Range)
-from psyclone.psyir.symbols import ScalarType
+from psyclone.psyir.symbols import (
+    ContainerSymbol, ImportInterface, ScalarType, Symbol)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -544,6 +545,137 @@ _FULL_SECTION_KERNEL = _SECTION_KERNEL.replace(
     "    difference(:) = difference(:) + (b_idx + nl)")
 
 
+# The same kernel declaring its own constants beside the routine, the way
+# poly1d_reconstruction and create_w2mask do. The module is `private`, so the
+# PSy layer could not import either name even if it wanted to; the value is
+# what reaches the region.
+_STATIC_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  integer(kind=i_def), parameter :: nfaces = 4\n"
+    "  real(kind=r_def), parameter :: tol = 1.0e-9_r_def\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) * nfaces + tol")
+
+
+# The same, with the constant declared as an array. `x_dofs(2) = (/ 1, 3 /)`
+# is what fractional_horizontal_wind writes, and there is no single literal to
+# substitute for a reference into it.
+_ARRAY_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  integer(kind=i_def), parameter :: x_dofs(2) = (/ 1, 3 /)\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(x_dofs(1))")
+
+
+# A kernel spelling a kind in its body rather than only in its declarations.
+# `real(x, r_def)` puts r_def into the tree as a Reference, which is not data
+# the PSy layer passes by value: the cast consumes it.
+_CAST_KIND_KERNEL = _LOCAL_KERNEL.replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      field_out(map_w3(1) + k - 1) = swept(k) + real(k, r_def)")
+
+
+# The same, casting to a kind no declaration in the body repeats. The width
+# has to come from the cast argument or the region silently computes at the C
+# writer's default instead of at the width the Fortran asked for.
+_UNDECLARED_CAST_KIND_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, r_def, r_second").replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      field_out(map_w3(1) + k - 1) = swept(k) + real(k, r_second)")
+
+
+# A kernel importing a constant whose kind is off the generated C ABI. The
+# module is readable and the constant resolves; a 1-byte logical simply has no
+# place on an interface carrying 4-byte integers and 4- and 8-byte reals.
+_OFF_ABI_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : rehabilitate").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      if (rehabilitate) swept(k) = swept(k + 1) - partial(k)")
+
+
+# A kernel importing a constant from a module PSyclone cannot read. Its kind
+# is stated only there, so there is no width to put on the ABI and no honest
+# guess to make -- the largest single cause left in the survey's residue.
+_UNREADABLE_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use unreadable_constants_mod, only : eps").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) + eps")
+
+
+# The same, casting to a kind the LFRic precision map does not carry. The map
+# names the kinds the model computes in; `r_native` is the compiler's own
+# default, and there is no width to record for it.
+_UNMAPPED_CAST_KIND_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, r_def, r_native").replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      field_out(map_w3(1) + k - 1) = real(swept(k), r_native)")
+
+
+# A kernel calling a function from a module PSyclone has not read. Without the
+# module the frontend cannot tell `helper(k)` from an array reference, so the
+# symbol is a plain Symbol until something resolves it -- which is why the
+# refusal has to be the one about calls rather than one about module data.
+_CALLED_ROUTINE_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use helper_mod, only : helper").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - helper(k)")
+
+
+# The module the kernel above calls into, written out only where a test needs
+# PSyclone to have read it. Until it does, `helper` is a plain Symbol; once it
+# has, `resolve_type` specialises it to a RoutineSymbol, which is the whole
+# difference the refusal turns on.
+_HELPER_MODULE = """
+module helper_mod
+  use constants_mod, only : r_def
+  implicit none
+contains
+  function helper(i) result(scaled)
+    integer, intent(in) :: i
+    real(kind=r_def) :: scaled
+    scaled = real(i, r_def)
+  end function helper
+end module helper_mod
+"""
+
+
+# A kernel module declaring a variable rather than a constant beside the
+# routine. It looks like the constant case at the point the walk meets it --
+# module scope, a literal beside the name -- and is not one: without
+# `parameter` the value is an initialisation the module may overwrite, so
+# writing it into the region would capture a state rather than a constant.
+_STATIC_VARIABLE_KERNEL = _LOCAL_KERNEL.replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  real(kind=r_def) :: cached_tol = 1.0e-9_r_def\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) + cached_tol")
+
+
+# The target kernel reading its one imported constant twice. Each reference is
+# a separate node, and describing the second would re-resolve a symbol already
+# on the ABI and offer the PSy layer the same argument twice.
+_REPEATED_IMPORT_KERNEL = _KERNEL.replace(
+    "            1.0_r_def + recip_epsilon * mr_v_at_dof",
+    "            recip_epsilon + recip_epsilon * mr_v_at_dof")
+
+
 # A kind-polymorphic kernel: one metadata name over several implementations
 # that differ only in the precision of their real arguments. Built from a
 # template rather than written out three times because the three fixtures below
@@ -654,10 +786,11 @@ end program kokkos_{name}_test
 # tests drive parse() and PSyFactory directly, so they say so themselves.
 _PLANET_CONFIG = """
 module planet_config_mod
-  use constants_mod, only : i_def, r_def
+  use constants_mod, only : i_def, l_def, r_def
   implicit none
   real(kind=r_def), public, protected :: recip_epsilon = 1.0_r_def
   integer(kind=i_def), public, parameter :: n_moist = 3
+  logical(kind=l_def), public, parameter :: rehabilitate = .false.
 end module planet_config_mod
 """
 
@@ -873,6 +1006,89 @@ def full_section_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel assigns a whole array at once."""
     return _invoke(
         tmp_path, "fv_difference", _SECTION_ALGORITHM, _FULL_SECTION_KERNEL)
+
+
+@pytest.fixture(name="static_constant_target")
+# pylint: disable-next=unused-argument
+def static_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel module declares its own constants."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _STATIC_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="array_constant_target")
+# pylint: disable-next=unused-argument
+def array_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel module declares an array parameter."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ARRAY_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="cast_kind_target")
+# pylint: disable-next=unused-argument
+def cast_kind_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel body names a kind in a cast."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _CAST_KIND_KERNEL)
+
+
+@pytest.fixture(name="undeclared_cast_kind_target")
+# pylint: disable-next=unused-argument
+def undeclared_cast_kind_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke casting to a kind no declaration in the body uses."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _UNDECLARED_CAST_KIND_KERNEL)
+
+
+@pytest.fixture(name="called_routine_target")
+# pylint: disable-next=unused-argument
+def called_routine_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel calls an unresolvable function."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _CALLED_ROUTINE_KERNEL)
+
+
+@pytest.fixture(name="off_abi_constant_target")
+# pylint: disable-next=unused-argument
+def off_abi_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke importing a constant of a kind off the C ABI."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _OFF_ABI_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="unreadable_constant_target")
+# pylint: disable-next=unused-argument
+def unreadable_constant_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke importing a constant from an unreadable module."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _UNREADABLE_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="unmapped_cast_kind_target")
+# pylint: disable-next=unused-argument
+def unmapped_cast_kind_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke casting to a kind the precision map does not carry."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _UNMAPPED_CAST_KIND_KERNEL)
+
+
+@pytest.fixture(name="static_variable_target")
+# pylint: disable-next=unused-argument
+def static_variable_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel module declares a module variable."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _STATIC_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="repeated_import_target")
+# pylint: disable-next=unused-argument
+def repeated_import_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads one imported constant twice."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _REPEATED_IMPORT_KERNEL)
 
 
 @pytest.fixture(name="polymorphic_target")
@@ -1938,3 +2154,220 @@ def test_lfric_kokkos_trans_bounds_defer_to_the_section_refusal(
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans._validate_sections(schedule)
     assert "cannot lower an array section to a loop" in str(error.value)
+
+
+def test_lfric_kokkos_trans_writes_a_declared_constant_as_its_value(
+        static_constant_target):
+    """A module-level parameter reaches the region as its literal.
+
+    It has to: the kernel module is ``private`` and publishes only its
+    metadata and its ``_code`` routine, so ``use column_solve_kernel_mod,
+    only: nfaces`` in the PSy layer would not compile. The value is stated in
+    the declaration, so the region carries the value.
+    """
+    _, loop, _ = static_constant_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "partial((k - 1)) * 4" in cpp
+    assert "+ 1.0e-9" in cpp
+    assert "nfaces" not in cpp
+    assert "tol" not in cpp
+
+
+def test_lfric_kokkos_trans_does_not_import_a_declared_constant(
+        static_constant_target):
+    """The PSy layer gains no import for a constant written in as a value."""
+    psy, loop, _ = static_constant_target
+
+    LFRicKokkosTrans().apply(loop)
+
+    generated = str(psy.gen)
+    assert "nfaces" not in generated
+    assert "tol" not in generated
+
+
+def test_lfric_kokkos_trans_refuses_a_declared_array_constant(
+        array_constant_target):
+    """An array parameter has no single literal to write in.
+
+    It is not a scalar the ABI could carry either, so it is refused rather
+    than silently reaching the region as one element of itself.
+    """
+    _, loop, _ = array_constant_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'x_dofs': a module-level constant is written "
+            "into the region as its value, and this one was not declared "
+            "with a literal value" in str(error.value))
+
+
+def test_lfric_kokkos_trans_casts_at_the_kind_the_body_names(cast_kind_target):
+    """A kind spelled in a cast is a type name, not data to pass by value.
+
+    ``real(k, r_def)`` puts ``r_def`` into the tree as a Reference like any
+    other. The writer consumes it as the cast's target and never emits it, so
+    there is nothing for the PSy layer to import or pass.
+    """
+    _, loop, _ = cast_kind_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "(double)k" in cpp
+    assert "r_def" not in cpp
+
+
+def test_lfric_kokkos_trans_casts_at_a_kind_no_declaration_repeats(
+        undeclared_cast_kind_target):
+    """A cast's own kind sets its width even when nothing else names it.
+
+    ``r_second`` is 8 bytes and appears only as this cast's target. Reading
+    the width from declarations alone would leave the backend with no entry
+    for it, and the C writer's default would silently make it ``float``.
+    """
+    _, loop, _ = undeclared_cast_kind_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "(double)k" in cpp
+    assert "(float)k" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
+        off_abi_constant_target):
+    """A constant that resolves can still have no place on the interface.
+
+    ``rehabilitate`` is an ``l_def`` logical: the module is readable and the
+    kind is known, and one byte of logical is still not something the
+    generated C interface carries. The refusal names the kinds it does.
+    """
+    _, loop, _ = off_abi_constant_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot pass 'rehabilitate' from 'planet_config_mod' by value"
+            in str(error.value))
+    assert "4-byte integer" in str(error.value)
+
+
+def test_lfric_kokkos_trans_names_the_module_it_could_not_read(
+        unreadable_constant_target):
+    """An unreadable container is named rather than guessed around.
+
+    The kind of an imported constant is stated only in its own module, so a
+    module PSyclone cannot read leaves no width for the ABI. Choosing one
+    would put a silently wrong type on the interface, so the refusal says
+    which module is missing and leaves the search path to the caller.
+    """
+    _, loop, _ = unreadable_constant_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot type 'eps' without the source of "
+            "'unreadable_constants_mod'" in str(error.value))
+    assert "module search path" in str(error.value)
+
+
+def test_lfric_kokkos_trans_leaves_out_a_kind_the_map_does_not_carry(
+        unmapped_cast_kind_target):
+    """A cast kind with no width recorded is left out, not written in as none.
+
+    ``r_native`` is the compiler's own default rather than one of the widths
+    the LFRic precision map names, so there is nothing to record. Storing the
+    failed lookup would be worse than leaving it out: the table is keyed by
+    kind name, and a declaration may already have resolved the same name.
+    """
+    _, loop, kernel = unmapped_cast_kind_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    kinds = dict(LFRicKokkosTrans._kind_types(schedule))
+
+    assert "r_native" not in kinds
+    assert kinds["r_def"] == "double"
+    assert "r_native" not in LFRicKokkosTrans().apply(loop)
+
+
+def test_lfric_kokkos_trans_names_a_called_routine_as_a_call(
+        called_routine_target):
+    """A function in an unread module is refused as a call, once.
+
+    Without the module the frontend cannot tell ``helper(k)`` from an array
+    reference, so the symbol is a plain ``Symbol`` and the constant machinery
+    used to claim it as module data it could not pass by value. The survey
+    calls each predicate independently, so that made one fact look like two
+    blocked patterns.
+    """
+    _, loop, kernel = called_routine_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    LFRicKokkosTrans._constants(schedule)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert ("cannot capture the call to 'helper'" in str(error.value))
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_refuses_a_resolved_routine_as_a_constant(
+        tmp_path, clear_module_manager_instance):
+    """A symbol that resolves to a routine is refused as one.
+
+    ``_constants`` skips a call's own routine reference, but a name used
+    another way -- as a procedure argument, say -- reaches
+    ``_describe_constant``, and only becomes known to be a routine when
+    ``resolve_type`` specialises it. Reading the module is what makes the
+    difference, so this test provides one.
+    """
+    (tmp_path / "helper_mod.f90").write_text(_HELPER_MODULE)
+    Config.get().include_paths = [str(tmp_path)]
+    ModuleManager.get().add_search_path(str(tmp_path))
+    symbol = Symbol(
+        "helper", interface=ImportInterface(ContainerSymbol("helper_mod")))
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._describe_constant(symbol)
+
+    assert ("cannot capture 'helper' from 'helper_mod': it is a routine "
+            "rather than data" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_declared_module_variable(
+        static_variable_target):
+    """A module variable is not a constant however it was initialised.
+
+    ``real(kind=r_def) :: cached_tol = 1.0e-9_r_def`` carries a literal in
+    its declaration exactly as the ``parameter`` beside it does, and the
+    module may assign to it afterwards. Writing the initialisation into the
+    region would freeze whatever value the module happened to start with.
+    """
+    _, loop, _ = static_variable_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'cached_tol': it is neither a kernel argument "
+            "nor imported from a module" in str(error.value))
+
+
+def test_lfric_kokkos_trans_passes_a_repeated_import_once(
+        repeated_import_target):
+    """An imported constant read twice reaches the ABI once.
+
+    Each reference is a separate node, so the walk meets ``recip_epsilon``
+    twice; describing it twice would re-resolve a symbol already on the ABI
+    and hand the PSy layer the same argument in two places.
+    """
+    psy, loop, kernel = repeated_import_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._constants(schedule) == [
+        ("recip_epsilon", "planet_config_mod", "double")]
+
+    LFRicKokkosTrans().apply(loop)
+
+    generated = str(psy.gen)
+    assert generated.count("map_wtheta, loop0_stop, recip_epsilon)") == 1
