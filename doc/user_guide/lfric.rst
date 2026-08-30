@@ -4157,7 +4157,16 @@ call site wraps the actual in ``LOGICAL(..., c_bool)``, so the compiler
 converts it whatever kind LFRic gave it, and no width assertion is generated
 for it because there is none to make. A ``logical`` *array* is still refused,
 because an array crosses by reference and would be reinterpreted rather than
-converted. The
+converted. A kernel that reads a
+field through a stencil is accepted when the stencil is ``cross2d`` and
+refused by name otherwise: a 2-D stencil gives the kernel a sliced dofmap and
+a sliced size array, both of which become Views with the cell index appended
+exactly as the ordinary dofmap does, whereas a 1-D or region stencil gives the
+size as a per-cell scalar for which the ABI has no argument kind. A stencil
+also makes the PSy layer emit a halo exchange in front of the loop; that
+exchange is lowered before the loop is replaced, because it computes its own
+depth by walking forward to the accesses that read the field and the
+replacement would have removed them first. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 

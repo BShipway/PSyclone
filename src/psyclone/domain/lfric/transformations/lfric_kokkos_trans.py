@@ -90,6 +90,21 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     storage would reinterpret 4-byte elements as 1-byte ones rather than
     convert them, which is the very failure conversion removes for a scalar.
 
+    **A stencil is accepted by shape**, and the accepted shapes are
+    :py:attr:`_SUPPORTED_STENCILS` -- ``cross2d`` alone. A 2-D stencil needs
+    no argument machinery of its own: LFRic hands the kernel a sliced dofmap
+    and a sliced size array, both of them array formals, so both become Views
+    with the cell index appended exactly as the dofmap ``map_w3(:,cell)``
+    already does. A 1-D or region stencil hands the size over as a *scalar*
+    formal fed from ``field_stencil_size(cell)``, which would need a per-cell
+    scalar argument kind that does not exist here, so those shapes are refused
+    by name. A stencil also makes the PSy layer emit a halo exchange in front
+    of the loop, which is lowered before the loop is replaced rather than
+    after; see :py:meth:`_lower_halo_exchanges`. The matcher refusal above is
+    unaffected: PSyclone's issue #928 leaves every stencil shape unbuilt, so a
+    stencil kernel written as a generic interface is still refused there
+    whatever its shape.
+
     A whole-column array section such as ``a(i:j)``, which the finite-volume
     kernels use to assign a column as a unit, is accepted and lowered to an
     explicit loop by
@@ -191,6 +206,19 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     _GENERATED_NAMES = ("body", "league_size", "probe", "rank",
                         "scratch_bytes", "team", "team_size")
 
+    #: Stencil shapes whose PSy-layer arguments :py:meth:`apply`'s generic
+    #: per-cell rule already passes correctly. A 2-D stencil hands the kernel
+    #: a sliced dofmap and a sliced size array, both of them array formals, so
+    #: both become Views with the cell index appended -- which is what
+    #: ``map_w3(:,cell)`` already does and needs nothing new.
+    #:
+    #: A 1-D or region stencil hands the size to the kernel as a *scalar*
+    #: formal, fed from ``x_stencil_size(cell)``. That rule would pass the
+    #: whole sliced expression against a by-value dummy, so admitting those
+    #: shapes needs a per-cell scalar argument kind that does not exist here.
+    #: No executed GungHo loop asks for one, so they are refused by name.
+    _SUPPORTED_STENCILS = ("cross2d",)
+
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
 
@@ -270,7 +298,8 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
             evaluator data, is a CMA or inter-grid kernel, takes an argument
             that is neither a field nor a scalar, takes an access a
             cell-parallel launch cannot honour, takes a non-real field, uses a
-            stencil, or writes to a field on a continuous space.
+            stencil shape outside :py:attr:`_SUPPORTED_STENCILS`, or writes to
+            a field on a continuous space.
         """
         if kernel.qr_required or kernel.eval_shapes:
             raise TransformationError(
@@ -301,8 +330,12 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
                     f"LFRicKokkosTrans supports only real fields, but "
                     f"'{argument.name}' is {argument.intrinsic_type}.")
             if argument.stencil:
-                raise TransformationError(
-                    "LFRicKokkosTrans does not support stencil accesses.")
+                shape = str(argument.stencil.name).lower()
+                if shape not in cls._SUPPORTED_STENCILS:
+                    raise TransformationError(
+                        f"LFRicKokkosTrans supports the "
+                        f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shape "
+                        f"only, but '{argument.name}' has '{shape}'.")
             if argument.access == AccessType.READ:
                 continue
             space = argument.function_space.orig_name.lower()

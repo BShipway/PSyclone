@@ -14,6 +14,7 @@ from psyclone.configuration import Config
 from psyclone.core import AccessType
 from psyclone.domain.lfric import LFRicLoop
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
+from psyclone.lfric import LFRicArgStencil
 from psyclone.parse import ModuleManager
 from psyclone.parse.algorithm import parse
 from psyclone.psyGen import PSyFactory
@@ -420,6 +421,128 @@ _LOGICAL_ARRAY_KERNEL = _LOGICAL_KERNEL.replace(
     "    logical(kind=l_def), intent(in) :: masked",
     "    logical(kind=l_def), dimension(ndf_w3), intent(in) :: masked"
     ).replace("        if (masked) then", "        if (masked(df)) then")
+
+
+_STENCIL_ALGORITHM = """
+program kokkos_stencil_test
+  use constants_mod, only : i_def
+  use field_mod, only : field_type
+  use stencil_sum_kernel_mod, only : stencil_sum_kernel_type
+  implicit none
+  type(field_type) :: field_out, field_in
+  integer(kind=i_def) :: extent = 1
+  call invoke(stencil_sum_kernel_type(field_out, field_in, extent))
+end program kokkos_stencil_test
+"""
+
+
+# apply_helmholtz_operator_code's stencil access with its algebra removed: a
+# CROSS2D branch loop over a sliced dofmap, bounded by a sliced size array.
+# The three formals the stencil adds are all used, because the point of the
+# fixture is what 'apply' does with each of them -- 'smap_sizes' and 'smap'
+# become Views with the cell index appended, 'max_length' stays a scalar --
+# and an unused formal would still be declared but would not be indexed.
+#
+# The branch counter is 'step' rather than the production kernel's 'cell'.
+# That collision is real and is Task 5.3's subject, tested by
+# '_CELL_LOCAL_KERNEL'; repeating it here would make a stencil failure and a
+# naming failure indistinguishable.
+_STENCIL_KERNEL = """
+module stencil_sum_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column, stencil, cross2d
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: stencil_sum_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                 &
+         arg_type(gh_field, gh_real, gh_write, w3),                     &
+         arg_type(gh_field, gh_real, gh_read,  w3, stencil(cross2d)) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: stencil_sum_code
+  end type stencil_sum_kernel_type
+contains
+  subroutine stencil_sum_code(nlayers, field_out, field_in, &
+                              smap_sizes, max_length, smap, &
+                              ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: max_length
+    integer(kind=i_def), dimension(4), intent(in) :: smap_sizes
+    integer(kind=i_def), dimension(ndf_w3, max_length, 4), intent(in) :: smap
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df, branch, step
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = 0.0_r_def
+        do branch = 1, 4
+          do step = 1, smap_sizes(branch)
+            field_out(map_w3(df) + k) = field_out(map_w3(df) + k) + &
+                field_in(smap(df, step, branch) + k)
+          end do
+        end do
+      end do
+    end do
+  end subroutine stencil_sum_code
+end module stencil_sum_kernel_mod
+"""
+
+
+_STENCIL_1D_ALGORITHM = _STENCIL_ALGORITHM.replace(
+    "stencil_sum", "stencil_line").replace(
+    "kokkos_stencil_test", "kokkos_stencil_line_test")
+
+
+# The same kernel through a 1-D CROSS stencil, which is the shape the
+# transformation refuses. The refusal is not a matter of taste: LFRic gives a
+# 1-D stencil's size to the kernel as a *scalar* formal, fed per cell from
+# 'field_in_stencil_size(cell)', where CROSS2D gives an array formal fed from
+# a whole array. 'apply''s per-cell rule appends the cell index to an array
+# actual, so the array form needs nothing new and the scalar form would need
+# a per-cell scalar argument kind that does not exist. The dofmap loses its
+# branch dimension for the same reason. Both differences are visible below.
+_STENCIL_1D_KERNEL = """
+module stencil_line_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column, stencil, cross
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: stencil_line_kernel_type
+    type(arg_type) :: meta_args(2) = (/                               &
+         arg_type(gh_field, gh_real, gh_write, w3),                   &
+         arg_type(gh_field, gh_real, gh_read,  w3, stencil(cross)) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: stencil_line_code
+  end type stencil_line_kernel_type
+contains
+  subroutine stencil_line_code(nlayers, field_out, field_in, &
+                               smap_size, smap, &
+                               ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: smap_size
+    integer(kind=i_def), dimension(ndf_w3, smap_size), intent(in) :: smap
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df, step
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = 0.0_r_def
+        do step = 1, smap_size
+          field_out(map_w3(df) + k) = field_out(map_w3(df) + k) + &
+              field_in(smap(df, step) + k)
+        end do
+      end do
+    end do
+  end subroutine stencil_line_code
+end module stencil_line_kernel_mod
+"""
 
 
 # A column solve reduced to its shape: two automatic arrays over nlayers, a
@@ -1013,6 +1136,22 @@ def logical_array_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical array."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_ARRAY_KERNEL)
+
+
+@pytest.fixture(name="stencil_target")
+# pylint: disable-next=unused-argument
+def stencil_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads through a CROSS2D stencil."""
+    return _invoke(
+        tmp_path, "stencil_sum", _STENCIL_ALGORITHM, _STENCIL_KERNEL)
+
+
+@pytest.fixture(name="stencil_1d_target")
+# pylint: disable-next=unused-argument
+def stencil_1d_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads through a 1-D CROSS stencil."""
+    return _invoke(
+        tmp_path, "stencil_line", _STENCIL_1D_ALGORITHM, _STENCIL_1D_KERNEL)
 
 
 @pytest.fixture(name="local_target")
@@ -1672,10 +1811,76 @@ def test_lfric_kokkos_trans_rejects_incremented_field(target):
         LFRicKokkosTrans().validate(loop)
 
 
+def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
+    """A CROSS2D stencil needs no argument machinery of its own.
+
+    Its three PSy-layer actuals are a cell-sliced rank-2 size array, a plain
+    integer and a cell-sliced rank-4 dofmap, and 'apply''s existing per-cell
+    rule already passes each of them correctly: the two slices are
+    ArrayReferences, so they are passed whole with the cell index appended,
+    exactly as 'map_w3(:,cell)' already is, and 'max_length' is a scalar that
+    stays one. The test asserts the shapes rather than the mere absence of a
+    refusal, because it is the shapes that carry that claim.
+    """
+    psy, loop, _ = stencil_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap_sizes(smap_sizes_data, 4, ncells);" in cpp)
+    assert ("Kokkos::View<const int****, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap(smap_data, ndf_w3, max_length, 4, ncells);" in cpp)
+    assert "const int max_length" in cpp
+    assert "max_length_data" not in cpp
+    assert "smap((df - 1), (step - 1), (branch - 1), cell)" in cpp
+    assert "smap_sizes((branch - 1), cell)" in cpp
+
+    # The three actuals are passed whole, the cell index having moved into the
+    # Views' last extent, and the halo exchange the stencil puts in front of
+    # the loop is still there and still ahead of the launch.
+    fortran = str(psy.gen)
+    assert "integer(c_int), dimension(*), intent(in) :: smap_sizes" in fortran
+    assert "integer(c_int), value :: max_length" in fortran
+    assert "integer(c_int), dimension(*), intent(in) :: smap" in fortran
+    assert ("call stencil_sum_kokkos(nlayers_field_out, field_out_data, "
+            "field_in_data, field_in_stencil_size, "
+            "field_in_max_branch_length, field_in_stencil_dofmap, ndf_w3, "
+            "undf_w3, map_w3, loop0_stop)" in fortran)
+    assert fortran.index("halo_exchange(depth=extent)") < fortran.index(
+        "call stencil_sum_kokkos(")
+
+
+def test_lfric_kokkos_trans_refuses_a_one_dimensional_stencil(
+        stencil_1d_target):
+    """A 1-D stencil hands the kernel its size as a scalar, not an array.
+
+    That is the difference the shape list is drawn along, and the fixture is a
+    real CROSS kernel rather than a patched CROSS2D one so that the difference
+    is the parser's rather than the test's. 'apply''s per-cell rule appends
+    the cell index to an array actual; a 1-D stencil's size arrives instead as
+    'field_in_stencil_size(cell)' against a by-value dummy, which would need a
+    per-cell scalar argument kind that does not exist. No executed GungHo loop
+    asks for one, so the shape is refused by name rather than mishandled.
+    """
+    _, loop, _ = stencil_1d_target
+
+    with pytest.raises(TransformationError, match="cross2d") as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'cross'" in str(error.value)
+    assert "'field_in'" in str(error.value)
+
+
 def test_lfric_kokkos_trans_rejects_stencil(target):
-    """Stencil storage and halo requirements are not silently captured."""
+    """Stencil storage and halo requirements are not silently captured.
+
+    The refusal is shape-specific rather than blanket from stage 5 on:
+    'cross2d' is accepted, and every other shape -- 'xory1d' here, which has a
+    direction argument on top of a 1-D size -- is named in the message that
+    refuses it.
+    """
     _, loop, kernel = target
-    kernel.arguments.args[1].stencil = {"type": "xory1d"}
+    kernel.arguments.args[1].stencil = LFRicArgStencil(name="xory1d")
     with pytest.raises(TransformationError, match="stencil"):
         LFRicKokkosTrans().validate(loop)
 
