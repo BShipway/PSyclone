@@ -16,6 +16,63 @@ from psyclone.psyir.nodes import (
 from psyclone.psyir.symbols import ArrayType
 
 
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def extent_names(value):
+    """Return the identifiers an extent expression is sized from.
+
+    An integer literal contributes nothing, so ``"(nlayers + 1)"`` gives
+    ``{"nlayers"}`` and ``"4"`` gives the empty set. Callers use this to ask
+    whether an extent can be evaluated where it is written, without having to
+    parse the expression themselves.
+
+    :param value: the candidate extent, which need not be a string.
+
+    :returns: every C++ identifier appearing in it.
+    :rtype: set[str]
+    """
+    if not isinstance(value, str):
+        return set()
+    return set(_IDENTIFIER.findall(value))
+
+
+def is_extent(value):
+    """Return whether ``value`` may be written as a Kokkos extent.
+
+    An extent is an integer expression over named sizes, so a bare name is
+    accepted as before and so are ``max_length``, ``4`` and
+    ``(nlayers + 1)``. Division is refused rather than merely unsupported:
+    Fortran and C++ can disagree about the rounding of an integer division,
+    and an extent is one of the few places where that disagreement would
+    produce a wrongly sized allocation instead of a compile error.
+
+    :param value: the candidate extent, which need not be a string.
+
+    :returns: whether it can be written into generated C++ as an extent.
+    :rtype: bool
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_ ()+\-*]+", value):
+        return False
+    depth = 0
+    for character in value:
+        depth += (character == "(") - (character == ")")
+        if depth < 0:
+            return False
+    if depth:
+        return False
+    # Split on the operators rather than searching for names, so that a
+    # malformed token such as ``4nlayers`` is seen whole and refused instead
+    # of reading as a literal beside an identifier.
+    for token in re.split(r"[ ()+\-*]+", value):
+        if token and not (token.isdigit()
+                          or _IDENTIFIER.fullmatch(token)):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class KokkosScalar:
     """A scalar on the generated C ABI."""
@@ -314,59 +371,6 @@ class KokkosWriter(CWriter):
         return isinstance(value, str) and bool(
             re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value))
 
-    @staticmethod
-    def _extent_names(value):
-        """Return the identifiers an extent expression is sized from.
-
-        An integer literal contributes nothing, so ``"(nlayers + 1)"`` gives
-        ``{"nlayers"}`` and ``"4"`` gives the empty set. Callers use this to
-        ask whether an extent can be evaluated where it is written, without
-        having to parse the expression themselves.
-
-        :param value: the candidate extent, which need not be a string.
-
-        :returns: every C++ identifier appearing in it.
-        :rtype: set[str]
-        """
-        if not isinstance(value, str):
-            return set()
-        return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", value))
-
-    @classmethod
-    def _is_extent(cls, value):
-        """Return whether ``value`` may be written as a Kokkos extent.
-
-        An extent is an integer expression over named sizes, so a bare name is
-        accepted as before and so are ``max_length``, ``4`` and
-        ``(nlayers + 1)``. Division is refused rather than merely unsupported:
-        Fortran and C++ can disagree about the rounding of an integer
-        division, and an extent is one of the few places where that
-        disagreement would be silent.
-
-        :param value: the candidate extent, which need not be a string.
-
-        :returns: whether it can be written into generated C++ as an extent.
-        :rtype: bool
-        """
-        if not isinstance(value, str) or not value.strip():
-            return False
-        if not re.fullmatch(r"[A-Za-z0-9_ ()+\-*]+", value):
-            return False
-        depth = 0
-        for character in value:
-            depth += (character == "(") - (character == ")")
-            if depth < 0:
-                return False
-        if depth:
-            return False
-        # Split on the operators rather than searching for names, so that a
-        # malformed token such as ``4nlayers`` is seen whole and refused
-        # instead of reading as a literal beside an identifier.
-        for token in re.split(r"[ ()+\-*]+", value):
-            if token and not (token.isdigit() or cls._is_identifier(token)):
-                return False
-        return True
-
     def _validate(self, region):
         """Reject incomplete or unsupported region descriptions.
 
@@ -508,11 +512,11 @@ class KokkosWriter(CWriter):
             raise ValueError(
                 f"Kokkos scratch '{scratch.name}' must have extents.")
         for extent in scratch.extents:
-            if not self._is_extent(extent):
+            if not is_extent(extent):
                 raise ValueError(
                     f"Kokkos scratch '{scratch.name}' has extent '{extent}' "
                     "which is not an integer expression over named sizes.")
-            for name in self._extent_names(extent):
+            for name in extent_names(extent):
                 if name not in scalar_names:
                     raise ValueError(
                         f"Kokkos scratch '{scratch.name}' has extent "
@@ -548,7 +552,7 @@ class KokkosWriter(CWriter):
             raise ValueError(
                 f"Kokkos View data name '{view.data_name}' is invalid.")
         if not view.extents or not all(
-                self._is_extent(extent) for extent in view.extents):
+                is_extent(extent) for extent in view.extents):
             raise ValueError(
                 f"Kokkos View '{view.name}' must have extents that are "
                 "integer expressions over named sizes.")
@@ -696,4 +700,4 @@ class KokkosWriter(CWriter):
 
 
 __all__ = ["KokkosRegion", "KokkosScalar", "KokkosScratch", "KokkosView",
-           "KokkosWriter"]
+           "KokkosWriter", "extent_names", "is_extent"]

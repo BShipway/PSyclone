@@ -4132,8 +4132,12 @@ rather than after the interface. A kernel holding an automatic array -- a
 column temporary whose extent is a runtime value -- is generated over a
 Kokkos ``TeamPolicy`` instead of a ``RangePolicy``, with that array placed
 in team scratch private to the rank running the cell; a kernel with no such
-array keeps the flat launch. The contract it accepts, and the reasons it
-refuses, are given in its documentation below.
+array keeps the flat launch. An extent -- of an array argument or of such a
+temporary -- is read as a declared bound rather than as a name, so
+``dimension(max_length,4)`` and ``dimension(nlayers+1)`` are accepted as
+readily as ``dimension(nlayers)``; what is required is an integer expression
+over the kernel's own arguments and literals. The contract it accepts, and
+the reasons it refuses, are given in its documentation below.
 
 The LFRic API-specific transformations currently available
 are given below. Early transformations include "Dynamo0p3" or "Dynamo"

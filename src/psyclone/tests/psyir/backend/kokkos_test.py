@@ -13,7 +13,8 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter)
+    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
+    extent_names, is_extent)
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import CodeBlock, KernelSchedule, Routine
 
@@ -547,7 +548,7 @@ def test_kokkos_view_takes_an_expression_extent():
     ("(nlayers", False), ("nlayers)", False), (")nlayers(", False),
     ("nlayers % 2", False), ("nlayers.size", False), (4, False), (None, False),
 ])
-def test_kokkos_is_extent(extent, accepted):
+def test_is_extent(extent, accepted):
     """The extent predicate accepts arithmetic and refuses everything else.
 
     Division is refused rather than unsupported: Fortran and C++ can disagree
@@ -555,16 +556,16 @@ def test_kokkos_is_extent(extent, accepted):
     that would be silent. ``)nlayers(`` is here because a depth count that
     only checked the total would accept it.
     """
-    assert KokkosWriter._is_extent(extent) is accepted
+    assert is_extent(extent) is accepted
 
 
 @pytest.mark.parametrize("extent, names", [
     ("nlayers", {"nlayers"}), ("4", set()), ("(nlayers + 1)", {"nlayers"}),
     ("2 * nrows - ncols", {"nrows", "ncols"}), (4, set()),
 ])
-def test_kokkos_extent_names(extent, names):
+def test_extent_names(extent, names):
     """An extent reports the sizes it is built from, and only those."""
-    assert KokkosWriter._extent_names(extent) == names
+    assert extent_names(extent) == names
 
 
 def test_kokkos_writer_rejects_two_scratch_arrays_sharing_a_name():
