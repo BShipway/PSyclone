@@ -335,12 +335,16 @@ Additionally, there are three partially-implemented back-ends
   literals, references, if-blocks, loops, unary and binary operations, a
   subset of intrinsics, and directives. It has no handler for a `Routine`,
   so it generates the statements and expressions of a body rather than a
-  whole kernel.
+  whole kernel. A loop's continuation test follows the sign of its step
+  where that sign is visible in the tree, so a Fortran countdown such as
+  `do k = n, 1, -1` becomes `for(k=n; k>=1; k+=-1)`; a step that is a
+  runtime value is taken to be positive.
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
-  region's name, its scalar arguments, its unmanaged Views and its
-  `kind_types`, and it visits the loop body through `CWriter`. The
+  region's name, its scalar arguments, its unmanaged Views, its
+  `kind_types` and its `scratch`, and it visits the loop body through
+  `CWriter`. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -385,6 +389,44 @@ can check them -- which is why they are generated from `kind_types`, and why
 interface. The assertion is a `parameter` whose kind is a `merge` over a
 `storage_size` comparison, so a false comparison asks for kind `-1` and the
 declaration itself is the error.
+
+Two launch shapes
+~~~~~~~~~~~~~~~~~
+
+The back-end generates one of two launches, selected by whether the region
+describes any `scratch`.
+
+A region with no scratch launches over `Kokkos::RangePolicy<>(0, ncells)`
+with a `KOKKOS_LAMBDA(const int cell)`. This is the shape every region had
+before scratch existed and it is generated unchanged, because a kernel with
+no local arrays has nothing to place.
+
+A region with scratch launches over `Kokkos::TeamPolicy<>`. A Fortran
+automatic local such as `real(r_def), dimension(nlayers) :: x_new` has an
+extent that is a runtime value, so it cannot become a C++ local; it becomes
+a `Kokkos::View` over `team.thread_scratch(0)`, sized by `shmem_size`. That
+is the allocation Kokkos provides for exactly this case -- no heap traffic,
+no storage outliving the launch, and shared memory rather than global on a
+GPU.
+
+Cells are tiled across the ranks of a team rather than given a team each, so
+that each rank takes one cell with its own per-thread scratch and the
+parallelism stays what the `RangePolicy` shape has: one cell per worker.
+The league is sized by rounding up, so the generated body returns early for
+a rank whose cell is past the end. The team size is not chosen by the
+back-end, because it depends on how much scratch each rank requests: the
+policy is asked with `team_size_max`, from a probe policy already carrying
+the scratch request.
+
+A `KokkosScratch` is described separately from the region's arguments, and
+deliberately so. It crosses no interface, so it must not appear in the C ABI
+or in the generated `bind(C)` interface, and it is not a kernel formal that
+the region has to account for. Its extents must name scalar arguments of the
+region, which is what lets the generated C++ size it. It does carry
+`index_offsets` and an always-empty `extra_indices`, so that
+`arrayreference_node` can resolve Views and scratch through one table
+without a type test; a scratch symbol is skipped when the kernel's locals
+are declared, since it is already declared as its View.
 
 SIR back-end
 ++++++++++++

@@ -446,6 +446,63 @@ def test_cw_loop(fortran_reader):
     assert correct in result
 
 
+def test_cw_loop_counts_down(fortran_reader):
+    '''Tests that a Fortran countdown keeps running in C.
+
+    Fortran's DO runs while the variable is still in range and so needs no
+    direction in its text, but C tests one way or the other. A negative step
+    written with C's ascending test compiles, links and runs zero iterations
+    -- a silent wrong answer rather than a diagnosable one.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b)
+          integer :: i, n
+          integer, dimension(:) :: b
+          do i = n, 1, -1
+            b(i) = i
+          enddo
+          do i = n, 1, -2
+            b(i) = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    container = fortran_reader.psyir_from_source(code).children[0]
+    module = container.children[0]
+
+    cwriter = CWriter()
+    assert 'for(i=n; i>=1; i+=(-1))' in cwriter(module[0])
+    assert 'for(i=n; i>=1; i+=(-2))' in cwriter(module[1])
+
+
+def test_cw_loop_step_of_unknown_sign(fortran_reader):
+    '''Tests that a step whose sign is not in the tree is taken as ascending.
+
+    The direction can only be followed where it is visible. A step that is a
+    runtime value keeps the ascending test it has always had, rather than the
+    writer refusing a loop it used to generate.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, s)
+          integer :: i, n
+          integer, intent(in) :: s
+          integer, dimension(:) :: b
+          do i = 1, n, s
+            b(i) = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    container = fortran_reader.psyir_from_source(code).children[0]
+    module = container.children[0]
+
+    assert 'for(i=1; i<=n; i+=s)' in CWriter()(module[0])
+
+
 def test_cw_unsupported_intrinsiccall():
     ''' Check the CWriter class SIZE intrinsic raises the expected error since
     there is no C equivalent. '''

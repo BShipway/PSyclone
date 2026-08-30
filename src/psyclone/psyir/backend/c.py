@@ -44,7 +44,8 @@ it needs to be extended for generating pure C code.
 '''
 from psyclone.psyir.backend.language_writer import LanguageWriter
 from psyclone.psyir.backend.visitor import VisitorError
-from psyclone.psyir.nodes import BinaryOperation, UnaryOperation, IntrinsicCall
+from psyclone.psyir.nodes import (
+    BinaryOperation, IntrinsicCall, Literal, UnaryOperation)
 from psyclone.psyir.symbols import ScalarType
 
 
@@ -466,9 +467,40 @@ class CWriter(LanguageWriter):
         '''
         raise VisitorError("CodeBlocks can not be translated to C.")
 
+    @staticmethod
+    def _loop_counts_down(step_expr):
+        '''Whether a loop with this step expression is known to count down.
+
+        Fortran's DO runs "while still in range" and needs no direction in
+        its text, but C tests one way or the other, so the direction has to
+        be decided here. It can only be decided for a step whose sign is
+        visible in the tree; a step that is a runtime value is assumed to be
+        positive, as it was before this returned anything.
+
+        :param step_expr: the loop's step expression.
+        :type step_expr: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: whether the step is a negative literal.
+        :rtype: bool
+
+        '''
+        if isinstance(step_expr, Literal):
+            return step_expr.value.startswith("-")
+        if (isinstance(step_expr, UnaryOperation)
+                and step_expr.operator == UnaryOperation.Operator.MINUS
+                and isinstance(step_expr.children[0], Literal)):
+            return not step_expr.children[0].value.startswith("-")
+        return False
+
     def loop_node(self, node):
         '''This method is called when a Loop instance is found in the
         PSyIR tree.
+
+        The loop's continuation test follows the sign of its step, so that a
+        Fortran countdown such as ``do k = n, 1, -1`` becomes ``for(k=n;
+        k>=1; k+=-1)`` rather than a loop whose body never runs. Only a step
+        whose sign is visible in the tree is followed; see
+        :py:meth:`_loop_counts_down`.
 
         :param node: a Loop PSyIR node.
         :type node: :py:class:`psyclone.psyir.nodes.Loop`
@@ -481,6 +513,7 @@ class CWriter(LanguageWriter):
         stop = self._visit(node.stop_expr)
         step = self._visit(node.step_expr)
         variable_name = node.variable.name
+        test = ">=" if self._loop_counts_down(node.step_expr) else "<="
 
         self._depth += 1
         body = ""
@@ -489,7 +522,7 @@ class CWriter(LanguageWriter):
         self._depth -= 1
 
         return f"{self._nindent}for({variable_name}={start}; "\
-               f"{variable_name}<={stop}; {variable_name}+={step})\n"\
+               f"{variable_name}{test}{stop}; {variable_name}+={step})\n"\
                f"{self._nindent}{{\n{body}{self._nindent}}}\n"
 
     def regiondirective_node(self, node):
