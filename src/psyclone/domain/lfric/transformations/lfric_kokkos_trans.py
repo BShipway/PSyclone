@@ -14,8 +14,10 @@ from psyclone.core import AccessType
 from psyclone.domain.lfric import KernCallArgList, LFRicConstants, LFRicLoop
 from psyclone.errors import GenerationError
 from psyclone.psyGen import InvokeSchedule, Transformation
+from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter)
+    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
+    extent_names, is_extent)
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Literal, Loop,
@@ -96,14 +98,26 @@ class LFRicKokkosTrans(Transformation):
     region is then launched over a ``TeamPolicy`` rather than a
     ``RangePolicy``; a kernel with no array locals keeps the flat launch.
 
-    That placement is what the two refusals protect. The array's element kind
-    must be one the ABI names, as a formal's must, and each of its extents
+    That placement is what the refusals protect. The array's element kind must
+    be one the ABI names, as a formal's must, and every **name** in its extents
     must be a **kernel argument**: the launch computes its scratch size before
     it enters the region, so an extent it cannot name there cannot be sized.
     A module constant is refused as an extent for that reason even though the
-    body may read one elsewhere. Both are refused by :py:meth:`validate`
-    rather than discovered by :py:meth:`apply`. A scalar local needs no
-    scratch and is declared in the region body as before.
+    body may read one elsewhere. A scalar local needs no scratch and is
+    declared in the region body as before.
+
+    An extent is a declared bound written as C, not a name copied over, so it
+    need not be a single symbol. ``dimension(max_length,4)`` and
+    ``dimension(nlayers+1)`` are both accepted, and both a formal and a local
+    are read the same way. What is required is an integer expression over
+    kernel arguments and literals using ``+``, ``-`` and ``*``: division is
+    refused, because Fortran and C++ can disagree about the rounding of an
+    integer division and a wrongly sized allocation would not announce
+    itself. A lower bound other than 1 is refused as well -- the generated
+    View subtracts a fixed 1 from each Fortran index -- so
+    ``dimension(0:nlayers-1)`` is out of reach while ``dimension(1:nlayers)``
+    is not. Every one of these is refused by :py:meth:`validate` rather than
+    discovered by :py:meth:`apply`.
 
     It captures all information needed by the Kokkos backend before lowering
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
@@ -481,10 +495,13 @@ class LFRicKokkosTrans(Transformation):
                     f"LFRicKokkosTrans supports {cls._supported_kinds()} "
                     f"argument kinds only, but '{symbol.name}' has "
                     f"'{cls._kind_name(symbol)}'.")
-            for extent in cls._extents(symbol):
-                if extent not in names:
+            # Sorted because the refusal names one offender and a set does
+            # not iterate in a fixed order, so an unsorted loop would give a
+            # different message run to run for the same kernel.
+            for name in sorted(cls._extent_names(symbol)):
+                if name not in names:
                     raise TransformationError(
-                        f"LFRicKokkosTrans needs the extent '{extent}' of "
+                        f"LFRicKokkosTrans needs the extent '{name}' of "
                         f"'{symbol.name}' to be a kernel argument, so that "
                         "the generated View can be sized.")
 
@@ -519,10 +536,10 @@ class LFRicKokkosTrans(Transformation):
                     f"LFRicKokkosTrans supports {cls._supported_kinds()} "
                     f"kernel-local array kinds only, but '{symbol.name}' has "
                     f"'{cls._kind_name(symbol)}'.")
-            for extent in cls._extents(symbol):
-                if extent not in names:
+            for name in sorted(cls._extent_names(symbol)):
+                if name not in names:
                     raise TransformationError(
-                        f"LFRicKokkosTrans needs the extent '{extent}' of "
+                        f"LFRicKokkosTrans needs the extent '{name}' of "
                         f"the kernel-local array '{symbol.name}' to be a "
                         "kernel argument, so that the generated scratch can "
                         "be sized.")
@@ -645,30 +662,82 @@ class LFRicKokkosTrans(Transformation):
 
     @staticmethod
     def _extents(symbol):
-        """Return the declared extents of an array formal, in order.
+        """Return the declared extents of an array, in order.
 
-        :param symbol: the formal whose shape is wanted.
+        Each is the symbol's declared upper bound written as C, so a formal
+        or a kernel-local array declared ``dimension(max_length,4)`` gives
+        ``("max_length", "4")`` and one declared ``dimension(nlayers+1)``
+        gives ``("(nlayers + 1)",)``. The routine serves array formals and
+        kernel-local arrays alike; both reach the backend as extents that are
+        emitted verbatim.
+
+        The lower bound is rendered too, and required to be ``1``. It is not
+        used to compute the extent, because it cannot be anything else once
+        it has been checked -- writing ``upper - lower + 1`` would be code no
+        test could reach. A lower bound the generated View cannot assume away
+        is refused instead, since ``KokkosView`` and ``KokkosScratch`` carry
+        integer index offsets and every caller supplies 1.
+
+        :param symbol: the array whose shape is wanted.
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
 
-        :returns: one name per dimension, empty for a scalar.
+        :returns: one C extent expression per dimension, empty for a scalar.
         :rtype: tuple[str]
 
-        :raises TransformationError: if a dimension's upper bound is anything
-            but a plain named symbol, which the generated View could not use
-            as an extent.
+        :raises TransformationError: if a dimension carries no declared
+            bounds, if its lower bound is not 1, or if its upper bound is not
+            an integer expression the Kokkos backend can write as an extent.
         """
         datatype = symbol.datatype
         if not isinstance(datatype, ArrayType):
             return ()
+        writer = CWriter()
         extents = []
         for dimension in datatype.shape:
+            lower = getattr(dimension, "lower", None)
             upper = getattr(dimension, "upper", None)
-            if not isinstance(upper, Reference) or upper.children:
+            if lower is None or upper is None:
                 raise TransformationError(
                     f"LFRicKokkosTrans requires '{symbol.name}' to be "
-                    "declared with simple named extents.")
-            extents.append(upper.symbol.name)
+                    "declared with explicit bounds.")
+            # A visitor lowers the tree it is handed, and this one belongs to
+            # a live datatype.
+            rendered_lower = writer(lower.copy())
+            if rendered_lower != "1":
+                raise TransformationError(
+                    f"LFRicKokkosTrans requires '{symbol.name}' to be "
+                    "declared with a lower bound of 1, but found "
+                    f"'{rendered_lower}'.")
+            extent = writer(upper.copy())
+            if not is_extent(extent):
+                raise TransformationError(
+                    f"LFRicKokkosTrans requires the extents of "
+                    f"'{symbol.name}' to be integer expressions over named "
+                    f"sizes, but found '{extent}'.")
+            extents.append(extent)
         return tuple(extents)
+
+    @classmethod
+    def _extent_names(cls, symbol):
+        """Return the names an array's extents are sized from.
+
+        An extent is no longer a single name, so a caller asking whether it
+        can be evaluated where the region is launched has to ask about every
+        name in it. A literal contributes nothing, so a purely fixed-size
+        array reports no names at all.
+
+        :param symbol: the array whose extents are to be resolved.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: every name appearing in any of its extents.
+        :rtype: set[str]
+
+        :raises TransformationError: as :py:meth:`_extents` does.
+        """
+        names = set()
+        for extent in cls._extents(symbol):
+            names |= extent_names(extent)
+        return names
 
     @classmethod
     def _constants(cls, schedule):

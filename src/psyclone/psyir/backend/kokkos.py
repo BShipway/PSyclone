@@ -16,6 +16,63 @@ from psyclone.psyir.nodes import (
 from psyclone.psyir.symbols import ArrayType
 
 
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def extent_names(value):
+    """Return the identifiers an extent expression is sized from.
+
+    An integer literal contributes nothing, so ``"(nlayers + 1)"`` gives
+    ``{"nlayers"}`` and ``"4"`` gives the empty set. Callers use this to ask
+    whether an extent can be evaluated where it is written, without having to
+    parse the expression themselves.
+
+    :param value: the candidate extent, which need not be a string.
+
+    :returns: every C++ identifier appearing in it.
+    :rtype: set[str]
+    """
+    if not isinstance(value, str):
+        return set()
+    return set(_IDENTIFIER.findall(value))
+
+
+def is_extent(value):
+    """Return whether ``value`` may be written as a Kokkos extent.
+
+    An extent is an integer expression over named sizes, so a bare name is
+    accepted as before and so are ``max_length``, ``4`` and
+    ``(nlayers + 1)``. Division is refused rather than merely unsupported:
+    Fortran and C++ can disagree about the rounding of an integer division,
+    and an extent is one of the few places where that disagreement would
+    produce a wrongly sized allocation instead of a compile error.
+
+    :param value: the candidate extent, which need not be a string.
+
+    :returns: whether it can be written into generated C++ as an extent.
+    :rtype: bool
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_ ()+\-*]+", value):
+        return False
+    depth = 0
+    for character in value:
+        depth += (character == "(") - (character == ")")
+        if depth < 0:
+            return False
+    if depth:
+        return False
+    # Split on the operators rather than searching for names, so that a
+    # malformed token such as ``4nlayers`` is seen whole and refused instead
+    # of reading as a literal beside an identifier.
+    for token in re.split(r"[ ()+\-*]+", value):
+        if token and not (token.isdigit()
+                          or _IDENTIFIER.fullmatch(token)):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class KokkosScalar:
     """A scalar on the generated C ABI."""
@@ -32,6 +89,9 @@ class KokkosView:
     name: str
     data_name: str
     c_type: str
+    #: One integer expression per dimension, over the region's scalar
+    #: arguments and integer literals: ``nlayers``, ``4``, ``(nlayers + 1)``.
+    #: They are emitted into the generated C++ verbatim.
     extents: Tuple[str, ...]
     index_offsets: Tuple[int, ...] = ()
     extra_indices: Tuple[str, ...] = ()
@@ -47,9 +107,11 @@ class KokkosScratch:
     A Fortran automatic local such as ``real(r_def), dimension(nlayers) ::
     x_new`` crosses no interface, so it is described here rather than among
     the region's arguments: it must not appear in the generated C ABI, and it
-    is not a kernel formal the region has to account for. Its extents name
-    scalar arguments of the region, which is what lets the generated C++ size
-    it.
+    is not a kernel formal the region has to account for. Its extents are
+    integer expressions over the region's scalar arguments, such as
+    ``nlayers``, ``4`` or ``(nlayers + 1)``, which is what lets the generated
+    C++ size it: a scratch size is computed on the host before the launch,
+    where only those scalars are in scope.
 
     ``index_offsets`` and ``extra_indices`` are carried, and the latter is
     always empty, so that one array-reference table can hold both Views and
@@ -323,8 +385,9 @@ class KokkosWriter(CWriter):
             in :py:attr:`_SUPPORTED_TYPES`, or if a View's index offsets are
             not integers.
         :raises ValueError: if the region's name, its cell count, an argument
-            name, a kind name or a View's data name, extents or region indices
-            are not C++ identifiers; if the schedule contains a
+            name, a kind name or a View's data name or region indices are not
+            C++ identifiers; if a View's or a scratch array's extent is not an
+            integer expression over named sizes; if the schedule contains a
             :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
             share a C ABI name; if the cell count is not itself a scalar
             argument; if a kernel argument has no description; if a View
@@ -422,9 +485,10 @@ class KokkosWriter(CWriter):
 
         :raises ValueError: if the scratch is not a
             :py:class:`KokkosScratch`; if its name is not a C++ identifier or
-            is already taken; if it has no extents, or an extent that is not a
-            scalar argument of the region; or if its rank does not match the
-            index offsets supplied for it.
+            is already taken; if it has no extents, an extent that is not an
+            integer expression over named sizes, or an extent naming something
+            that is not a scalar argument of the region; or if its rank does
+            not match the index offsets supplied for it.
         :raises TypeError: if its C type is not in
             :py:attr:`_SUPPORTED_TYPES`, or its index offsets are not
             integers.
@@ -446,12 +510,20 @@ class KokkosWriter(CWriter):
                 f"'{scratch.c_type}'.")
         if not scratch.extents:
             raise ValueError(
-                f"Kokkos scratch '{scratch.name}' must have named extents.")
+                f"Kokkos scratch '{scratch.name}' must have extents.")
         for extent in scratch.extents:
-            if extent not in scalar_names:
+            if not is_extent(extent):
                 raise ValueError(
                     f"Kokkos scratch '{scratch.name}' has extent '{extent}' "
-                    "which is not a scalar argument.")
+                    "which is not an integer expression over named sizes.")
+            # Sorted for the same reason the transformation sorts: the
+            # refusal names one offender, and a set has no fixed order.
+            for name in sorted(extent_names(extent)):
+                if name not in scalar_names:
+                    raise ValueError(
+                        f"Kokkos scratch '{scratch.name}' has extent "
+                        f"'{extent}', which is sized from '{name}' rather "
+                        "than from a scalar argument.")
         if len(scratch.extents) != len(scratch.index_offsets):
             raise ValueError(
                 f"Kokkos scratch '{scratch.name}' dimensions do not match its "
@@ -469,9 +541,10 @@ class KokkosWriter(CWriter):
         :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
 
         :raises ValueError: if the View is managed, so would own LFRic
-            storage; if its data name, extents or region indices are not C++
-            identifiers; if its rank does not match the kernel and region
-            indices supplied for it; or if it is writable while asking for
+            storage; if its data name or region indices are not C++
+            identifiers; if an extent is not an integer expression over named
+            sizes; if its rank does not match the kernel and region indices
+            supplied for it; or if it is writable while asking for
             ``RandomAccess``.
         :raises TypeError: if its index offsets are not integers.
         """
@@ -481,9 +554,10 @@ class KokkosWriter(CWriter):
             raise ValueError(
                 f"Kokkos View data name '{view.data_name}' is invalid.")
         if not view.extents or not all(
-                self._is_identifier(extent) for extent in view.extents):
+                is_extent(extent) for extent in view.extents):
             raise ValueError(
-                f"Kokkos View '{view.name}' must have named extents.")
+                f"Kokkos View '{view.name}' must have extents that are "
+                "integer expressions over named sizes.")
         if len(view.extents) != (
                 len(view.index_offsets) + len(view.extra_indices)):
             raise ValueError(
@@ -628,4 +702,4 @@ class KokkosWriter(CWriter):
 
 
 __all__ = ["KokkosRegion", "KokkosScalar", "KokkosScratch", "KokkosView",
-           "KokkosWriter"]
+           "KokkosWriter", "extent_names", "is_extent"]

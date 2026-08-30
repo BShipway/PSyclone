@@ -13,7 +13,8 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter)
+    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
+    extent_names, is_extent)
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import CodeBlock, KernelSchedule, Routine
 
@@ -452,12 +453,25 @@ def test_kokkos_writer_views_are_never_managed():
     (KokkosScratch("x_new", "half", ("nlayers",), index_offsets=(1,)),
      "Kokkos scratch 'x_new' has unsupported C type 'half'."),
     (KokkosScratch("x_new", "double", ()),
-     "Kokkos scratch 'x_new' must have named extents."),
+     "Kokkos scratch 'x_new' must have extents."),
     (KokkosScratch("x_new", "double", ("nrows",), index_offsets=(1,)),
-     "Kokkos scratch 'x_new' has extent 'nrows' which is not a scalar "
-     "argument."),
+     "Kokkos scratch 'x_new' has extent 'nrows', which is sized from 'nrows' "
+     "rather than from a scalar argument."),
     (KokkosScratch("x_new", "double", ("y",), index_offsets=(1,)),
-     "Kokkos scratch 'x_new' has extent 'y' which is not a scalar argument."),
+     "Kokkos scratch 'x_new' has extent 'y', which is sized from 'y' rather "
+     "than from a scalar argument."),
+    (KokkosScratch("x_new", "double", ("nrows + 1",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent 'nrows + 1', which is sized from "
+     "'nrows' rather than from a scalar argument."),
+    (KokkosScratch("x_new", "double", ("nlayers / 2",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent 'nlayers / 2' which is not an integer "
+     "expression over named sizes."),
+    (KokkosScratch("x_new", "double", ("(nlayers",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent '(nlayers' which is not an integer "
+     "expression over named sizes."),
+    (KokkosScratch("x_new", "double", ("4nlayers",), index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent '4nlayers' which is not an integer "
+     "expression over named sizes."),
     (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1, 1)),
      "Kokkos scratch 'x_new' dimensions do not match its kernel indices."),
     (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=("1",)),
@@ -475,6 +489,83 @@ def test_kokkos_writer_rejects_invalid_scratch(scratch, message):
     with pytest.raises((ValueError, TypeError)) as error:
         KokkosWriter()(region)
     assert message in str(error.value)
+
+
+def test_kokkos_writer_takes_a_literal_extent():
+    """A dimension the kernel author wrote as a number is emitted as one.
+
+    A literal bound is what refuses 179 of the 183 loops the ``local-array``
+    catalogue row counts, so a literal reaching the generated C++ unchanged is
+    the whole of what this stage buys.
+    """
+    scratch = tuple(
+        replace(item, extents=("4",)) if item.name == "x_new" else item
+        for item in _scratch_region().scratch)
+    code = KokkosWriter()(_scratch_region(scratch=scratch))
+
+    assert "x_new_scratch_t::shmem_size(4)\n" in code
+    assert "x_new_scratch_t x_new(team.thread_scratch(0), 4);" in code
+    # The other array is still sized from a name, so the two forms coexist in
+    # one request rather than the writer having switched mode.
+    assert "+ tri_plus_new_scratch_t::shmem_size(nlayers);" in code
+
+
+def test_kokkos_writer_takes_an_arithmetic_extent():
+    """An extent may be an expression, and reaches both places verbatim."""
+    scratch = tuple(
+        replace(item, extents=("(nlayers + 1)",)) if item.name == "x_new"
+        else item
+        for item in _scratch_region().scratch)
+    code = KokkosWriter()(_scratch_region(scratch=scratch))
+
+    assert "x_new_scratch_t::shmem_size((nlayers + 1))\n" in code
+    assert "x_new_scratch_t x_new(team.thread_scratch(0), (nlayers + 1));" \
+        in code
+
+
+def test_kokkos_view_takes_an_expression_extent():
+    """A View sizes from an expression as scratch does.
+
+    ``_extents`` serves array formals and kernel-local arrays alike, so
+    widening it reaches Views whether or not an LFRic formal is ever declared
+    with a bound that is not a name.
+    """
+    arguments = tuple(
+        replace(argument, extents=("4", "ncells"))
+        if getattr(argument, "name", None) == "map" else argument
+        for argument in _scratch_region().arguments)
+    code = KokkosWriter()(_scratch_region(arguments=arguments))
+
+    assert "map(map_data, 4, ncells);" in code
+    # Still rank 2: a literal extent must not change how the View is typed.
+    assert "Kokkos::View<const int**, Kokkos::LayoutLeft, " in code
+
+
+@pytest.mark.parametrize("extent, accepted", [
+    ("nlayers", True), ("4", True), ("(nlayers + 1)", True),
+    ("nlayers + 1", True), ("2 * nlayers - 1", True), ("nlayers*4", True),
+    ("", False), ("   ", False), ("nlayers / 2", False), ("4nlayers", False),
+    ("(nlayers", False), ("nlayers)", False), (")nlayers(", False),
+    ("nlayers % 2", False), ("nlayers.size", False), (4, False), (None, False),
+])
+def test_is_extent(extent, accepted):
+    """The extent predicate accepts arithmetic and refuses everything else.
+
+    Division is refused rather than unsupported: Fortran and C++ can disagree
+    about the rounding of an integer division, and an extent is a place where
+    that would be silent. ``)nlayers(`` is here because a depth count that
+    only checked the total would accept it.
+    """
+    assert is_extent(extent) is accepted
+
+
+@pytest.mark.parametrize("extent, names", [
+    ("nlayers", {"nlayers"}), ("4", set()), ("(nlayers + 1)", {"nlayers"}),
+    ("2 * nrows - ncols", {"nrows", "ncols"}), (4, set()),
+])
+def test_extent_names(extent, names):
+    """An extent reports the sizes it is built from, and only those."""
+    assert extent_names(extent) == names
 
 
 def test_kokkos_writer_rejects_two_scratch_arrays_sharing_a_name():

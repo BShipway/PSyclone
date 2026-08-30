@@ -409,6 +409,52 @@ _UNSIZED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "dimension(nlayers) :: swept", "dimension(n_moist) :: swept")
 
 
+# The same kernel with one array declared the way apply_helmholtz_operator's
+# `coeff` is -- `dimension(max_length,4)` -- which is the commonest shape among
+# the kernels the catalogue's `local-array` row blocks. A literal bound is not
+# a Reference, so before extents were rendered rather than named this kernel
+# was refused whole.
+_LITERAL_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(nlayers,4) :: swept").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    swept(nlayers,1) = partial(nlayers)").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k,1) = swept(k + 1,1) - partial(k)").replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      field_out(map_w3(1) + k - 1) = swept(k,1)")
+
+
+# The same kernel with arithmetic in a bound. `dimension(nlayers+1)` is the
+# second tier of what a kernel author writes: still sized from a formal, but
+# not by naming one.
+_ARITHMETIC_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(nlayers+1) :: swept")
+
+
+# The same kernel with a lower bound written out and equal to 1. The rule is
+# about the rendered value, not the source text, so this is tier 1 wearing the
+# syntax of a tier the transformation refuses.
+_EXPLICIT_ONE_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(1:nlayers) :: swept")
+
+
+# The same kernel with a lower bound that is not 1. KokkosView and
+# KokkosScratch subtract a fixed 1 from each Fortran index, so this cannot be
+# described without index offsets becoming expressions.
+_LOWER_BOUND_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(0:nlayers-1) :: swept")
+
+
+# Arithmetic over a module constant rather than over a formal. Accepting
+# expressions must not have widened *which names* may appear in one: the
+# scratch size is still computed where only kernel arguments are in scope.
+_UNSIZED_EXPRESSION_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : n_moist").replace(
+    "dimension(nlayers) :: swept", "dimension(n_moist+1) :: swept")
+
+
 # The same kernel with a third local of a kind the ABI does not name. The
 # refusal is the one _validate_formals already makes for a formal, asked of a
 # local: the scratch View has to have a C element type.
@@ -630,6 +676,47 @@ def unsized_local_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel sizes a local by a module constant."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNSIZED_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="literal_local_target")
+# pylint: disable-next=unused-argument
+def literal_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local partly by a literal."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _LITERAL_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="arithmetic_local_target")
+# pylint: disable-next=unused-argument
+def arithmetic_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local by nlayers + 1."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ARITHMETIC_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="explicit_one_local_target")
+# pylint: disable-next=unused-argument
+def explicit_one_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel writes out a lower bound of 1."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _EXPLICIT_ONE_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="lower_bound_local_target")
+# pylint: disable-next=unused-argument
+def lower_bound_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local from zero."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOWER_BOUND_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="unsized_expression_target")
+# pylint: disable-next=unused-argument
+def unsized_expression_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local by n_moist + 1."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNSIZED_EXPRESSION_KERNEL)
 
 
 @pytest.fixture(name="unmapped_local_target")
@@ -1352,8 +1439,130 @@ def test_lfric_kokkos_trans_keeps_the_flat_launch_for_scalar_locals(
     assert "float scaled;" in cpp
 
 
+def test_lfric_kokkos_trans_takes_a_literal_extent(literal_local_target):
+    """A local declared ``dimension(nlayers,4)`` is captured, not refused.
+
+    This is ``apply_helmholtz_operator_code``'s ``coeff`` in miniature, and
+    the reason this widening exists: a literal bound refuses 179 of the 183
+    loops the catalogue's ``local-array`` row counts, and that kernel is one
+    of them.
+    """
+    psy, loop, kernel = literal_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._extents(
+        schedule.symbol_table.lookup("swept")) == ("nlayers", "4")
+    # The literal is not a kernel argument and must not be asked to be one.
+    assert LFRicKokkosTrans._extent_names(
+        schedule.symbol_table.lookup("swept")) == {"nlayers"}
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "swept_scratch_t::shmem_size(nlayers, 4)" in cpp
+    assert "swept_scratch_t swept(team.thread_scratch(0), nlayers, 4);" in cpp
+    assert ("using swept_scratch_t = Kokkos::View<double**, "
+            "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;" in cpp)
+    # Both indices lose their Fortran base, not just the first.
+    assert "swept((k - 1), (1 - 1))" in cpp
+    # Nothing about it reaches the ABI, as for any other scratch array.
+    assert "swept" not in str(psy.gen)
+
+
+def test_lfric_kokkos_trans_takes_an_arithmetic_extent(
+        arithmetic_local_target):
+    """A local declared ``dimension(nlayers+1)`` is captured."""
+    _, loop, kernel = arithmetic_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("swept")
+
+    assert LFRicKokkosTrans._extents(symbol) == ("(nlayers + 1)",)
+    assert LFRicKokkosTrans._extent_names(symbol) == {"nlayers"}
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "swept_scratch_t::shmem_size((nlayers + 1))" in cpp
+    assert ("swept_scratch_t swept(team.thread_scratch(0), (nlayers + 1));"
+            in cpp)
+
+
+def test_lfric_kokkos_trans_takes_an_explicit_lower_bound_of_one(
+        explicit_one_local_target):
+    """``dimension(1:nlayers)`` is accepted; the rule is about the value.
+
+    A rule written against the source text would refuse this, since it is
+    spelt like the ``dimension(0:nlayers-1)`` case that is out of reach. The
+    lower bound is rendered and compared instead.
+    """
+    _, loop, kernel = explicit_one_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._extents(
+        schedule.symbol_table.lookup("swept")) == ("nlayers",)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "swept_scratch_t swept(team.thread_scratch(0), nlayers);" in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_lower_bound_that_is_not_one(
+        lower_bound_local_target):
+    """``dimension(0:nlayers-1)`` is refused, naming the lower bound.
+
+    The generated View subtracts a fixed 1 from each Fortran index, so a
+    different base would need index offsets to become expressions. That is a
+    capability of its own; this is the boundary it starts at, asserted rather
+    than assumed.
+    """
+    _, loop, _ = lower_bound_local_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'swept'" in str(error.value)
+    assert "lower bound of 1" in str(error.value)
+    assert "found '0'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_an_unsizable_expression(
+        unsized_expression_target):
+    """``dimension(n_moist+1)`` is refused, naming the module constant.
+
+    Accepting arithmetic widened what an extent may be shaped like, not what
+    may appear in one: the scratch size is still computed by the launch,
+    where only kernel arguments are in scope.
+    """
+    _, loop, _ = unsized_expression_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "n_moist" in str(error.value)
+    assert "kernel-local array 'swept'" in str(error.value)
+    assert "kernel argument" in str(error.value)
+
+
 @pytest.mark.parametrize("fixture_name", [
-    "unsized_local_target", "unmapped_local_target"])
+    "literal_local_target", "arithmetic_local_target",
+    "explicit_one_local_target"])
+def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
+        fixture_name, request):
+    """Every widened shape passes ``validate`` as well as ``apply``.
+
+    The agreement between the two is the property Task 3a.4 established, and
+    it holds in the accepting direction as well as the refusing one: a
+    transformation whose ``validate`` were stricter than its ``apply`` would
+    report a capturable loop as blocked and understate its own coverage.
+    """
+    _, loop, _ = request.getfixturevalue(fixture_name)
+    trans = LFRicKokkosTrans()
+
+    trans.validate(loop)
+    assert trans.apply(loop)
+
+
+@pytest.mark.parametrize("fixture_name", [
+    "unsized_local_target", "unmapped_local_target",
+    "lower_bound_local_target", "unsized_expression_target"])
 def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
         fixture_name, request):
     """Both refusals are made by ``validate``, not discovered by ``apply``.
