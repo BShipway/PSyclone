@@ -4136,8 +4136,13 @@ array keeps the flat launch. An extent -- of an array argument or of such a
 temporary -- is read as a declared bound rather than as a name, so
 ``dimension(max_length,4)`` and ``dimension(nlayers+1)`` are accepted as
 readily as ``dimension(nlayers)``; what is required is an integer expression
-over the kernel's own arguments and literals. The contract it accepts, and
-the reasons it refuses, are given in its documentation below.
+over the kernel's own arguments and literals. A body that asks an array for
+its shape -- ``LBOUND``, ``UBOUND`` or ``SIZE`` -- is answered from that same
+declaration rather than at run time, so the region carries the declared bound
+instead of querying a View. Most such calls are written by PSyclone rather
+than by the kernel author: lowering a whole-array assignment to an explicit
+loop puts a pair of them into its bounds. The contract it accepts, and the
+reasons it refuses, are given in its documentation below.
 
 The LFRic API-specific transformations currently available
 are given below. Early transformations include "Dynamo0p3" or "Dynamo"

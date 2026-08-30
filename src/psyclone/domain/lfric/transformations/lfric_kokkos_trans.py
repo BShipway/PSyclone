@@ -85,6 +85,19 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     reason quoted. A section outside an assignment altogether is beyond what
     lowering can reach and is refused before the backend sees it.
 
+    ``LBOUND``, ``UBOUND`` and ``SIZE`` are resolved from the declaration
+    rather than evaluated. Each is replaced by the bound the kernel's own
+    symbol table gives, so ``UBOUND(partial, 1)`` on a local declared
+    ``dimension(nlayers)`` becomes ``nlayers`` and the region never asks a
+    View for a shape the Fortran has already stated. Most of them are not
+    written by the kernel author at all: the section lowering above puts them
+    into the loop bounds of every full-extent assignment it rewrites, which is
+    why the substitution runs after that lowering rather than before it. What
+    is required is a plain reference to a declared array and a dimension given
+    as an integer literal within its rank -- ``SIZE(a)`` needs no dimension
+    only when ``a`` is rank 1 -- and the extents themselves must satisfy the
+    grammar described below, whose refusal is passed through unchanged.
+
     A kernel-local automatic array -- a temporary such as
     ``real(kind=r_def), dimension(nlayers) :: x_new``, whose extent is known
     only at runtime -- is placed in Kokkos team scratch, one private View per
@@ -143,9 +156,9 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
 
         :raises TransformationError: if ``node`` is not an LFRicLoop, or if
             its bounds, its kernel's metadata, its body, its array sections,
-            its formal arguments, its local arrays or the module constants it
-            reads fall outside the contract stated in this class's
-            description.
+            its shape enquiries, its formal arguments, its local arrays or the
+            module constants it reads fall outside the contract stated in this
+            class's description.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
@@ -158,6 +171,7 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
         schedule = self._schedule(kernel)
         self._validate_body(schedule)
         self._validate_sections(schedule)
+        self._validate_bounds(schedule)
         self._validate_formals(schedule)
         self._validate_locals(schedule)
         self._constants(schedule)
@@ -423,6 +437,51 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
                 lowering.apply(assignment)
 
     @classmethod
+    def _validate_bounds(cls, schedule):
+        """Check that every shape enquiry resolves to a declared bound.
+
+        Predicts :py:meth:`_substitute_bounds` over a copy, as
+        :py:meth:`_validate_sections` predicts the lowering, because that
+        substitution mutates the schedule and :py:meth:`validate` must leave
+        it as it found it.
+
+        The copy is lowered first. ``ArrayAssignment2LoopsTrans`` is a
+        *producer* of ``LBOUND`` and ``UBOUND``, writing them into the loop
+        bounds of every full-extent section it rewrites, so checking before
+        the lowering would miss the calls the transformation itself creates.
+        On a schedule that is already lowered -- which is what the coverage
+        survey hands this method -- the lowering is a no-op, so the one
+        method serves both callers. The cost is a second schedule copy per
+        validation, taken so that each predicate stays readable alone.
+
+        A schedule whose sections cannot be lowered says nothing about its
+        bounds that :py:meth:`_validate_sections` has not already said, so
+        that failure is passed over rather than re-reported. Reaching it means
+        this method was called on its own, as the coverage survey calls each
+        predicate independently; from :py:meth:`validate` the section check
+        has refused the schedule before this runs.
+
+        :param schedule: the kernel schedule to be captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if a shape enquiry cannot be resolved
+            from the declaration, for any of the reasons
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosTypesMixin._substitute_bounds` gives.
+        """
+        probe = schedule.copy()
+        try:
+            cls._lower_sections(probe)
+        except TransformationError:
+            return
+        try:
+            cls._substitute_bounds(probe)
+        except TransformationError as err:
+            raise TransformationError(
+                "LFRicKokkosTrans cannot resolve an array bound from its "
+                f"declaration: {err}") from err
+
+    @classmethod
     def _validate_formals(cls, schedule):
         """Check that every kernel formal has a place on the C ABI.
 
@@ -501,7 +560,8 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
         """Generate C++ and replace ``node`` with the typed launch call.
 
         Unlike :py:meth:`validate`, this alters the kernel schedule: any
-        array section it holds is lowered to an explicit loop before the
+        array section it holds is lowered to an explicit loop, and every shape
+        enquiry is replaced by the bound its declaration gives, before the
         region is described.
 
         :param node: the loop to capture as a Kokkos region.
@@ -524,6 +584,7 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
         self._lower_sections(schedule)
+        self._substitute_bounds(schedule)
 
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.

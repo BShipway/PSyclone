@@ -51,9 +51,9 @@ import re
 from psyclone.configuration import Config
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos import extent_names, is_extent
-from psyclone.psyir.nodes import Literal, Reference
+from psyclone.psyir.nodes import IntrinsicCall, Literal, Reference
 from psyclone.psyir.symbols import (
-    ArrayType, ImportInterface, RoutineSymbol, ScalarType,
+    ArrayType, DataSymbol, ImportInterface, RoutineSymbol, ScalarType,
     UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
 
@@ -96,6 +96,15 @@ class LFRicKokkosTypesMixin:
         ScalarType.Intrinsic.INTEGER: "1",
         ScalarType.Intrinsic.REAL: "1.0",
     }
+
+    #: The shape enquiries answered from an array's declaration rather than
+    #: from the array itself. A ``Kokkos::View`` does carry an ``extent``, but
+    #: asking it would make the generated code depend on a shape the Fortran
+    #: has already stated, so :py:meth:`_substitute_bounds` replaces each of
+    #: these with the declared bound before the backend sees it.
+    _BOUND_INTRINSICS = (IntrinsicCall.Intrinsic.LBOUND,
+                         IntrinsicCall.Intrinsic.UBOUND,
+                         IntrinsicCall.Intrinsic.SIZE)
 
     @classmethod
     def _supported_kinds(cls):
@@ -291,6 +300,104 @@ class LFRicKokkosTypesMixin:
         for extent in cls._extents(symbol):
             names |= extent_names(extent)
         return names
+
+    @classmethod
+    def _substitute_bounds(cls, schedule):
+        """Replace every shape enquiry with the bound its declaration gives.
+
+        ``LBOUND``, ``UBOUND`` and ``SIZE`` are resolved symbolically against
+        the symbol table, not evaluated: each call is replaced by a **copy of
+        the declared bound's PSyIR**, so the backend renders it by the path it
+        renders any other expression and no new writer support is needed.
+        ``UBOUND`` and ``SIZE`` give the same node, because
+        :py:meth:`_extents` has already required the lower bound to be 1.
+
+        The schedule is mutated in place, which is why :py:meth:`validate`
+        predicts this over a copy rather than running it.
+
+        :param schedule: the kernel schedule to be captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if a shape enquiry's first argument is
+            not a plain reference to a declared array, if its dimension is not
+            an integer literal within the array's rank, or if a rank-2 or
+            higher array is asked for its ``SIZE`` without one.
+        :raises TransformationError: as :py:meth:`_extents` does, unwrapped,
+            so a reader gets the extent grammar's own message rather than a
+            paraphrase of it.
+        """
+        for call in schedule.walk(IntrinsicCall):
+            if call.intrinsic not in cls._BOUND_INTRINSICS:
+                continue
+            symbol, dimension = cls._bound_target(call)
+            cls._extents(symbol)
+            if call.intrinsic is IntrinsicCall.Intrinsic.LBOUND:
+                replacement = Literal("1", ScalarType.integer_type())
+            else:
+                # The tree is a live piece of the symbol's datatype.
+                replacement = symbol.datatype.shape[dimension - 1].upper.copy()
+            call.replace_with(replacement)
+
+    @staticmethod
+    def _bound_target(call):
+        """Return the array a shape enquiry asks about and which dimension.
+
+        :param call: the ``LBOUND``, ``UBOUND`` or ``SIZE`` call.
+        :type call: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+
+        :returns: the declared array and the 1-based dimension asked for.
+        :rtype: tuple[:py:class:`psyclone.psyir.symbols.DataSymbol`, int]
+
+        :raises TransformationError: if the first argument is not a plain
+            reference to a declared array, rather than an element of one, a
+            component of a structure or a symbol of unknown type.
+        :raises TransformationError: if the dimension is given by anything
+            other than an integer literal, is outside the array's rank, or is
+            omitted for anything but ``SIZE`` of a rank-1 array.
+        """
+        name = call.intrinsic.name
+        arguments = call.arguments
+        # An ArrayReference is a Reference, and asking one of these about an
+        # element rather than the array is a different question, so the test
+        # is for the exact type. isinstance would accept the element, and
+        # naming the subclasses to exclude would miss the next one added.
+        # pylint: disable-next=unidiomatic-typecheck
+        if not arguments or type(arguments[0]) is not Reference:
+            raise TransformationError(
+                f"LFRicKokkosTrans requires the first argument of '{name}' to "
+                "be a plain reference to a declared array.")
+        symbol = arguments[0].symbol
+        if (not isinstance(symbol, DataSymbol) or
+                not isinstance(symbol.datatype, ArrayType)):
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot resolve '{name}' of "
+                f"'{symbol.name}', which is not declared as an array.")
+        rank = len(symbol.datatype.shape)
+        if len(arguments) == 1:
+            if call.intrinsic is not IntrinsicCall.Intrinsic.SIZE or rank != 1:
+                raise TransformationError(
+                    f"LFRicKokkosTrans requires '{name}' of "
+                    f"'{symbol.name}' to name a dimension, since "
+                    f"'{symbol.name}' is declared with rank {rank}.")
+            return symbol, 1
+        # Anything past the second argument is 'kind', which asks about the
+        # result's type rather than the array's shape.
+        named = [given for given in call.argument_names[1:]
+                 if given is not None and given.lower() != "dim"]
+        dimension = arguments[1]
+        if (len(arguments) > 2 or named or
+                not isinstance(dimension, Literal) or
+                dimension.datatype.intrinsic != ScalarType.Intrinsic.INTEGER):
+            raise TransformationError(
+                f"LFRicKokkosTrans requires the dimension of '{name}' of "
+                f"'{symbol.name}' to be an integer literal.")
+        index = int(dimension.value)
+        if not 1 <= index <= rank:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot resolve '{name}' of '{symbol.name}' "
+                f"in dimension {index}, since it is declared with rank "
+                f"{rank}.")
+        return symbol, index
 
     @classmethod
     def _constants(cls, schedule):

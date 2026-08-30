@@ -471,6 +471,79 @@ _UNMAPPED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "      end if")
 
 
+# The same kernel asking three shape enquiries of arrays it already declares.
+# LBOUND and UBOUND of a local, and SIZE of a formal, all of which the
+# declaration answers: the region never asks a View for a shape the Fortran
+# has stated.
+_BOUND_KERNEL = _LOCAL_KERNEL.replace(
+    "    do k = 2, nlayers",
+    "    do k = lbound(partial, 1) + 1, ubound(partial, 1)").replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      field_out(map_w3(1) + k - 1) = swept(k) + size(field_in)")
+
+
+# SIZE in a dimension other than the first, of a rank-2 local. The literal
+# bound is the answer, so the substitution has to reach the second entry of
+# the declared shape rather than assuming the first.
+_RANK_TWO_BOUND_KERNEL = _LITERAL_LOCAL_KERNEL.replace(
+    "      swept(k,1) = swept(k + 1,1) - partial(k)",
+    "      swept(k,1) = swept(k + 1,1) - partial(k) * size(swept, 2)")
+
+
+# SIZE of the same rank-2 local without naming a dimension. Valid Fortran --
+# it returns the total element count -- but not a bound of any one dimension,
+# and the region has no way to say it.
+_WHOLE_SIZE_KERNEL = _LITERAL_LOCAL_KERNEL.replace(
+    "      swept(k,1) = swept(k + 1,1) - partial(k)",
+    "      swept(k,1) = swept(k + 1,1) - partial(k) * size(swept)")
+
+
+# SIZE of a scalar formal. fparser2 parses it, since the check that would
+# refuse it is semantic rather than syntactic, so the transformation is what
+# has to notice.
+_SCALAR_BOUND_KERNEL = _LOCAL_KERNEL.replace(
+    "    do k = 2, nlayers", "    do k = 2, size(nlayers)")
+
+
+# UBOUND of one element of an array rather than of the array. An
+# ArrayReference is a Reference, so the test has to be for the exact type or
+# an element's bound is read as the array's.
+_ELEMENT_BOUND_KERNEL = _LOCAL_KERNEL.replace(
+    "    do k = 2, nlayers", "    do k = 2, ubound(map_w3(1), 1)")
+
+
+# A dimension given by a variable. The substitution is symbolic, against the
+# declaration, so it has to know which entry of the shape to take before the
+# region runs.
+_VARIABLE_BOUND_KERNEL = _LOCAL_KERNEL.replace(
+    "    do k = 2, nlayers", "    do k = 2, ubound(partial, k)")
+
+
+# A dimension outside the declared rank. Fortran would refuse it, but nothing
+# between the source and the backend does.
+_OUT_OF_RANGE_BOUND_KERNEL = _LOCAL_KERNEL.replace(
+    "    do k = 2, nlayers", "    do k = 2, ubound(partial, 2)")
+
+
+# UBOUND of an array whose lower bound is not 1. The extent grammar already
+# refuses that declaration, and the enquiry inherits the refusal rather than
+# paraphrasing it, because the answer depends on the same bounds.
+_LOWER_BOUND_ENQUIRY_KERNEL = _LOWER_BOUND_LOCAL_KERNEL.replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    swept(ubound(swept, 1)) = partial(nlayers)")
+
+
+# A whole-array assignment, which is where these enquiries mostly come from:
+# the lowering writes LBOUND and UBOUND into the loop bounds of every
+# full-extent section it rewrites, so they are produced by the transformation
+# rather than by the kernel author.
+_FULL_SECTION_KERNEL = _SECTION_KERNEL.replace(
+    "    difference(w3_idx : w3_idx + nl) = &\n"
+    "        mass_flux(b_idx + 1 : b_idx + nl + 1) "
+    "- mass_flux(b_idx : b_idx + nl)",
+    "    difference(:) = difference(:) + (b_idx + nl)")
+
+
 # A kind-polymorphic kernel: one metadata name over several implementations
 # that differ only in the precision of their real arguments. Built from a
 # template rather than written out three times because the three fixtures below
@@ -725,6 +798,81 @@ def unmapped_local_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel holds a local array of a logical kind."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNMAPPED_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="bound_target")
+# pylint: disable-next=unused-argument
+def bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel asks for LBOUND, UBOUND and SIZE."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _BOUND_KERNEL)
+
+
+@pytest.fixture(name="rank_two_bound_target")
+# pylint: disable-next=unused-argument
+def rank_two_bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke asking the SIZE of a rank-2 local's second axis."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _RANK_TWO_BOUND_KERNEL)
+
+
+@pytest.fixture(name="whole_size_target")
+# pylint: disable-next=unused-argument
+def whole_size_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke asking the SIZE of a rank-2 local with no dimension."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _WHOLE_SIZE_KERNEL)
+
+
+@pytest.fixture(name="scalar_bound_target")
+# pylint: disable-next=unused-argument
+def scalar_bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke asking the SIZE of a scalar formal."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _SCALAR_BOUND_KERNEL)
+
+
+@pytest.fixture(name="element_bound_target")
+# pylint: disable-next=unused-argument
+def element_bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke asking the UBOUND of one array element."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ELEMENT_BOUND_KERNEL)
+
+
+@pytest.fixture(name="variable_bound_target")
+# pylint: disable-next=unused-argument
+def variable_bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose UBOUND names its dimension with a variable."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _VARIABLE_BOUND_KERNEL)
+
+
+@pytest.fixture(name="out_of_range_bound_target")
+# pylint: disable-next=unused-argument
+def out_of_range_bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke asking for a dimension past the declared rank."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _OUT_OF_RANGE_BOUND_KERNEL)
+
+
+@pytest.fixture(name="lower_bound_enquiry_target")
+# pylint: disable-next=unused-argument
+def lower_bound_enquiry_target_fixture(tmp_path,
+                                       clear_module_manager_instance):
+    """Create an invoke asking the UBOUND of an array based other than at 1."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _LOWER_BOUND_ENQUIRY_KERNEL)
+
+
+@pytest.fixture(name="full_section_target")
+# pylint: disable-next=unused-argument
+def full_section_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel assigns a whole array at once."""
+    return _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM, _FULL_SECTION_KERNEL)
 
 
 @pytest.fixture(name="polymorphic_target")
@@ -1581,3 +1729,212 @@ def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
         trans.apply(loop)
 
     assert str(predicted.value) == str(attempted.value)
+
+
+def test_lfric_kokkos_trans_resolves_bounds_from_the_declaration(
+        bound_target):
+    """LBOUND, UBOUND and SIZE become the bounds the kernel declared.
+
+    Each is answered symbolically, against the symbol table, so the generated
+    region carries the declared bound as an expression rather than a call.
+    The loop is the evidence: its start is ``LBOUND(partial, 1) + 1`` and its
+    end is ``UBOUND(partial, 1)``, and both have to have gone before the
+    backend sees them.
+    """
+    _, loop, _ = bound_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "for(k=(1 + 1); k<=nlayers; k+=1)" in cpp
+    # SIZE of a formal declared dimension(undf_w3), read in an expression
+    # rather than as a bound.
+    assert "(swept((k - 1)) + undf_w3)" in cpp
+    # Nothing of the enquiries survives into the region. A bare "size(" would
+    # match shmem_size, team_size and league_size, so the one call the kernel
+    # made is named instead.
+    for name in ("LBOUND", "UBOUND", "SIZE", "lbound(", "ubound(",
+                 "size(field_in)"):
+        assert name not in cpp
+
+
+def test_lfric_kokkos_trans_resolves_a_bound_in_a_later_dimension(
+        rank_two_bound_target):
+    """``SIZE(swept, 2)`` takes the second entry of the declared shape.
+
+    A rank-2 local declared ``dimension(nlayers,4)`` answers its second
+    dimension with a literal, so the substitution has to index the shape
+    rather than assume the first entry.
+    """
+    _, loop, _ = rank_two_bound_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "(partial((k - 1)) * 4)" in cpp
+    assert "swept_scratch_t::shmem_size(nlayers, 4)" in cpp
+
+
+def test_lfric_kokkos_trans_resolves_a_lowered_full_section(
+        full_section_target):
+    """The bounds the lowering itself writes are substituted too.
+
+    ``difference(:)`` is rewritten to an explicit loop by
+    ``ArrayAssignment2LoopsTrans``, which writes ``LBOUND`` and ``UBOUND``
+    into that loop's bounds. They are produced by the transformation rather
+    than by the kernel author, which is why the substitution runs after the
+    lowering and not before it.
+    """
+    _, loop, _ = full_section_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "for(idx=1; idx<=undf_w3; idx+=1)" in cpp
+    assert "difference((idx - 1)) = (difference((idx - 1)) + (b_idx + nl));" \
+        in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_bound_of_a_scalar(scalar_bound_target):
+    """``SIZE`` of a scalar is refused, naming the symbol.
+
+    fparser2 parses it, the check that would refuse it being semantic rather
+    than syntactic, so the transformation is the first thing in the chain
+    that can notice.
+    """
+    _, loop, _ = scalar_bound_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot resolve 'SIZE' of 'nlayers', which is not declared as an "
+            "array" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_bound_of_an_element(
+        element_bound_target):
+    """``UBOUND(map_w3(1), 1)`` asks about an element, not about the array.
+
+    An ``ArrayReference`` is a ``Reference``, so a test that accepted any
+    reference would read this as the array's bound and generate the wrong
+    answer silently.
+    """
+    _, loop, _ = element_bound_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires the first argument of 'UBOUND' to be a plain reference "
+            "to a declared array" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_variable_dimension(
+        variable_bound_target):
+    """A dimension given by a variable cannot be resolved from the table."""
+    _, loop, _ = variable_bound_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires the dimension of 'UBOUND' of 'partial' to be an "
+            "integer literal" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_dimension_past_the_rank(
+        out_of_range_bound_target):
+    """A dimension outside the declared rank is refused rather than indexed."""
+    _, loop, _ = out_of_range_bound_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot resolve 'UBOUND' of 'partial' in dimension 2, since it is "
+            "declared with rank 1" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_whole_size_above_rank_one(
+        whole_size_target):
+    """``SIZE(a)`` on a rank-2 array is a count, not a bound.
+
+    It is valid Fortran and has a well-defined value, so the refusal is about
+    what the region can express rather than about the source being wrong: no
+    one entry of the declared shape answers it.
+    """
+    _, loop, _ = whole_size_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires 'SIZE' of 'swept' to name a dimension, since 'swept' is "
+            "declared with rank 2" in str(error.value))
+
+
+def test_lfric_kokkos_trans_inherits_the_extent_grammar_refusal(
+        lower_bound_enquiry_target):
+    """A bound of an array based other than at 1 gets the grammar's message.
+
+    ``_extents`` already refuses that declaration, and the enquiry depends on
+    the same bounds, so its refusal is passed through rather than paraphrased
+    -- a reader gets the sentence that says which rule was broken.
+    """
+    _, loop, _ = lower_bound_enquiry_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires 'swept' to be declared with a lower bound of 1, but "
+            "found '0'" in str(error.value))
+
+
+@pytest.mark.parametrize("fixture_name", [
+    "scalar_bound_target", "element_bound_target", "variable_bound_target",
+    "out_of_range_bound_target", "whole_size_target"])
+def test_lfric_kokkos_trans_validate_and_apply_agree_on_bounds(
+        fixture_name, request):
+    """Every bound refusal is made by ``validate``, not found by ``apply``."""
+    _, loop, _ = request.getfixturevalue(fixture_name)
+    trans = LFRicKokkosTrans()
+
+    with pytest.raises(TransformationError) as predicted:
+        trans.validate(loop)
+    with pytest.raises(TransformationError) as attempted:
+        trans.apply(loop)
+
+    assert str(predicted.value) == str(attempted.value)
+
+
+def test_lfric_kokkos_trans_validate_leaves_bounds_alone(bound_target):
+    """``validate`` predicts the substitution over a copy.
+
+    The schedule it is handed is cached by ``LFRicKern.get_callees``, so a
+    substitution made during validation would persist and a second call would
+    see a schedule with no enquiries left in it.
+    """
+    _, loop, kernel = bound_target
+
+    LFRicKokkosTrans().validate(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert any(call.intrinsic in LFRicKokkosTrans._BOUND_INTRINSICS
+               for call in schedule.walk(IntrinsicCall))
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_bounds_defer_to_the_section_refusal(
+        tmp_path, clear_module_manager_instance):
+    """An unlowerable section is not re-reported as a bound problem.
+
+    ``_validate_bounds`` has to lower a copy before it can see the bounds the
+    lowering writes, so a schedule the lowering refuses leaves it with nothing
+    to check. ``_validate_sections`` owns that refusal, and the coverage
+    survey calls each predicate independently, so reporting it twice would
+    make one fact look like two blocked patterns.
+    """
+    # pylint: disable-next=unused-variable
+    _, loop, kernel = _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM,
+        _DEPENDENT_SECTION_KERNEL)
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    LFRicKokkosTrans._validate_bounds(schedule)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_sections(schedule)
+    assert "cannot lower an array section to a loop" in str(error.value)
