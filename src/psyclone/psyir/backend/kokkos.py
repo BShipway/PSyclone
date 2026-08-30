@@ -283,7 +283,7 @@ class KokkosWriter(CWriter):
             "      }\n"
             f"{constructions}"
             f"{local_declarations}{body}"
-            "        });\n"
+            "    });\n"
             "  };\n\n"
             "  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)\n"
             "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes));\n"

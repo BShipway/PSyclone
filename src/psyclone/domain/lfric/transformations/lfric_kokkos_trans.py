@@ -15,7 +15,7 @@ from psyclone.domain.lfric import KernCallArgList, LFRicConstants, LFRicLoop
 from psyclone.errors import GenerationError
 from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosView, KokkosWriter)
+    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter)
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Literal, Loop,
@@ -89,6 +89,22 @@ class LFRicKokkosTrans(Transformation):
     reason quoted. A section outside an assignment altogether is beyond what
     lowering can reach and is refused before the backend sees it.
 
+    A kernel-local automatic array -- a temporary such as
+    ``real(kind=r_def), dimension(nlayers) :: x_new``, whose extent is known
+    only at runtime -- is placed in Kokkos team scratch, one private View per
+    team rank, so that the cells sharing a team do not share a temporary. The
+    region is then launched over a ``TeamPolicy`` rather than a
+    ``RangePolicy``; a kernel with no array locals keeps the flat launch.
+
+    That placement is what the two refusals protect. The array's element kind
+    must be one the ABI names, as a formal's must, and each of its extents
+    must be a **kernel argument**: the launch computes its scratch size before
+    it enters the region, so an extent it cannot name there cannot be sized.
+    A module constant is refused as an extent for that reason even though the
+    body may read one elsewhere. Both are refused by :py:meth:`validate`
+    rather than discovered by :py:meth:`apply`. A scalar local needs no
+    scratch and is declared in the region body as before.
+
     It captures all information needed by the Kokkos backend before lowering
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
     halo-dirty calls are retained, and only the resulting generic loop is
@@ -160,8 +176,9 @@ class LFRicKokkosTrans(Transformation):
 
         :raises TransformationError: if ``node`` is not an LFRicLoop, or if
             its bounds, its kernel's metadata, its body, its array sections,
-            its formal arguments or the module constants it reads fall
-            outside the contract stated in this class's description.
+            its formal arguments, its local arrays or the module constants it
+            reads fall outside the contract stated in this class's
+            description.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
@@ -175,6 +192,7 @@ class LFRicKokkosTrans(Transformation):
         self._validate_body(schedule)
         self._validate_sections(schedule)
         self._validate_formals(schedule)
+        self._validate_locals(schedule)
         self._constants(schedule)
 
     @staticmethod
@@ -469,6 +487,45 @@ class LFRicKokkosTrans(Transformation):
                         f"LFRicKokkosTrans needs the extent '{extent}' of "
                         f"'{symbol.name}' to be a kernel argument, so that "
                         "the generated View can be sized.")
+
+    @classmethod
+    def _validate_locals(cls, schedule):
+        """Check that every kernel-local array can be placed in team scratch.
+
+        An automatic array is a per-cell temporary whose extent is a runtime
+        value, so the region gives each team rank its own scratch View of it.
+        Sizing that View is what the two refusals below protect: the element
+        type has to be one the ABI names, and the extent has to be a value
+        the launch already holds, which is a kernel argument.
+
+        A module constant is refused as an extent even though
+        :py:meth:`_constants` could import one, because the launch computes
+        its scratch size before it enters the region.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if a local array's kind is not one
+            :py:attr:`_C_TYPES` maps, or if one of its extents is not a
+            kernel argument, so the scratch View could not be sized.
+        """
+        table = schedule.symbol_table
+        names = {symbol.name for symbol in table.argument_list}
+        for symbol in table.automatic_datasymbols:
+            if not symbol.is_array:
+                continue
+            if cls._c_type(symbol) is None:
+                raise TransformationError(
+                    f"LFRicKokkosTrans supports {cls._supported_kinds()} "
+                    f"kernel-local array kinds only, but '{symbol.name}' has "
+                    f"'{cls._kind_name(symbol)}'.")
+            for extent in cls._extents(symbol):
+                if extent not in names:
+                    raise TransformationError(
+                        f"LFRicKokkosTrans needs the extent '{extent}' of "
+                        f"the kernel-local array '{symbol.name}' to be a "
+                        "kernel argument, so that the generated scratch can "
+                        "be sized.")
 
     @classmethod
     def _supported_kinds(cls):
@@ -780,7 +837,8 @@ class LFRicKokkosTrans(Transformation):
             schedule=schedule,
             cell_count=self._CELL_COUNT,
             arguments=self._region_arguments(schedule, per_cell, constants),
-            kind_types=self._kind_types(schedule))
+            kind_types=self._kind_types(schedule),
+            scratch=self._local_arrays(schedule))
         try:
             cpp = KokkosWriter()(region)
         except (VisitorError, ValueError, TypeError) as err:
@@ -894,6 +952,35 @@ class LFRicKokkosTrans(Transformation):
         arguments.extend(
             KokkosScalar(name, c_type) for name, _, c_type in constants)
         return tuple(arguments)
+
+    @classmethod
+    def _local_arrays(cls, schedule):
+        """Describe the kernel's automatic arrays as team scratch.
+
+        Each one becomes a scratch View private to the team rank running the
+        cell, which is what makes the region's per-cell temporaries per-cell.
+        A scalar local needs none of this and is declared in the region body,
+        so only arrays appear here.
+
+        :py:meth:`_validate_locals` has already refused anything this could
+        not describe.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: one description per automatic array, in declaration order.
+        :rtype: tuple[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`, ...]
+        """
+        scratch = []
+        for symbol in schedule.symbol_table.automatic_datasymbols:
+            if not symbol.is_array:
+                continue
+            extents = cls._extents(symbol)
+            scratch.append(KokkosScratch(
+                symbol.name, cls._c_type(symbol), extents,
+                index_offsets=(1,) * len(extents)))
+        return tuple(scratch)
 
     @staticmethod
     def _import_constant(symbol_table, name, container):
