@@ -39,7 +39,8 @@
 
 import pytest
 
-from psyclone.psyir.backend.c import CWriter
+from psyclone.errors import InternalError
+from psyclone.psyir.backend.c import CWriter, _is_real_argument
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayReference, Assignment, BinaryOperation, CodeBlock, IfBlock, Literal,
@@ -47,7 +48,7 @@ from psyclone.psyir.nodes import (
     OMPTaskloopDirective, OMPMasterDirective, OMPParallelDirective,
     IntrinsicCall, OMPBarrierDirective)
 from psyclone.psyir.symbols import (
-    ArgumentInterface, ArrayType, ScalarType, DataSymbol)
+    ArgumentInterface, ArrayType, ScalarType, DataSymbol, UnresolvedType)
 
 
 def test_cw_gen_declaration():
@@ -376,18 +377,23 @@ def test_cw_intrinsiccall():
                  (IntrinsicCall.Intrinsic.ACOS, 'acos(a)'),
                  (IntrinsicCall.Intrinsic.ASIN, 'asin(a)'),
                  (IntrinsicCall.Intrinsic.ATAN, 'atan(a)'),
-                 (IntrinsicCall.Intrinsic.ABS, 'abs(a)'),
-                 (IntrinsicCall.Intrinsic.REAL, '(float)a'))
+                 (IntrinsicCall.Intrinsic.ABS, 'fabs(a)'),
+                 (IntrinsicCall.Intrinsic.EXP, 'exp(a)'),
+                 (IntrinsicCall.Intrinsic.LOG, 'log(a)'),
+                 (IntrinsicCall.Intrinsic.NINT, '(int)round(a)'),
+                 (IntrinsicCall.Intrinsic.FLOOR, '(int)floor(a)'),
+                 (IntrinsicCall.Intrinsic.REAL, '(double)a'))
     ref1 = Reference(DataSymbol("a", ScalarType.real_type()))
     for intrinsic, expected in test_list:
         icall = IntrinsicCall.create(intrinsic, [ref1.copy()])
         assert cwriter(icall) == expected
 
     # Check that operator-style formatting with a number of children different
-    # than 2 produces an error
+    # than 2 produces an error. The argument has to be an integer: a real MOD
+    # is now written as fmod, so '%' is only reached on the integer path.
     with pytest.raises(VisitorError) as err:
         icall = IntrinsicCall(IntrinsicCall.Intrinsic.MOD)
-        icall.addchild(ref1.copy())
+        icall.addchild(Reference(DataSymbol("i", ScalarType.integer_type())))
         _ = cwriter(icall)
     assert ("The C Writer binary_operator formatter for IntrinsicCall only "
             "supports intrinsics with 2 children, but found '%' with '1' "
@@ -395,8 +401,10 @@ def test_cw_intrinsiccall():
 
     # Test all supported Intrinsics with 2 arguments
     test_list = (
-                 (IntrinsicCall.Intrinsic.MOD, '(a % b)'),
+                 (IntrinsicCall.Intrinsic.MOD, 'fmod(a, b)'),
                  (IntrinsicCall.Intrinsic.SIGN, 'copysign(a, b)'),
+                 (IntrinsicCall.Intrinsic.ATAN2, 'atan2(a, b)'),
+                 (IntrinsicCall.Intrinsic.MIN, 'fmin(a, b)'),
     )
     ref1 = Reference(DataSymbol("a", ScalarType.real_type()))
     ref2 = Reference(DataSymbol("b", ScalarType.real_type()))
@@ -404,15 +412,101 @@ def test_cw_intrinsiccall():
         icall = IntrinsicCall.create(intrinsic, [ref1.copy(), ref2.copy()])
         assert cwriter(icall) == expected
 
-    # Check that casts with more than one children produce an error
+    # A variadic Fortran intrinsic folds right to left into nested binary
+    # C calls, since fmax and fmin take exactly two arguments.
+    ref3 = Reference(DataSymbol("c", ScalarType.real_type()))
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.MAX,
+                                 [ref1.copy(), ref2.copy(), ref3.copy()])
+    assert cwriter(icall) == 'fmax(a, fmax(b, c))'
+
+    # A cast now accepts the Fortran kind as a second child, and discards
+    # it: REAL(a, r_def) asks for a width a kind-blind writer cannot honour.
+    icall = IntrinsicCall(IntrinsicCall.Intrinsic.REAL)
+    icall.addchild(ref1.copy())
+    icall.addchild(ref2.copy())
+    assert cwriter(icall) == '(double)a'
+
+    # Three children is still an error.
     with pytest.raises(VisitorError) as err:
         icall = IntrinsicCall(IntrinsicCall.Intrinsic.REAL)
+        for _ in range(3):
+            icall.addchild(ref1.copy())
+        _ = cwriter(icall)
+    assert ("The C Writer IntrinsicCall cast-style formatter only supports "
+            "intrinsics with 1 or 2 children, but found 'double' with '3' "
+            "children." in str(err.value))
+
+    # The cast-function formatter takes exactly one child.
+    with pytest.raises(VisitorError) as err:
+        icall = IntrinsicCall(IntrinsicCall.Intrinsic.NINT)
         icall.addchild(ref1.copy())
         icall.addchild(ref2.copy())
         _ = cwriter(icall)
-    assert ("The C Writer IntrinsicCall cast-style formatter only supports "
-            "intrinsics with 1 child, but found 'float' with '2' children."
+    assert ("The C Writer IntrinsicCall cast-function formatter only supports "
+            "intrinsics with 1 child, but found 'int:round' with '2' children."
             in str(err.value))
+
+    # The fold formatter takes at least two.
+    with pytest.raises(VisitorError) as err:
+        icall = IntrinsicCall(IntrinsicCall.Intrinsic.MAX)
+        icall.addchild(ref1.copy())
+        _ = cwriter(icall)
+    assert ("The C Writer IntrinsicCall fold formatter only supports "
+            "intrinsics with 2 or more children, but found 'fmax' with '1' "
+            "children." in str(err.value))
+
+
+def test_cw_intrinsiccall_integer():
+    '''Check that the intrinsics Fortran overloads on the argument's type
+    are written by that type: an integer keeps C's integer spelling where a
+    real takes the maths-library one, and an integer maximum, which C has no
+    standard spelling for, is refused rather than written wrongly.
+
+    '''
+    cwriter = CWriter()
+    int1 = Reference(DataSymbol("i", ScalarType.integer_type()))
+    int2 = Reference(DataSymbol("j", ScalarType.integer_type()))
+
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.ABS, [int1.copy()])
+    assert cwriter(icall) == 'abs(i)'
+
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.MOD,
+                                 [int1.copy(), int2.copy()])
+    assert cwriter(icall) == '(i % j)'
+
+    # fmax returns a double, C has no standard integer maximum, and a
+    # conditional expression would evaluate its arguments twice. KokkosWriter
+    # handles both types, with the type-generic Kokkos::max.
+    for intrinsic in (IntrinsicCall.Intrinsic.MAX,
+                      IntrinsicCall.Intrinsic.MIN):
+        with pytest.raises(VisitorError) as err:
+            icall = IntrinsicCall.create(intrinsic,
+                                         [int1.copy(), int2.copy()])
+            _ = cwriter(icall)
+        assert (f"The C backend does not support the '{intrinsic.name}' "
+                f"intrinsic." in str(err.value))
+
+
+def test_cw_is_real_argument():
+    '''Check that _is_real_argument answers "no" rather than raising for
+    every reason it might not know the type, since the kind-blind default
+    path has to stay reachable for a caller probing the writer with
+    synthetic arguments.
+
+    '''
+    assert _is_real_argument(
+        Reference(DataSymbol("a", ScalarType.real_type()))) is True
+    assert _is_real_argument(
+        Reference(DataSymbol("i", ScalarType.integer_type()))) is False
+    assert _is_real_argument(
+        Reference(DataSymbol("u", UnresolvedType()))) is False
+    # An incomplete tree: ArrayReference.datatype raises rather than
+    # returning anything for a reference carrying no indices.
+    malformed = ArrayReference(
+        DataSymbol("x", ArrayType(ScalarType.real_type(), [10])))
+    with pytest.raises(InternalError):
+        _ = malformed.datatype
+    assert _is_real_argument(malformed) is False
 
 
 def test_cw_loop(fortran_reader):

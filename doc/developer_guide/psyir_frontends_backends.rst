@@ -338,7 +338,9 @@ Additionally, there are three partially-implemented back-ends
   whole kernel. A loop's continuation test follows the sign of its step
   where that sign is visible in the tree, so a Fortran countdown such as
   `do k = n, 1, -1` becomes `for(k=n; k>=1; k+=-1)`; a step that is a
-  runtime value is taken to be positive.
+  runtime value is taken to be positive. Which intrinsics that subset
+  contains, and why four of them depend on their argument's type, is set out
+  in the C back-end section below.
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
@@ -356,6 +358,44 @@ Additionally, there are three partially-implemented back-ends
   built before the field existed did.
 - `SIRWriter()` in `psyclone.psyir.backend.sir` which can generate
   valid SIR from simple Fortran code conforming to the NEMO API.
+
+C back-end
+++++++++++
+
+`CWriter.intrinsiccall_node` translates an `IntrinsicCall` through a table
+that gives each supported intrinsic a C spelling and one of five formatters:
+an infix operator, a function call, a cast, a cast wrapped round a function
+call, and a right-to-left fold. `NINT` and `FLOOR` need the fourth, because
+both return an integer in Fortran while neither `round` nor `floor` does in
+C; without the cast, `FLOOR(x)` would silently stay a real.
+
+Four intrinsics have no single right spelling, because Fortran overloads them
+on their argument's type and C does not. `REAL_INTRINSIC_ALTERNATIVES` gives
+the real spelling of each -- `ABS` becomes `fabs`, `MOD` becomes `fmod`,
+`MAX` and `MIN` become `fmax` and `fmin` -- and the module-level helper
+`_is_real_argument` chooses between that and the table entry. Choosing wrongly
+is silent in one direction and loud in the other: `abs` binds `::abs(int)` and
+truncates a real, while `%` does not compile for one.
+
+`_is_real_argument` answers "no" for every reason it might not know, including
+an `UnresolvedType` and a `datatype` property that raises on a tree assembled
+by hand. A caller probing the writer with synthetic arguments is asking which
+intrinsics it supports rather than what one particular expression is, so the
+kind-blind path has to stay reachable rather than becoming an error.
+
+Integer `MAX` and `MIN` are refused rather than translated, which is why
+neither has a table entry and both are reachable only through the real
+dispatch. C has no standard integer maximum, `fmax` returns a double, and a
+conditional expression would evaluate its arguments twice. The refusal is
+this writer's: `Kokkos::max` and `Kokkos::min` are type-generic, so a
+subclass generating C++ need not make it.
+
+A cast accepts a second argument and discards it. That argument is a Fortran
+kind, so `real(x, r_solver)` and `real(x, r_def)` are both `(double)x` here.
+Discarding it is safe only because each cast target is the widest of its
+intrinsic, so the value is never narrowed below what was asked for. Honouring
+it needs a writer that has been told what each kind's width is, which is what
+`kind_types` gives the Kokkos back-end below.
 
 Kokkos back-end
 +++++++++++++++

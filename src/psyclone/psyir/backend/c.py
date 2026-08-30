@@ -58,6 +58,43 @@ TYPE_MAP_TO_C = {ScalarType.Intrinsic.INTEGER: "int",
                  ScalarType.Intrinsic.BOOLEAN: "bool",
                  ScalarType.Intrinsic.REAL: "double"}
 
+#: Intrinsics whose C spelling depends on the argument's type. Fortran
+#: overloads on it and C does not, so a single map entry is a wrong
+#: answer for one of the two: ``abs`` binds ``::abs(int)`` and truncates
+#: a real, and ``%`` does not compile for one.
+REAL_INTRINSIC_ALTERNATIVES = {
+    IntrinsicCall.Intrinsic.ABS: "fabs",
+    IntrinsicCall.Intrinsic.MOD: "fmod",
+    IntrinsicCall.Intrinsic.MAX: "fmax",
+    IntrinsicCall.Intrinsic.MIN: "fmin",
+    }
+
+
+def _is_real_argument(node):
+    '''Whether an intrinsic's argument is known to be of real type.
+
+    Deliberately answers "no" rather than raising, for every reason it
+    might not know: an :py:class:`UnresolvedType`, an
+    :py:class:`UnsupportedFortranType`, or a ``datatype`` property that
+    raises on a tree the caller assembled by hand. The kind-blind default
+    path has to stay reachable, because a caller probing the writer with
+    synthetic arguments is asking which intrinsics it supports rather than
+    what one particular expression is.
+
+    :param node: the argument to inspect.
+    :type node: :py:class:`psyclone.psyir.nodes.DataNode`
+
+    :returns: whether its datatype is a real scalar.
+    :rtype: bool
+
+    '''
+    try:
+        datatype = node.datatype
+    except Exception:                            # pylint: disable=W0703
+        return False
+    return (isinstance(datatype, ScalarType) and
+            datatype.intrinsic == ScalarType.Intrinsic.REAL)
+
 
 class CWriter(LanguageWriter):
     '''Implements a PSyIR-to-C back-end for the PSyIR AST.
@@ -408,15 +445,68 @@ class CWriter(LanguageWriter):
 
             :raise VisitorError: unexpected number of children.
             '''
-            if len(expr_str) != 1:
+            if len(expr_str) not in (1, 2):
                 raise VisitorError(
                     f"The C Writer IntrinsicCall cast-style formatter "
-                    f"only supports intrinsics with 1 child, but found "
-                    f"'{type_str}' with '{len(expr_str)}' children.")
+                    f"only supports intrinsics with 1 or 2 children, but "
+                    f"found '{type_str}' with '{len(expr_str)}' children.")
+            # A second child is a Fortran kind: REAL(x, r_def) asks for a
+            # particular width. A kind-blind writer cannot honour it, and
+            # discarding it is only safe because each cast target here is
+            # the widest of its intrinsic, so the result is never narrowed
+            # below what was asked for. Honouring it needs a writer that has
+            # been told what each kind's width is, which is why KokkosWriter
+            # is handed the region's kind_types.
             return "(" + type_str + ")" + expr_str[0]
 
+        def cast_function_format(spec, expr_str):
+            '''
+            :param str spec: the cast target and the function name, joined
+                by a colon, as in ``int:round``.
+            :param List[str] expr_str: String representation of the operands.
+
+            :returns: C language cast of a unary function expression.
+            :rtype: str
+
+            :raise VisitorError: unexpected number of children.
+            '''
+            if len(expr_str) != 1:
+                raise VisitorError(
+                    f"The C Writer IntrinsicCall cast-function formatter "
+                    f"only supports intrinsics with 1 child, but found "
+                    f"'{spec}' with '{len(expr_str)}' children.")
+            type_str, function_str = spec.split(":")
+            return f"({type_str}){function_str}({expr_str[0]})"
+
+        def fold_format(function_str, expr_str):
+            '''
+            :param str function_str: Name of the binary function.
+            :param List[str] expr_str: String representation of the operands.
+
+            :returns: C language expression folding a variadic Fortran
+                intrinsic into nested binary calls, right to left.
+            :rtype: str
+
+            :raise VisitorError: unexpected number of children.
+            '''
+            if len(expr_str) < 2:
+                raise VisitorError(
+                    f"The C Writer IntrinsicCall fold formatter only "
+                    f"supports intrinsics with 2 or more children, but found "
+                    f"'{function_str}' with '{len(expr_str)}' children.")
+            folded = expr_str[-1]
+            for operand in reversed(expr_str[:-1]):
+                folded = f"{function_str}({operand}, {folded})"
+            return folded
+
         # Define a map with the intrinsic string and the formatter function
-        # associated with each Intrinsic
+        # associated with each Intrinsic. MAX and MIN are deliberately absent:
+        # they are reached only through REAL_INTRINSIC_ALTERNATIVES below, so
+        # that an integer MAX raises rather than being written wrongly. C has
+        # no standard integer maximum, fmax returns a double, and a
+        # conditional expression would evaluate its arguments twice. The
+        # refusal is this writer's alone: Kokkos::max and Kokkos::min are
+        # type-generic, so a subclass generating C++ need not make it.
         intrinsic_map = {
             IntrinsicCall.Intrinsic.MOD: ("%", binary_operator_format),
             IntrinsicCall.Intrinsic.SIGN: ("copysign", function_format),
@@ -426,21 +516,37 @@ class CWriter(LanguageWriter):
             IntrinsicCall.Intrinsic.ASIN: ("asin", function_format),
             IntrinsicCall.Intrinsic.ACOS: ("acos", function_format),
             IntrinsicCall.Intrinsic.ATAN: ("atan", function_format),
+            IntrinsicCall.Intrinsic.ATAN2: ("atan2", function_format),
             IntrinsicCall.Intrinsic.ABS: ("abs", function_format),
-            IntrinsicCall.Intrinsic.REAL: ("float", cast_format),
+            IntrinsicCall.Intrinsic.EXP: ("exp", function_format),
+            IntrinsicCall.Intrinsic.LOG: ("log", function_format),
+            IntrinsicCall.Intrinsic.REAL: ("double", cast_format),
             IntrinsicCall.Intrinsic.INT: ("int", cast_format),
+            IntrinsicCall.Intrinsic.NINT: ("int:round", cast_function_format),
+            IntrinsicCall.Intrinsic.FLOOR: ("int:floor",
+                                            cast_function_format),
             IntrinsicCall.Intrinsic.SQRT: ("sqrt", function_format),
             }
 
-        # If the intrinsic exists in the map, use its associated
-        # operator and formatter to generate the code, otherwise raise
-        # an Error.
-        try:
-            opstring, formatter = intrinsic_map[node.intrinsic]
-        except KeyError as err:
-            raise VisitorError(
-                f"The C backend does not support the '{node.intrinsic.name}' "
-                f"intrinsic.") from err
+        # An intrinsic Fortran overloads on the argument's type is spelt by
+        # that type first, so that a real ABS does not reach C's integer
+        # ::abs. Everything else, and every argument whose type is not known
+        # to be real, falls through to the map; if the intrinsic is not there
+        # either, raise an Error.
+        alternative = REAL_INTRINSIC_ALTERNATIVES.get(node.intrinsic)
+        if alternative and _is_real_argument(node.arguments[0]):
+            opstring = alternative
+            formatter = (fold_format
+                         if node.intrinsic in (IntrinsicCall.Intrinsic.MAX,
+                                               IntrinsicCall.Intrinsic.MIN)
+                         else function_format)
+        else:
+            try:
+                opstring, formatter = intrinsic_map[node.intrinsic]
+            except KeyError as err:
+                raise VisitorError(
+                    f"The C backend does not support the "
+                    f"'{node.intrinsic.name}' intrinsic.") from err
 
         return formatter(opstring, [self._visit(ch) for ch in node.arguments])
 
