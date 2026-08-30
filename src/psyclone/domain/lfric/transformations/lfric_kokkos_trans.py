@@ -126,6 +126,18 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     is not. Every one of these is refused by :py:meth:`validate` rather than
     discovered by :py:meth:`apply`.
 
+    **A local is also read for its name, not only its type.** The generated
+    launch declares identifiers of its own in the scope the kernel body is
+    generated into, and a kernel-local of the same name would shadow one and
+    then overwrite it -- a wrong answer rather than a compile error. The cell
+    count is one, and the team launch adds ``body``, ``league_size``,
+    ``probe``, ``rank``, ``scratch_bytes``, ``team`` and ``team_size``, which
+    are checked only for a kernel that has an automatic array to place. The
+    launch *index* is the exception: it is renamed rather than refused,
+    because a kernel declaring ``cell`` is a real GungHo shape and the fix is
+    one name in two places rather than seven threaded through two launch
+    shapes.
+
     **A constant the body reads reaches the region one of three ways.** A
     module-level ``parameter`` declared beside the kernel with a literal value
     -- ``integer(kind=i_def), parameter :: nfaces = 4`` -- is written into the
@@ -150,6 +162,19 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
     #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
     _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE)
+
+    #: Identifiers the generated launch declares in the scope the kernel
+    #: body is generated into. A kernel-local of the same name would
+    #: shadow the launch's own and then overwrite it, which is a wrong
+    #: answer rather than a compile error. The cell index is absent
+    #: because it is renamed instead; see
+    #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`.
+    #: These seven belong to the team launch only, so they are checked only
+    #: for a kernel that has an automatic array to place;
+    #: :py:attr:`_CELL_COUNT` is declared by both shapes and is always
+    #: checked.
+    _GENERATED_NAMES = ("body", "league_size", "probe", "rank",
+                        "scratch_bytes", "team", "team_size")
 
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
@@ -546,15 +571,43 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         :py:meth:`_constants` could import one, because the launch computes
         its scratch size before it enters the region.
 
+        A local is also refused for its *name* alone, where that name is one
+        the generated launch declares in the scope the kernel body is
+        generated into. The kernel's declaration would shadow the launch's
+        and then be assigned to, so the region would run with a value the
+        kernel had overwritten -- a wrong answer, where the launch index's
+        collision is a compile error. The launch index is renamed around that
+        collision rather than refused because it is one name in two places;
+        these are threaded through both launch shapes and the scratch sizing,
+        and no GungHo kernel declares one.
+
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
+        :raises TransformationError: if the kernel declares a local named
+            :py:attr:`_CELL_COUNT`, which both launch shapes declare.
+        :raises TransformationError: if the kernel has an automatic array and
+            declares a local named in :py:attr:`_GENERATED_NAMES`, which the
+            team launch that array selects declares.
         :raises TransformationError: if a local array's kind is not one
             :py:attr:`_C_TYPES` maps, or if one of its extents is not a
             kernel argument, so the scratch View could not be sized.
         """
         table = schedule.symbol_table
         names = {symbol.name for symbol in table.argument_list}
+
+        locals_ = list(table.automatic_datasymbols)
+        generated = {cls._CELL_COUNT}
+        if any(symbol.is_array for symbol in locals_):
+            generated.update(cls._GENERATED_NAMES)
+        # Sorted so that a kernel colliding with two of them names the same
+        # one on every run.
+        for name in sorted(generated.intersection(
+                symbol.name for symbol in locals_)):
+            raise TransformationError(
+                f"LFRicKokkosTrans' generated launch declares '{name}', but "
+                "the kernel declares a local of that name.")
+
         for symbol in table.automatic_datasymbols:
             if not symbol.is_array:
                 continue

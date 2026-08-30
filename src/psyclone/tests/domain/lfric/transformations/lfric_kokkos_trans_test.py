@@ -414,6 +414,29 @@ end module column_solve_kernel_mod
 """
 
 
+# The same kernel with a scalar local named after one of the identifiers the
+# team launch declares around the kernel body. The kernel's declaration would
+# shadow the launch's and then be assigned to, which C++ accepts: the region
+# would run with a team size the kernel had overwritten. That is a wrong answer
+# rather than a compile error, which is why it is refused.
+_TEAM_NAME_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k, team_size\n").replace(
+    "    partial(1) = field_in(map_w3(1))",
+    "    team_size = nlayers\n    partial(1) = field_in(map_w3(1))").replace(
+    "    do k = 2, nlayers", "    do k = 2, team_size")
+
+
+# A kernel with no local arrays and a scalar local named 'ncells'. The cell
+# count is declared by both launch shapes, not only the team one, so this
+# refusal does not depend on there being scratch to place.
+_NCELLS_LOCAL_KERNEL = _KERNEL.replace(
+    "integer(kind=i_def) :: k, df",
+    "integer(kind=i_def) :: k, df, ncells").replace(
+    "    do k = 0, nlayers - 1",
+    "    ncells = nlayers\n    do k = 0, ncells - 1")
+
+
 # The same kernel with one array sized by a module constant instead of by a
 # formal. Fortran allows it -- a module entity is as valid an automatic bound
 # as a dummy -- but the launch computes its scratch size before it enters the
@@ -897,6 +920,22 @@ def local_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel holds two automatic column arrays."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOCAL_KERNEL)
+
+
+@pytest.fixture(name="team_name_target")
+# pylint: disable-next=unused-argument
+def team_name_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local named 'team_size'."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _TEAM_NAME_KERNEL)
+
+
+@pytest.fixture(name="ncells_local_target")
+# pylint: disable-next=unused-argument
+def ncells_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local named 'ncells'."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _NCELLS_LOCAL_KERNEL)
 
 
 @pytest.fixture(name="unsized_local_target")
@@ -1795,6 +1834,41 @@ def test_lfric_kokkos_trans_describes_each_local_array(local_target):
     assert all(item.extents == ("nlayers",) for item in scratch)
     # Fortran declares from 1 and C indexes from 0, as for a formal.
     assert all(item.index_offsets == (1,) for item in scratch)
+
+
+def test_lfric_kokkos_trans_refuses_a_local_named_after_the_launch(
+        team_name_target):
+    """A local shadowing a name the team launch declares is refused.
+
+    The launch index is renamed around such a collision instead, because a
+    lambda parameter and a body declaration are a compile error and the fix
+    is one name in two places. These seven are threaded through two launch
+    shapes and through the scratch sizing, so they are refused rather than
+    renamed; no GungHo kernel declares any of them.
+    """
+    _, loop, _ = team_name_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "generated launch declares 'team_size'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_local_named_ncells(
+        ncells_local_target):
+    """A local named for the cell count is refused whatever the launch shape.
+
+    ``_validate_formals`` already refuses a *formal* of this name. The cell
+    count is declared by the range launch as well as the team one, so this
+    kernel has no local arrays: the refusal must not be conditional on there
+    being scratch to place.
+    """
+    _, loop, _ = ncells_local_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "generated launch declares 'ncells'" in str(error.value)
 
 
 def test_lfric_kokkos_trans_refuses_an_unsizable_local(unsized_local_target):
