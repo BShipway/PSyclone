@@ -2187,11 +2187,12 @@ def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
     assert "partial_scratch_t partial(team.thread_scratch(0), nlayers);" in cpp
     assert "swept_scratch_t swept(team.thread_scratch(0), nlayers);" in cpp
 
-    # The launch is the team shape, not the flat one, and its team size comes
-    # from a probe of the policy that already carries the scratch request.
+    # The launch is the team shape, not the flat one, and its team size is
+    # the one the backend recommends for this functor, asked of a probe
+    # policy already carrying the scratch request.
     assert "Kokkos::TeamPolicy" in cpp
     assert "Kokkos::RangePolicy" not in cpp
-    assert "team_size_max(body, Kokkos::ParallelForTag())" in cpp
+    assert "team_size_recommended(body, Kokkos::ParallelForTag())" in cpp
     assert "if (cell >= ncells) {\n        return;\n      }" in cpp
 
     # Neither local is declared in the body as well: a scratch View and a C++

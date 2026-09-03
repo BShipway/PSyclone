@@ -534,10 +534,13 @@ Cells are tiled across the ranks of a team rather than given a team each, so
 that each rank takes one cell with its own per-thread scratch and the
 parallelism stays what the `RangePolicy` shape has: one cell per worker.
 The league is sized by rounding up, so the generated body returns early for
-a rank whose cell is past the end. The team size is not chosen by the
-back-end, because it depends on how much scratch each rank requests: the
-policy is asked with `team_size_max`, from a probe policy already carrying
-the scratch request.
+a rank whose cell is past the end. The team size is asked of a probe policy
+already carrying the scratch request, with `team_size_recommended`: the team
+the backend recommends for a `parallel_for` of this functor, which on the
+OpenMP backend is one thread, so that the leagues rather than the ranks
+carry the parallelism. `team_size_max` is not asked instead. It returns the
+whole thread pool there whatever the scratch request, which puts one team on
+the whole league with a rendezvous between consecutive cells.
 
 A `KokkosScratch` is described separately from the region's arguments, and
 deliberately so. It crosses no interface, so it must not appear in the C ABI

@@ -358,13 +358,15 @@ def test_kokkos_writer_places_locals_in_team_scratch():
         in code
     assert "if (cell >= ncells) {" in code
 
-    # The team size depends on how much scratch a rank asks for, so it is
-    # asked for rather than chosen, from a policy already carrying the
-    # request. A probe without it would answer for a different launch.
+    # The team the backend recommends for this functor, not the largest the
+    # scratch allows: on OpenMP the recommendation is one thread, so the
+    # leagues rather than the ranks carry the parallelism. The probe policy
+    # carries the scratch request, since a backend other than OpenMP may
+    # answer differently for a launch that asks for none.
     probe = code.index("TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)")
     assert ".set_scratch_size(0, Kokkos::PerThread(scratch_bytes));" in \
         code[probe:]
-    assert "const int team_size = probe.team_size_max(body, " \
+    assert "const int team_size = probe.team_size_recommended(body, " \
         "Kokkos::ParallelForTag());" in code
     assert "const int league_size = (ncells + team_size - 1) / team_size;" \
         in code
@@ -497,8 +499,21 @@ def test_kokkos_writer_without_scratch_keeps_the_range_launch():
         "Kokkos::RangePolicy<>(0, ncells),\n" \
         "      KOKKOS_LAMBDA(const int cell) {" in code
     for absent in ("TeamPolicy", "TeamMember", "ScratchSpace",
-                   "scratch_bytes", "thread_scratch", "team_size_max"):
+                   "scratch_bytes", "thread_scratch",
+                   "team_size_recommended"):
         assert absent not in code
+
+
+def test_kokkos_team_launch_never_asks_team_size_max():
+    """``team_size_max`` is the whole thread pool, and is never asked for.
+
+    On the OpenMP backend it returns the pool size whatever the scratch
+    request, which put the model on one team running the whole league with a
+    rendezvous between consecutive cells. The query is wrong rather than
+    merely suboptimal, so its absence is asserted and not just the presence
+    of its replacement.
+    """
+    assert "team_size_max" not in KokkosWriter()(_scratch_region())
 
 
 def test_kokkos_launch_module_renders_both_existing_shapes():

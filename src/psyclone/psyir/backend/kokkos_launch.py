@@ -78,10 +78,20 @@ def team_launch(region, local_declarations, body):
     giving each worker fast, launch-scoped storage; on a GPU that scratch
     is shared memory rather than global.
 
-    The team size cannot be chosen here, because it depends on how much
-    scratch each rank asks for, so the policy is asked for the largest it
-    supports. The scratch request is set on the probe policy before the
-    query, or the answer is the one for a policy requesting nothing.
+    The probe policy carries the scratch request and is asked for the team
+    size the backend recommends for a ``parallel_for`` of this functor. On
+    the OpenMP backend that recommendation is one thread, so the leagues
+    rather than the ranks carry the parallelism and no team runs more than
+    one cell in sequence. The request is set on the probe before the query,
+    or the answer is the one for a policy asking for nothing -- a backend
+    other than OpenMP may read it.
+
+    ``team_size_max`` is not asked instead, although the largest team the
+    scratch permits sounds like the accommodating answer. On OpenMP it
+    returns the whole thread pool whatever the scratch request, which put
+    one team on the whole league with a ``team_rendezvous`` between
+    consecutive cells; the largest team the scratch permits is not the team
+    that runs fastest.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -128,7 +138,7 @@ def team_launch(region, local_declarations, body):
         "  };\n\n"
         "  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)\n"
         "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes));\n"
-        "  const int team_size = probe.team_size_max(body, "
+        "  const int team_size = probe.team_size_recommended(body, "
         "Kokkos::ParallelForTag());\n"
         f"  const int league_size = ({region.cell_count} + team_size - 1)"
         " / team_size;\n"
