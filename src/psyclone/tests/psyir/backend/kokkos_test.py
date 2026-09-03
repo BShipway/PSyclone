@@ -605,8 +605,11 @@ def test_kokkos_hierarchical_region_launches_one_team_per_cell():
     assert "const int cell = team.league_rank();" in code
     assert "using TeamPolicy = Kokkos::TeamPolicy<>;" in code
     assert "using TeamMember = TeamPolicy::member_type;" in code
-    assert "using ScratchSpace = " \
-        "Kokkos::DefaultExecutionSpace::scratch_memory_space;" in code
+    # The scratch alias is not emitted, because this region has no scratch.
+    # It rode along with the other two until this stage, when the loop
+    # selection made a team launch without scratch reachable for the first
+    # time and left the alias naming a space nothing is placed in.
+    assert "ScratchSpace" not in code
 
     # Neither of the flat shapes' fingerprints: no range launch, and none of
     # the team-size arithmetic that tiles cells across a team.

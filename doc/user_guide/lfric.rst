@@ -4128,11 +4128,23 @@ precision map decides which implementation of a kind-polymorphic kernel is
 captured: a kernel written as a generic interface over specific procedures
 that differ only in precision is resolved to the one the algorithm layer's
 arguments select, and the generated region is named after that procedure
-rather than after the interface. A kernel holding an automatic array -- a
-column temporary whose extent is a runtime value -- is generated over a
-Kokkos ``TeamPolicy`` instead of a ``RangePolicy``, with that array placed
-in team scratch private to the rank running the cell; a kernel with no such
-array keeps the flat launch. An extent -- of an array argument or of such a
+rather than after the interface. A kernel whose body holds a loop that
+PSyclone's dependence analysis accepts -- in practice a loop over a column's
+levels whose iterations touch disjoint elements, rather than one sweeping a
+recurrence -- is generated over a Kokkos ``TeamPolicy`` with one team on each
+cell, and that loop is spread across the team's members as a
+``TeamVectorRange``; everything outside it runs on every member, with an
+array write made by one under ``Kokkos::single`` and published by a team
+barrier. A kernel holding an automatic array -- a column temporary whose
+extent is a runtime value -- is generated over a ``TeamPolicy`` too, with
+that array placed in team scratch; where it has no loop to spread, the launch
+is the flat one and the scratch is private to the rank running the cell,
+and where it has one, the team runs the cell and shares the scratch. A kernel
+with neither keeps the ``RangePolicy``. The optional ``team_size`` argument
+of ``apply`` fixes how many members a team has; without it the policy asks
+for ``Kokkos::AUTO``, which is one member on the OpenMP back-end, so a host
+build reaches the team-level concurrency only by naming a size. An extent --
+of an array argument or of such a
 temporary -- is read as a declared bound rather than as a name, so
 ``dimension(max_length,4)`` and ``dimension(nlayers+1)`` are accepted as
 readily as ``dimension(nlayers)``; what is required is an integer expression

@@ -263,13 +263,19 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             self._view_declaration(argument)
             for argument in region.arguments
             if isinstance(argument, KokkosView))
+        # Both team shapes need the policy and its member type. Only a region
+        # with scratch needs the space its Views are placed in, and the
+        # hierarchical shape is reached without scratch, so that alias is
+        # conditioned separately rather than riding along unused.
         team_aliases = "".join(
             f"  {alias}\n" for alias in (
                 "using TeamPolicy = Kokkos::TeamPolicy<>;",
                 "using TeamMember = TeamPolicy::member_type;",
-                "using ScratchSpace = "
-                "Kokkos::DefaultExecutionSpace::scratch_memory_space;",
             )) if region.scratch or region.parallel_loops else ""
+        if region.scratch:
+            team_aliases += (
+                "  using ScratchSpace = "
+                "Kokkos::DefaultExecutionSpace::scratch_memory_space;\n")
 
         # The flat team shape nests the body one level deeper, inside the
         # TeamThreadRange lambda. The hierarchical one does not: its body sits

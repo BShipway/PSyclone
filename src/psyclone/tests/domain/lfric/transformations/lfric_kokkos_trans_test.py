@@ -617,6 +617,160 @@ _TEAM_NAME_KERNEL = _LOCAL_KERNEL.replace(
     "    do k = 2, nlayers", "    do k = 2, team_size")
 
 
+# The tri_solve shape as the model actually writes it: a forward elimination
+# and a backward substitution, each carrying its own recurrence, and no third
+# loop. _LOCAL_KERNEL above is this kernel with the backward sweep's result
+# copied out in a separate loop, which the dependence analysis accepts -- so
+# _LOCAL_KERNEL takes the hierarchical launch and this one does not. That is
+# what keeps a witness for the flat team launch: sci_tri_solve_kernel_mod has
+# no parallelisable loop at all, and a fixture that says so has to be shaped
+# like it rather than like a kernel with one.
+_TRI_SOLVE_ALGORITHM = """
+program kokkos_tri_solve_test
+  use field_mod, only : field_type
+  use tri_sweep_kernel_mod, only : tri_sweep_kernel_type
+  implicit none
+  type(field_type) :: y_vec, x_vec
+  call invoke(tri_sweep_kernel_type(y_vec, x_vec))
+end program kokkos_tri_solve_test
+"""
+
+
+_TRI_SOLVE_KERNEL = """
+module tri_sweep_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: tri_sweep_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_write, w3),                  &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: tri_sweep_code
+  end type tri_sweep_kernel_type
+contains
+  subroutine tri_sweep_code(nlayers, y, x, ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: y
+    real(kind=r_def), dimension(undf_w3), intent(in) :: x
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, ij
+    real(kind=r_def), dimension(nlayers) :: x_new, tri_plus_new
+    real(kind=r_def) :: denom
+    k = 0
+    ij = map_w3(1)
+    denom = 1.0_r_def / x(ij + k)
+    tri_plus_new(1) = x(ij + k) * denom
+    x_new(1) = x(ij + k) * denom
+    do k = 1, nlayers - 1
+      denom = 1.0_r_def / (x(ij + k) - x(ij + k) * tri_plus_new(k))
+      tri_plus_new(k + 1) = x(ij + k) * denom
+      x_new(k + 1) = (x(ij + k) - x(ij + k) * x_new(k)) * denom
+    end do
+    k = nlayers - 1
+    y(ij + k) = x_new(k + 1)
+    do k = nlayers - 2, 0, -1
+      y(ij + k) = x_new(k + 1) - tri_plus_new(k + 1) * y(ij + k + 1)
+    end do
+  end subroutine tri_sweep_code
+end module tri_sweep_kernel_mod
+"""
+
+
+# A kernel of the shape the hierarchical launch exists for: a scalar set once,
+# a level loop whose iterations are independent, and a boundary element written
+# outside it. The three become, in order, a plain assignment every team member
+# makes, a TeamVectorRange the members share, and a write one member makes
+# inside a Kokkos::single. It holds no automatic array, so it selects the
+# hierarchical launch on the loop alone.
+_LEVEL_ALGORITHM = """
+program kokkos_level_test
+  use field_mod, only : field_type
+  use column_scale_kernel_mod, only : column_scale_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(column_scale_kernel_type(out_field, in_field))
+end program kokkos_level_test
+"""
+
+
+_LEVEL_KERNEL = """
+module column_scale_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: column_scale_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_write, w3),                  &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: column_scale_code
+  end type column_scale_kernel_type
+contains
+  subroutine column_scale_code(nlayers, field_out, field_in, &
+                               ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k
+    real(kind=r_def) :: scaling
+    scaling = 0.5_r_def
+    do k = 1, nlayers - 1
+      field_out(map_w3(1) + k - 1) = scaling * field_in(map_w3(1) + k - 1)
+    end do
+    field_out(map_w3(1) + nlayers - 1) = field_in(map_w3(1) + nlayers - 1)
+  end subroutine column_scale_code
+end module column_scale_kernel_mod
+"""
+
+
+# The same kernel with a second parallelisable loop inside the first. One team
+# is one pool of members, so nesting a TeamVectorRange inside another would
+# divide the same members twice; the outer loop alone is taken.
+_NESTED_LEVEL_KERNEL = _LEVEL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k, df\n").replace(
+    "    real(kind=r_def) :: scaling",
+    "    real(kind=r_def) :: scaling\n"
+    "    real(kind=r_def), dimension(nlayers,4) :: work").replace(
+    "      field_out(map_w3(1) + k - 1) = "
+    "scaling * field_in(map_w3(1) + k - 1)",
+    "      do df = 1, 4\n"
+    "        work(k, df) = scaling * field_in(map_w3(1) + k - 1)\n"
+    "      end do\n"
+    "      field_out(map_w3(1) + k - 1) = work(k, 1)")
+
+
+# The same kernel with the level loop stepped. The dependence analysis accepts
+# it -- the iterations are as independent as they were -- and the launch still
+# refuses it, because TeamVectorRange(team, begin, end) counts by one and has
+# no stride to give it.
+_STEPPED_LEVEL_KERNEL = _LEVEL_KERNEL.replace(
+    "    do k = 1, nlayers - 1", "    do k = 1, nlayers - 1, 2")
+
+
+# The same kernel with a scalar local named 'team' and no automatic array. The
+# hierarchical launch declares 'team' as its lambda parameter whether or not
+# there is scratch to place, so the reserved names cannot be conditional on
+# there being an automatic array as they were until this stage.
+_TEAM_LEVEL_KERNEL = _LEVEL_KERNEL.replace(
+    "    real(kind=r_def) :: scaling",
+    "    integer(kind=i_def) :: team\n"
+    "    real(kind=r_def) :: scaling").replace(
+    "    scaling = 0.5_r_def",
+    "    team = nlayers\n    scaling = 0.5_r_def").replace(
+    "    do k = 1, nlayers - 1", "    do k = 1, team - 1")
+
+
 # A kernel with no local arrays and a scalar local named 'ncells'. The cell
 # count is declared by both launch shapes, not only the team one, so this
 # refusal does not depend on there being scratch to place.
@@ -1170,6 +1324,46 @@ def team_name_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _TEAM_NAME_KERNEL)
 
 
+@pytest.fixture(name="tri_solve_target")
+# pylint: disable-next=unused-argument
+def tri_solve_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel is two recurrences and nothing else."""
+    return _invoke(
+        tmp_path, "tri_sweep", _TRI_SOLVE_ALGORITHM, _TRI_SOLVE_KERNEL)
+
+
+@pytest.fixture(name="level_target")
+# pylint: disable-next=unused-argument
+def level_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel holds one parallelisable level loop."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _LEVEL_KERNEL)
+
+
+@pytest.fixture(name="nested_level_target")
+# pylint: disable-next=unused-argument
+def nested_level_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel nests one level loop inside another."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _NESTED_LEVEL_KERNEL)
+
+
+@pytest.fixture(name="stepped_level_target")
+# pylint: disable-next=unused-argument
+def stepped_level_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose level loop counts in twos."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _STEPPED_LEVEL_KERNEL)
+
+
+@pytest.fixture(name="team_level_target")
+# pylint: disable-next=unused-argument
+def team_level_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local named 'team'."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _TEAM_LEVEL_KERNEL)
+
+
 @pytest.fixture(name="ncells_local_target")
 # pylint: disable-next=unused-argument
 def ncells_local_target_fixture(tmp_path, clear_module_manager_instance):
@@ -1547,8 +1741,12 @@ def test_lfric_kokkos_trans_captures_an_array_section(section_target):
 
     assert 'extern "C" void fv_difference_kokkos(' in cpp
     # The section became a counted loop over the column, keeping each side's
-    # own lower bound as an offset from the assigned range's start.
-    assert "for(idx=w3_idx; idx<=(w3_idx + nl); idx+=1)" in cpp
+    # own lower bound as an offset from the assigned range's start. The
+    # lowering is a producer of loops, and the loop it produces is one the
+    # dependence analysis accepts, so the column is spread over the team
+    # rather than swept by one member of it.
+    assert ("Kokkos::parallel_for(Kokkos::TeamVectorRange"
+            "(team, w3_idx, (w3_idx + nl) + 1)," in cpp)
     assert "difference((idx - 1)) = " in cpp
     assert "mass_flux(((idx + ((b_idx + 1) - w3_idx)) - 1))" in cpp
     assert "mass_flux(((idx + (b_idx - w3_idx)) - 1))" in cpp
@@ -1557,7 +1755,8 @@ def test_lfric_kokkos_trans_captures_an_array_section(section_target):
     # than a kind the region described -- which is the fallback in
     # KokkosWriter.gen_declaration, load-bearing rather than defensive.
     assert "int idx;" in cpp
-    assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
+    assert "TeamPolicy(ncells, Kokkos::AUTO)" in cpp
+    assert "Kokkos::RangePolicy" not in cpp
 
     assert "call fv_difference_kokkos(" in fortran
     assert "call fv_difference_code(" not in fortran
@@ -2167,12 +2366,20 @@ def test_lfric_kokkos_trans_asserts_nothing_about_an_unkinded_region():
 
 
 def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
-    """An automatic array becomes one scratch View per team rank.
+    """An automatic array becomes one scratch View the team shares.
 
     Two arrays over ``nlayers``, so the launch has to size both and the region
     has to build both. The sizing is what distinguishes scratch from a C++
     local: ``nlayers`` is a runtime value, so the bytes are asked for before
     the launch and the View is placed in them inside it.
+
+    This kernel is the one that shows the two selections are independent. It
+    has scratch *and* a level loop the dependence analysis accepts -- the
+    write-back sweep, whose iterations touch disjoint elements -- so it takes
+    the hierarchical launch, and the scratch it asked for is placed in team
+    scratch rather than thread scratch. The flat launch is still reached, by
+    a kernel whose every loop is a recurrence; see
+    ``test_apply_keeps_tri_solve_flat``.
     """
     psy, loop, _ = local_target
 
@@ -2184,26 +2391,46 @@ def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
             "Kokkos::DefaultExecutionSpace::scratch_memory_space;" in cpp)
     assert "partial_scratch_t::shmem_size(nlayers)" in cpp
     assert "swept_scratch_t::shmem_size(nlayers)" in cpp
-    assert "partial_scratch_t partial(team.thread_scratch(0), nlayers);" in cpp
-    assert "swept_scratch_t swept(team.thread_scratch(0), nlayers);" in cpp
+    # Team scratch, not thread scratch: every member of the team works on the
+    # one column, so one allocation is shared rather than one per member.
+    assert "partial_scratch_t partial(team.team_scratch(0), nlayers);" in cpp
+    assert "swept_scratch_t swept(team.team_scratch(0), nlayers);" in cpp
+    assert "PerTeam(scratch_bytes)" in cpp
 
-    # The launch is the team shape, not the flat one, and its team size is
-    # the one the backend recommends for this functor, asked of a probe
-    # policy already carrying the scratch request.
-    assert "Kokkos::TeamPolicy" in cpp
+    # The launch is the hierarchical shape. It has no team-size probe and no
+    # bounds guard, because the league is one team per cell rather than a
+    # flat range of ranks that has to be folded onto cells.
+    assert "TeamPolicy(ncells, Kokkos::AUTO)" in cpp
     assert "Kokkos::RangePolicy" not in cpp
-    assert "team_size_recommended(body, Kokkos::ParallelForTag())" in cpp
-    assert "if (cell >= ncells) {\n        return;\n      }" in cpp
+    assert "team_size_recommended" not in cpp
+    assert "if (cell >= ncells)" not in cpp
 
     # Neither local is declared in the body as well: a scratch View and a C++
     # array of the same name would not compile.
     assert "double partial[" not in cpp
     assert "double swept[" not in cpp
 
+    # The two recurrences stay serial, each write made by one member and
+    # published to the rest before the next statement reads it.
+    assert ("Kokkos::single(Kokkos::PerTeam(team), [&]() {\n"
+            "      partial((1 - 1)) = "
+            "field_in((map_w3((1 - 1), cell) - 1));\n"
+            "    });\n"
+            "    team.team_barrier();" in cpp)
+    assert "for(k=2; k<=nlayers; k+=1)" in cpp
+
     # The backward sweep counts down. Before the CWriter followed the step
     # sign this read 'k<=1' and ran no iterations, so the region built, linked
     # and returned the forward sweep's intermediates.
     assert "for(k=(nlayers - 1); k>=1; k+=(-1))" in cpp
+
+    # The write-back is the loop that is spread. Its lambda parameter shadows
+    # the region-scope 'k' the two serial sweeps drive, which is why that
+    # declaration is emitted even though a parallel loop declares its own.
+    assert "int k;" in cpp
+    assert ("Kokkos::parallel_for(Kokkos::TeamVectorRange"
+            "(team, 1, nlayers + 1),\n"
+            "        [&](const int k) {" in cpp)
 
     # Nothing about the scratch reaches the Fortran side: it is allocated by
     # the launch, so the ABI is the same as any other region's.
@@ -2334,7 +2561,7 @@ def test_lfric_kokkos_trans_takes_a_literal_extent(literal_local_target):
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "swept_scratch_t::shmem_size(nlayers, 4)" in cpp
-    assert "swept_scratch_t swept(team.thread_scratch(0), nlayers, 4);" in cpp
+    assert "swept_scratch_t swept(team.team_scratch(0), nlayers, 4);" in cpp
     assert ("using swept_scratch_t = Kokkos::View<double**, "
             "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;" in cpp)
     # Both indices lose their Fortran base, not just the first.
@@ -2356,7 +2583,7 @@ def test_lfric_kokkos_trans_takes_an_arithmetic_extent(
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "swept_scratch_t::shmem_size((nlayers + 1))" in cpp
-    assert ("swept_scratch_t swept(team.thread_scratch(0), (nlayers + 1));"
+    assert ("swept_scratch_t swept(team.team_scratch(0), (nlayers + 1));"
             in cpp)
 
 
@@ -2376,7 +2603,7 @@ def test_lfric_kokkos_trans_takes_an_explicit_lower_bound_of_one(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "swept_scratch_t swept(team.thread_scratch(0), nlayers);" in cpp
+    assert "swept_scratch_t swept(team.team_scratch(0), nlayers);" in cpp
 
 
 def test_lfric_kokkos_trans_refuses_a_lower_bound_that_is_not_one(
@@ -2514,7 +2741,8 @@ def test_lfric_kokkos_trans_resolves_a_lowered_full_section(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "for(idx=1; idx<=undf_w3; idx+=1)" in cpp
+    assert ("Kokkos::parallel_for(Kokkos::TeamVectorRange"
+            "(team, 1, undf_w3 + 1)," in cpp)
     assert "difference((idx - 1)) = (difference((idx - 1)) + (b_idx + nl));" \
         in cpp
 
@@ -2907,3 +3135,194 @@ def test_lfric_kokkos_trans_passes_a_repeated_import_once(
 
     generated = str(psy.gen)
     assert generated.count("map_wtheta, loop0_stop, recip_epsilon)") == 1
+
+
+def test_parallel_loops_selects_a_level_loop_the_analysis_accepts(
+        level_target):
+    """A level loop whose iterations are independent is selected.
+
+    The judgement is PSyclone's own: ``_parallel_loops`` asks
+    ``DependencyTools.can_loop_be_parallelised`` rather than deciding for
+    itself what a level loop is. This one writes ``field_out`` at ``map_w3(1)
+    + k - 1`` and reads ``field_in`` at the same place, so no iteration reads
+    what another wrote.
+    """
+    _, _, kernel = level_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == ["k"]
+
+
+def test_parallel_loops_refuses_a_recurrence(tri_solve_target):
+    """A tridiagonal sweep has no loop that may be spread.
+
+    Both of ``tri_sweep_code``'s loops read at ``k - 1`` or ``k + 1`` what a
+    neighbouring iteration wrote, which is the shape the whole selection
+    exists to keep out of a ``TeamVectorRange``. The kernel is a miniature of
+    ``sci_tri_solve_kernel_mod``, one of the six captured regions, so this is
+    the case the model actually contains rather than an invented one.
+    """
+    _, _, kernel = tri_solve_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._parallel_loops(schedule) == ()
+
+
+def test_parallel_loops_takes_the_outermost_of_a_nested_pair(
+        nested_level_target):
+    """Only the outer loop of an acceptable nest is selected.
+
+    ``TeamVectorRange`` may not be nested inside itself, and spreading the
+    outer loop already occupies the team, so an inner loop that would also
+    qualify is left as a serial loop inside the lambda.
+    """
+    _, _, kernel = nested_level_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == ["k"]
+
+
+def test_parallel_loops_skips_a_stepped_loop(stepped_level_target):
+    """A loop with a step other than one is left alone.
+
+    ``TeamVectorRange(team, start, stop + 1)`` gives every member a unit
+    stride, so a stepped loop would have to be rewritten before it could be
+    spread. It is skipped instead, and the analysis is not even asked: the
+    step is checked first, so a stepped loop the analysis would accept is
+    still skipped.
+    """
+    _, _, kernel = stepped_level_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._parallel_loops(schedule) == ()
+
+
+def test_parallel_loops_classifies_the_lowered_section(section_target):
+    """The loop the section lowering produces is classified like any other.
+
+    ``fv_difference_code`` has no loop at all in its source: its column is
+    one array assignment, and ``_lower_sections`` turns that into a loop. The
+    selection therefore has to run after the lowering, which is why
+    ``validate`` predicts on a lowered copy rather than on the schedule as
+    parsed.
+    """
+    _, _, kernel = section_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._parallel_loops(schedule) == ()
+
+    LFRicKokkosTrans._lower_sections(schedule)
+    LFRicKokkosTrans._substitute_bounds(schedule)
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == ["idx"]
+
+
+def test_apply_builds_a_hierarchical_region_for_a_level_loop(level_target):
+    """A kernel with a parallel level loop takes the hierarchical launch.
+
+    No scratch is involved: the selection that reaches the hierarchical shape
+    is the loop one, and it reaches it on its own. The league is one team per
+    cell, so the cell index comes from the league rank rather than from a
+    flat rank folded onto cells.
+    """
+    psy, loop, _ = level_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "TeamPolicy(ncells, Kokkos::AUTO)," in cpp
+    assert "KOKKOS_LAMBDA(const TeamMember &team) {" in cpp
+    assert "const int cell = team.league_rank();" in cpp
+    assert ("Kokkos::parallel_for(Kokkos::TeamVectorRange"
+            "(team, 1, (nlayers - 1) + 1)," in cpp)
+    assert "        [&](const int k) {" in cpp
+    assert "team.team_barrier();" in cpp
+    # The trailing scalar write is outside the spread loop, so one member
+    # makes it and the rest wait.
+    assert "Kokkos::single(Kokkos::PerTeam(team), [&]() {" in cpp
+    # Nothing asked for scratch, so nothing sizes any.
+    assert "set_scratch_size" not in cpp
+    assert "ScratchSpace" not in cpp
+    assert "Kokkos::RangePolicy" not in cpp
+
+    assert "call column_scale_kokkos(" in str(psy.gen)
+
+
+def test_apply_keeps_tri_solve_flat(tri_solve_target):
+    """A kernel with scratch and no parallel loop keeps the flat launch.
+
+    This is the witness that the two selections are separate. Scratch alone
+    reaches the flat team launch, where the team is a way of owning a
+    per-column allocation rather than a way of sharing the column's work, so
+    the scratch is per member and the league is a flat range of ranks folded
+    onto cells.
+    """
+    _, loop, _ = tri_solve_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "team_size_recommended(body, Kokkos::ParallelForTag())" in cpp
+    assert "x_new_scratch_t x_new(team.thread_scratch(0), nlayers);" in cpp
+    assert "if (cell >= ncells) {\n        return;\n      }" in cpp
+    assert "TeamVectorRange" not in cpp
+    assert "Kokkos::single" not in cpp
+    # The flat launch does read the league rank -- it folds it and the member
+    # rank into one flat index -- so its absence is not what distinguishes
+    # the two. The cell is derived rather than being the league rank itself.
+    assert "const int cell = team.league_rank();" not in cpp
+    assert "team.league_rank() * team.team_size() + rank;" in cpp
+
+
+def test_team_size_option_reaches_the_launch(level_target):
+    """``team_size`` replaces ``Kokkos::AUTO`` in the policy.
+
+    On the OpenMP backend ``Kokkos::AUTO`` is one member, so a host build
+    reaches the team-level concurrency only by asking for a size. The option
+    is the only way to ask.
+    """
+    _, loop, _ = level_target
+
+    cpp = LFRicKokkosTrans().apply(loop, options={"team_size": 4})
+
+    assert "TeamPolicy(ncells, 4)," in cpp
+    assert "Kokkos::AUTO" not in cpp
+
+
+@pytest.mark.parametrize("value", ["4", 4.0, True, 0, -1])
+def test_team_size_option_is_validated(level_target, value):
+    """A team size that is not a positive integer is refused.
+
+    ``True`` is in the list because ``isinstance(True, int)`` is true in
+    Python, so a bare integer check would let it through and write
+    ``TeamPolicy(ncells, True)``.
+    """
+    _, loop, _ = level_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop, options={"team_size": value})
+
+    assert ("'team_size' option must be a positive integer, but found "
+            f"'{value}'" in str(error.value))
+
+
+def test_team_is_reserved_for_a_hierarchical_kernel_without_scratch(
+        team_level_target):
+    """``team`` is refused for a kernel the loop selection alone reaches.
+
+    Until this stage the seven generated names were reserved only for a
+    kernel with a local array, because only scratch reached a launch that
+    declares ``team``. The hierarchical launch declares it whether or not
+    there is scratch, so the reservation follows the launch rather than the
+    scratch.
+    """
+    _, loop, _ = team_level_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("generated launch declares 'team', but the kernel declares a "
+            "local of that name" in str(error.value))
