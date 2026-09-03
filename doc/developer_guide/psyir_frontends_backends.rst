@@ -345,8 +345,15 @@ Additionally, there are three partially-implemented back-ends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
   region's name, its scalar arguments, its unmanaged Views, its
-  `kind_types` and its `scratch`, and it visits the loop body through
-  `CWriter`. The
+  `kind_types`, its `scratch`, and the `parallel_loops` and `team_size`
+  that select and size the hierarchical launch, and it visits the loop body
+  through `CWriter`. Two parts of the back-end live beside it because they
+  grow as regions are captured while the writer's own job does not:
+  `psyclone.psyir.backend.kokkos_launch` renders the launch shapes, one
+  function per shape, and `KokkosIntrinsicsMixin` in
+  `psyclone.psyir.backend.kokkos_intrinsics_mixin` holds the intrinsics,
+  inherited ahead of `CWriter` so its handlers are found first and fall
+  through to `CWriter`'s. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -497,11 +504,16 @@ There is no kind-blind spelling to fall back to: the trait is a template over
 the type, so a region that does not describe the argument's kind raises a
 `VisitorError` naming `kind_types` rather than guessing at `double`.
 
-Two launch shapes
-~~~~~~~~~~~~~~~~~
+Three launch shapes
+~~~~~~~~~~~~~~~~~~~
 
-The back-end generates one of two launches, selected by whether the region
-describes any `scratch`. The launches themselves are rendered by
+The back-end generates one of three launches. A region naming any
+`parallel_loops` takes the hierarchical launch; otherwise one describing any
+`scratch` takes the flat team launch; otherwise the range launch. The
+selection is a chain rather than a separate selector field, so nothing can
+disagree with it, and each shape is reached only by a region carrying the
+field it selects on -- a region built before either field existed generates
+exactly the source it generated then. The launches themselves are rendered by
 `psyclone.psyir.backend.kokkos_launch`, one function per shape, and
 `KokkosWriter` chooses among them.
 
@@ -541,6 +553,43 @@ OpenMP backend is one thread, so that the leagues rather than the ranks
 carry the parallelism. `team_size_max` is not asked instead. It returns the
 whole thread pool there whatever the scratch request, which puts one team on
 the whole league with a rendezvous between consecutive cells.
+
+A region naming `parallel_loops` launches over `Kokkos::TeamPolicy<>` too,
+but divides the work the other way round: one team per cell, `cell =
+team.league_rank()`, and the team's members spread over the cell's levels
+rather than over cells. That is the division an LFRic kernel is shaped for,
+since a cell's levels are the inner dimension of every field it reads, so
+members of one team touch neighbouring elements rather than columns a stride
+apart. Each loop the region named becomes a
+`Kokkos::parallel_for(Kokkos::TeamVectorRange(team, start, stop + 1), ...)`
+-- the `+ 1` converting Fortran's inclusive bound to Kokkos's half-open
+range -- followed by an unconditional `team.team_barrier()`. `TeamVectorRange`
+rather than `TeamThreadRange` because the two are the same loop on a host and
+the former spreads over the whole team on a device whatever shape the team
+has. The barrier is unconditional because a statement after the loop may read
+what the loop wrote, and deciding whether one does is a second dependence
+analysis the back-end does not perform.
+
+Every member of the team executes the rest of the body on its own copy of the
+locals, which is right for a scalar and wrong for an array: an element
+assigned outside every one of these loops would be written by all the members
+at once, which is a race in the memory model even though the values agree. So
+`KokkosWriter.assignment_node` wraps such an assignment in
+`Kokkos::single(Kokkos::PerTeam(team), ...)` and a barrier, wherever it sits
+-- at the top of the body, inside an `if`, or inside a serial loop, where
+each iteration's write is wrapped on its own. Scratch moves with the same
+change of meaning: `team.team_scratch(0)` with `PerTeam`, since a per-cell
+temporary is team-shared once a team is a cell.
+
+Which loops may be spread is a dependence judgement, and it is made by
+`LFRicKokkosTrans` rather than here: the back-end renders the loops it is
+given and does not judge them. It does check what it is given, since none of
+the four mistakes announces itself downstream -- an entry must be a `Loop` of
+the region's own schedule, not nested inside another chosen loop, and of unit
+step, `TeamVectorRange` having no stride. `team_size` renders as a literal in
+the policy, `Kokkos::AUTO` when it is `None`; the two flat shapes ignore it,
+the range launch having no team and the flat team launch taking the size its
+own probe recommends.
 
 A `KokkosScratch` is described separately from the region's arguments, and
 deliberately so. It crosses no interface, so it must not appear in the C ABI

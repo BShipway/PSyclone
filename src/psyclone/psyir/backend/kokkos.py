@@ -8,13 +8,15 @@
 
 from dataclasses import dataclass
 import re
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
-from psyclone.psyir.backend.c import CWriter, _is_real_argument
-from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
-from psyclone.psyir.backend.visitor import VisitorError
+from psyclone.psyir.backend.c import CWriter
+from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
+    KokkosIntrinsicsMixin)
+from psyclone.psyir.backend.kokkos_launch import (
+    hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.nodes import (
-    ArrayReference, CodeBlock, IntrinsicCall, KernelSchedule, Reference)
+    ArrayReference, CodeBlock, KernelSchedule, Literal, Loop, Reference)
 from psyclone.psyir.symbols import ArrayType
 
 
@@ -130,6 +132,9 @@ class KokkosScratch:
 @dataclass(frozen=True)
 class KokkosRegion:
     """All information required to generate one Kokkos translation unit."""
+    # A description carries as many fields as the thing it describes has
+    # parts, and splitting them into sub-objects would only move the count.
+    # pylint: disable=too-many-instance-attributes
 
     name: str
     schedule: KernelSchedule
@@ -163,67 +168,39 @@ class KokkosRegion:
     #: per-thread scratch. A kernel with no local arrays has no scratch to
     #: place, so it keeps the simpler launch.
     scratch: Tuple[KokkosScratch, ...] = ()
+    #: The loops of the region's own schedule that are to be spread over the
+    #: team. A non-empty tuple selects the hierarchical launch -- one team per
+    #: cell, with each of these loops rendered as a ``TeamVectorRange``
+    #: ``parallel_for`` -- and overrides the selection by :py:attr:`scratch`;
+    #: an empty tuple leaves that selection in force, so a region built before
+    #: this field existed generates exactly the source it generated then.
+    #: Which loops may be spread is a dependence judgement made by the driving
+    #: transformation, not here; the writer checks only that what it is given
+    #: is a set of unnested unit-stride loops it can find in the schedule.
+    parallel_loops: Tuple[Loop, ...] = ()
+    #: The team size the hierarchical launch asks for. ``None`` renders
+    #: ``Kokkos::AUTO`` and lets the backend choose; a positive integer
+    #: renders itself, which is how a host build reaches the team-level
+    #: concurrency that ``AUTO`` sizes to one member. The flat shapes ignore
+    #: it: the range launch has no team, and the flat team launch takes the
+    #: size the backend recommends for its own functor.
+    team_size: Optional[int] = None
 
 
-class KokkosWriter(CWriter):
-    """Generate a C++/Kokkos translation unit for a captured region."""
+class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
+    """Generate a C++/Kokkos translation unit for a captured region.
+
+    The intrinsics are inherited rather than written here, and the mixin
+    precedes :py:class:`~psyclone.psyir.backend.c.CWriter` in the bases so
+    that its handlers are found first and fall through to the C writer's by
+    ``super()``.
+    """
 
     #: The C types this writer will declare. ``bool`` is the one with no
     #: width behind it: the driving transformation puts a Fortran ``logical``
     #: on the ABI by conversion rather than by matching kinds, so nothing here
     #: has to know what ``l_def`` measures.
     _SUPPORTED_TYPES = ("bool", "double", "float", "int")
-
-    #: Intrinsics that become a plain ``Kokkos::`` function call, by the name
-    #: Kokkos gives them. Qualification is required for device code -- an
-    #: unqualified ``sqrt`` is a host function -- and is correct on the host
-    #: too. ``ABS`` and ``MOD`` are absent because both are spelt differently
-    #: for an integer argument; they are dispatched in
-    #: :py:meth:`intrinsiccall_node` instead.
-    _KOKKOS_FUNCTIONS = {
-        IntrinsicCall.Intrinsic.ACOS: "acos",
-        IntrinsicCall.Intrinsic.ASIN: "asin",
-        IntrinsicCall.Intrinsic.ATAN: "atan",
-        IntrinsicCall.Intrinsic.ATAN2: "atan2",
-        IntrinsicCall.Intrinsic.COS: "cos",
-        IntrinsicCall.Intrinsic.EXP: "exp",
-        IntrinsicCall.Intrinsic.LOG: "log",
-        IntrinsicCall.Intrinsic.SIGN: "copysign",
-        IntrinsicCall.Intrinsic.SIN: "sin",
-        IntrinsicCall.Intrinsic.SQRT: "sqrt",
-        IntrinsicCall.Intrinsic.TAN: "tan",
-        }
-
-    #: Intrinsics that return a Fortran integer from a floating-point
-    #: function, so that the call needs an ``(int)`` cast round it. Fortran's
-    #: ``NINT`` rounds a half away from zero, which is ``round`` and not
-    #: ``nearbyint``: the latter rounds a half to even under the default
-    #: rounding mode, so ``NINT(2.5)`` would give 2 rather than 3.
-    _KOKKOS_CAST_FUNCTIONS = {
-        IntrinsicCall.Intrinsic.FLOOR: "floor",
-        IntrinsicCall.Intrinsic.NINT: "round",
-        }
-
-    #: Intrinsics written as a cast, and the C types a resolved kind is
-    #: allowed to give for each. The check is not redundant: PSyIR infers the
-    #: precision of a kindless ``real(i)`` from its *argument*, reporting
-    #: ``Scalar<REAL, Reference['i_def']>``, so resolving that kind would cast
-    #: to ``int`` and lose the value. A kind whose C type does not belong to
-    #: the intrinsic being cast to is therefore treated as unresolved, and the
-    #: C writer's kind-blind answer -- the widest of the intrinsic -- stands.
-    _KOKKOS_CAST_TYPES = {
-        IntrinsicCall.Intrinsic.REAL: ("double", "float"),
-        IntrinsicCall.Intrinsic.INT: ("int",),
-        }
-
-    #: Variadic intrinsics folded pairwise into nested binary calls. Unlike
-    #: ``fmax``, ``Kokkos::max`` is type-generic, so the integer case
-    #: :py:class:`~psyclone.psyir.backend.c.CWriter` refuses is generated
-    #: here.
-    _KOKKOS_FOLDS = {
-        IntrinsicCall.Intrinsic.MAX: "max",
-        IntrinsicCall.Intrinsic.MIN: "min",
-        }
 
     def __init__(self, **kwargs):
         """Create a writer holding no region.
@@ -235,6 +212,12 @@ class KokkosWriter(CWriter):
         super().__init__(**kwargs)
         self._views = {}
         self._kind_types = {}
+        self._parallel_loops = ()
+        # How many of the region's chosen loops the visitor is currently
+        # inside. A team-level array write is one made at depth zero; inside a
+        # chosen loop the members already have disjoint iterations, so the
+        # write is theirs alone and needs no ``Kokkos::single``.
+        self._parallel_depth = 0
 
     def __call__(self, region: KokkosRegion) -> str:
         """Generate code for ``region``.
@@ -243,11 +226,15 @@ class KokkosWriter(CWriter):
         duration of the call and cleared afterwards, so that a writer reused
         for a second region does not carry the first one's widths into it.
 
-        One of two launch shapes is generated, selected by whether the region
-        describes any :py:attr:`KokkosRegion.scratch`. A region without
-        scratch is generated exactly as it was before scratch existed; see
-        :py:func:`~psyclone.psyir.backend.kokkos_launch.range_launch` and
-        :py:func:`~psyclone.psyir.backend.kokkos_launch.team_launch`.
+        One of three launch shapes is generated. A region naming any
+        :py:attr:`KokkosRegion.parallel_loops` takes the hierarchical launch;
+        otherwise one describing any :py:attr:`KokkosRegion.scratch` takes the
+        flat team launch; otherwise the range launch. Neither of the older two
+        reads the fields it does not select on, so a region built before they
+        existed is generated exactly as it was then; see
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.range_launch`,
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.team_launch` and
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.hierarchical_launch`.
 
         :param region: the captured region to generate.
 
@@ -267,6 +254,7 @@ class KokkosWriter(CWriter):
         # ``x_new(k)`` and ``mr_v(df)`` by one lookup.
         self._views.update({item.name: item for item in region.scratch})
         self._kind_types = dict(region.kind_types)
+        self._parallel_loops = region.parallel_loops
 
         signature = ",\n    ".join(
             self._argument_declaration(argument)
@@ -281,12 +269,13 @@ class KokkosWriter(CWriter):
                 "using TeamMember = TeamPolicy::member_type;",
                 "using ScratchSpace = "
                 "Kokkos::DefaultExecutionSpace::scratch_memory_space;",
-            )) if region.scratch else ""
+            )) if region.scratch or region.parallel_loops else ""
 
-        # The team shape nests the body one level deeper, inside the
-        # TeamThreadRange lambda.
+        # The flat team shape nests the body one level deeper, inside the
+        # TeamThreadRange lambda. The hierarchical one does not: its body sits
+        # directly in the functor, as the range shape's does.
         scratch_names = {item.name for item in region.scratch}
-        self._depth = 3 if region.scratch else 2
+        self._depth = 3 if region.scratch and not region.parallel_loops else 2
         local_declarations = "".join(
             self.gen_local_variable(symbol)
             for symbol in region.schedule.symbol_table.automatic_datasymbols
@@ -299,11 +288,14 @@ class KokkosWriter(CWriter):
             self._visit(child) for child in region.schedule.children)
         self._depth = 0
         self._views, self._kind_types = {}, {}
+        self._parallel_loops = ()
 
-        launch = (
-            team_launch(region, local_declarations, body)
-            if region.scratch
-            else range_launch(region, local_declarations, body))
+        if region.parallel_loops:
+            launch = hierarchical_launch(region, local_declarations, body)
+        elif region.scratch:
+            launch = team_launch(region, local_declarations, body)
+        else:
+            launch = range_launch(region, local_declarations, body)
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
@@ -354,8 +346,12 @@ class KokkosWriter(CWriter):
             :py:class:`~psyclone.psyir.nodes.KernelSchedule`, if an argument
             is neither a :py:class:`KokkosScalar` nor a
             :py:class:`KokkosView`, if an argument's or a kind's C type is not
-            in :py:attr:`_SUPPORTED_TYPES`, or if a View's index offsets are
-            not integers.
+            in :py:attr:`_SUPPORTED_TYPES`, if a View's index offsets are
+            not integers, if a :py:attr:`KokkosRegion.parallel_loops` entry is
+            not a :py:class:`~psyclone.psyir.nodes.Loop`, or if the region's
+            :py:attr:`KokkosRegion.team_size` is neither ``None`` nor an
+            ``int`` -- ``bool`` among them, since ``TeamPolicy(ncells, True)``
+            is a legal team of one that nothing downstream would report.
         :raises ValueError: if the region's name, its cell count, an argument
             name, a kind name or a View's data name or region indices are not
             C++ identifiers; if a View's or a scratch array's extent is not an
@@ -364,8 +360,11 @@ class KokkosWriter(CWriter):
             share a C ABI name; if the cell count is not itself a scalar
             argument; if a kernel argument has no description; if a View
             breaks the ownership or dimensional contract
-            :py:meth:`_validate_view` states; or if a scratch array breaks the
-            contract :py:meth:`_validate_scratch` states.
+            :py:meth:`_validate_view` states; if a scratch array breaks the
+            contract :py:meth:`_validate_scratch` states; if a parallel loop
+            is not in the region's schedule, is nested inside another of them,
+            or has a step other than the literal ``1``; or if the team size is
+            not positive.
         """
         # pylint: disable=too-many-branches
         if not isinstance(region, KokkosRegion):
@@ -444,6 +443,65 @@ class KokkosWriter(CWriter):
         for item in region.scratch:
             self._validate_scratch(item, scalar_names, used_names)
             used_names.add(item.name)
+
+        self._validate_launch(region)
+
+    @staticmethod
+    def _validate_launch(region):
+        """Validate the loops and the team size the hierarchical launch takes.
+
+        These are checked rather than trusted because none of the four
+        mistakes below announces itself downstream: a loop from another
+        schedule is never matched by identity and silently generates a serial
+        ``for``, and the other three generate C++ that compiles and means
+        something the Fortran did not.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :raises TypeError: if a ``parallel_loops`` entry is not a
+            :py:class:`~psyclone.psyir.nodes.Loop`, or if ``team_size`` is
+            neither ``None`` nor an ``int``.
+        :raises ValueError: if a parallel loop is not in the region's
+            schedule, is nested inside another of them, or has a step other
+            than the literal ``1``; or if the team size is not positive.
+        """
+        for entry in region.parallel_loops:
+            if not isinstance(entry, Loop):
+                raise TypeError(
+                    "KokkosRegion parallel_loops must be Loop instances, "
+                    f"found '{type(entry).__name__}'.")
+            if not any(entry is loop
+                       for loop in region.schedule.walk(Loop)):
+                raise ValueError(
+                    f"Kokkos parallel loop over '{entry.variable.name}' is "
+                    "not in the region's schedule.")
+            ancestor = entry.ancestor(Loop)
+            while ancestor is not None:
+                if any(ancestor is other
+                       for other in region.parallel_loops):
+                    raise ValueError(
+                        f"Kokkos parallel loop over '{entry.variable.name}' "
+                        "is nested inside another parallel loop.")
+                ancestor = ancestor.ancestor(Loop)
+            step = entry.step_expr
+            if not isinstance(step, Literal) or step.value != "1":
+                raise ValueError(
+                    f"Kokkos parallel loop over '{entry.variable.name}' has "
+                    "a step that is not the literal 1; TeamVectorRange has "
+                    "no stride.")
+
+        if region.team_size is None:
+            return
+        if isinstance(region.team_size, bool) or not isinstance(
+                region.team_size, int):
+            raise TypeError(
+                "KokkosRegion team_size must be None or an int, found "
+                f"'{type(region.team_size).__name__}'.")
+        if region.team_size <= 0:
+            raise ValueError(
+                f"KokkosRegion team_size must be positive, found "
+                f"{region.team_size}.")
 
     def _validate_scratch(self, scratch, scalar_names, used_names):
         """Validate one kernel-local array placed in team scratch.
@@ -626,174 +684,88 @@ class KokkosWriter(CWriter):
         pointer = "* restrict " if symbol.is_array else ""
         return f"{c_type} {pointer}{symbol.name}"
 
-    def literal_node(self, node) -> str:
-        """Write a literal at the width its own Fortran kind has.
+    def loop_node(self, node) -> str:
+        """Spread one of the region's chosen loops over the team.
 
-        ``2.0_r_solver`` is a ``float`` in a single-precision build, and C++
-        would otherwise read the generated ``2.0`` as a ``double`` and promote
-        the whole expression around it.
+        A loop the region named in :py:attr:`KokkosRegion.parallel_loops`
+        becomes a ``TeamVectorRange`` ``parallel_for``; every other loop,
+        including one nested inside this body, is left to
+        :py:class:`~psyclone.psyir.backend.c.CWriter` as a serial ``for`` that
+        each member runs on its own. The Fortran bound is inclusive and the
+        Kokkos range is half-open, which is the ``+ 1`` on the stop
+        expression.
 
-        :param node: the literal to write.
-        :type node: :py:class:`psyclone.psyir.nodes.Literal`
+        A ``team_barrier`` follows unconditionally. A statement after the loop
+        may read what the loop wrote, and working out whether one does is a
+        second dependence analysis this writer does not perform; under
+        ``Kokkos::AUTO`` on the OpenMP backend the team has one member and the
+        barrier costs nothing measurable.
 
-        :returns: the C representation of the literal.
+        The lambda's parameter shadows the region-scope declaration of the
+        loop variable, which stays because the same variable may also drive a
+        serial loop in the same body. Shadowing a local with a lambda
+        parameter is legal C++, and the generated code is not compiled with
+        ``-Wshadow``.
+
+        :param node: the loop in the captured body.
+        :type node: :py:class:`psyclone.psyir.nodes.Loop`
+
+        :returns: the ``TeamVectorRange`` launch and its barrier, or the
+            serial ``for`` the C writer would have produced.
         :rtype: str
         """
-        text = super().literal_node(node)
-        if self._kind_c_type(node.datatype) == "float":
-            return f"{text}f"
-        return text
+        if not any(loop is node for loop in self._parallel_loops):
+            return super().loop_node(node)
 
-    def intrinsiccall_node(self, node) -> str:
-        """Write an intrinsic call as Kokkos spells it.
+        start = self._visit(node.start_expr)
+        stop = self._visit(node.stop_expr)
+        self._parallel_depth += 1
+        self._depth += 1
+        body = "".join(self._visit(child) for child in node.loop_body)
+        self._depth -= 1
+        self._parallel_depth -= 1
+        return (
+            f"{self._nindent}Kokkos::parallel_for("
+            f"Kokkos::TeamVectorRange(team, {start}, {stop} + 1),\n"
+            f"{self._nindent}    [&](const int {node.variable.name}) {{\n"
+            f"{body}{self._nindent}}});\n"
+            f"{self._nindent}team.team_barrier();\n")
 
-        The C writer is right about the shape of every intrinsic it knows and
-        wrong about two things a Kokkos region cares about: it cannot see the
-        width a Fortran kind asks for, and it emits unqualified names that are
-        host functions. Each case this method does not recognise falls back to
-        it, so the set of intrinsics supported here is the C writer's plus
-        ``EPSILON``, plus integer ``MAX`` and ``MIN``.
+    def assignment_node(self, node) -> str:
+        """Let one member make a team-level write to an array.
 
-        :param node: the intrinsic call to write.
-        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+        Every member of the team executes the body of a hierarchical launch,
+        so an array element assigned outside any of the region's parallel
+        loops is written by all of them at once. The values agree, but
+        concurrent writes to one element are a race in the memory model
+        whatever they carry, so the statement is wrapped in
+        ``Kokkos::single``. A scalar needs nothing: it is a per-member local,
+        and each member writing its own copy races with no one.
 
-        :returns: the C++/Kokkos representation of the call.
-        :rtype: str
+        Inside a parallel loop the members already hold disjoint iterations,
+        so the write is theirs alone and is left as it is. So is every
+        assignment in the two flat launch shapes, whose members are cells
+        rather than lanes of one.
 
-        :raises VisitorError: if the intrinsic needs a kind the region did
-            not describe, or if the C writer has no handler for it.
-        """
-        for handler in (self._kokkos_cast, self._kokkos_numeric_limit,
-                        self._kokkos_function):
-            written = handler(node)
-            if written is not None:
-                return written
-        return super().intrinsiccall_node(node)
+        :param node: the assignment in the captured body.
+        :type node: :py:class:`psyclone.psyir.nodes.Assignment`
 
-    def _kokkos_cast(self, node):
-        """Write ``REAL`` or ``INT`` at the width its own kind asks for.
-
-        ``real(x, r_solver)`` is a ``float`` in a single-precision build, and
-        the C writer casts every real to ``double``. A kind the region did not
-        describe is left to it: the probe a caller uses to ask which
-        intrinsics are supported replaces every argument with a bare literal,
-        so an unresolved kind is that probe's normal case rather than an
-        error. So is a kind that resolves to the wrong intrinsic, for the
-        reason given at :py:attr:`_KOKKOS_CAST_TYPES`.
-
-        :param node: the intrinsic call to write.
-        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
-
-        :returns: the cast, or ``None`` if this is not a cast, if its kind is
-            unresolved, or if its arity is one the C writer should refuse.
-        :rtype: Optional[str]
-        """
-        allowed = self._KOKKOS_CAST_TYPES.get(node.intrinsic)
-        if allowed is None or len(node.arguments) not in (1, 2):
-            return None
-        c_type = self._kind_c_type(node.datatype)
-        if c_type not in allowed:
-            return None
-        return f"({c_type}){self._visit(node.arguments[0])}"
-
-    def _kokkos_numeric_limit(self, node):
-        """Write ``EPSILON`` as the Kokkos numeric trait for its kind.
-
-        The argument is consumed for its type and never visited, since the
-        intrinsic asks a question about a type rather than about a value.
-
-        :param node: the intrinsic call to write.
-        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
-
-        :returns: the trait, or ``None`` if this is not ``EPSILON``.
-        :rtype: Optional[str]
-
-        :raises VisitorError: if the region described no kind for the
-            argument, leaving the trait with no type to instantiate.
-        """
-        if node.intrinsic is not IntrinsicCall.Intrinsic.EPSILON:
-            return None
-        c_type = self._kind_c_type(node.arguments[0].datatype)
-        if c_type is None:
-            raise VisitorError(
-                "EPSILON needs the width of its argument's kind, which this "
-                "region does not describe. Add the kind to the region's "
-                "'kind_types'.")
-        return f"Kokkos::Experimental::epsilon_v<{c_type}>"
-
-    def _kokkos_function(self, node):
-        """Write an intrinsic that becomes a qualified Kokkos function call.
-
-        :param node: the intrinsic call to write.
-        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
-
-        :returns: the call, or ``None`` if Kokkos has no function for this
-            intrinsic and the C writer's own answer should stand.
-        :rtype: Optional[str]
-
-        :raises VisitorError: if a folded intrinsic has fewer than two
-            arguments, which no valid Fortran ``MAX`` or ``MIN`` has.
-        """
-        intrinsic = node.intrinsic
-        if intrinsic in self._KOKKOS_FOLDS:
-            if len(node.arguments) < 2:
-                raise VisitorError(
-                    f"The Kokkos back-end can only fold "
-                    f"'{intrinsic.name}' over 2 or more arguments, but found "
-                    f"{len(node.arguments)}.")
-            return self._fold(self._KOKKOS_FOLDS[intrinsic], node)
-        if intrinsic in self._KOKKOS_CAST_FUNCTIONS and \
-                len(node.arguments) == 1:
-            name = self._KOKKOS_CAST_FUNCTIONS[intrinsic]
-            return f"(int)Kokkos::{name}({self._visit(node.arguments[0])})"
-        name = self._function_name(node)
-        if name is None:
-            return None
-        arguments = ", ".join(self._visit(argument)
-                              for argument in node.arguments)
-        return f"Kokkos::{name}({arguments})"
-
-    @classmethod
-    def _function_name(cls, node):
-        """Return the Kokkos function an intrinsic call is written with.
-
-        ``ABS`` and ``MOD`` are spelt by their argument's type, exactly as in
-        the C writer: ``Kokkos::abs`` truncates a real and ``Kokkos::fabs``
-        returns a double for an integer. Integer ``MOD`` has no function at
-        all -- it is the ``%`` operator, which needs no qualification -- so it
-        is returned to the C writer.
-
-        :param node: the intrinsic call to write.
-        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
-
-        :returns: the unqualified function name, or ``None`` if this
-            intrinsic is not written as a Kokkos function call.
-        :rtype: Optional[str]
-        """
-        if node.intrinsic is IntrinsicCall.Intrinsic.ABS:
-            return "fabs" if _is_real_argument(node.arguments[0]) else "abs"
-        if node.intrinsic is IntrinsicCall.Intrinsic.MOD:
-            return "fmod" if _is_real_argument(node.arguments[0]) else None
-        return cls._KOKKOS_FUNCTIONS.get(node.intrinsic)
-
-    def _fold(self, name, node):
-        """Fold a variadic intrinsic into nested binary Kokkos calls.
-
-        Folded right to left, so that three arguments give
-        ``Kokkos::max(a, Kokkos::max(b, c))``.
-
-        :param str name: the unqualified Kokkos function to fold with.
-        :param node: the intrinsic call to write.
-        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
-
-        :returns: the nested calls.
+        :returns: the assignment, wrapped in ``Kokkos::single`` and followed
+            by a barrier where the team would otherwise race.
         :rtype: str
         """
-        operands = [self._visit(argument) for argument in node.arguments]
-        folded = operands[-1]
-        for operand in reversed(operands[:-1]):
-            folded = f"Kokkos::{name}({operand}, {folded})"
-        return folded
+        if (not self._parallel_loops or self._parallel_depth
+                or not isinstance(node.lhs, ArrayReference)):
+            return super().assignment_node(node)
+
+        self._depth += 1
+        inner = super().assignment_node(node)
+        self._depth -= 1
+        return (
+            f"{self._nindent}Kokkos::single(Kokkos::PerTeam(team), "
+            "[&]() {\n"
+            f"{inner}{self._nindent}}});\n"
+            f"{self._nindent}team.team_barrier();\n")
 
     def arrayreference_node(self, node: ArrayReference) -> str:
         """Emit an indexed View access with Fortran lower bounds removed.

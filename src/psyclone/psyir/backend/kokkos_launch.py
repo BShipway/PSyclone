@@ -43,6 +43,43 @@ writer is the only caller; nothing here visits PSyIR.
 """
 
 
+def _scratch_text(region, allocation, indent):
+    """Return the three pieces of C++ a region's scratch arrays generate.
+
+    The two team launches place scratch differently -- one array per rank in
+    the flat shape, one per team in the hierarchical one -- but the aliases
+    and the size sum are the same text in both, and were duplicated between
+    them until this function held them. ``allocation`` and ``indent`` are the
+    whole of the difference.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    :param allocation: the member function the Views are constructed over,
+        ``team.thread_scratch(0)`` or ``team.team_scratch(0)``.
+    :type allocation: str
+    :param indent: the leading whitespace of each construction, which differs
+        because the flat shape nests its body one level deeper.
+    :type indent: str
+
+    :returns: the type aliases, the ``shmem_size`` sum, and the View
+        constructions.
+    :rtype: Tuple[str, str, str]
+    """
+    aliases = "".join(
+        f"  using {item.name}_scratch_t = Kokkos::View<{item.c_type}"
+        f"{'*' * len(item.extents)}, Kokkos::LayoutLeft, ScratchSpace, "
+        "Unmanaged>;\n"
+        for item in region.scratch)
+    sizes = "\n      + ".join(
+        f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})"
+        for item in region.scratch)
+    constructions = "".join(
+        f"{indent}{item.name}_scratch_t {item.name}("
+        f"{allocation}, {', '.join(item.extents)});\n"
+        for item in region.scratch)
+    return aliases, sizes, constructions
+
+
 def range_launch(region, local_declarations, body):
     """Return the ``RangePolicy`` launch, one cell per iteration.
 
@@ -105,18 +142,8 @@ def team_launch(region, local_declarations, body):
         body, the team-size probe and the ``parallel_for``.
     :rtype: str
     """
-    aliases = "".join(
-        f"  using {item.name}_scratch_t = Kokkos::View<{item.c_type}"
-        f"{'*' * len(item.extents)}, Kokkos::LayoutLeft, ScratchSpace, "
-        "Unmanaged>;\n"
-        for item in region.scratch)
-    sizes = "\n      + ".join(
-        f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})"
-        for item in region.scratch)
-    constructions = "".join(
-        f"      {item.name}_scratch_t {item.name}("
-        f"team.thread_scratch(0), {', '.join(item.extents)});\n"
-        for item in region.scratch)
+    aliases, sizes, constructions = _scratch_text(
+        region, "team.thread_scratch(0)", "      ")
     return (
         f"{aliases}\n"
         f"  const size_t scratch_bytes = {sizes};\n\n"
@@ -147,3 +174,60 @@ def team_launch(region, local_declarations, body):
         "          .set_scratch_size(0, "
         "Kokkos::PerThread(scratch_bytes)),\n"
         "      body);\n")
+
+
+def hierarchical_launch(region, local_declarations, body):
+    """Return the ``TeamPolicy`` launch, one team per cell.
+
+    The league carries the cells and the team carries the levels: each team
+    takes one cell, and the loops the region named in
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.parallel_loops` are
+    spread across its members by
+    :py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter.loop_node`. That is
+    the opposite division from :py:func:`team_launch`, and it is the one an
+    LFRic kernel is shaped for: a cell's levels are the inner dimension of
+    every field it reads, so members of one team touch neighbouring elements
+    rather than columns a stride apart.
+
+    The team's own work -- the scalars, the loop control, and the boundary
+    writes ``Kokkos::single`` guards -- is what a cell has that its levels do
+    not, so it sits in the functor rather than in a range over the league.
+    Every member runs it redundantly on its own copy of the locals.
+
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.team_size` renders
+    as a literal in the policy rather than as anything the generated code
+    computes, so a run may be given a different team by regenerating nothing
+    but this line -- which is what the forced-team build does to reach the
+    team-level concurrency ``Kokkos::AUTO`` sizes to one member on a host.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    :param local_declarations: the generated declarations of the kernel's
+        scalar locals, already indented.
+    :type local_declarations: str
+    :param body: the generated kernel body, already indented.
+    :type body: str
+
+    :returns: the scratch type aliases and size computation where the region
+        has scratch, and the ``parallel_for`` over one team per cell.
+    :rtype: str
+    """
+    aliases, sizes, constructions = _scratch_text(
+        region, "team.team_scratch(0)", "    ")
+    preamble = (
+        f"{aliases}\n  const size_t scratch_bytes = {sizes};\n\n"
+        if region.scratch else "")
+    team_size = (
+        "Kokkos::AUTO" if region.team_size is None
+        else str(region.team_size))
+    policy = f"TeamPolicy({region.cell_count}, {team_size})" + (
+        "\n          .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))"
+        if region.scratch else "")
+    return (
+        f"{preamble}"
+        f'  Kokkos::parallel_for("{region.name}",\n'
+        f"      {policy},\n"
+        "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
+        f"    const int {region.cell_index} = team.league_rank();\n"
+        f"{constructions}{local_declarations}{body}"
+        "  });\n")
