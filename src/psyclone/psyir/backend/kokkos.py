@@ -11,6 +11,7 @@ import re
 from typing import Tuple, Union
 
 from psyclone.psyir.backend.c import CWriter, _is_real_argument
+from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayReference, CodeBlock, IntrinsicCall, KernelSchedule, Reference)
@@ -245,7 +246,8 @@ class KokkosWriter(CWriter):
         One of two launch shapes is generated, selected by whether the region
         describes any :py:attr:`KokkosRegion.scratch`. A region without
         scratch is generated exactly as it was before scratch existed; see
-        :py:meth:`_range_launch` and :py:meth:`_team_launch`.
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.range_launch` and
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.team_launch`.
 
         :param region: the captured region to generate.
 
@@ -299,9 +301,9 @@ class KokkosWriter(CWriter):
         self._views, self._kind_types = {}, {}
 
         launch = (
-            self._team_launch(region, local_declarations, body)
+            team_launch(region, local_declarations, body)
             if region.scratch
-            else self._range_launch(region, local_declarations, body))
+            else range_launch(region, local_declarations, body))
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
@@ -328,102 +330,6 @@ class KokkosWriter(CWriter):
             f"{launch}"
             "  Kokkos::fence();\n"
             "}\n")
-
-    @staticmethod
-    def _range_launch(region, local_declarations, body):
-        """Return the ``RangePolicy`` launch, one cell per iteration.
-
-        This is the shape every region had before scratch existed, and it is
-        reproduced here unchanged: the captures already in the model are gated
-        on whole-model checksums and on assertions over this exact text.
-
-        :param region: the region being generated.
-        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
-        :param local_declarations: the generated declarations of the kernel's
-            scalar locals, already indented.
-        :type local_declarations: str
-        :param body: the generated kernel body, already indented.
-        :type body: str
-
-        :returns: the ``parallel_for`` and its captured body.
-        :rtype: str
-        """
-        return (
-            f'  Kokkos::parallel_for("{region.name}", '
-            f"Kokkos::RangePolicy<>(0, {region.cell_count}),\n"
-            f"      KOKKOS_LAMBDA(const int {region.cell_index}) {{\n"
-            f"{local_declarations}{body}"
-            "      });\n")
-
-    @staticmethod
-    def _team_launch(region, local_declarations, body):
-        """Return the ``TeamPolicy`` launch, one cell per team rank.
-
-        Cells are tiled across the ranks of a team so that each rank takes one
-        cell and holds its own per-thread scratch. That keeps the parallelism
-        identical to :py:meth:`_range_launch` -- one cell per worker -- while
-        giving each worker fast, launch-scoped storage; on a GPU that scratch
-        is shared memory rather than global.
-
-        The team size cannot be chosen here, because it depends on how much
-        scratch each rank asks for, so the policy is asked for the largest it
-        supports. The scratch request is set on the probe policy before the
-        query, or the answer is the one for a policy requesting nothing.
-
-        :param region: the region being generated.
-        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
-        :param local_declarations: the generated declarations of the kernel's
-            scalar locals, already indented.
-        :type local_declarations: str
-        :param body: the generated kernel body, already indented.
-        :type body: str
-
-        :returns: the scratch type aliases, the size computation, the bound
-            body, the team-size probe and the ``parallel_for``.
-        :rtype: str
-        """
-        aliases = "".join(
-            f"  using {item.name}_scratch_t = Kokkos::View<{item.c_type}"
-            f"{'*' * len(item.extents)}, Kokkos::LayoutLeft, ScratchSpace, "
-            "Unmanaged>;\n"
-            for item in region.scratch)
-        sizes = "\n      + ".join(
-            f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})"
-            for item in region.scratch)
-        constructions = "".join(
-            f"      {item.name}_scratch_t {item.name}("
-            f"team.thread_scratch(0), {', '.join(item.extents)});\n"
-            for item in region.scratch)
-        return (
-            f"{aliases}\n"
-            f"  const size_t scratch_bytes = {sizes};\n\n"
-            "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
-            "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
-            "team.team_size()),\n"
-            "        [&](const int rank) {\n"
-            f"      const int {region.cell_index} = team.league_rank() * "
-            "team.team_size() + rank;\n"
-            # The league is sized by rounding up, so the last team runs with
-            # ranks that have no cell. Without this they would run the body
-            # for a cell past the end of every View.
-            f"      if ({region.cell_index} >= {region.cell_count}) {{\n"
-            "        return;\n"
-            "      }\n"
-            f"{constructions}"
-            f"{local_declarations}{body}"
-            "    });\n"
-            "  };\n\n"
-            "  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)\n"
-            "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes));\n"
-            "  const int team_size = probe.team_size_max(body, "
-            "Kokkos::ParallelForTag());\n"
-            f"  const int league_size = ({region.cell_count} + team_size - 1)"
-            " / team_size;\n"
-            f'  Kokkos::parallel_for("{region.name}",\n'
-            "      TeamPolicy(league_size, team_size)\n"
-            "          .set_scratch_size(0, "
-            "Kokkos::PerThread(scratch_bytes)),\n"
-            "      body);\n")
 
     @staticmethod
     def _is_identifier(value):

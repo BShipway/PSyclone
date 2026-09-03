@@ -501,7 +501,9 @@ Two launch shapes
 ~~~~~~~~~~~~~~~~~
 
 The back-end generates one of two launches, selected by whether the region
-describes any `scratch`.
+describes any `scratch`. The launches themselves are rendered by
+`psyclone.psyir.backend.kokkos_launch`, one function per shape, and
+`KokkosWriter` chooses among them.
 
 A region with no scratch launches over `Kokkos::RangePolicy<>(0, ncells)`
 with a `KOKKOS_LAMBDA(const int cell)`. This is the shape every region had

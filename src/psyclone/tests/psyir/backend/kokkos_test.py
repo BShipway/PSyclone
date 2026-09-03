@@ -15,6 +15,7 @@ import pytest
 from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
     extent_names, is_extent)
+from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
@@ -498,6 +499,26 @@ def test_kokkos_writer_without_scratch_keeps_the_range_launch():
     for absent in ("TeamPolicy", "TeamMember", "ScratchSpace",
                    "scratch_bytes", "thread_scratch", "team_size_max"):
         assert absent not in code
+
+
+def test_kokkos_launch_module_renders_both_existing_shapes():
+    """The launch shapes are rendered by ``kokkos_launch``, not the writer.
+
+    The writer selects a shape and the module renders it. Pinning the two
+    existing shapes to the module's own output is what makes the split
+    checkable: the strings below are the first line each renderer emits.
+    """
+    code = KokkosWriter()(_scratch_region())
+    assert team_launch(_scratch_region(), "", "").splitlines()[0] == (
+        "  using x_new_scratch_t = Kokkos::View<double*, Kokkos::LayoutLeft,"
+        " ScratchSpace, Unmanaged>;")
+    assert team_launch(_scratch_region(), "", "").splitlines()[0] in code
+
+    code = KokkosWriter()(_region())
+    assert range_launch(_region(), "", "").splitlines()[0] == (
+        '  Kokkos::parallel_for("moist_dyn_gas_kokkos", '
+        "Kokkos::RangePolicy<>(0, ncells),")
+    assert range_launch(_region(), "", "").splitlines()[0] in code
 
 
 def test_kokkos_writer_views_are_never_managed():
