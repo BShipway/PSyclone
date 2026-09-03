@@ -18,8 +18,9 @@ from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Range,
-    Reference, Routine)
+    ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Literal, Loop,
+    Range, Reference, Routine)
+from psyclone.psyir.tools import DependencyTools
 from psyclone.psyir.transformations import (
     ArrayAssignment2LoopsTrans, TransformationError)
 
@@ -130,10 +131,9 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
 
     A kernel-local automatic array -- a temporary such as
     ``real(kind=r_def), dimension(nlayers) :: x_new``, whose extent is known
-    only at runtime -- is placed in Kokkos team scratch, one private View per
-    team rank, so that the cells sharing a team do not share a temporary. The
-    region is then launched over a ``TeamPolicy`` rather than a
-    ``RangePolicy``; a kernel with no array locals keeps the flat launch.
+    only at runtime -- is placed in Kokkos team scratch, so that the cells
+    sharing a team do not share a temporary. The region is then launched over
+    a ``TeamPolicy`` rather than a ``RangePolicy``.
 
     That placement is what the refusals protect. The array's element kind must
     be one the ABI names, as a formal's must, and every **name** in its extents
@@ -156,17 +156,53 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     is not. Every one of these is refused by :py:meth:`validate` rather than
     discovered by :py:meth:`apply`.
 
+    **A loop inside the kernel body may be spread over the team**, and which
+    loops those are is PSyclone's own judgement rather than this
+    transformation's: each is put to
+    :py:meth:`~psyclone.psyir.tools.DependencyTools.can_loop_be_parallelised`,
+    and one it accepts becomes a ``Kokkos::TeamVectorRange`` over the team's
+    members. Only the outermost of an accepted nest is taken, because a
+    ``TeamVectorRange`` may not be nested inside itself, and a loop whose step
+    is not 1 is left alone, because that range gives every member a unit
+    stride. In practice these are the level loops: a GungHo kernel's outer
+    loop runs over a column's levels, and the loops that survive the analysis
+    are the ones whose iterations touch disjoint elements rather than sweeping
+    a recurrence.
+
+    A kernel with such a loop is launched over one team per cell -- the cell
+    is the team's league rank -- **whether or not it has an automatic array**.
+    The two selections are separate, and the region shows it: a kernel with
+    scratch and no acceptable loop keeps the flat launch, where the team is a
+    way of owning a per-member temporary and its scratch is per member; a
+    kernel with both takes the one-team-per-cell shape and its scratch becomes
+    per team, shared by the members working on that column. A kernel with
+    neither keeps the ``RangePolicy``.
+
+    Everything outside a spread loop runs on **every** member of the team, on
+    that member's own copy of the scalar locals. That is harmless for a scalar
+    but not for an array, so an array write outside a spread loop is made by
+    one member under ``Kokkos::single`` and published to the rest by a team
+    barrier before the next statement reads it. A barrier also follows each
+    spread loop, unconditionally: deciding whether a later reader needs it is
+    a second analysis this transformation does not do.
+
+    ``"team_size"`` is the one option, an optional positive ``int``. Absent,
+    the policy asks for ``Kokkos::AUTO`` and the backend sizes the team --
+    which on the OpenMP backend is **one member**, so on a host build the
+    leagues carry all of the parallelism and a spread loop runs serially. A
+    host build reaches the team-level concurrency only by naming a size here.
+
     **A local is also read for its name, not only its type.** The generated
     launch declares identifiers of its own in the scope the kernel body is
     generated into, and a kernel-local of the same name would shadow one and
     then overwrite it -- a wrong answer rather than a compile error. The cell
-    count is one, and the team launch adds ``body``, ``league_size``,
+    count is one, and the two team launches add ``body``, ``league_size``,
     ``probe``, ``rank``, ``scratch_bytes``, ``team`` and ``team_size``, which
-    are checked only for a kernel that has an automatic array to place. The
-    launch *index* is the exception: it is renamed rather than refused,
-    because a kernel declaring ``cell`` is a real GungHo shape and the fix is
-    one name in two places rather than seven threaded through two launch
-    shapes.
+    are checked for a kernel that has an automatic array to place **or** a
+    loop to spread -- either reaches a launch that declares them. The launch
+    *index* is the exception: it is renamed rather than refused, because a
+    kernel declaring ``cell`` is a real GungHo shape and the fix is one name
+    in two places rather than seven threaded through two launch shapes.
 
     **A constant the body reads reaches the region one of three ways.** A
     module-level ``parameter`` declared beside the kernel with a literal value
@@ -199,9 +235,11 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     #: answer rather than a compile error. The cell index is absent
     #: because it is renamed instead; see
     #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`.
-    #: These seven belong to the team launch only, so they are checked only
-    #: for a kernel that has an automatic array to place;
-    #: :py:attr:`_CELL_COUNT` is declared by both shapes and is always
+    #: These seven belong to the two team launches, so they are checked for a
+    #: kernel that selects one: an automatic array selects the flat team
+    #: launch and a parallelisable level loop the hierarchical one, and the
+    #: hierarchical launch declares ``team`` whether or not there is scratch.
+    #: :py:attr:`_CELL_COUNT` is declared by all three shapes and is always
     #: checked.
     _GENERATED_NAMES = ("body", "league_size", "probe", "rank",
                         "scratch_bytes", "team", "team_size")
@@ -219,6 +257,12 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     #: No executed GungHo loop asks for one, so they are refused by name.
     _SUPPORTED_STENCILS = ("cross2d",)
 
+    #: The option naming the team size the hierarchical launch asks for.
+    #: Absent, the launch writes ``Kokkos::AUTO`` and lets the backend size
+    #: the team; on the OpenMP backend that is one member, so a host build
+    #: reaches the team-level concurrency only by setting this.
+    _TEAM_SIZE_OPTION = "team_size"
+
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
 
@@ -231,7 +275,8 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
 
         :param node: the loop that is to be captured as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-        :param options: a dictionary with options for transformations.
+        :param options: a dictionary with options for transformations. The
+            one read here is ``"team_size"``; see :py:meth:`apply`.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.validate`.
@@ -242,11 +287,21 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
             its shape enquiries, its formal arguments, its local arrays or the
             module constants it reads fall outside the contract stated in this
             class's description.
+        :raises TransformationError: if the ``"team_size"`` option is neither
+            absent nor a positive integer.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
                 "LFRicKokkosTrans expects an LFRicLoop but found "
                 f"'{type(node).__name__}'.")
+
+        team_size = (options or {}).get(self._TEAM_SIZE_OPTION)
+        if team_size is not None and (
+                isinstance(team_size, bool) or not isinstance(team_size, int)
+                or team_size <= 0):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._TEAM_SIZE_OPTION}' option must be "
+                f"a positive integer, but found '{team_size}'.")
 
         self._validate_loop(node)
         kernel = node.kernels()[0]
@@ -256,7 +311,17 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
         self._validate_sections(schedule)
         self._validate_bounds(schedule)
         self._validate_formals(schedule)
-        self._validate_locals(schedule)
+        # Which names the launch reserves depends on which launch is selected,
+        # and that is decided by the loops apply() will spread over the team.
+        # Those are asked of a copy carrying the rewrites apply() makes,
+        # because the lowering is itself a producer of loops: a kernel whose
+        # only parallelisable loop is the one a section lowers to has none at
+        # all until the copy is lowered. The two predicates above have already
+        # shown that both rewrites succeed on this schedule.
+        probe = schedule.copy()
+        self._lower_sections(probe)
+        self._substitute_bounds(probe)
+        self._validate_locals(schedule, self._parallel_loops(probe))
         self._constants(schedule)
 
     @staticmethod
@@ -569,6 +634,57 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                 "LFRicKokkosTrans cannot resolve an array bound from its "
                 f"declaration: {err}") from err
 
+    @staticmethod
+    def _parallel_loops(schedule):
+        """Return the loops of ``schedule`` that may be spread over the team.
+
+        The judgement is PSyclone's own:
+        :py:meth:`~psyclone.psyir.tools.DependencyTools.\
+can_loop_be_parallelised`
+        is what decides whether a loop's iterations are independent, so a
+        recurrence such as ``x_new(k + 1) = ... x_new(k) ...`` is left where it
+        is rather than being re-analysed here. It is conservative in a way that
+        matters for LFRic: a write through a dofmap, ``field(map(df) + k)``,
+        reads as a write-write race because the indirection is opaque to it,
+        so a kernel whose only loops write that way keeps the flat launch.
+
+        Two rules narrow what it accepts, both of them properties of the shape
+        the loop is rendered into rather than of the dependence analysis:
+
+        * **Outermost wins.** A team is one pool of members, so nesting a
+          ``TeamVectorRange`` inside another would divide the same members
+          twice. A loop with a chosen ancestor is therefore skipped, which
+          leaves the outermost of any parallelisable nest.
+        * **A stepped loop is skipped.** ``TeamVectorRange(team, begin, end)``
+          counts by one and has no stride, so a loop that does not is left as
+          a serial ``for`` even where the analysis would allow it.
+
+        :param schedule: the kernel schedule being captured, already lowered
+            and bound-substituted, since both create loops.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: the loops to spread, outermost first, in schedule order.
+        :rtype: Tuple[:py:class:`psyclone.psyir.nodes.Loop`, ...]
+        """
+        tools = DependencyTools()
+        chosen = []
+        for loop in schedule.walk(Loop):
+            ancestor = loop.ancestor(Loop)
+            nested = False
+            while ancestor is not None:
+                if any(ancestor is entry for entry in chosen):
+                    nested = True
+                    break
+                ancestor = ancestor.ancestor(Loop)
+            if nested:
+                continue
+            step = loop.step_expr
+            if not (isinstance(step, Literal) and step.value == "1"):
+                continue
+            if tools.can_loop_be_parallelised(loop):
+                chosen.append(loop)
+        return tuple(chosen)
+
     @classmethod
     def _validate_formals(cls, schedule):
         """Check that every kernel formal has a place on the C ABI.
@@ -606,11 +722,13 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
                         "the generated View can be sized.")
 
     @classmethod
-    def _validate_locals(cls, schedule):
+    def _validate_locals(cls, schedule, parallel_loops=()):
         """Check that every kernel-local array can be placed in team scratch.
 
         An automatic array is a per-cell temporary whose extent is a runtime
-        value, so the region gives each team rank its own scratch View of it.
+        value, so the region places it in scratch rather than declaring it in
+        the body -- per team rank under the flat launch, where a rank is a
+        cell, and per team under the hierarchical one, where a team is.
         Sizing that View is what the two refusals below protect: the element
         type has to be one the ABI names, and the extent has to be a value
         the launch already holds, which is a kernel argument.
@@ -631,12 +749,20 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
 
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param parallel_loops: the loops the launch will spread over the team,
+            as :py:meth:`_parallel_loops` gives them. Only whether there are
+            any is read: a non-empty tuple selects the hierarchical launch,
+            which declares ``team`` with or without scratch, so the names
+            below are reserved for a kernel that has one even if it has no
+            automatic array to place.
+        :type parallel_loops: Tuple[:py:class:`psyclone.psyir.nodes.Loop`, ...]
 
         :raises TransformationError: if the kernel declares a local named
-            :py:attr:`_CELL_COUNT`, which both launch shapes declare.
-        :raises TransformationError: if the kernel has an automatic array and
-            declares a local named in :py:attr:`_GENERATED_NAMES`, which the
-            team launch that array selects declares.
+            :py:attr:`_CELL_COUNT`, which all three launch shapes declare.
+        :raises TransformationError: if the kernel selects a team launch --
+            by having an automatic array, or a loop to spread over the team --
+            and declares a local named in :py:attr:`_GENERATED_NAMES`, which
+            that launch declares.
         :raises TransformationError: if a local array's kind is not one
             :py:attr:`_C_TYPES` maps, or if one of its extents is not a
             kernel argument, so the scratch View could not be sized.
@@ -646,7 +772,7 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
 
         locals_ = list(table.automatic_datasymbols)
         generated = {cls._CELL_COUNT}
-        if any(symbol.is_array for symbol in locals_):
+        if any(symbol.is_array for symbol in locals_) or bool(parallel_loops):
             generated.update(cls._GENERATED_NAMES)
         # Sorted so that a kernel colliding with two of them names the same
         # one on every run.
@@ -739,11 +865,14 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         array section it holds is lowered to an explicit loop, every shape
         enquiry is replaced by the bound its declaration gives, and every
         module-level ``parameter`` it reads is replaced by its value, before
-        the region is described.
+        the region is described. The loops to spread over the team are chosen
+        after all three, because the first two create loops.
 
         :param node: the loop to capture as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations.
+            ``"team_size"`` sets the team the hierarchical launch asks for, as
+            a positive integer; absent, the launch writes ``Kokkos::AUTO``.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.apply`.
@@ -763,6 +892,7 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)
         self._substitute_constants(schedule)
+        parallel_loops = self._parallel_loops(schedule)
 
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.
@@ -803,7 +933,9 @@ LFRicKokkosTypesMixin._substitute_bounds` gives.
             arguments=self._region_arguments(
                 schedule, per_cell, constants, cell_index),
             kind_types=self._kind_types(schedule),
-            scratch=self._local_arrays(schedule))
+            scratch=self._local_arrays(schedule),
+            parallel_loops=parallel_loops,
+            team_size=(options or {}).get(self._TEAM_SIZE_OPTION))
         try:
             cpp = KokkosWriter()(region)
         except (VisitorError, ValueError, TypeError) as err:

@@ -15,10 +15,12 @@ import pytest
 from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
     extent_names, is_extent)
+from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
-    Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Reference, Routine)
+    Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Literal, Loop,
+    Reference, Routine)
 from psyclone.psyir.symbols import DataSymbol, ScalarType
 
 
@@ -340,6 +342,60 @@ def _scratch_region(**overrides):
     return replace(region, **overrides) if overrides else region
 
 
+def _level_schedule():
+    """Create a body with one parallel level loop and one boundary write.
+
+    This is the shape of the five regions the hierarchical launch takes, in
+    miniature: a scalar the whole team computes redundantly, a level loop
+    whose iterations are independent, and a single-element write outside it.
+    Nothing smaller exercises all three of the statement kinds the writer
+    renders differently, since a body with only a loop would never need
+    ``Kokkos::single``.
+    """
+    source = """
+subroutine inject_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  real(kind=r_double) :: scale
+  scale = 0.5_r_double
+  do k = 1, nlayers
+    y(map(1) + k - 1) = scale * x(map(1) + k - 1)
+  end do
+  y(map(1) + nlayers) = x(map(1) + nlayers)
+end subroutine inject_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inject_code", symbol_table=symbol_table, children=children)
+
+
+def _level_region(**overrides):
+    """Return a region whose level loop is spread over the team.
+
+    Its ABI is ``_scratch_region``'s, so that the two shapes differ in the
+    launch and not in what they are handed. The parallel loop is taken from
+    the schedule the region itself carries: the writer matches the loops by
+    identity, so a node from a second parse of the same source would be
+    refused.
+    """
+    schedule = _level_schedule()
+    region = KokkosRegion(
+        name="inject_kokkos",
+        schedule=schedule,
+        cell_count="ncells",
+        arguments=_scratch_region().arguments,
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(),
+        parallel_loops=(schedule.walk(Loop)[0],))
+    return replace(region, **overrides) if overrides else region
+
+
 def test_kokkos_writer_places_locals_in_team_scratch():
     """A region with kernel-local arrays launches over teams, not a range."""
     code = KokkosWriter()(_scratch_region())
@@ -357,13 +413,15 @@ def test_kokkos_writer_places_locals_in_team_scratch():
         in code
     assert "if (cell >= ncells) {" in code
 
-    # The team size depends on how much scratch a rank asks for, so it is
-    # asked for rather than chosen, from a policy already carrying the
-    # request. A probe without it would answer for a different launch.
+    # The team the backend recommends for this functor, not the largest the
+    # scratch allows: on OpenMP the recommendation is one thread, so the
+    # leagues rather than the ranks carry the parallelism. The probe policy
+    # carries the scratch request, since a backend other than OpenMP may
+    # answer differently for a launch that asks for none.
     probe = code.index("TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)")
     assert ".set_scratch_size(0, Kokkos::PerThread(scratch_bytes));" in \
         code[probe:]
-    assert "const int team_size = probe.team_size_max(body, " \
+    assert "const int team_size = probe.team_size_recommended(body, " \
         "Kokkos::ParallelForTag());" in code
     assert "const int league_size = (ncells + team_size - 1) / team_size;" \
         in code
@@ -496,8 +554,228 @@ def test_kokkos_writer_without_scratch_keeps_the_range_launch():
         "Kokkos::RangePolicy<>(0, ncells),\n" \
         "      KOKKOS_LAMBDA(const int cell) {" in code
     for absent in ("TeamPolicy", "TeamMember", "ScratchSpace",
-                   "scratch_bytes", "thread_scratch", "team_size_max"):
+                   "scratch_bytes", "thread_scratch",
+                   "team_size_recommended"):
         assert absent not in code
+
+
+def test_kokkos_team_launch_never_asks_team_size_max():
+    """``team_size_max`` is the whole thread pool, and is never asked for.
+
+    On the OpenMP backend it returns the pool size whatever the scratch
+    request, which put the model on one team running the whole league with a
+    rendezvous between consecutive cells. The query is wrong rather than
+    merely suboptimal, so its absence is asserted and not just the presence
+    of its replacement.
+    """
+    assert "team_size_max" not in KokkosWriter()(_scratch_region())
+
+
+def test_kokkos_launch_module_renders_both_existing_shapes():
+    """The launch shapes are rendered by ``kokkos_launch``, not the writer.
+
+    The writer selects a shape and the module renders it. Pinning the two
+    existing shapes to the module's own output is what makes the split
+    checkable: the strings below are the first line each renderer emits.
+    """
+    code = KokkosWriter()(_scratch_region())
+    assert team_launch(_scratch_region(), "", "").splitlines()[0] == (
+        "  using x_new_scratch_t = Kokkos::View<double*, Kokkos::LayoutLeft,"
+        " ScratchSpace, Unmanaged>;")
+    assert team_launch(_scratch_region(), "", "").splitlines()[0] in code
+
+    code = KokkosWriter()(_region())
+    assert range_launch(_region(), "", "").splitlines()[0] == (
+        '  Kokkos::parallel_for("moist_dyn_gas_kokkos", '
+        "Kokkos::RangePolicy<>(0, ncells),")
+    assert range_launch(_region(), "", "").splitlines()[0] in code
+
+
+def test_kokkos_hierarchical_region_launches_one_team_per_cell():
+    """A region naming a parallel loop puts one team on each cell.
+
+    The league carries the cells, so nothing computes a cell from a rank and
+    no team runs a second cell after the first; the shape's parallelism is
+    the level loops inside the body rather than the ranks around it.
+    """
+    code = KokkosWriter()(_level_region())
+
+    assert "TeamPolicy(ncells, Kokkos::AUTO)," in code
+    assert "KOKKOS_LAMBDA(const TeamMember &team) {" in code
+    assert "const int cell = team.league_rank();" in code
+    assert "using TeamPolicy = Kokkos::TeamPolicy<>;" in code
+    assert "using TeamMember = TeamPolicy::member_type;" in code
+    # The scratch alias is not emitted, because this region has no scratch.
+    # It rode along with the other two until this stage, when the loop
+    # selection made a team launch without scratch reachable for the first
+    # time and left the alias naming a space nothing is placed in.
+    assert "ScratchSpace" not in code
+
+    # Neither of the flat shapes' fingerprints: no range launch, and none of
+    # the team-size arithmetic that tiles cells across a team.
+    for absent in ("Kokkos::RangePolicy<>", "team_size_recommended",
+                   "league_size"):
+        assert absent not in code
+
+
+def test_kokkos_hierarchical_region_spreads_the_loop_over_the_team():
+    """A chosen loop becomes a ``TeamVectorRange``, not a serial ``for``."""
+    code = KokkosWriter()(_level_region())
+
+    assert "    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, 1, " \
+        "nlayers + 1),\n        [&](const int k) {\n" in code
+    # The Fortran bound is inclusive and the Kokkos range is half-open, so
+    # the stop expression gains the ``+ 1`` above and the loop is gone.
+    assert "for(k=1;" not in code
+
+    # Every parallel loop is followed by a barrier: a later statement may
+    # read what it wrote, and deciding whether one does is a second analysis
+    # this writer does not attempt.
+    closed = code.index("        [&](const int k) {")
+    assert "    });\n    team.team_barrier();\n" in code[closed:]
+
+
+def test_kokkos_hierarchical_region_wraps_team_level_array_writes():
+    """An array written outside a parallel loop is written by one member."""
+    code = KokkosWriter()(_level_region())
+
+    assert "    Kokkos::single(Kokkos::PerTeam(team), [&]() {\n" \
+        "      y(((map((1 - 1), cell) + nlayers) - 1)) = " \
+        "x(((map((1 - 1), cell) + nlayers) - 1));\n" \
+        "    });\n" \
+        "    team.team_barrier();\n" in code
+
+    # A scalar is a per-member local, so every member writing its own copy
+    # races with nothing and needs no wrapper.
+    assert "    scale = 0.5;\n" in code
+
+
+def test_kokkos_hierarchical_region_places_scratch_per_team():
+    """Team-shared scratch, because a team is now a cell rather than a rank."""
+    code = KokkosWriter()(_level_region(scratch=(
+        KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1,)),)))
+
+    assert ".set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))" in code
+    assert "x_new_scratch_t x_new(team.team_scratch(0), nlayers);" in code
+    for absent in ("PerThread", "thread_scratch"):
+        assert absent not in code
+
+
+def test_kokkos_hierarchical_region_takes_a_team_size():
+    """A forced team size is a literal in the policy, replacing ``AUTO``."""
+    code = KokkosWriter()(_level_region(team_size=4))
+
+    assert "TeamPolicy(ncells, 4)," in code
+    assert "Kokkos::AUTO" not in code
+
+
+def test_kokkos_flat_shapes_ignore_team_size():
+    """Neither flat shape reads ``team_size``; both size their own team.
+
+    The range launch has no team at all and the flat team launch takes the
+    size the backend recommends for its functor, so the option is inert on
+    both rather than quietly overriding a measured answer.
+    """
+    for region in (_region(), _scratch_region()):
+        assert KokkosWriter()(replace(region, team_size=4)) == \
+            KokkosWriter()(region)
+
+
+def _nested_schedule():
+    """Create a body whose three loops are one inside the next.
+
+    Three rather than two, so that a chosen loop can be given a parent that
+    was not chosen and a grandparent that was: the enclosure check walks up
+    to the schedule and is not satisfied by looking at the parent alone.
+    """
+    source = """
+subroutine nested_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k, df, i
+  do df = 1, ndf
+    do k = 1, nlayers
+      do i = 1, 4
+        y(map(df) + k - 1) = x(map(df) + k - 1)
+      end do
+    end do
+  end do
+end subroutine nested_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "nested_code", symbol_table=symbol_table, children=children)
+
+
+def _invalid_parallel_loops(case):
+    """Return a region whose ``parallel_loops`` breaks one of the four rules.
+
+    :param case: which rule to break.
+    :type case: str
+
+    :returns: the region to hand the writer.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    if case == "not-a-loop":
+        return _level_region(parallel_loops=("k",))
+    if case == "foreign":
+        return _level_region(
+            parallel_loops=(_scratch_schedule().walk(Loop)[0],))
+    if case in ("nested", "nested-deep"):
+        schedule = _nested_schedule()
+        loops = schedule.walk(Loop)
+        return _level_region(
+            schedule=schedule,
+            parallel_loops=(
+                (loops[0], loops[1]) if case == "nested"
+                else (loops[0], loops[2])))
+    region = _level_region()
+    region.parallel_loops[0].step_expr.replace_with(
+        Literal("2", ScalarType.integer_type()))
+    return region
+
+
+@pytest.mark.parametrize("case, error, message", [
+    ("not-a-loop", TypeError, "parallel_loops"),
+    ("foreign", ValueError, "not in the region's schedule"),
+    ("nested", ValueError, "nested"),
+    ("nested-deep", ValueError, "nested"),
+    ("stepped", ValueError, "step"),
+])
+def test_kokkos_writer_rejects_invalid_parallel_loops(case, error, message):
+    """The loops the transformation chose are checked, not trusted.
+
+    A loop from another schedule would be visited by identity and never
+    matched, so the region would silently generate a serial ``for``; the
+    other three would generate C++ that does not mean what the Fortran did.
+    """
+    with pytest.raises(error) as err:
+        KokkosWriter()(_invalid_parallel_loops(case))
+    assert message in str(err.value)
+
+
+@pytest.mark.parametrize("team_size, error", [
+    ("4", TypeError),
+    (4.0, TypeError),
+    (True, TypeError),
+    (0, ValueError),
+    (-1, ValueError),
+])
+def test_kokkos_writer_rejects_invalid_team_size(team_size, error):
+    """``team_size`` is rendered into the policy, so it is checked first.
+
+    ``True`` is refused although it is an ``int`` in Python: a team of one
+    written as ``TeamPolicy(ncells, True)`` compiles and runs, so nothing
+    downstream would report it.
+    """
+    with pytest.raises(error) as err:
+        KokkosWriter()(_level_region(team_size=team_size))
+    assert "team_size" in str(err.value)
 
 
 def test_kokkos_writer_views_are_never_managed():
