@@ -345,9 +345,10 @@ Additionally, there are three partially-implemented back-ends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
   region's name, its scalar arguments, its unmanaged Views, its
-  `kind_types`, its `scratch`, and the `parallel_loops` and `team_size`
-  that select and size the hierarchical launch, and it visits the loop body
-  through `CWriter`. Two parts of the back-end live beside it because they
+  `kind_types`, its `scratch`, the `parallel_loops` and `team_size`
+  that select and size the hierarchical launch, and the `cell_position`
+  naming the one formal it declares rather than takes, and it visits the
+  loop body through `CWriter`. Two parts of the back-end live beside it because they
   grow as regions are captured while the writer's own job does not:
   `psyclone.psyir.backend.kokkos_launch` renders the launch shapes, one
   function per shape, and `KokkosIntrinsicsMixin` in
@@ -599,6 +600,41 @@ always-empty `extra_indices`, so that `arrayreference_node` can resolve Views
 and scratch through one table without a type test; a scratch symbol is
 skipped when the kernel's locals are declared, since it is already declared
 as its View.
+
+The cell position
+~~~~~~~~~~~~~~~~~
+
+`cell_position` names the one kernel formal a region declares rather than
+takes. LFRic passes its cell index to every kernel that takes an operator,
+because the kernel finds its own slice of the operator's local stencil
+arithmetically -- `ik = (cell - 1) * nlayers + 1` -- rather than being handed
+the slice. That is a formal like any other, and the region's `arguments` do
+not describe it; instead the back-end generates
+
+.. code-block:: c++
+
+    const int cell = cell_1 + 1;
+
+as the first line of the launch body, from the launch's own index. The `+ 1`
+is the whole of the conversion: the launch index is zero-based and LFRic's
+cell is one-based.
+
+The declaration is prepended to the kernel's local declarations rather than
+written into each launch, because all three shapes place those declarations
+immediately after establishing the index this one reads. `None`, the default,
+generates nothing, so a region built before the field existed generates
+exactly the source it generated then.
+
+Passing it across the ABI instead is what makes this worth a field. The
+value would then be a launch parameter, fixed for the whole region, and the
+PSy layer has nothing sensible to pass: its own loop counter is the obvious
+candidate and by then it has been lowered away, so every cell computes `ik`
+from an unassigned variable. That compiles, links and runs, and produces a
+wrong answer, which is why `_validate_cell_position` checks four things none
+of which a build would catch -- the name must be a C++ identifier, must be
+one of the schedule's formals, must not also be described as a region
+argument, and must not be the launch's own cell index, since `const int cell
+= cell + 1;` initialises an object from itself.
 
 Extents
 ~~~~~~~

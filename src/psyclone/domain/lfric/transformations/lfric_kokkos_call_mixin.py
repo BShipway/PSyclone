@@ -146,11 +146,18 @@ class LFRicKokkosCallMixin:
         return f"{name}_kokkos"
 
     @classmethod
-    def _region_arguments(cls, schedule, per_cell, constants, cell_index):
+    def _region_arguments(cls, formals, per_cell, constants, cell_index):
         """Describe the generated signature for the backend.
 
-        :param schedule: the kernel schedule being captured.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        The formals are passed in rather than read from the schedule because
+        one of them may already have been dropped: a kernel taking an LMA
+        operator has a leading cell argument the region declares instead of
+        taking, and :py:meth:`apply` removes it from the formals and the
+        actuals together, so that the two stay index-aligned.
+
+        :param formals: the kernel formals the generated signature carries,
+            in call order.
+        :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
         :param set[str] per_cell: formals the PSy layer slices by cell.
         :param constants: the module constants passed by value, as
             :py:meth:`_constants` returns them.
@@ -167,7 +174,7 @@ class LFRicKokkosCallMixin:
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
         """
         arguments = []
-        for symbol in schedule.symbol_table.argument_list:
+        for symbol in formals:
             c_type = cls._c_type(symbol)
             extents = cls._extents(symbol)
             if not extents:
