@@ -14,6 +14,7 @@ from psyclone.configuration import Config
 from psyclone.core import AccessType
 from psyclone.domain.lfric import KernCallArgList, LFRicLoop
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
+from psyclone.errors import GenerationError
 from psyclone.lfric import LFRicArgStencil
 from psyclone.parse import ModuleManager
 from psyclone.parse.algorithm import parse
@@ -24,6 +25,7 @@ from psyclone.psyir.nodes import (
 from psyclone.psyir.symbols import (
     ContainerSymbol, ImportInterface, ScalarType, Symbol)
 from psyclone.psyir.transformations import TransformationError
+from psyclone.transformations import LFRicColourTrans
 
 
 _ALGORITHM = """
@@ -211,6 +213,65 @@ program kokkos_paired_test
   call invoke(scaled_copy_kernel_type(out_field, in_field, scaling),   &
               scaled_copy_kernel_type(other_field, in_field, scaling))
 end program kokkos_paired_test
+"""
+
+
+# A sibling the capture cannot take and colouring must: 'gh_inc' onto W2, a
+# continuous space, which is what makes 'colour_loops' pick it up. Every
+# captured invoke before stage 10 left colouring nothing to do, so the
+# ordering fault this shape exposes stayed latent.
+_COLOURED_KERNEL = """
+module assemble_w2_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: assemble_w2_kernel_type
+    type(arg_type) :: meta_args(2) = (/                       &
+         arg_type(gh_field, gh_real, gh_inc,  w2),            &
+         arg_type(gh_field, gh_real, gh_read, w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: assemble_w2_code
+  end type assemble_w2_kernel_type
+contains
+  subroutine assemble_w2_code(nlayers, field_out, field_in, &
+                              ndf_w2, undf_w2, map_w2, &
+                              ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w2
+        field_out(map_w2(df) + k) = field_in(map_w3(1) + k)
+      end do
+    end do
+  end subroutine assemble_w2_code
+end module assemble_w2_kernel_mod
+"""
+
+
+# The shape 'apply_split_mixed_operator' has in GungHo: one loop the
+# transformation captures, and one beside it that stays Fortran and is
+# coloured afterwards.
+_COLOURED_ALGORITHM = """
+program kokkos_coloured_test
+  use constants_mod, only : r_tran
+  use field_mod, only : field_type
+  use scaled_copy_kernel_mod, only : scaled_copy_kernel_type
+  use assemble_w2_kernel_mod, only : assemble_w2_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field, vel_field
+  real(kind=r_tran) :: scaling
+  call invoke(scaled_copy_kernel_type(out_field, in_field, scaling),  &
+              assemble_w2_kernel_type(vel_field, out_field))
+end program kokkos_coloured_test
 """
 
 
@@ -1317,13 +1378,38 @@ end module planet_config_mod
 """
 
 
-def _invoke(tmp_path, name, algorithm_source, kernel_source):
-    """Build a one-invoke LFRic PSy layer from the given sources."""
+def _invoke(tmp_path, name, algorithm_source, kernel_source, extra=None,
+            dist_mem=True):
+    """Build a one-invoke LFRic PSy layer from the given sources.
+
+    :param tmp_path: the directory the sources are written to.
+    :type tmp_path: :py:class:`pathlib.Path`
+    :param str name: stem of the algorithm and kernel file names.
+    :param str algorithm_source: the algorithm layer to parse.
+    :param str kernel_source: the kernel module ``name`` resolves to.
+    :param extra: further kernel modules, keyed by module name. An invoke
+        calling two kernels from different modules needs a file per module,
+        because the parser resolves each ``use`` by file name.
+    :type extra: Optional[Dict[str, str]]
+    :param bool dist_mem: whether to build with distributed memory. An LFRic
+        invoke with it disabled and no kernel asking for a mesh property has
+        no mesh object at all, which is the one state colouring cannot be
+        completed from.
+
+    :returns: the PSy layer, its first loop and that loop's first kernel.
+    :rtype: Tuple[:py:class:`psyclone.psyGen.PSy`,
+        :py:class:`psyclone.domain.lfric.LFRicLoop`,
+        :py:class:`psyclone.domain.lfric.LFRicKern`]
+
+    """
     Config.get().api = "lfric"
     algorithm = tmp_path / f"{name}_alg.f90"
     kernel = tmp_path / f"{name}_kernel_mod.f90"
     algorithm.write_text(algorithm_source, encoding="utf-8")
     kernel.write_text(kernel_source, encoding="utf-8")
+    for module_name, module_source in (extra or {}).items():
+        (tmp_path / f"{module_name}.f90").write_text(
+            module_source, encoding="utf-8")
     (tmp_path / "planet_config_mod.f90").write_text(
         _PLANET_CONFIG, encoding="utf-8")
     # Assigned rather than appended to. Config is a singleton for the session
@@ -1338,7 +1424,8 @@ def _invoke(tmp_path, name, algorithm_source, kernel_source):
     ModuleManager.get().add_search_path(str(tmp_path))
     _, invoke_info = parse(
         str(algorithm), api="lfric", kernel_paths=[str(tmp_path)])
-    psy = PSyFactory("lfric", distributed_memory=True).create(invoke_info)
+    psy = PSyFactory(
+        "lfric", distributed_memory=dist_mem).create(invoke_info)
     loop = psy.invokes.invoke_list[0].schedule.walk(LFRicLoop)[0]
     return psy, loop, loop.kernels()[0]
 
@@ -1380,6 +1467,15 @@ def paired_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose captured loop has a cell loop beside it."""
     return _invoke(
         tmp_path, "scaled_copy", _PAIRED_ALGORITHM, _SECOND_KERNEL)
+
+
+@pytest.fixture(name="coloured_target")
+# pylint: disable-next=unused-argument
+def coloured_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose captured loop has a continuous-space sibling."""
+    return _invoke(
+        tmp_path, "scaled_copy", _COLOURED_ALGORITHM, _SECOND_KERNEL,
+        extra={"assemble_w2_kernel_mod": _COLOURED_KERNEL})
 
 
 @pytest.fixture(name="section_target")
@@ -2083,6 +2179,87 @@ def test_lfric_kokkos_trans_keeps_a_shared_counter(paired_target):
     assert "call scaled_copy_kokkos(" in fortran
     assert "call scaled_copy_code(" in fortran
     assert "integer(kind=i_def) :: cell" in fortran
+
+
+def test_lfric_kokkos_trans_leaves_later_colouring_initialised(
+        coloured_target):
+    """Colouring applied after a capture must still reach the PSy layer.
+
+    The capture materialises the PSy-layer symbols early, because
+    'KernCallArgList' needs them specialised. A transformation running
+    afterwards can add loops -- colouring replaces one loop with two -- and
+    those loops carry placeholder bounds until the invoke initialises them.
+    Suppressing that initialisation leaves the placeholders in the Fortran,
+    where they are undeclared, and leaves the colour map declared but never
+    assigned. The second is the dangerous one: a dangling 'cmap' compiles.
+
+    """
+    psy, loop, _ = coloured_target
+
+    LFRicKokkosTrans().apply(loop)
+    schedule = psy.invokes.invoke_list[0].schedule
+    sibling = [each for each in schedule.walk(LFRicLoop) if each.kernels()][0]
+    LFRicColourTrans().apply(sibling)
+    fortran = str(psy.gen)
+
+    assert "uninitialised_loop" not in fortran
+    assert "ncolour = mesh%get_ncolours()" in fortran
+    assert "cmap => mesh%get_colour_map()" in fortran
+    assert ("last_halo_cell_all_colours = "
+            "mesh%get_last_halo_cell_all_colours()" in fortran)
+    # Everything the coloured loop reads is assigned before it runs.
+    assert (fortran.index("cmap => mesh%get_colour_map()") <
+            fortran.index("do colour ="))
+
+
+def test_lfric_kokkos_trans_later_colouring_keeps_captured_bounds(
+        coloured_target):
+    """The completion pass binds the new loops and leaves the old ones.
+
+    Re-binding a loop the first pass already handled would leave its first
+    pair of bounds assigned and unread, and would repoint the region call at
+    a second copy of a cell count it already has.
+
+    """
+    psy, loop, _ = coloured_target
+
+    LFRicKokkosTrans().apply(loop)
+    schedule = psy.invokes.invoke_list[0].schedule
+    sibling = [each for each in schedule.walk(LFRicLoop) if each.kernels()][0]
+    LFRicColourTrans().apply(sibling)
+    fortran = str(psy.gen)
+
+    assert "loop0_stop = mesh%get_last_edge_cell()" in fortran
+    assert fortran.count("loop0_stop = ") == 1
+    assert fortran.count("! Set-up all of the loop bounds") == 1
+    assert "map_wtheta, loop0_stop)" in fortran
+
+
+def test_lfric_kokkos_trans_refuses_colouring_of_a_meshless_invoke(
+        tmp_path, clear_module_manager_instance):
+    # pylint: disable=unused-argument
+    """An invoke with no mesh object cannot have its colouring completed.
+
+    'LFRicColourTrans' creates the mesh symbol when the invoke had none, but
+    only the PSy-layer set-up assigns it, and that reads a kernel argument
+    which the capture has by then removed from the tree. Refusing says so;
+    emitting the look-up anyway would dereference a null pointer at runtime.
+
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "scaled_copy", _COLOURED_ALGORITHM, _SECOND_KERNEL,
+        extra={"assemble_w2_kernel_mod": _COLOURED_KERNEL}, dist_mem=False)
+
+    LFRicKokkosTrans().apply(loop)
+    schedule = psy.invokes.invoke_list[0].schedule
+    sibling = [each for each in schedule.walk(LFRicLoop) if each.kernels()][0]
+    LFRicColourTrans().apply(sibling)
+
+    with pytest.raises(GenerationError) as err:
+        _ = psy.gen
+    assert "has been coloured after its PSy-layer symbols were set up" in str(
+        err.value)
+    assert "'mesh' is never assigned" in str(err.value)
 
 
 def test_untransformed_invoke_can_be_generated_repeatedly(target):

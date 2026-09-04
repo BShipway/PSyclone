@@ -592,21 +592,20 @@ class LFRicMeshProperties(LFRicCollection):
                     f" declarations for kernel stub. Only members of the "
                     f"MeshProperty Enum are permitted ({list(MeshProperty)})")
 
-    def initialise(self, cursor: int) -> int:
+    def colour_limits_required(self) -> tuple:
         '''
-        Creates the PSyIR nodes for the initialisation of properties of
-        the mesh.
+        Works out which of the per-colour cell limits this Invoke needs.
 
-        :param cursor: position where to add the next initialisation
-            statements.
-        :returns: Updated cursor value.
+        Since colouring is applied via transformations, this has to be
+        checked when the initialisation is generated rather than when this
+        class was first constructed.
 
-        :raises InternalError: if an unsupported mesh property is encountered.
+        :returns: whether edge-cell, halo-cell, edge-tile and halo-tile
+            limits are respectively required, in that order.
+        :rtype: Tuple[bool, bool, bool, bool]
 
         '''
         const = LFRicConstants()
-        # Since colouring is applied via transformations, we have to check for
-        # it now, rather than when this class was first constructed.
         need_colour_limits = False
         need_colour_halo_limits = False
         need_tilecolour_limits = False
@@ -631,10 +630,22 @@ class LFRicMeshProperties(LFRicCollection):
                     else:
                         need_colour_limits = True
 
-        needs_colour_maps = (need_colour_limits or
-                             need_colour_halo_limits or
-                             need_tilecolour_limits or
-                             need_tilecolour_halo_limits)
+        return (need_colour_limits, need_colour_halo_limits,
+                need_tilecolour_limits, need_tilecolour_halo_limits)
+
+    def initialise(self, cursor: int) -> int:
+        '''
+        Creates the PSyIR nodes for the initialisation of properties of
+        the mesh.
+
+        :param cursor: position where to add the next initialisation
+            statements.
+        :returns: Updated cursor value.
+
+        :raises InternalError: if an unsupported mesh property is encountered.
+
+        '''
+        needs_colour_maps = any(self.colour_limits_required())
 
         if not self._properties and not needs_colour_maps:
             # If no mesh properties are required and there's no colouring
@@ -689,6 +700,35 @@ class LFRicMeshProperties(LFRicCollection):
                     f"MeshProperty Enum are permitted ({list(MeshProperty)})")
         self._invoke.schedule[init_cursor].append_preceding_comment(
             "Initialise mesh properties")
+
+        return self.initialise_colour_limits(cursor)
+
+    def initialise_colour_limits(self, cursor: int) -> int:
+        '''
+        Creates the PSyIR nodes that look up the per-colour cell limits
+        required by the Invoke.
+
+        Colouring is applied by a transformation, so whether these limits
+        are needed is not known when this object is constructed. They are
+        therefore emitted from a method of their own, so that a Schedule
+        which gained its colouring after the rest of its initialisation had
+        been generated can be completed without regenerating that.
+
+        :param cursor: position where to add the next initialisation
+            statements.
+
+        :returns: Updated cursor value.
+
+        '''
+        (need_colour_limits, need_colour_halo_limits,
+         need_tilecolour_limits,
+         need_tilecolour_halo_limits) = self.colour_limits_required()
+
+        if not any((need_colour_limits, need_colour_halo_limits,
+                    need_tilecolour_limits, need_tilecolour_halo_limits)):
+            return cursor
+
+        mesh = self.symtab.lookup_with_tag("mesh")
 
         if need_colour_halo_limits:
             lhs = self.symtab.find_or_create_tag(
@@ -2295,6 +2335,73 @@ class LFRicMeshes():
                 # colourmap information
                 csym = self.symtab.lookup_with_tag("tilecolourmap")
 
+    def initialise_colourmaps(self, cursor: int) -> int:
+        '''
+        Creates the PSyIR nodes that look up any colourmaps required by the
+        Invoke.
+
+        Colouring is applied by a transformation, so whether a colourmap is
+        needed is not known when this object is constructed. The look-ups are
+        therefore emitted from a method of their own, so that a Schedule which
+        gained its colouring after the rest of its initialisation had been
+        generated can be completed without regenerating that.
+
+        :param cursor: position where to add the next initialisation
+            statements.
+
+        :returns: Updated cursor value.
+
+        '''
+        if len(self._mesh_tag_names) != 1:
+            # Inter-grid invokes are not coloured and an invoke with no mesh
+            # cannot be.
+            return cursor
+
+        mesh_sym = self.symtab.lookup_with_tag(self._mesh_tag_names[0])
+
+        if self._needs_colourmap or self._needs_colourmap_halo:
+            # Look-up variable names for colourmap and number of colours
+            cmap = self.symtab.find_or_create_tag("cmap")
+            ncolour = self.symtab.find_or_create_tag("ncolour")
+            # Get the number of colours
+            assignment = Assignment.create(
+                    lhs=Reference(ncolour),
+                    rhs=Call.create(StructureReference.create(
+                        mesh_sym, ["get_ncolours"])))
+            assignment.preceding_comment = "Get the colourmap"
+            self._invoke.schedule.addchild(assignment, cursor)
+            cursor += 1
+            # Get the colour map
+            assignment = Assignment.create(
+                    lhs=Reference(cmap),
+                    rhs=Call.create(StructureReference.create(
+                        mesh_sym, ["get_colour_map"])),
+                    is_pointer=True)
+            self._invoke.schedule.addchild(assignment, cursor)
+            cursor += 1
+        if self._needs_colourtilemap or self._needs_colourtilemap_halo:
+            # Look-up variable names for colourmap and number of colours
+            tmap = self.symtab.lookup_with_tag("tilecolourmap")
+            ntc = self.symtab.lookup_with_tag("ntilecolours")
+            # Get the number of colours
+            assignment = Assignment.create(
+                    lhs=Reference(ntc),
+                    rhs=Call.create(StructureReference.create(
+                        mesh_sym, ["get_ntilecolours"])))
+            assignment.preceding_comment = "Get the tiled colourmap"
+            self._invoke.schedule.addchild(assignment, cursor)
+            cursor += 1
+            # Get the colour map
+            assignment = Assignment.create(
+                    lhs=Reference(tmap),
+                    rhs=Call.create(StructureReference.create(
+                        mesh_sym, ["get_coloured_tiling_map"])),
+                    is_pointer=True)
+            self._invoke.schedule.addchild(assignment, cursor)
+            cursor += 1
+
+        return cursor
+
     def initialise(self, cursor: int) -> int:
         '''
         Initialise parameters specific to inter-grid kernels.
@@ -2335,46 +2442,7 @@ class LFRicMeshes():
                         mesh_sym, ["get_halo_depth"]))),
                     cursor)
                 cursor += 1
-            if self._needs_colourmap or self._needs_colourmap_halo:
-                # Look-up variable names for colourmap and number of colours
-                cmap = self.symtab.find_or_create_tag("cmap")
-                ncolour = self.symtab.find_or_create_tag("ncolour")
-                # Get the number of colours
-                assignment = Assignment.create(
-                        lhs=Reference(ncolour),
-                        rhs=Call.create(StructureReference.create(
-                            mesh_sym, ["get_ncolours"])))
-                assignment.preceding_comment = "Get the colourmap"
-                self._invoke.schedule.addchild(assignment, cursor)
-                cursor += 1
-                # Get the colour map
-                assignment = Assignment.create(
-                        lhs=Reference(cmap),
-                        rhs=Call.create(StructureReference.create(
-                            mesh_sym, ["get_colour_map"])),
-                        is_pointer=True)
-                self._invoke.schedule.addchild(assignment, cursor)
-                cursor += 1
-            if self._needs_colourtilemap or self._needs_colourtilemap_halo:
-                # Look-up variable names for colourmap and number of colours
-                tmap = self.symtab.lookup_with_tag("tilecolourmap")
-                ntc = self.symtab.lookup_with_tag("ntilecolours")
-                # Get the number of colours
-                assignment = Assignment.create(
-                        lhs=Reference(ntc),
-                        rhs=Call.create(StructureReference.create(
-                            mesh_sym, ["get_ntilecolours"])))
-                assignment.preceding_comment = "Get the tiled colourmap"
-                self._invoke.schedule.addchild(assignment, cursor)
-                cursor += 1
-                # Get the colour map
-                assignment = Assignment.create(
-                        lhs=Reference(tmap),
-                        rhs=Call.create(StructureReference.create(
-                            mesh_sym, ["get_coloured_tiling_map"])),
-                        is_pointer=True)
-                self._invoke.schedule.addchild(assignment, cursor)
-                cursor += 1
+            cursor = self.initialise_colourmaps(cursor)
 
         # Keep a list of quantities that we've already initialised so
         # that we don't generate duplicate assignments

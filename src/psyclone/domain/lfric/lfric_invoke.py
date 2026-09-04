@@ -301,6 +301,10 @@ class LFRicInvoke(Invoke):
         # (rather than the Invoke) because code generation operates on a copy.
         # pylint: disable=protected-access
         if getattr(self.schedule, "_psy_layer_symbols_setup", False):
+            # This has already run against an earlier state of the Schedule.
+            # Anything a transformation has since made necessary is added by
+            # the completion pass rather than by running this one again.
+            self.complete_psy_layer_symbols()
             return
         # Declare all quantities required by this PSy routine (Invoke)
         for entities in [self.scalar_args, self. scalar_array_args,
@@ -360,6 +364,78 @@ class LFRicInvoke(Invoke):
         # Deallocate any basis arrays
         self.evaluators.deallocate()
         self.schedule._psy_layer_symbols_setup = True
+        self.schedule._psy_layer_symbols_cursor = cursor
+
+    def complete_psy_layer_symbols(self):
+        '''
+        Adds the initialisation that a transformation has made necessary
+        since setup_psy_layer_symbols() ran.
+
+        setup_psy_layer_symbols() is not idempotent, so a transformation that
+        needs the PSy-layer symbols before code generation - LFRicKokkosTrans
+        does, because it removes the kernel that would otherwise supply them -
+        has to suppress the second call. Suppressing it wholesale would drop
+        whatever the transformations applied after it require, and colouring
+        is exactly that case: LFRicColourTrans creates the colourmap symbols
+        and replaces one loop with two, so the colourmap look-ups, the
+        per-colour cell limits and the new loops' bounds would all be declared
+        and never assigned.
+
+        Only the initialisation that can become necessary in this way is
+        re-run, and only for what is actually missing, so an Invoke that no
+        transformation has changed since gains nothing. The statements are
+        added at the end of the preamble, which is where the first pass
+        stopped.
+
+        :raises GenerationError: if colouring has been applied to an Invoke
+            whose mesh object was never initialised, which the completion
+            pass cannot repair.
+
+        '''
+        # pylint: disable=protected-access
+        cursor = min(getattr(self.schedule, "_psy_layer_symbols_cursor", 0),
+                     len(self.schedule.children))
+        self._check_mesh_initialised(cursor)
+        cursor = self.meshes.initialise_colourmaps(cursor)
+        cursor = self.mesh_properties.initialise_colour_limits(cursor)
+        cursor = self.loop_bounds.initialise(cursor, resume=True)
+        self.schedule._psy_layer_symbols_cursor = cursor
+
+    def _check_mesh_initialised(self, cursor: int):
+        '''
+        Checks that a colourmap look-up added by the completion pass will
+        have a mesh object to read.
+
+        LFRicColourTrans creates the mesh symbol if the Invoke had none, but
+        only setup_psy_layer_symbols() assigns it, and that reads an argument
+        of a kernel which by this point may have been removed from the tree.
+        An Invoke that reached colouring without a mesh therefore cannot be
+        completed, and saying so is better than emitting a look-up through an
+        unassigned pointer.
+
+        :param cursor: the end of the preamble the first pass generated.
+
+        :raises GenerationError: if a colourmap is required but the mesh
+            object it is read from was never assigned.
+
+        '''
+        # pylint: disable=protected-access
+        if not (self.meshes._needs_colourmap or
+                self.meshes._needs_colourmap_halo or
+                self.meshes._needs_colourtilemap or
+                self.meshes._needs_colourtilemap_halo):
+            return
+        mesh = self.schedule.symbol_table.lookup_with_tag("mesh")
+        for node in self.schedule.children[:cursor]:
+            if (isinstance(node, Assignment) and
+                    isinstance(node.lhs, Reference) and
+                    node.lhs.symbol is mesh):
+                return
+        raise GenerationError(
+            f"Invoke '{self.name}' has been coloured after its PSy-layer "
+            f"symbols were set up, but it had no mesh object at that point "
+            f"so '{mesh.name}' is never assigned. Colour this Invoke before "
+            f"the transformation that sets the symbols up.")
 
 
 # ---------- Documentation utils -------------------------------------------- #

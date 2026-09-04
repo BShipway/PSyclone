@@ -50,24 +50,53 @@ class LFRicLoopBounds(LFRicCollection):
     an LFRic PSy-layer routine.
     '''
 
-    def initialise(self, cursor: int) -> int:
+    #: Prefix of the placeholder symbols LFRicLoop gives its bounds until
+    #: this class replaces them. They are deliberately not in the symbol
+    #: table, so their name is the only way to recognise an unbound loop.
+    PLACEHOLDER_PREFIX = "uninitialised_loop"
+
+    @classmethod
+    def is_unbound(cls, loop) -> bool:
+        '''
+        Reports whether a loop still carries the placeholder bounds that
+        LFRicLoop gave it when it was created.
+
+        :param loop: the loop to examine.
+        :type loop: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :returns: whether the loop's lower bound is still a placeholder.
+
+        '''
+        lower = loop.children[0]
+        return (isinstance(lower, Reference) and
+                lower.symbol.name.startswith(cls.PLACEHOLDER_PREFIX))
+
+    def initialise(self, cursor: int, resume: bool = False) -> int:
         '''
         Updates the PSyIR so that all of the variables holding the lower
         and upper bounds of all loops in an Invoke are initialised.
 
         :param cursor: position where to add the next initialisation
             statements.
+        :param resume: whether to leave alone the loops that a previous call
+            has already bound, and initialise only those a transformation
+            has added since. Defaults to False, which binds every loop.
         :returns: Updated cursor value.
 
         '''
         loops = filter(lambda x: isinstance(x, LFRicLoop),
                        self._invoke.schedule.loops())
 
-        first = True
+        first = not resume
         for idx, loop in enumerate(loops):
 
             if loop.loop_type == "null":
                 # Generic or 'null' loops don't need any variables to be set
+                continue
+
+            if resume and not self.is_unbound(loop):
+                # This loop was bound by the call this one is resuming and
+                # re-binding it would leave its first bounds as dead code.
                 continue
 
             # Set the lower bound

@@ -245,6 +245,36 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
     halo-dirty calls are retained, and only the resulting generic loop is
     replaced.
+
+    **A loop this transformation leaves behind may still be transformed
+    afterwards**, colouring included, even though capturing forces the
+    Invoke's PSy-layer symbols to be set up early. The region's actual
+    arguments are built by
+    :py:class:`~psyclone.domain.lfric.KernCallArgList`, which reads symbols
+    that
+    :py:meth:`~psyclone.domain.lfric.LFRicInvoke.setup_psy_layer_symbols`
+    specialises, so that pass has to run here rather than at code generation:
+    by then the kernel that would supply them has been removed from the tree.
+    It is not idempotent, so the call code generation would otherwise make is
+    suppressed, and whatever a later transformation has since made necessary
+    is added instead by
+    :py:meth:`~psyclone.domain.lfric.LFRicInvoke.complete_psy_layer_symbols`.
+    Colouring is the case that needs it:
+    :py:class:`~psyclone.domain.lfric.transformations.LFRicColourTrans`
+    creates the colourmap symbols and replaces one loop with two, and without
+    that completion the colourmaps would be declared and never assigned and
+    the new loops would keep the placeholder bounds
+    :py:class:`~psyclone.domain.lfric.LFRicLoop` gave them.
+
+    The one thing completion cannot repair is a colourmap look-up in an
+    Invoke that has no mesh object -- one built without distributed memory
+    whose loops were all uncoloured when the capture ran -- because the mesh
+    is obtained from a kernel argument that capture has removed. That raises
+    :py:class:`~psyclone.errors.GenerationError` at code generation, naming
+    the Invoke, rather than emitting a look-up on an unassigned pointer.
+    Colouring such an Invoke before capturing it is refused by
+    :py:meth:`validate` and colouring it afterwards by this, so the case is
+    reported either way round.
     """
 
     #: The option naming the team size the hierarchical launch asks for.
