@@ -4178,7 +4178,24 @@ size as a per-cell scalar for which the ABI has no argument kind. A stencil
 also makes the PSy layer emit a halo exchange in front of the loop; that
 exchange is lowered before the loop is replaced, because it computes its own
 depth by walking forward to the accesses that read the field and the
-replacement would have removed them first. The
+replacement would have removed them first. A kernel taking an LMA operator --
+a ``gh_operator`` argument -- is accepted, and needs nothing added to the ABI:
+such an operator reaches the kernel as an integer ``ncell_3d`` and a rank-3
+array over ``(ncell_3d, ndf1, ndf2)``, with every one of those extents a
+formal of its own, so the ordinary View description covers it whole. A
+*columnwise* operator -- ``gh_columnwise_operator``, the CMA form -- is
+refused: it is a banded matrix carrying its own bandwidth and indexing
+arguments, none of which the region has an argument kind for. Taking an
+operator also gives the kernel a leading ``cell`` argument, which the PSy
+layer fills with the cell-column loop's own counter; that counter is the
+region's launch index, so the cell position is *declared* in the launch body
+from the index the launch already has rather than passed across the interface.
+The generated interface is therefore one argument shorter than the kernel's
+own signature, while the arithmetic the kernel writes over it --
+``ik = (cell - 1) * nlayers + 1``, by which a kernel finds its column's slice
+of the operator -- is generated unchanged. If the PSy layer ever supplied
+something other than the loop variable there, the transformation refuses
+rather than binding the wrong index. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 

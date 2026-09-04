@@ -12,7 +12,7 @@ import pytest
 
 from psyclone.configuration import Config
 from psyclone.core import AccessType
-from psyclone.domain.lfric import LFRicLoop
+from psyclone.domain.lfric import KernCallArgList, LFRicLoop
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.lfric import LFRicArgStencil
 from psyclone.parse import ModuleManager
@@ -1075,6 +1075,128 @@ _REPEATED_IMPORT_KERNEL = _KERNEL.replace(
     "            recip_epsilon + recip_epsilon * mr_v_at_dof")
 
 
+# dg_matrix_vector's shape: an LMA operator read as a rank-3 array, a leading
+# cell argument LFRic supplies to every kernel that takes one, and the column
+# addressed by array section on the operator's first dimension. That is what
+# all four of the kernels this capability releases look like.
+_OPERATOR_ALGORITHM = """
+program kokkos_operator_test
+  use field_mod,    only : field_type
+  use operator_mod, only : operator_type
+  use dg_matrix_vector_kernel_mod, only : dg_matrix_vector_kernel_type
+  implicit none
+  type(field_type)    :: lhs, x
+  type(operator_type) :: matrix
+  call invoke(dg_matrix_vector_kernel_type(lhs, x, matrix))
+end program kokkos_operator_test
+"""
+
+
+_OPERATOR_KERNEL = """
+module dg_matrix_vector_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_operator, gh_real,       &
+                           gh_readwrite, gh_read, cell_column,             &
+                           any_discontinuous_space_1, any_space_1
+  use constants_mod, only : i_def, r_def
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: dg_matrix_vector_kernel_type
+    type(arg_type) :: meta_args(3) = (/                                    &
+         arg_type(gh_field,    gh_real, gh_readwrite,                      &
+                                        any_discontinuous_space_1),        &
+         arg_type(gh_field,    gh_real, gh_read, any_space_1),             &
+         arg_type(gh_operator, gh_real, gh_read,                           &
+                               any_discontinuous_space_1, any_space_1) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: dg_matrix_vector_code
+  end type dg_matrix_vector_kernel_type
+contains
+  subroutine dg_matrix_vector_code(cell, nlayers, lhs, x, ncell_3d, matrix, &
+                                   ndf1, undf1, map1, ndf2, undf2, map2)
+    integer(kind=i_def), intent(in) :: cell, nlayers, ncell_3d
+    integer(kind=i_def), intent(in) :: ndf1, undf1, ndf2, undf2
+    integer(kind=i_def), dimension(ndf1), intent(in) :: map1
+    integer(kind=i_def), dimension(ndf2), intent(in) :: map2
+    real(kind=r_def), dimension(undf1), intent(inout) :: lhs
+    real(kind=r_def), dimension(undf2), intent(in) :: x
+    real(kind=r_def), dimension(ncell_3d,ndf1,ndf2), intent(in) :: matrix
+    integer(kind=i_def) :: df, m, ik, i1, i2, nl
+    nl = nlayers - 1
+    ik = (cell - 1) * nlayers + 1
+    do m = 1, ndf2
+      i2 = map2(m)
+      do df = 1, ndf1
+        i1 = map1(df)
+        lhs(i1:i1+nl) = lhs(i1:i1+nl) &
+                      + matrix(ik:ik+nl, df, m) * x(i2:i2+nl)
+      end do
+    end do
+  end subroutine dg_matrix_vector_code
+end module dg_matrix_vector_kernel_mod
+"""
+
+
+# apply_mixed_u_operator's shape, reduced to what makes it different: two
+# operators over the same pair of spaces, each with an ncell of its own. The
+# captured region this capability adds to the model has exactly this.
+_TWO_OPERATOR_ALGORITHM = _OPERATOR_ALGORITHM.replace(
+    "  type(operator_type) :: matrix",
+    "  type(operator_type) :: matrix, matrix2").replace(
+    "dg_matrix_vector_kernel_type(lhs, x, matrix)",
+    "dg_matrix_vector_kernel_type(lhs, x, matrix, matrix2)")
+
+
+# The fragments that variant swaps, held apart from the .replace() chain
+# below rather than written into it: a Fortran continuation line indented by
+# a Python expression as well as by itself does not fit in 79 columns.
+_ONE_OPERATOR_ARG = """\
+         arg_type(gh_operator, gh_real, gh_read,                           &
+                               any_discontinuous_space_1, any_space_1) /)"""
+
+
+_TWO_OPERATOR_ARGS = """\
+         arg_type(gh_operator, gh_real, gh_read,                           &
+                               any_discontinuous_space_1, any_space_1),    &
+         arg_type(gh_operator, gh_real, gh_read,                           &
+                               any_discontinuous_space_1, any_space_1) /)"""
+
+
+_ONE_OPERATOR_SIGNATURE = """\
+  subroutine dg_matrix_vector_code(cell, nlayers, lhs, x, ncell_3d, matrix, &
+                                   ndf1, undf1, map1, ndf2, undf2, map2)"""
+
+
+_TWO_OPERATOR_SIGNATURE = """\
+  subroutine dg_matrix_vector_code(cell, nlayers, lhs, x,           &
+                                   ncell_3d, matrix, ncell_3d_2, matrix2, &
+                                   ndf1, undf1, map1, ndf2, undf2, map2)"""
+
+
+_ONE_OPERATOR_DECL = (
+    "    real(kind=r_def), dimension(ncell_3d,ndf1,ndf2), intent(in) "
+    ":: matrix")
+
+
+_TWO_OPERATOR_DECL = (
+    _ONE_OPERATOR_DECL + "\n"
+    "    real(kind=r_def), dimension(ncell_3d_2,ndf1,ndf2), intent(in) "
+    ":: matrix2")
+
+
+_TWO_OPERATOR_KERNEL = _OPERATOR_KERNEL.replace(
+    "meta_args(3)", "meta_args(4)").replace(
+    _ONE_OPERATOR_ARG, _TWO_OPERATOR_ARGS).replace(
+    _ONE_OPERATOR_SIGNATURE, _TWO_OPERATOR_SIGNATURE).replace(
+    "    integer(kind=i_def), intent(in) :: cell, nlayers, ncell_3d",
+    "    integer(kind=i_def), intent(in) :: cell, nlayers, ncell_3d\n"
+    "    integer(kind=i_def), intent(in) :: ncell_3d_2").replace(
+    _ONE_OPERATOR_DECL, _TWO_OPERATOR_DECL).replace(
+    "                      + matrix(ik:ik+nl, df, m) * x(i2:i2+nl)",
+    "                      + (matrix(ik:ik+nl, df, m) &\n"
+    "                      +  matrix2(ik:ik+nl, df, m)) * x(i2:i2+nl)")
+
+
 # A kind-polymorphic kernel: one metadata name over several implementations
 # that differ only in the precision of their real arguments. Built from a
 # template rather than written out three times because the three fixtures below
@@ -1290,6 +1412,23 @@ def logical_array_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical array."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_ARRAY_KERNEL)
+
+
+@pytest.fixture(name="operator_target")
+# pylint: disable-next=unused-argument
+def operator_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads an LMA operator."""
+    return _invoke(
+        tmp_path, "dg_matrix_vector", _OPERATOR_ALGORITHM, _OPERATOR_KERNEL)
+
+
+@pytest.fixture(name="two_operator_target")
+# pylint: disable-next=unused-argument
+def two_operator_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads two LMA operators."""
+    return _invoke(
+        tmp_path, "dg_matrix_vector", _TWO_OPERATOR_ALGORITHM,
+        _TWO_OPERATOR_KERNEL)
 
 
 @pytest.fixture(name="stencil_target")
@@ -1994,12 +2133,130 @@ def test_lfric_kokkos_trans_rejects_quadrature(target):
         LFRicKokkosTrans().validate(loop)
 
 
-def test_lfric_kokkos_trans_rejects_operator(target):
-    """Operator arguments are outside the first region contract."""
+def test_lfric_kokkos_trans_rejects_a_columnwise_operator(target):
+    """A CMA operator is refused where an LMA one is now accepted.
+
+    The two are not variants of one capability. An LMA operator is a rank-3
+    array the kernel slices by cell, which the region describes as a View like
+    any other; a CMA operator is a banded matrix with its own bandwidth and
+    indexing arguments, and none of that machinery exists here.
+    """
     _, loop, kernel = target
-    kernel.arguments.args[1]._argument_type = "gh_operator"
-    with pytest.raises(TransformationError, match="gh_operator"):
+    kernel.arguments.args[1]._argument_type = "gh_columnwise_operator"
+    with pytest.raises(TransformationError, match="gh_columnwise_operator"):
         LFRicKokkosTrans().validate(loop)
+
+
+def test_lfric_kokkos_trans_accepts_an_operator(operator_target):
+    """An LMA operator becomes a rank-3 read-only View and nothing else.
+
+    Every extent of the local stencil -- ncell_3d, ndf1 and ndf2 -- is itself
+    a kernel formal, so the operator needs no machinery of its own: the
+    existing View description covers it.
+    """
+    _, loop, _ = operator_target
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
+        "ReadOnly> matrix(matrix_data, ncell_3d, ndf1, ndf2);" in code
+    assert "const double *matrix_data" in code
+    assert "const int ncell_3d" in code
+
+
+def test_lfric_kokkos_trans_declares_the_cell_position(operator_target):
+    """The kernel's cell argument is declared, not taken across the ABI.
+
+    LFRic passes its loop counter for that argument, and the counter is
+    lowered away when the loop becomes a launch. Taking it would therefore
+    read an unassigned variable on every cell -- a wrong answer rather than a
+    build failure, which is why this is asserted from both sides.
+    """
+    _, loop, _ = operator_target
+    code = LFRicKokkosTrans().apply(loop)
+
+    # The launch renames its own index, because the kernel has taken 'cell'.
+    assert "const int cell = cell_1 + 1;" in code
+
+    signature = code.split(") {\n")[0]
+    parameters = [
+        parameter.strip().split()[-1] for parameter in signature.split(",")
+        if parameter.strip().split()
+    ]
+    assert "cell" not in parameters
+    assert "ncells" in parameters
+
+
+def test_lfric_kokkos_trans_operator_dofmaps_keep_their_cell_index(
+        operator_target):
+    """Dropping the cell actual must not shift the formal/actual pairing.
+
+    The per-cell detection walks the two lists together, so dropping the
+    actual alone attributes every dofmap to the formal before it and the
+    generated Views silently lose their cell dimension. That compiles and
+    runs, and reads the wrong column.
+    """
+    _, loop, _ = operator_target
+    code = LFRicKokkosTrans().apply(loop)
+
+    for dofmap in ("map1", "map2"):
+        assert f"Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, " \
+            f"ReadOnly> {dofmap}({dofmap}_data, ndf" in code
+        assert f"{dofmap}_data, ndf1, ncells)" in code or \
+            f"{dofmap}_data, ndf2, ncells)" in code
+        assert f"{dofmap}(" in code
+    assert ", cell_1)" in code
+
+
+def test_lfric_kokkos_trans_operator_call_drops_the_cell_actual(
+        operator_target):
+    """The generated call passes the operator, not the vanished counter."""
+    psy, loop, _ = operator_target
+    LFRicKokkosTrans().apply(loop)
+    generated = str(psy.gen).lower()
+
+    call = [line for line in generated.splitlines()
+            if "call dg_matrix_vector_kokkos(" in line]
+    assert call, generated
+    arguments = call[0].split("(", 1)[1]
+    assert "matrix_proxy%ncell_3d" in arguments
+    assert "matrix_local_stencil" in arguments
+    # The PSy loop counter is not passed, and having no other reader it is
+    # dropped from the routine altogether.
+    assert "cell," not in arguments
+    assert ":: cell\n" not in generated
+
+
+def test_lfric_kokkos_trans_accepts_two_operators(two_operator_target):
+    """Two operators give two Views and still one cell declaration."""
+    _, loop, _ = two_operator_target
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "matrix(matrix_data, ncell_3d, ndf1, ndf2);" in code
+    assert "matrix2(matrix2_data, ncell_3d_2, ndf1, ndf2);" in code
+    assert code.count("const int cell = cell_1 + 1;") == 1
+
+
+def test_lfric_kokkos_trans_operator_cell_actual_must_be_the_counter(
+        operator_target, monkeypatch):
+    """A cell actual that is not the loop's own variable is refused.
+
+    The transformation reads the position of the cell argument from
+    ``has_operator()``, mirroring ``ArgOrdering.generate``. If those two ever
+    part company the actual at that index stops being the loop variable, and
+    the region would drop the wrong argument -- so the assumption is checked
+    rather than trusted.
+    """
+    _, loop, _ = operator_target
+    original = KernCallArgList.generate
+
+    def _shuffled(self, var_accesses=None):
+        original(self, var_accesses=var_accesses)
+        # Put something that is not the loop variable where the cell is.
+        self._psyir_arglist[0] = self._psyir_arglist[1].copy()
+
+    monkeypatch.setattr(KernCallArgList, "generate", _shuffled)
+    with pytest.raises(TransformationError, match="cell index"):
+        LFRicKokkosTrans().apply(loop)
 
 
 def test_lfric_kokkos_trans_rejects_incremented_field(target):

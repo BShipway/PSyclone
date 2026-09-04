@@ -31,12 +31,12 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
 
     The transformation recognises a kernel shape rather than a named kernel:
     an uncoloured owned-cell loop over a single kernel whose arguments are
-    fields and scalars, whose written fields are on discontinuous spaces, and
-    whose formals and referenced module constants all map onto the
-    ``int``/``float``/``double`` ABI the Kokkos backend emits. Every part of
-    the generated region -- its name, its C signature, its Views and the
-    ``bind(C)`` interface the PSy layer calls through -- is derived from that
-    kernel, so a second kernel needs no change here.
+    fields, scalars and LMA operators, whose written fields are on
+    discontinuous spaces, and whose formals and referenced module constants
+    all map onto the ``int``/``float``/``double`` ABI the Kokkos backend
+    emits. Every part of the generated region -- its name, its C signature,
+    its Views and the ``bind(C)`` interface the PSy layer calls through -- is
+    derived from that kernel, so a second kernel needs no change here.
 
     **Precision is carried, not chosen.** A kind is placed on the ABI by the
     width LFRic's precision map gives it, so an ``r_solver`` kernel reaches
@@ -90,6 +90,27 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     crosses by reference: a ``View<bool*>`` laid over ``logical(l_def)``
     storage would reinterpret 4-byte elements as 1-byte ones rather than
     convert them, which is the very failure conversion removes for a scalar.
+
+    **An LMA operator is accepted; a CMA operator is not.** An LMA
+    operator reaches the kernel as ``ncell_3d`` and a rank-3 array
+    ``dimension(ncell_3d, ndf1, ndf2)`` holding every cell's local stencil
+    end to end. Every extent is a formal of its own, so the operator becomes
+    an ordinary read-only View and needs no argument machinery: what it needs
+    is the cell. A CMA operator stays refused, as before, because a banded
+    matrix carries its own bandwidth and indexing arguments that this region
+    has no way to describe.
+
+    **The kernel's cell argument is declared rather than passed.** LFRic gives
+    a leading ``cell`` formal to exactly the kernels that take an operator,
+    because a kernel finds its own slice of a local stencil arithmetically --
+    ``ik = (cell - 1) * nlayers + 1`` -- rather than being handed the slice.
+    The launch already knows which cell it is on, so the region declares
+    ``const int cell = cell_1 + 1;`` from its own index and the formal never
+    reaches the generated signature. Passing it instead is what makes this
+    worth stating: it would become a launch parameter fixed for the whole
+    region, and the actual the PSy layer supplies is its own loop counter,
+    which lowering removes. Every cell would then compute ``ik`` from an
+    unassigned variable -- code that compiles, links, runs and is wrong.
 
     **A stencil is accepted by shape**, and the accepted shapes are
     :py:attr:`_SUPPORTED_STENCILS` -- ``cross2d`` alone. A 2-D stencil needs
@@ -228,6 +249,14 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
     #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
     #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
     _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE)
+    #: The LFRic argument types the region can describe. ``gh_operator`` is an
+    #: LMA operator, which reaches the kernel as a rank-3 array over
+    #: ``(ncell_3d, ndf1, ndf2)`` with every extent a formal of its own, so
+    #: the existing View description covers it whole.
+    #: ``gh_columnwise_operator`` is absent and is the CMA case: a banded
+    #: matrix carrying its own bandwidth and indexing arguments, none of
+    #: which this region has.
+    _SUPPORTED_ARGUMENTS = ("gh_field", "gh_scalar", "gh_operator")
 
     #: Identifiers the generated launch declares in the scope the kernel
     #: body is generated into. A kernel-local of the same name would
@@ -361,10 +390,10 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
 
         :raises TransformationError: if the kernel needs quadrature or
             evaluator data, is a CMA or inter-grid kernel, takes an argument
-            that is neither a field nor a scalar, takes an access a
-            cell-parallel launch cannot honour, takes a non-real field, uses a
-            stencil shape outside :py:attr:`_SUPPORTED_STENCILS`, or writes to
-            a field on a continuous space.
+            that is not a field, a scalar or an LMA operator, takes an access
+            a cell-parallel launch cannot honour, takes a non-real field, uses
+            a stencil shape outside :py:attr:`_SUPPORTED_STENCILS`, or writes
+            to a field on a continuous space.
         """
         if kernel.qr_required or kernel.eval_shapes:
             raise TransformationError(
@@ -379,10 +408,17 @@ class LFRicKokkosTrans(LFRicKokkosTypesMixin, LFRicKokkosCallMixin,
 
         discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
         for argument in kernel.arguments.args:
-            if argument.argument_type not in ("gh_field", "gh_scalar"):
+            # An LMA operator needs no rule of its own beyond this one. It
+            # reaches the kernel as a rank-3 array whose every extent is
+            # itself a formal, so the existing View description covers it, and
+            # a cell's slice of it is disjoint from every other cell's by
+            # construction -- so a cell-parallel launch cannot race on it
+            # whatever space it is built over.
+            if argument.argument_type not in cls._SUPPORTED_ARGUMENTS:
                 raise TransformationError(
-                    "LFRicKokkosTrans supports only gh_field and gh_scalar "
-                    f"arguments, found '{argument.argument_type}'.")
+                    "LFRicKokkosTrans supports only "
+                    f"{', '.join(cls._SUPPORTED_ARGUMENTS)} arguments, "
+                    f"found '{argument.argument_type}'.")
             if argument.access not in cls._SAFE_ACCESSES:
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot capture the '{argument.access}' "
@@ -858,6 +894,51 @@ can_loop_be_parallelised`
         for exchange in schedule.walk(LFRicHaloExchange):
             exchange.lower_to_language_level()
 
+    @staticmethod
+    def _cell_position(kernel, loop, formals, actuals):
+        """Return the formal carrying LFRic's cell index, or ``None``.
+
+        ``ArgOrdering.generate`` emits that index as the kernel's first
+        argument for exactly the kernels that take an operator, so
+        ``has_operator()`` is both the test and the position. The kernel uses
+        the value arithmetically -- ``ik = (cell - 1) * nlayers + 1`` -- to
+        find its own slice of an operator's local stencil, and the region
+        declares it from the launch's own index rather than taking it, since
+        the actual the PSy layer supplies is the loop counter that lowering
+        removes.
+
+        That the actual *is* the loop counter is checked rather than assumed.
+        If ``ArgOrdering`` and this method ever part company, the entry
+        dropped below is some other argument, and the result is a region that
+        compiles, runs and reads the wrong data.
+
+        :param kernel: the kernel being captured.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param loop: the loop the kernel sits in.
+        :type loop: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param formals: the kernel's formal arguments, in order.
+        :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
+        :param actuals: the actual arguments the PSy layer supplies, in the
+            same order.
+        :type actuals: list[:py:class:`psyclone.psyir.nodes.Node`]
+
+        :returns: the name of the cell-position formal, or ``None``.
+        :rtype: Optional[str]
+
+        :raises TransformationError: if the kernel takes an operator but the
+            first actual is not a reference to the loop's own variable.
+        """
+        if not kernel.arguments.has_operator():
+            return None
+        actual = actuals[0]
+        if not (isinstance(actual, Reference)
+                and actual.symbol is loop.variable):
+            raise TransformationError(
+                f"LFRicKokkosTrans expected the PSy layer to supply the "
+                f"loop's own cell index as the first argument of "
+                f"'{kernel.name}', but found '{actual.debug_string()}'.")
+        return formals[0].name
+
     def apply(self, node, options=None, **kwargs):
         """Generate C++ and replace ``node`` with the typed launch call.
 
@@ -908,6 +989,17 @@ can_loop_be_parallelised`
                 f"for '{kernel.name}' but the PSy layer supplies "
                 f"{len(actuals)}.")
 
+        cell_position = self._cell_position(kernel, node, formals, actuals)
+        if cell_position is not None:
+            # Both lists, together. They are walked in step below -- and
+            # 'formals' is what describes the generated signature -- so
+            # dropping the actual alone would attribute every later actual to
+            # the formal before it, and the dofmaps, being the ones detected
+            # by the shape of their actual, would silently lose the cell
+            # dimension that makes them per-cell.
+            formals = formals[1:]
+            del actuals[0]
+
         # An actual that indexes into PSy-layer storage -- a dofmap sliced as
         # map(:,cell) -- is passed whole instead, and the region takes the
         # cell index itself. Everything else is already a plain reference.
@@ -930,8 +1022,9 @@ can_loop_be_parallelised`
             schedule=schedule,
             cell_count=self._CELL_COUNT,
             cell_index=cell_index,
+            cell_position=cell_position,
             arguments=self._region_arguments(
-                schedule, per_cell, constants, cell_index),
+                formals, per_cell, constants, cell_index),
             kind_types=self._kind_types(schedule),
             scratch=self._local_arrays(schedule),
             parallel_loops=parallel_loops,
