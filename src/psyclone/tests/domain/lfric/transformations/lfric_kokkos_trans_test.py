@@ -2133,6 +2133,28 @@ def test_lfric_kokkos_trans_rejects_quadrature(target):
         LFRicKokkosTrans().validate(loop)
 
 
+def test_lfric_kokkos_trans_rejects_an_intergrid_kernel(target):
+    """An inter-grid kernel iterates two meshes; the region knows one."""
+    _, loop, kernel = target
+    kernel._intergrid_ref = object()
+    with pytest.raises(TransformationError, match="inter-grid"):
+        LFRicKokkosTrans().validate(loop)
+
+
+def test_lfric_kokkos_trans_rejects_a_columnwise_assembly(target):
+    """The CMA refusal is by operation, ahead of the argument-type walk.
+
+    A CMA kernel is refused for what it does rather than for what it takes:
+    an assembly kernel builds a banded matrix from an LMA one, so its
+    arguments alone would now pass. The two refusals are therefore both
+    needed and are asserted apart.
+    """
+    _, loop, kernel = target
+    kernel._cma_operation = "assembly"
+    with pytest.raises(TransformationError, match="CMA operators"):
+        LFRicKokkosTrans().validate(loop)
+
+
 def test_lfric_kokkos_trans_rejects_a_columnwise_operator(target):
     """A CMA operator is refused where an LMA one is now accepted.
 
