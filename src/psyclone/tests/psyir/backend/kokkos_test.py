@@ -21,7 +21,8 @@ from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
     Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Literal, Loop,
     Reference, Routine)
-from psyclone.psyir.symbols import DataSymbol, ScalarType
+from psyclone.psyir.symbols import (
+    ArgumentInterface, DataSymbol, ScalarType)
 
 
 def _kernel_schedule():
@@ -679,6 +680,126 @@ def test_kokkos_flat_shapes_ignore_team_size():
     for region in (_region(), _scratch_region()):
         assert KokkosWriter()(replace(region, team_size=4)) == \
             KokkosWriter()(region)
+
+
+def _with_cell_position(region, name="cell"):
+    """Return ``region`` with ``name`` prepended to its schedule's formals.
+
+    LFRic gives every kernel taking an operator a leading cell argument, which
+    the region declares from its own launch index rather than taking across the
+    ABI. This builds that state directly: the formal is in the schedule's
+    argument list and in none of ``region.arguments``.
+
+    :param region: the region to add a cell position to.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    :param name: the formal's name, defaulting to the one LFRic uses.
+    :type name: str
+
+    :returns: the same region, with the formal added and named as its cell
+        position.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    table = region.schedule.symbol_table
+    # Read the existing formals before adding: the property revalidates the
+    # table, and between the add and the specify there is an argument symbol
+    # the list does not carry.
+    formals = list(table.argument_list)
+    symbol = DataSymbol(
+        name, ScalarType.integer_type(),
+        interface=ArgumentInterface(ArgumentInterface.Access.READ))
+    table.add(symbol)
+    table.specify_argument_list([symbol] + formals)
+    return replace(region, cell_position=name)
+
+
+def test_kokkos_cell_position_declared_in_range_launch():
+    """The cell position is declared from the launch index, not passed.
+
+    The kernel computes its own offset into an operator from ``cell``, so the
+    value has to be the cell the iteration is on. Taking it as a parameter
+    would give every cell whatever the caller passed once, which is why it is
+    declared inside the lambda instead.
+    """
+    code = KokkosWriter()(_with_cell_position(_renamed(_region())))
+
+    assert ("KOKKOS_LAMBDA(const int cell_1) {\n"
+            "    const int cell = cell_1 + 1;\n") in code
+
+    # And it is nowhere on the ABI: the caller neither has the value nor
+    # needs it.
+    signature = code.split(") {\n")[0]
+    parameters = [
+        parameter.strip().split()[-1] for parameter in signature.split(",")
+        if parameter.strip().split()
+    ]
+    assert "cell" not in parameters
+    assert "ncells" in parameters
+
+
+def test_kokkos_cell_position_declared_in_team_launch():
+    """The flat team launch declares it after computing its own index."""
+    code = KokkosWriter()(_with_cell_position(_renamed(_scratch_region())))
+
+    assert "\n      const int cell = cell_1 + 1;\n" in code
+    assert code.index("const int cell_1 = team.league_rank()") < \
+        code.index("const int cell = cell_1 + 1;")
+
+
+def test_kokkos_cell_position_declared_in_hierarchical_launch():
+    """The hierarchical launch declares it straight from the league rank."""
+    code = KokkosWriter()(_with_cell_position(_renamed(_level_region())))
+
+    assert ("    const int cell_1 = team.league_rank();\n"
+            "    const int cell = cell_1 + 1;\n") in code
+
+
+def test_kokkos_cell_position_absent_declares_nothing():
+    """The field is inert on every region that does not set it.
+
+    Every capture in the model was generated before it existed, and each is
+    gated on assertions over its exact text, so the declaration has to be
+    conditional rather than empty-when-unset.
+    """
+    for region in (_region(), _scratch_region(), _level_region()):
+        code = KokkosWriter()(region)
+        assert "= cell + 1;" not in code
+        assert "= cell_1 + 1;" not in code
+
+
+@pytest.mark.parametrize("name, message", [
+    ("not an identifier", "is not a C++ identifier"),
+    ("ik", "is not a kernel argument"),
+    ("nlayers", "is also described as a region argument"),
+])
+def test_kokkos_writer_rejects_an_invalid_cell_position(name, message):
+    """Three ways the field can name something it cannot declare.
+
+    None announces itself downstream: an unknown name generates a declaration
+    initialised from nothing, and a name the region also passes generates a
+    parameter and a local of the same name in one scope.
+    """
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(replace(_region(), cell_position=name))
+
+    assert message in str(error.value)
+    assert name in str(error.value)
+
+
+def test_kokkos_writer_rejects_a_cell_position_shadowing_the_index():
+    """A cell position equal to the launch index initialises from itself.
+
+    ``const int cell = cell + 1;`` reads the object being declared, which C++
+    permits and no compiler is obliged to diagnose. The transformation renames
+    the index away from a kernel's own names, so this is unreachable from
+    there; it is checked because the consequence of reaching it is a value
+    rather than an error.
+    """
+    region = _with_cell_position(_region())
+
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(region)
+
+    assert "'cell' is also the launch's cell index" in str(error.value)
 
 
 def _nested_schedule():

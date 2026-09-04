@@ -178,6 +178,15 @@ class KokkosRegion:
     #: transformation, not here; the writer checks only that what it is given
     #: is a set of unnested unit-stride loops it can find in the schedule.
     parallel_loops: Tuple[Loop, ...] = ()
+    #: The name of the kernel formal carrying LFRic's cell index, or ``None``
+    #: for a kernel that has none. LFRic passes that index to every kernel
+    #: taking an operator, which uses it arithmetically to find its own slice
+    #: of the operator's local stencil. It is the one formal the region
+    #: declares rather than takes: the launch already knows which cell it is
+    #: on, so the value is generated from :py:attr:`cell_index` inside the
+    #: functor. Taking it across the ABI instead would compile and run, and
+    #: give every cell whatever the caller passed once.
+    cell_position: Optional[str] = None
     #: The team size the hierarchical launch asks for. ``None`` renders
     #: ``Kokkos::AUTO`` and lets the backend choose; a positive integer
     #: renders itself, which is how a host build reaches the team-level
@@ -290,6 +299,13 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             # renders an array local as ``double * restrict x_new`` -- a
             # pointer to nothing, which compiles and would shadow the View.
             if symbol.name not in scratch_names)
+        if region.cell_position is not None:
+            # First, and prepended here rather than in each launch shape: all
+            # three place these declarations immediately after establishing
+            # their own cell index, which is the only thing this one reads.
+            local_declarations = (
+                f"{self._nindent}const int {region.cell_position} = "
+                f"{region.cell_index} + 1;\n") + local_declarations
         body = "".join(
             self._visit(child) for child in region.schedule.children)
         self._depth = 0
@@ -364,7 +380,9 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             integer expression over named sizes; if the schedule contains a
             :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
             share a C ABI name; if the cell count is not itself a scalar
-            argument; if a kernel argument has no description; if a View
+            argument; if the cell position breaks the contract
+            :py:meth:`_validate_cell_position` states; if a kernel argument
+            has no description; if a View
             breaks the ownership or dimensional contract
             :py:meth:`_validate_view` states; if a scratch array breaks the
             contract :py:meth:`_validate_scratch` states; if a parallel loop
@@ -436,6 +454,12 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             for symbol in region.schedule.symbol_table.argument_list
         }
         provided = scalar_names | view_names
+        if region.cell_position is not None:
+            self._validate_cell_position(
+                region, schedule_arguments, provided)
+            # Described by declaration rather than by argument, so it counts
+            # as provided for the completeness check below.
+            provided = provided | {region.cell_position}
         missing = schedule_arguments - provided
         if missing:
             raise ValueError(
@@ -451,6 +475,44 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             used_names.add(item.name)
 
         self._validate_launch(region)
+
+    def _validate_cell_position(self, region, formals, described):
+        """Reject a cell position the region could not correctly declare.
+
+        Checked rather than trusted for the reason
+        :py:meth:`_validate_launch` gives: none of the four mistakes stops a
+        build. A name that is not a formal declares a local nothing reads; a
+        name the region also passes puts a parameter and a local of the same
+        name in one scope, which C++ resolves in favour of the local; and a
+        name equal to the launch index generates ``const int cell = cell + 1``,
+        which initialises an object from itself.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+        :param formals: the names of the schedule's kernel arguments.
+        :type formals: Set[str]
+        :param described: the names ``region.arguments`` already covers.
+        :type described: Set[str]
+
+        :raises ValueError: if the cell position is not a C++ identifier, is
+            not one of the schedule's kernel arguments, is also described as a
+            region argument, or is the launch's own cell index.
+        """
+        position = region.cell_position
+        if not self._is_identifier(position):
+            raise ValueError(
+                f"Cell position '{position}' is not a C++ identifier.")
+        if position == region.cell_index:
+            raise ValueError(
+                f"Cell position '{position}' is also the launch's cell "
+                "index.")
+        if position not in formals:
+            raise ValueError(
+                f"Cell position '{position}' is not a kernel argument.")
+        if position in described:
+            raise ValueError(
+                f"Cell position '{position}' is also described as a region "
+                "argument.")
 
     @staticmethod
     def _validate_launch(region):
