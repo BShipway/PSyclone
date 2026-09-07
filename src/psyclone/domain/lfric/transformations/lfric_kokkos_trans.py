@@ -213,22 +213,45 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     a ``TeamPolicy`` rather than a ``RangePolicy``.
 
     That placement is what the refusals protect. The array's element kind must
-    be one the ABI names, as a formal's must, and every **name** in its extents
-    must be a **kernel argument**: the launch computes its scratch size before
-    it enters the region, so an extent it cannot name there cannot be sized.
-    A module constant is refused as an extent for that reason even though the
-    body may read one elsewhere. A scalar local needs no scratch and is
-    declared in the region body as before.
+    be one the ABI names, as a formal's must, and every **name** left in its
+    extents must be a **kernel argument**: the launch computes its scratch
+    size before it enters the region, so an extent it cannot name there
+    cannot be sized. A module constant is refused as an extent for that
+    reason even though the body may read one elsewhere. A scalar local needs
+    no scratch and is declared in the region body as before.
+
+    A name whose value the declaration states is not left in the extent at
+    all. ``integer(kind=i_def), parameter :: nfaces = 4`` beside
+    ``real(kind=r_tran), dimension(nfaces) :: v_dot_n`` is the commonest
+    kernel-local shape GungHo has, and the value is in the Fortran: the
+    extent is resolved to ``4`` before it is read, by the same substitution
+    that already replaces such a name in the body. Only names the declaration
+    has values for are replaced, so ``dimension(order+1,nfaces)`` keeps the
+    formal and loses the constant.
 
     An extent is a declared bound written as C, not a name copied over, so it
     need not be a single symbol. ``dimension(max_length,4)`` and
     ``dimension(nlayers+1)`` are both accepted, and both a formal and a local
     are read the same way. What is required is an integer expression over
-    kernel arguments and literals using ``+``, ``-`` and ``*``: division is
-    refused, because Fortran and C++ can disagree about the rounding of an
-    integer division and a wrongly sized allocation would not announce
-    itself. Every one of these is refused by :py:meth:`validate` rather than
-    discovered by :py:meth:`apply`.
+    kernel arguments and literals using ``+``, ``-``, ``*`` and ``/``.
+    Division is carried rather than refused because Fortran and C++ agree
+    about it -- both truncate an integer quotient toward zero -- so
+    ``dimension((stencil_size + 1) / 2)`` is sized as the kernel declared it.
+    What the two languages do not agree about is an allocation of negative
+    size, which neither defines, so a launch whose scratch extent divides
+    emits a guard that says which rule it is relying on and aborts rather
+    than requesting one. A call is still refused: ``max(nlayers, 1)`` and
+    ``pow(nlayers, 2)`` carry a comma, which a ``shmem_size`` argument may
+    not.
+
+    A declaration that states no shape is refused by name. An allocatable or
+    an assumed-shape local -- ``real(kind=r_def), allocatable, dimension(:)``
+    -- is sized by an ALLOCATE in the kernel body or by its caller, and
+    scratch bytes are requested before the launch enters the region, so there
+    is no point at which such a size could be known. A shape the C writer
+    cannot render at all, such as ``dimension(MAX(nlayers-n,1))``, is refused
+    with the writer's own reason attached. Every one of these is refused by
+    :py:meth:`validate` rather than discovered by :py:meth:`apply`.
 
     **A declared lower bound need not be 1.** ``dimension(0:nlayers-1)`` and
     ``dimension(-nlayers:nlayers)`` are accepted alongside
@@ -238,8 +261,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     ``u_e(k)`` over a local declared ``dimension(0:nlayers)`` becomes
     ``u_e((k - 0))``. The lower bound must satisfy the same grammar as the
     upper -- an integer expression over kernel arguments and literals using
-    ``+``, ``-`` and ``*`` -- and is refused on the same terms when it does
-    not. A bound of 1 renders exactly the source it rendered before this was
+    ``+``, ``-``, ``*`` and ``/`` -- and is refused on the same terms when it
+    does not. A bound of 1 renders exactly the source it rendered before this was
     accepted, the span folding back to the upper bound alone.
 
     The subtraction is written out even where it is zero, because it is

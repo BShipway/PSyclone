@@ -252,6 +252,46 @@ class LFRicKokkosConstantsMixin:
         return tuple(described[name] for name in sorted(described))
 
     @classmethod
+    def _resolve_constants(cls, expression):
+        """Return a copy of ``expression`` with each named constant replaced.
+
+        :py:meth:`_substitute_constants` does this to a schedule, which is
+        every place the *body* names a constant. A declared array bound is
+        the other place, and it is not in the schedule: it hangs off a
+        symbol's datatype, where a walk of the body never reaches it. So a
+        kernel declaring ``integer, parameter :: nfaces = 4`` beside
+        ``real(kind=r_tran), dimension(nfaces) :: v_dot_n`` states an extent
+        of 4 that the launch cannot see, and reads ``nfaces`` in a loop bound
+        the launch never has to.
+
+        The replacement is partial by design. ``dimension(order+1,nfaces)``
+        mixes a kernel argument with a constant, and only the constant is
+        replaced: what the caller wants is the extent with everything the
+        Fortran has already decided taken out of it, not a refusal because
+        one name in it survived.
+
+        A copy throughout, for :py:meth:`_fold`'s reason: a declared bound is
+        a live piece of a symbol's datatype, and substituting into it would
+        rewrite the declaration this is only reading.
+
+        :param expression: the declared bound to resolve.
+        :type expression: :py:class:`psyclone.psyir.nodes.DataNode`
+
+        :returns: the copy, owned by the caller.
+        :rtype: :py:class:`psyclone.psyir.nodes.DataNode`
+        """
+        resolved = expression.copy()
+        for reference in resolved.walk(Reference):
+            value = cls._static_constant(reference.symbol)
+            if value is None:
+                continue
+            if reference is resolved:
+                resolved = value
+            else:
+                reference.replace_with(value)
+        return resolved
+
+    @classmethod
     def _substitute_constants(cls, schedule):
         """Replace each module-level ``parameter`` by the value it was given.
 

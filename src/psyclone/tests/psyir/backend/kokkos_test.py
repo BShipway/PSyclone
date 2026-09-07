@@ -929,9 +929,10 @@ def test_kokkos_writer_views_are_never_managed():
     (KokkosScratch("x_new", "double", ("nrows + 1",), index_offsets=(1,)),
      "Kokkos scratch 'x_new' has extent 'nrows + 1', which is sized from "
      "'nrows' rather than from a scalar argument."),
-    (KokkosScratch("x_new", "double", ("nlayers / 2",), index_offsets=(1,)),
-     "Kokkos scratch 'x_new' has extent 'nlayers / 2' which is not an integer "
-     "expression over named sizes."),
+    (KokkosScratch("x_new", "double", ("max(nlayers, 1)",),
+                   index_offsets=(1,)),
+     "Kokkos scratch 'x_new' has extent 'max(nlayers, 1)' which is not an "
+     "integer expression over named sizes."),
     (KokkosScratch("x_new", "double", ("(nlayers",), index_offsets=(1,)),
      "Kokkos scratch 'x_new' has extent '(nlayers' which is not an integer "
      "expression over named sizes."),
@@ -944,7 +945,7 @@ def test_kokkos_writer_views_are_never_managed():
      "Kokkos scratch 'x_new' index offsets must be integers or integer "
      "expressions over named sizes."),
     (KokkosScratch("x_new", "double", ("nlayers",),
-                   index_offsets=("nlayers / 2",)),
+                   index_offsets=("max(nlayers, 1)",)),
      "Kokkos scratch 'x_new' index offsets must be integers or integer "
      "expressions over named sizes."),
     (KokkosScratch("y", "double", ("nlayers",), index_offsets=(1,)),
@@ -1114,25 +1115,28 @@ def test_kokkos_view_takes_an_expression_extent():
 @pytest.mark.parametrize("extent, accepted", [
     ("nlayers", True), ("4", True), ("(nlayers + 1)", True),
     ("nlayers + 1", True), ("2 * nlayers - 1", True), ("nlayers*4", True),
-    ("", False), ("   ", False), ("nlayers / 2", False), ("4nlayers", False),
+    ("nlayers / 2", True), ("((stencil_size + 1) / 2)", True),
+    ("", False), ("   ", False), ("4nlayers", False),
     ("(nlayers", False), ("nlayers)", False), (")nlayers(", False),
     ("nlayers % 2", False), ("nlayers.size", False), (4, False), (None, False),
+    ("pow(nlayers, 2)", False), ("max(nlayers, 1)", False),
 ])
 def test_is_extent(extent, accepted):
     """The extent predicate accepts arithmetic and refuses everything else.
 
-    Division is refused rather than unsupported: Fortran and C++ can disagree
-    about the rounding of an integer division, and an extent is a place where
-    that would be silent. ``)nlayers(`` is here because a depth count that
-    only checked the total would accept it.
+    Division is accepted: Fortran and C++ both truncate an integer quotient
+    toward zero, so an extent that divides is the extent the kernel declared.
+    A call is not, because the comma in one is what a generated
+    ``shmem_size`` argument may not carry. ``)nlayers(`` is here because a
+    depth count that only checked the total would accept it.
     """
     assert is_extent(extent) is accepted
 
 
 @pytest.mark.parametrize("offset, accepted", [
     (1, True), (0, True), (-3, True), ("1", True), ("0", True),
-    ("(-nlayers)", True), ("2 * nlayers", True),
-    (1.5, False), ("nlayers / 2", False), ("", False), (None, False),
+    ("(-nlayers)", True), ("2 * nlayers", True), ("nlayers / 2", True),
+    (1.5, False), ("max(nlayers, 1)", False), ("", False), (None, False),
 ])
 def test_is_offset(offset, accepted):
     """An offset is an integer, or an extent expression standing in for one.
@@ -1141,7 +1145,9 @@ def test_is_offset(offset, accepted):
     readings of one declaration: a shape admitted into the extent and refused
     in the origin would size a View correctly and index it from the wrong
     place. A negative integer is accepted, since an array centred on zero has
-    a negative origin.
+    a negative origin, and a division is accepted for the same reason it is
+    accepted in an extent: an origin that rounded the other way would shift
+    every subscript of the array by one.
     """
     assert is_offset(offset) is accepted
 

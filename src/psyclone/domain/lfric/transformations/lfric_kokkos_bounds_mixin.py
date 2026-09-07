@@ -53,12 +53,15 @@ predicate the capture contract and the coverage survey ask, and it predicts
 that rewrite over a copy.
 
 The sibling mixins are reached through ``cls``, resolved on
-``LFRicKokkosTrans``: ``_validate_bounds`` predicts ``cls._lower_sections``.
-Calling a method here directly on this mixin is therefore not supported.
+``LFRicKokkosTrans``: ``_validate_bounds`` predicts ``cls._lower_sections``
+and ``_bounds`` asks ``cls._resolve_constants`` for a declaration written
+over a ``parameter``. Calling a method here directly on this mixin is
+therefore not supported.
 """
 
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos import extent_names, is_extent
+from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     BinaryOperation, IntrinsicCall, Literal, Reference)
 from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
@@ -86,6 +89,63 @@ class LFRicKokkosBoundsMixin:
     _BOUND_INTRINSICS = (IntrinsicCall.Intrinsic.LBOUND,
                          IntrinsicCall.Intrinsic.UBOUND,
                          IntrinsicCall.Intrinsic.SIZE)
+
+    #: What a declaration carrying no bounds carries instead, and where the
+    #: shape it does not state is stated. Both are refusals, and the reason
+    #: they are refusals is different, so a reader who is told which of the
+    #: two this is knows whether to look at the kernel or at its caller.
+    _SHAPELESS_WORDING = {
+        ArrayType.Extent.DEFERRED:
+            "a deferred shape, so its size is stated by an ALLOCATE in the "
+            "kernel body and not by its declaration",
+        ArrayType.Extent.ATTRIBUTE:
+            "an assumed shape, so its size is stated by its caller and not "
+            "by its declaration",
+    }
+
+    @classmethod
+    def _shapeless_wording(cls, dimension):
+        """Name the shape a dimension carries in place of declared bounds.
+
+        :param dimension: the entry of the array's shape that has no bounds.
+        :type dimension: :py:class:`psyclone.psyir.symbols.ArrayType.Extent`
+
+        :returns: what the Fortran declared, worded for a refusal.
+        :rtype: str
+        """
+        return cls._SHAPELESS_WORDING.get(dimension, f"'{dimension}'")
+
+    @staticmethod
+    def _render(writer, symbol, expression):
+        """Return one declared bound written as C.
+
+        The refusal exists because the writer's own failure is a
+        ``VisitorError``, which :py:meth:`validate` is not allowed to raise:
+        a caller asking whether a kernel can be captured gets an answer or a
+        ``TransformationError``, never a back-end exception. A real GungHo
+        declaration reaches it -- ``dimension(MAX(nlayers-above,1))`` --
+        where the shape is arithmetic the C writer has no intrinsic for.
+
+        :param writer: the C writer rendering the bound.
+        :type writer: :py:class:`psyclone.psyir.backend.c.CWriter`
+        :param symbol: the array the bound was declared for, named in the
+            refusal.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+        :param expression: the bound to render, owned by the caller and
+            lowered by this call.
+        :type expression: :py:class:`psyclone.psyir.nodes.DataNode`
+
+        :returns: the bound written as C.
+        :rtype: str
+
+        :raises TransformationError: if the C writer cannot render it.
+        """
+        try:
+            return writer(expression)
+        except VisitorError as err:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot write the declared shape of "
+                f"'{symbol.name}' as C: {err}") from err
 
     @staticmethod
     def _span(lower, upper):
@@ -150,6 +210,17 @@ class LFRicKokkosBoundsMixin:
         not 1 needs both to move: a View of the right size indexed from the
         wrong place compiles, runs and returns the wrong answer.
 
+        A bound written over a named constant is resolved to what that
+        constant was declared as, by the method that resolves the same names
+        in the body. ``integer(kind=i_def), parameter :: nfaces = 4`` beside
+        ``real(kind=r_tran), dimension(nfaces) :: v_dot_n`` is the commonest
+        kernel-local shape in GungHo there is, and the value is in the
+        Fortran: an extent left as ``nfaces`` would be refused for naming
+        something the launch cannot evaluate, when the launch does not need
+        to evaluate it. Only names the declaration has values for are
+        replaced, so ``dimension(order+1,nfaces)`` keeps the formal and loses
+        the constant.
+
         :param symbol: the array whose shape is wanted.
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
 
@@ -158,7 +229,9 @@ class LFRicKokkosBoundsMixin:
         :rtype: tuple[tuple[str, str]]
 
         :raises TransformationError: if a dimension carries no declared
-            bounds.
+            bounds, naming the shape it was declared with instead.
+        :raises TransformationError: if a declared bound names something the
+            C writer cannot render.
         :raises TransformationError: if its declared lower bound, or the
             extent its two bounds give, is not an integer expression the
             Kokkos backend can write.
@@ -174,16 +247,22 @@ class LFRicKokkosBoundsMixin:
             if lower is None or upper is None:
                 raise TransformationError(
                     f"LFRicKokkosTrans requires '{symbol.name}' to be "
-                    "declared with explicit bounds.")
+                    f"declared with explicit bounds, but it is declared with "
+                    f"{cls._shapeless_wording(dimension)}.")
+            # Both bounds are resolved before either is rendered, so that the
+            # extent and the origin are read with every name the Fortran has
+            # already given a value taken out of them.
+            lower = cls._resolve_constants(lower)
+            upper = cls._resolve_constants(upper)
             # A visitor lowers the tree it is handed, and this one belongs to
             # a live datatype.
-            origin = writer(lower.copy())
+            origin = cls._render(writer, symbol, lower.copy())
             if not is_extent(origin):
                 raise TransformationError(
                     f"LFRicKokkosTrans requires the declared origin of "
                     f"'{symbol.name}' to be an integer expression over named "
                     f"sizes, but found '{origin}'.")
-            extent = writer(cls._span(lower, upper))
+            extent = cls._render(writer, symbol, cls._span(lower, upper))
             if not is_extent(extent):
                 raise TransformationError(
                     f"LFRicKokkosTrans requires the extents of "
