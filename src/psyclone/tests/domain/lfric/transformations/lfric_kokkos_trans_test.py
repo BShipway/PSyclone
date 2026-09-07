@@ -484,6 +484,90 @@ _LOGICAL_ARRAY_KERNEL = _LOGICAL_KERNEL.replace(
     ).replace("        if (masked) then", "        if (masked(df)) then")
 
 
+# The logical fixture's kernel with the kind name taken off its formal. LFRic
+# defines l_def as kind(.false.), which is the default logical kind, so a
+# kernel declaring 'logical(kind=l_def)' and one declaring a plain 'logical'
+# declare the same thing; GungHo writes both, and calc_dz_face_code writes the
+# second. The missing name costs nothing here because a logical crosses the
+# ABI by conversion: there is no width to look up, so none to fail to find.
+_DEFAULT_LOGICAL_KERNEL = _LOGICAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, l_def, r_solver",
+    "  use constants_mod, only : i_def, r_solver").replace(
+    "    logical(kind=l_def), intent(in) :: masked",
+    "    logical, intent(in) :: masked")
+
+
+# average_w3_to_w0_code's shape: every one of the seven integers LFRic's
+# argument ordering supplies -- the layer count, and a dof count, a dof total
+# and a dofmap for each of the two function spaces -- declared with no kind at
+# all. That is not a contrivance; the kernel is written that way in
+# lfric_apps, and it is the whole of what stands between it and the ABI.
+#
+# Unlike a logical, an integer does cross the ABI as a width, and the default
+# integer's width is stated in no kind parameter the precision map could be
+# asked about. It is asserted instead, against the compiler that will build
+# the generated code: see the assertion this fixture's test looks for.
+_DEFAULT_INTEGER_ALGORITHM = """
+program kokkos_default_integer_test
+  use field_mod, only : field_type
+  use average_w3_to_w0_kernel_mod, only : average_w3_to_w0_kernel_type
+  implicit none
+  type(field_type) :: coarse_field, fine_field
+  call invoke(average_w3_to_w0_kernel_type(coarse_field, fine_field))
+end program kokkos_default_integer_test
+"""
+
+
+_DEFAULT_INTEGER_KERNEL = """
+module average_w3_to_w0_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : r_def
+  use fs_continuity_mod, only : w0, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: average_w3_to_w0_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_write, w3),                  &
+         arg_type(gh_field, gh_real, gh_read,  w0) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: average_w3_to_w0_code
+  end type average_w3_to_w0_kernel_type
+contains
+  subroutine average_w3_to_w0_code(nlayers, field_w3, field_w0, &
+                                   ndf_w3, undf_w3, map_w3,     &
+                                   ndf_w0, undf_w0, map_w0)
+    integer, intent(in) :: nlayers, ndf_w3, undf_w3, ndf_w0, undf_w0
+    integer, dimension(ndf_w3), intent(in) :: map_w3
+    integer, dimension(ndf_w0), intent(in) :: map_w0
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_w3
+    real(kind=r_def), dimension(undf_w0), intent(in) :: field_w0
+    integer :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w0
+        field_w3(map_w3(1) + k) = field_w3(map_w3(1) + k) + &
+                                  field_w0(map_w0(df) + k)
+      end do
+    end do
+  end subroutine average_w3_to_w0_code
+end module average_w3_to_w0_kernel_mod
+"""
+
+
+# The single-precision fixture's kernel with the kind name taken off its real.
+# A real is refused where an integer and a logical are admitted, and the
+# asymmetry is deliberate: LFRic names a kind on every real it means -- r_def,
+# r_solver, r_single and r_tran are all in use and all different -- so a real
+# declared with no kind is more likely an oversight than a default, and the
+# default a compiler picks for it is the one width nobody wrote down.
+_DEFAULT_REAL_KERNEL = _SOLVER_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_single, r_solver",
+    "  use constants_mod, only : i_def, r_solver").replace(
+    "    real(kind=r_single), intent(in) :: scaling",
+    "    real, intent(in) :: scaling")
+
+
 _STENCIL_ALGORITHM = """
 program kokkos_stencil_test
   use constants_mod, only : i_def
@@ -1047,6 +1131,19 @@ _OFF_ABI_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
     "      if (rehabilitate) swept(k) = swept(k + 1) - partial(k)")
 
 
+# A kernel importing a module constant declared with no kind. PROTECTED leaves
+# the frontend with the declaration text rather than a typed symbol, so this
+# reaches the ABI by the declaration reader rather than by the symbol's own
+# type -- the second of the two routes an unkinded declaration can arrive by,
+# and the one that would otherwise still refuse it.
+_DEFAULT_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : quenching").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      if (quenching) swept(k) = swept(k + 1) - partial(k)")
+
+
 # A kernel importing a module datum whose kind the ABI does not carry.
 # 'unmapped_width' is an r_quad real, 16 bytes and so off a C ABI carrying 4-
 # and 8-byte ones, and it is declared with no attributes so that PSyIR models
@@ -1373,6 +1470,7 @@ module planet_config_mod
   real(kind=r_def), public, protected :: recip_epsilon = 1.0_r_def
   integer(kind=i_def), public, parameter :: n_moist = 3
   logical(kind=l_def), public, parameter :: rehabilitate = .false.
+  logical, public, protected :: quenching = .true.
   real(kind=r_quad) :: unmapped_width
 end module planet_config_mod
 """
@@ -1508,6 +1606,40 @@ def logical_array_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes an l_def logical array."""
     return _invoke(
         tmp_path, "masked_solver", _LOGICAL_ALGORITHM, _LOGICAL_ARRAY_KERNEL)
+
+
+@pytest.fixture(name="default_logical_target")
+# pylint: disable-next=unused-argument
+def default_logical_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes a logical declared with no kind."""
+    return _invoke(
+        tmp_path, "masked_solver", _LOGICAL_ALGORITHM,
+        _DEFAULT_LOGICAL_KERNEL)
+
+
+@pytest.fixture(name="default_integer_target")
+# pylint: disable-next=unused-argument
+def default_integer_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes seven default-kind integers."""
+    return _invoke(
+        tmp_path, "average_w3_to_w0", _DEFAULT_INTEGER_ALGORITHM,
+        _DEFAULT_INTEGER_KERNEL)
+
+
+@pytest.fixture(name="default_real_target")
+# pylint: disable-next=unused-argument
+def default_real_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes a real declared with no kind."""
+    return _invoke(
+        tmp_path, "scaled_solver", _SOLVER_ALGORITHM, _DEFAULT_REAL_KERNEL)
+
+
+@pytest.fixture(name="default_constant_target")
+# pylint: disable-next=unused-argument
+def default_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads an unkinded module constant."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _DEFAULT_CONSTANT_KERNEL)
 
 
 @pytest.fixture(name="operator_target")
@@ -2558,11 +2690,20 @@ def test_lfric_kokkos_trans_rejects_codeblock(target):
 
 
 def test_lfric_kokkos_trans_rejects_unsupported_kind(target):
-    """The fixed C ABI must fail closed if a Fortran kind changes."""
+    """The fixed C ABI must fail closed if a Fortran kind changes.
+
+    The witness is an integer whose declaration states a width rather than a
+    kind name -- 'integer*8', as PSyIR records it. Stage 5 admits an integer
+    that states neither, reading it as the default kind and asserting that
+    width against the compiler; this one is not that, because the declaration
+    did say which width it wanted and it is not the ABI's. Reading the two the
+    same way would drop the top four bytes of every value in silence, so the
+    pair is tested rather than only the half that is admitted.
+    """
     _, loop, kernel = target
     schedule = kernel.get_callees()[0]
-    schedule.symbol_table.lookup("nlayers").datatype = (
-        ScalarType.integer_type())
+    schedule.symbol_table.lookup("nlayers").datatype = ScalarType(
+        ScalarType.Intrinsic.INTEGER, 8)
     with pytest.raises(TransformationError, match="argument kinds"):
         LFRicKokkosTrans().validate(loop)
 
@@ -2655,6 +2796,117 @@ def test_lfric_kokkos_trans_refuses_a_logical_array(logical_array_target):
         LFRicKokkosTrans().validate(loop)
 
     assert "masked" in str(error.value)
+
+
+def test_lfric_kokkos_trans_accepts_a_default_kind_logical(
+        default_logical_target):
+    """A logical declared with no kind crosses exactly as a kinded one does.
+
+    LFRic's l_def is kind(.false.), so 'logical' and 'logical(kind=l_def)'
+    name the same type and GungHo writes both. The conversion the ABI already
+    uses for a logical is what makes the unnamed kind cost nothing: the dummy
+    is logical(c_bool), value and the call site wraps the actual, so nothing
+    on either side has to know what width the kernel's declaration meant.
+
+    The absence of an assertion is therefore part of the result, not an
+    omission from it. A width that is never read is a width that cannot be
+    wrong, and asserting one here would invent a claim the generated code does
+    not make.
+    """
+    psy, loop, _ = default_logical_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const bool masked" in cpp
+    assert "logical(c_bool), value :: masked" in fortran
+    assert "LOGICAL(masked, kind=c_bool)" in fortran
+    # No width is asserted for it, and it contributes no name to the assertion
+    # block: the kinds asserted are the two the kernel still names.
+    assert "storage_size(.true." not in fortran
+    assert "use constants_mod, only : i_def, r_solver" in fortran
+
+
+def test_lfric_kokkos_trans_accepts_default_kind_integers(
+        default_integer_target):
+    """Default-kind integers cross as int, at a width the compiler checks.
+
+    All seven of the integers LFRic's argument ordering supplies are declared
+    with no kind here, as average_w3_to_w0_code declares them. An integer does
+    cross the ABI as a width, so unlike the logical above this one cannot be
+    admitted by ignoring the question: it is admitted by asking the compiler
+    instead of the precision map, which has no entry to be asked about because
+    a default kind is precisely the one with no name to key it by.
+
+    The assertion is that question. It compares storage_size of a default
+    literal against storage_size of a c_int one, in the generated interface,
+    so a build whose default integer is not c_int fails to compile rather than
+    reading four bytes where the Fortran wrote eight.
+    """
+    psy, loop, _ = default_integer_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const int nlayers" in cpp
+    assert "const int ndf_w0" in cpp
+    assert "const int *map_w0_data" in cpp
+    assert "Kokkos::View<const int**, Kokkos::LayoutLeft" in cpp
+    for name in ("nlayers", "ndf_w3", "undf_w3", "ndf_w0", "undf_w0"):
+        assert f"integer(c_int), value :: {name}" in fortran
+    for name in ("map_w3", "map_w0"):
+        assert f"integer(c_int), dimension(*), intent(in) :: {name}" in fortran
+
+    # The width is measured rather than assumed, and this is the measurement.
+    # The probe is the bare literal, because the kind it is about is the one a
+    # literal has when nothing is said about it.
+    assert ("integer(kind=merge(4, -1, storage_size(1) == &\n"
+            "        storage_size(1_c_int))), parameter :: "
+            "assert_kind_default_integer = 0") in fortran
+    # constants_mod is asked only for the kind the kernel still names. The
+    # default kind is declared nowhere -- being unnamed is what makes it the
+    # default -- so importing it by that name would not compile.
+    assert "use constants_mod, only : r_def\n" in fortran
+    assert "only : default_integer" not in fortran
+
+
+def test_lfric_kokkos_trans_rejects_a_default_kind_real(default_real_target):
+    """A real declared with no kind stays off the ABI.
+
+    The integer above is admitted because LFRic has one default integer and
+    means it. It has no default real: r_def, r_solver, r_single and r_tran are
+    all in use and all different, so the kind is the whole of what a real
+    declaration says about its width. Reading a missing one as 'whatever the
+    compiler picks' would put a promotion or a truncation on the ABI silently,
+    which is the failure every other refusal here exists to prevent.
+    """
+    _, loop, _ = default_real_target
+
+    with pytest.raises(TransformationError, match="argument kinds") as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'scaling'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_accepts_an_unkinded_module_constant(
+        default_constant_target):
+    """The declaration reader admits an unkinded constant on the same terms.
+
+    A module constant carrying PROTECTED leaves the frontend with the original
+    text rather than a typed symbol, so its kind is recovered by reading the
+    declaration. That reader has to answer the unkinded case the same way the
+    typed path does, or the contract would depend on which attributes a
+    constant happens to carry: 'quenching' is a plain logical, and it crosses
+    by the same conversion 'rehabilitate' does.
+    """
+    psy, loop, _ = default_constant_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const bool quenching" in cpp
+    assert "if (quenching)" in cpp
+    assert "LOGICAL(quenching, kind=c_bool)" in fortran
 
 
 def test_lfric_kokkos_trans_carries_single_precision_to_c(solver_target):
@@ -3460,7 +3712,7 @@ def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
     witness of a kind that is still off the ABI: ``unmapped_width`` is an
     ``r_quad`` real, 16 bytes where the ABI carries 4 and 8. The
     message names the kinds the ABI does carry, which now includes the
-    logical clause.
+    logical clause and the unkinded one.
     """
     _, loop, _ = unmapped_constant_target
 
@@ -3470,7 +3722,8 @@ def test_lfric_kokkos_trans_refuses_a_constant_of_a_kind_off_the_abi(
     assert ("cannot pass 'unmapped_width' from 'planet_config_mod' by value"
             in str(error.value))
     assert "4-byte integer" in str(error.value)
-    assert "and logical of any kind" in str(error.value)
+    assert "logical of any kind" in str(error.value)
+    assert "integer or logical declared with no kind" in str(error.value)
 
 
 def test_lfric_kokkos_trans_names_the_module_it_could_not_read(

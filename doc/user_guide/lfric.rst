@@ -4169,7 +4169,22 @@ call site wraps the actual in ``LOGICAL(..., c_bool)``, so the compiler
 converts it whatever kind LFRic gave it, and no width assertion is generated
 for it because there is none to make. A ``logical`` *array* is still refused,
 because an array crosses by reference and would be reinterpreted rather than
-converted. A kernel that reads a
+converted. A formal or constant declared with no kind at all -- ``logical,
+intent(in) :: include_surface``, or the ``integer`` housekeeping arguments
+LFRic's argument ordering supplies -- is accepted where it is a logical or an
+integer, and refused where it is a real. The logical needs no width, by the
+conversion just described. The default integer does cross at a width, and
+that width is stated in no kind parameter the precision map could be asked
+about, so it is measured instead of assumed: the generated interface carries
+``storage_size(1) == storage_size(1_c_int)`` as a compile-time assertion, and
+a build whose default integer is not ``c_int`` fails to compile. A real is
+refused because LFRic names a kind on every real it means -- ``r_def``,
+``r_solver``, ``r_single`` and ``r_tran`` are all in use and all different --
+so a real that names none has said nothing about its width rather than having
+chosen a default. A declaration stating a width in place of a kind name,
+``integer*8`` or ``real(kind=8)``, is refused for every intrinsic: it did say
+which width it wanted, and reading it as the default would narrow it in
+silence. A kernel that reads a
 field through a stencil is accepted when the stencil is ``cross2d`` and
 refused by name otherwise: a 2-D stencil gives the kernel a sliced dofmap and
 a sliced size array, both of which become Views with the cell index appended
