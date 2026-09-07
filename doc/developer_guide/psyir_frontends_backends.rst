@@ -332,15 +332,18 @@ code (a KernelSchedule with all its children), these are:
 Additionally, there are three partially-implemented back-ends
 
 - `CWriter()` in `psyclone.psyir.backend.c` which handles assignments,
-  literals, references, if-blocks, loops, unary and binary operations, a
-  subset of intrinsics, and directives. It has no handler for a `Routine`,
+  literals, references, if-blocks, loops, while loops, array constructors,
+  unary and binary operations, a subset of intrinsics, and directives. It
+  has no handler for a `Routine`,
   so it generates the statements and expressions of a body rather than a
   whole kernel. A loop's continuation test follows the sign of its step
   where that sign is visible in the tree, so a Fortran countdown such as
   `do k = n, 1, -1` becomes `for(k=n; k>=1; k+=-1)`; a step that is a
-  runtime value is taken to be positive. Which intrinsics that subset
-  contains, and why four of them depend on their argument's type, is set out
-  in the C back-end section below.
+  runtime value is taken to be positive. An array constructor is written
+  only where it fills an array, and the C back-end section below says why
+  that is the only position it can be written in. Which intrinsics that
+  subset contains, and why four of them depend on their argument's type, is
+  set out there too.
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
@@ -405,6 +408,36 @@ intrinsic, so the value is never narrowed below what was asked for. Honouring
 it needs a writer that has been told what each kind's width is, which is what
 `kind_types` gives the Kokkos back-end below; that back-end overrides this
 method and casts at the width the Fortran asked for.
+
+`CWriter.arrayconstructor_node` writes an array constructor as one
+assignment per element rather than as a value, because C has no array-valued
+expression. `assignment_node` therefore hands an assignment whose right-hand
+side is a constructor to that callback whole, and the callback returns
+statements rather than an expression -- the only handler in this writer that
+does. A braced initialiser is not the alternative it appears to be: C accepts
+one only on a declaration, and the array being assigned to has been declared
+earlier in the body.
+
+That leaves one position the constructor can be written in, and
+`_constructor_target` decides whether the assignment is in it. The target must
+be a whole rank-1 array, `x = [...]`, or a full-extent section of one
+dimension of an array, `x(:) = [...]` or `v(:,1,q) = [...]`, and that
+dimension's declared lower bound must be a literal. The elements are then
+placed from that lower bound rather than from zero, so the subscript each
+element assignment carries is the Fortran one and a writer that re-bases
+subscripts -- `KokkosWriter.arrayreference_node`, applying a View's index
+offsets -- subtracts the origin exactly once, on the same path as every other
+subscript. Every other position -- an actual argument, an operand, a nested
+constructor -- raises a `VisitorError` naming the position, because the value
+would have to survive as an array of its own and this writer creates no
+temporary to hold one. The refusal is raised before any child is visited, so
+a caller can use it as a predicate on a constructor it has not otherwise
+prepared, which is how the prototype's coverage survey asks whether a kernel's
+constructors can be written.
+
+An implied-do constructor is not one of these cases. The fparser2 frontend
+does not model an implied do, so `[ (i, i=1,n) ]` becomes a `CodeBlock`
+holding the whole constructor and never reaches this handler at all.
 
 Kokkos back-end
 +++++++++++++++

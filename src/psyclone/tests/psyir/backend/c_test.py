@@ -43,12 +43,13 @@ from psyclone.errors import InternalError
 from psyclone.psyir.backend.c import CWriter, _is_real_argument
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, BinaryOperation, CodeBlock, IfBlock, Literal,
-    Node, Reference, Return, Schedule, UnaryOperation, Loop,
-    OMPTaskloopDirective, OMPMasterDirective, OMPParallelDirective,
-    IntrinsicCall, OMPBarrierDirective)
+    ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Call,
+    CodeBlock, IfBlock, Literal, Node, Reference, Return, Schedule,
+    UnaryOperation, Loop, OMPTaskloopDirective, OMPMasterDirective,
+    OMPParallelDirective, IntrinsicCall, OMPBarrierDirective)
 from psyclone.psyir.symbols import (
-    ArgumentInterface, ArrayType, ScalarType, DataSymbol, UnresolvedType)
+    ArgumentInterface, ArrayType, ScalarType, DataSymbol, RoutineSymbol,
+    UnresolvedType)
 
 
 def test_cw_gen_declaration():
@@ -742,3 +743,240 @@ def test_cw_directive_with_clause(fortran_reader):
   }
 }
 ''' == cwriter(schedule.children[0])
+
+
+def test_cw_while_loop(fortran_reader):
+    '''Tests writing out a WhileLoop node in C.
+
+    Fortran's ``DO WHILE`` and C's ``while`` say the same thing, so the only
+    things this can get wrong are the punctuation and the indentation of a
+    body that is more than one statement deep.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(n)
+          integer, intent(in) :: n
+          integer :: i
+          i = 0
+          do while (i < n)
+            i = i + 1
+            if (i > 3) then
+              i = i + 2
+            end if
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[1]) == (
+        "while ((i < n)) {\n"
+        "  i = (i + 1);\n"
+        "  if ((i > 3)) {\n"
+        "    i = (i + 2);\n"
+        "  }\n"
+        "}\n")
+
+
+def test_cw_array_constructor_of_literals(fortran_reader):
+    '''Tests that a constructor assigned to a whole array is written out as
+    one assignment per element.
+
+    A braced initialiser would be the obvious translation and is not a legal
+    one: C accepts a braced list only on a declaration, and the array being
+    assigned to here was declared earlier in the body. Element assignments
+    are what is left.
+
+    The elements are placed from the array's declared lower bound rather than
+    from zero, so ``y`` below starts at 0 and ``x`` at 1. The Fortran index
+    is what a writer that re-bases subscripts expects to be given.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp()
+          integer :: x(4)
+          real :: y(0:2)
+          x = [1, 2, 3, 4]
+          y = (/ 1.0, 2.0, 3.0 /)
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+    cwriter = CWriter()
+
+    assert cwriter(module[0]) == (
+        "x[1] = 1;\n"
+        "x[2] = 2;\n"
+        "x[3] = 3;\n"
+        "x[4] = 4;\n")
+    assert cwriter(module[1]) == (
+        "y[0] = 1.0;\n"
+        "y[1] = 2.0;\n"
+        "y[2] = 3.0;\n")
+
+
+def test_cw_array_constructor_into_a_section(fortran_reader):
+    '''Tests that a constructor filling one whole dimension of an array is
+    written out with the other subscripts kept.
+
+    A full-extent section names the same elements as the bare array does, so
+    ``x(:)`` is written exactly as ``x`` is. The second case is the one that
+    earns the generality: the section is a rank-1 slice of a rank-3 array, so
+    each element assignment has to carry the two subscripts the source fixed.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(q)
+          integer, intent(in) :: q
+          integer :: x(4)
+          real :: v(3,2,2)
+          x(:) = [1, 2, 3, 4]
+          v(:,1,q) = [0.0, 0.0, 1.0]
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+    cwriter = CWriter()
+
+    assert cwriter(module[0]) == (
+        "x[1] = 1;\n"
+        "x[2] = 2;\n"
+        "x[3] = 3;\n"
+        "x[4] = 4;\n")
+    assert cwriter(module[1]) == (
+        "v[1 + 1 * vLEN1 + q * vLEN1 * vLEN2] = 0.0;\n"
+        "v[2 + 1 * vLEN1 + q * vLEN1 * vLEN2] = 0.0;\n"
+        "v[3 + 1 * vLEN1 + q * vLEN1 * vLEN2] = 1.0;\n")
+
+
+def test_cw_array_constructor_in_an_expression(fortran_reader):
+    '''Tests that a constructor used as a value is refused by name.
+
+    Anywhere but the whole right-hand side of an assignment, the constructor
+    has to survive as an array in its own right, which needs a temporary this
+    backend does not create. The refusal names the position so that a reader
+    of the message knows which of the two it is looking at, and says what is
+    missing rather than only that the node is unsupported.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp()
+          integer :: x(4)
+          real :: y(3)
+          x = x + [1, 2, 3, 4]
+          x = [ [1, 2], [3, 4] ]
+          y = abs([1.0, 2.0, 3.0])
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+    cwriter = CWriter()
+
+    for statement, position in ((module[0], "as an operand of an expression"),
+                                (module[1], "nested inside another array "
+                                            "constructor"),
+                                (module[2], "as an argument of the 'ABS' "
+                                            "intrinsic")):
+        with pytest.raises(VisitorError) as err:
+            _ = cwriter(statement)
+        assert (f"The C backend cannot write an array constructor {position}: "
+                f"C has no array-valued expression, so this constructor needs "
+                f"a temporary array to hold its elements and the backend "
+                f"creates none." in str(err.value))
+
+    # A constructor whose parent is a call to something other than an
+    # intrinsic, and one with no parent at all, are reachable by calling the
+    # handler directly, which is how a caller surveying what the writer can
+    # write reaches it. Neither is reachable through a whole statement,
+    # because this writer has no handler for a Call.
+    for parent, position in (
+            (Call.create(RoutineSymbol("sub")), "as an actual argument of a "
+                                                "call"),
+            (None, "in an expression")):
+        constructor = ArrayConstructor.create(
+            [Literal("1", ScalarType.integer_type())])
+        if parent:
+            parent.addchild(constructor)
+        with pytest.raises(VisitorError) as err:
+            _ = cwriter.arrayconstructor_node(constructor)
+        assert (f"cannot write an array constructor {position}: "
+                in str(err.value))
+
+
+def test_cw_array_constructor_with_an_implied_do(fortran_reader):
+    '''Tests that an implied-do array constructor is refused.
+
+    The refusal is not this back-end\'s. The PSyIR frontend does not model an
+    implied do, so ``[ (i, i=1,4) ]`` arrives as a CodeBlock holding the whole
+    constructor rather than as an ArrayConstructor with an unusual child, and
+    the CodeBlock refusal is the one that fires. This is asserted rather than
+    left implicit because the element-by-element translation above would be
+    wrong for an implied do -- there is no list of elements to count -- and a
+    later change that taught the frontend to model one would silently reach
+    that translation.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp()
+          integer :: x(4), i
+          x = [ (i, i=1,4) ]
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert isinstance(module[0].rhs, CodeBlock)
+    with pytest.raises(VisitorError) as err:
+        _ = CWriter()(module[0])
+    assert "CodeBlocks can not be translated to C." in str(err.value)
+
+
+def test_cw_array_constructor_needing_a_temporary(fortran_reader):
+    '''Tests that a constructor assigned to something other than a whole
+    array, or to an array whose origin is not known, is refused.
+
+    A partial section and a rank-2 target are refused because the elements
+    would have to be counted against a shape the writer would be guessing at;
+    a scalar target because the assignment is not conforming Fortran in the
+    first place. An assumed-shape dummy is refused for a different reason:
+    the target is right, but its declared lower bound is not in the tree, so
+    the Fortran index of an element is not known and an assumed origin of 1
+    would be a silently wrong answer wherever it was not 1.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b)
+          integer, dimension(:) :: b
+          integer :: x(4), s, m(2,2)
+          x(2:3) = [1, 2]
+          m = [1, 2, 3, 4]
+          s = [1]
+          b = [1, 2, 3]
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+    cwriter = CWriter()
+
+    for statement, name in ((module[0], "x"), (module[1], "m"),
+                            (module[2], "s")):
+        with pytest.raises(VisitorError) as err:
+            _ = cwriter(statement)
+        assert (f"The C backend can only write an array constructor into a "
+                f"whole rank-1 array or a full-extent section of one "
+                f"dimension of an array, but found one assigned to '{name}', "
+                f"which is neither: that assignment needs a temporary array "
+                f"to hold the constructor." in str(err.value))
+
+    with pytest.raises(VisitorError) as err:
+        _ = cwriter(module[3])
+    assert ("The C backend cannot write an array constructor into 'b' because "
+            "dimension 1 of its declaration has no literal lower bound, so "
+            "the Fortran index of each element of the constructor is not "
+            "known here." in str(err.value))
