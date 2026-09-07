@@ -11,6 +11,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_bounds_mixin import (
     LFRicKokkosBoundsMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
     LFRicKokkosCallMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
+    import LFRicKokkosConstantsMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin import (
     LFRicKokkosContractMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
@@ -30,7 +32,7 @@ from psyclone.psyir.transformations import (
 
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosBoundsMixin, LFRicKokkosCallMixin,
-                       Transformation):
+                       LFRicKokkosConstantsMixin, Transformation):
     """Replace one supported LFRic cell-column loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
