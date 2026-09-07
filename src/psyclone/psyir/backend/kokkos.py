@@ -16,7 +16,8 @@ from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.nodes import (
-    ArrayReference, CodeBlock, KernelSchedule, Literal, Loop, Reference)
+    ArrayConstructor, ArrayReference, CodeBlock, KernelSchedule, Literal,
+    Loop, Reference)
 from psyclone.psyir.symbols import ArrayType
 
 
@@ -843,6 +844,13 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
         assignment in the two flat launch shapes, whose members are cells
         rather than lanes of one.
 
+        An array constructor on the right-hand side writes array elements
+        too, and names its target without subscripting it -- ``x = [a, b]``
+        -- so it is wrapped for the same reason. All of its element
+        assignments go inside one ``Kokkos::single``, which is both cheaper
+        than one region each and what the Fortran meant: the statement is one
+        assignment.
+
         :param node: the assignment in the captured body.
         :type node: :py:class:`psyclone.psyir.nodes.Assignment`
 
@@ -850,8 +858,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             by a barrier where the team would otherwise race.
         :rtype: str
         """
+        writes_an_array = isinstance(node.lhs, ArrayReference) or isinstance(
+            node.rhs, ArrayConstructor)
         if (not self._parallel_loops or self._parallel_depth
-                or not isinstance(node.lhs, ArrayReference)):
+                or not writes_an_array):
             return super().assignment_node(node)
 
         self._depth += 1

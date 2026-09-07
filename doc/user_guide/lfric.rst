@@ -4157,7 +4157,16 @@ its shape -- ``LBOUND``, ``UBOUND`` or ``SIZE`` -- is answered from that same
 declaration rather than at run time, so the region carries the declared bound
 instead of querying a View. Most such calls are written by PSyclone rather
 than by the kernel author: lowering a whole-array assignment to an explicit
-loop puts a pair of them into its bounds. A constant the body reads reaches
+loop puts a pair of them into its bounds. A body may also fill an array from a
+constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
+dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
+generated as one assignment per element, into the array the kernel has
+already declared and from the origin its declaration gives. A constructor
+used as a value rather than as a whole right-hand side -- an actual argument,
+an operand, or one nested inside another -- is refused by naming the
+position, because C has no array-valued expression and the region creates no
+temporary to hold one. A ``DO WHILE`` loop in the body is generated as a C
+``while``, and is never spread across the team. A constant the body reads reaches
 the region one of three ways: a ``parameter`` declared in the kernel's own
 module is written in as its value, since a kernel module is ``private`` by
 default and the PSy layer could not import the name; a constant imported from

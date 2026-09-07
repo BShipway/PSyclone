@@ -45,8 +45,9 @@ it needs to be extended for generating pure C code.
 from psyclone.psyir.backend.language_writer import LanguageWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    BinaryOperation, IntrinsicCall, Literal, UnaryOperation)
-from psyclone.psyir.symbols import ScalarType
+    ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Call,
+    IntrinsicCall, Literal, Operation, Range, Reference, UnaryOperation)
+from psyclone.psyir.symbols import ArrayType, ScalarType
 
 
 # PSyIR datatypes now support precision as well as intrinsics. It is
@@ -94,6 +95,31 @@ def _is_real_argument(node):
         return False
     return (isinstance(datatype, ScalarType) and
             datatype.intrinsic == ScalarType.Intrinsic.REAL)
+
+
+def _constructor_position(node):
+    '''Name the position an array constructor was found in.
+
+    Only ever used to build a refusal, so a position it does not recognise
+    is described in general terms rather than being an error of its own.
+
+    :param node: the array constructor whose position is being named.
+    :type node: :py:class:`psyclone.psyir.nodes.ArrayConstructor`
+
+    :returns: a phrase naming where the constructor sits.
+    :rtype: str
+
+    '''
+    parent = node.parent
+    if isinstance(parent, ArrayConstructor):
+        return "nested inside another array constructor"
+    if isinstance(parent, IntrinsicCall):
+        return f"as an argument of the '{parent.intrinsic.name}' intrinsic"
+    if isinstance(parent, Call):
+        return "as an actual argument of a call"
+    if isinstance(parent, Operation):
+        return "as an operand of an expression"
+    return "in an expression"
 
 
 class CWriter(LanguageWriter):
@@ -193,6 +219,12 @@ class CWriter(LanguageWriter):
         '''This method is called when an Assignment instance is found in the
         PSyIR tree.
 
+        An assignment whose right-hand side is an array constructor is handed
+        to :py:meth:`arrayconstructor_node` whole, because C has no value of
+        array type and so no right-hand side for this method to write. That
+        callback produces the statements the assignment becomes -- one per
+        element -- rather than an expression.
+
         :param node: An Assignment PSyIR node.
         :type node: :py:class:`psyclone.psyir.nodes.Assignment``
 
@@ -200,10 +232,134 @@ class CWriter(LanguageWriter):
         :rtype: str
 
         '''
+        if isinstance(node.rhs, ArrayConstructor):
+            return self._visit(node.rhs)
+
         lhs = self._visit(node.lhs)
         rhs = self._visit(node.rhs)
 
         result = f"{self._nindent}{lhs} = {rhs};\n"
+        return result
+
+    @staticmethod
+    def _constructor_target(node):
+        '''Find where the elements of an array constructor are to be put.
+
+        C has no value of array type, so a constructor can only be written
+        where each of its elements already has somewhere to go: as the whole
+        right-hand side of an assignment to an array. A braced initialiser is
+        not the alternative it looks like, because C accepts one only on a
+        declaration and the array assigned to here was declared earlier; and
+        anywhere else -- an actual argument, an operand, a nested constructor
+        -- the value has to survive as a whole, which needs a temporary array
+        this backend does not create.
+
+        The target is named as Fortran subscripts it. The first element goes
+        to the declared lower bound of the dimension being filled rather than
+        to zero, so that a writer which re-bases subscripts -- as
+        :py:class:`psyclone.psyir.backend.kokkos.KokkosWriter` does with a
+        View's index offsets -- is handed the same Fortran index here as
+        everywhere else and subtracts the origin exactly once.
+
+        :param node: the array constructor being written.
+        :type node: :py:class:`psyclone.psyir.nodes.ArrayConstructor`
+
+        :returns: the reference to the target array, the dimension the
+            constructor fills, counted from zero, and the Fortran index of
+            the first element of that dimension.
+        :rtype: Tuple[:py:class:`psyclone.psyir.nodes.Reference`, int, int]
+
+        :raises VisitorError: if the constructor is not the whole right-hand
+            side of an assignment, and so would need a temporary array.
+        :raises VisitorError: if the target is neither a whole array nor a
+            full-extent section of one dimension of an array.
+        :raises VisitorError: if that dimension has no literal lower bound in
+            its declaration, so the Fortran index of an element is not known.
+
+        '''
+        assignment = node.parent
+        if (not isinstance(assignment, Assignment)
+                or assignment.rhs is not node):
+            raise VisitorError(
+                f"The C backend cannot write an array constructor "
+                f"{_constructor_position(node)}: C has no array-valued "
+                f"expression, so this constructor needs a temporary array to "
+                f"hold its elements and the backend creates none. Only a "
+                f"constructor that is the whole right-hand side of an "
+                f"assignment to an array is written, element by element.")
+
+        lhs = assignment.lhs
+        dimension = 0
+        if isinstance(lhs, ArrayReference):
+            sections = [index for index, subscript in enumerate(lhs.indices)
+                        if isinstance(subscript, Range)]
+            supported = (len(sections) == 1
+                         and lhs.is_full_range(sections[0]))
+            if supported:
+                dimension = sections[0]
+        else:
+            supported = (isinstance(lhs, Reference) and not lhs.children
+                         and isinstance(lhs.symbol.datatype, ArrayType)
+                         and len(lhs.symbol.datatype.shape) == 1)
+        if not supported:
+            target = lhs.name if isinstance(lhs, Reference) else str(lhs)
+            raise VisitorError(
+                f"The C backend can only write an array constructor into a "
+                f"whole rank-1 array or a full-extent section of one "
+                f"dimension of an array, but found one assigned to "
+                f"'{target}', which is neither: that assignment needs a "
+                f"temporary array to hold the constructor.")
+
+        datatype = lhs.symbol.datatype
+        bounds = (datatype.shape[dimension]
+                  if isinstance(datatype, ArrayType) else None)
+        lower = getattr(bounds, "lower", None)
+        if not isinstance(lower, Literal):
+            raise VisitorError(
+                f"The C backend cannot write an array constructor into "
+                f"'{lhs.name}' because dimension {dimension + 1} of its "
+                f"declaration has no literal lower bound, so the Fortran "
+                f"index of each element of the constructor is not known "
+                f"here.")
+        return lhs, dimension, int(lower.value)
+
+    def arrayconstructor_node(self, node):
+        '''This method is called when an ArrayConstructor instance is found
+        in the PSyIR tree.
+
+        The constructor is written as one assignment per element rather than
+        as a value: ``x = [a, b]`` on an array declared from 1 becomes
+        ``x[1] = a; x[2] = b;``. This callback therefore produces whole
+        statements, which is why :py:meth:`assignment_node` hands it the
+        assignment instead of asking it for a right-hand side, and why every
+        other position raises rather than being written. Which positions
+        those are, and why, is in :py:meth:`_constructor_target`.
+
+        :param node: an ArrayConstructor PSyIR node.
+        :type node: :py:class:`psyclone.psyir.nodes.ArrayConstructor`
+
+        :returns: The C code as a string.
+        :rtype: str
+
+        :raises VisitorError: if the constructor is in a position that would
+            need a temporary array; see :py:meth:`_constructor_target`.
+
+        '''
+        reference, dimension, first = self._constructor_target(node)
+
+        integer = ScalarType.integer_type()
+        result = ""
+        for position, element in enumerate(node.children):
+            index = Literal(str(first + position), integer)
+            if isinstance(reference, ArrayReference):
+                indices = [subscript.copy()
+                           for subscript in reference.indices]
+                indices[dimension] = index
+            else:
+                indices = [index]
+            target = ArrayReference.create(reference.symbol, indices)
+            result += (f"{self._nindent}{self._visit(target)} = "
+                       f"{self._visit(element)};\n")
         return result
 
     def literal_node(self, node):
@@ -630,6 +786,35 @@ class CWriter(LanguageWriter):
         return f"{self._nindent}for({variable_name}={start}; "\
                f"{variable_name}{test}{stop}; {variable_name}+={step})\n"\
                f"{self._nindent}{{\n{body}{self._nindent}}}\n"
+
+    def whileloop_node(self, node):
+        '''This method is called when a WhileLoop instance is found in the
+        PSyIR tree.
+
+        Fortran's ``DO WHILE`` and C's ``while`` test the same condition in
+        the same place, so the translation is the text and nothing else. In
+        particular there is no counterpart here to the step-direction
+        reasoning :py:meth:`loop_node` has to do: a while loop states its own
+        continuation test rather than leaving it to be inferred.
+
+        :param node: a WhileLoop PSyIR node.
+        :type node: :py:class:`psyclone.psyir.nodes.WhileLoop`
+
+        :returns: the C code as a string.
+        :rtype: str
+
+        '''
+        condition = self._visit(node.condition)
+
+        self._depth += 1
+        body = ""
+        for child in node.loop_body:
+            body += self._visit(child)
+        self._depth -= 1
+
+        return (f"{self._nindent}while ({condition}) {{\n"
+                f"{body}"
+                f"{self._nindent}}}\n")
 
     def regiondirective_node(self, node):
         '''This method is called when an RegionDirective instance is found in

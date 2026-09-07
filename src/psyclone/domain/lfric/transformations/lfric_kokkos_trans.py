@@ -141,6 +141,26 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     reason quoted. A section outside an assignment altogether is beyond what
     lowering can reach and is refused before the backend sees it.
 
+    **An array constructor fills an array; it is not a value.** A kernel
+    writing ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or filling one
+    full-extent dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)``,
+    is generated as one assignment per element, into the array the kernel has
+    already declared and from the origin that declaration gives. A braced
+    initialiser is not the alternative it looks like: C accepts one only on a
+    declaration, and the array is declared before the statement is reached.
+    Anywhere else -- an actual argument, an operand of an expression, a
+    constructor nested inside another -- the constructor has to survive as an
+    array in its own right, which needs a temporary this region does not
+    create, so the backend refuses it by naming the position and
+    :py:meth:`apply` reports that refusal as it does any other the backend
+    raises. An implied-do constructor never reaches the backend at all: the
+    PSyIR frontend does not model one, so ``[ (i, i=1,n) ]`` arrives as a
+    CodeBlock and is refused with every other CodeBlock.
+
+    **A** ``DO WHILE`` **loop is accepted** and generated as a C ``while``. It
+    is never spread over the team: the loops that are have a counter and a
+    step for a ``TeamVectorRange`` to divide, and a while loop states neither.
+
     ``LBOUND``, ``UBOUND`` and ``SIZE`` are resolved from the declaration
     rather than evaluated. Each is replaced by the bound the kernel's own
     symbol table gives, so ``UBOUND(partial, 1)`` on a local declared
@@ -222,7 +242,11 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     that member's own copy of the scalar locals. That is harmless for a scalar
     but not for an array, so an array write outside a spread loop is made by
     one member under ``Kokkos::single`` and published to the rest by a team
-    barrier before the next statement reads it. A barrier also follows each
+    barrier before the next statement reads it. An array constructor
+    assignment is such a write even though it names its target without
+    subscripting it, and all of the element assignments it becomes go inside
+    one ``Kokkos::single``, which is both cheaper than one region each and
+    what the Fortran said. A barrier also follows each
     spread loop, unconditionally: deciding whether a later reader needs it is
     a second analysis this transformation does not do.
 
