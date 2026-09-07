@@ -56,11 +56,11 @@ import re
 
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.nodes import (
-    ArrayConstructor, ArrayReference, BinaryOperation, Literal, Node,
-    Reference, UnaryOperation)
+    ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Container,
+    Literal, Node, Reference, UnaryOperation)
 from psyclone.psyir.symbols import (
     ArrayType, DataSymbol, ImportInterface, RoutineSymbol, ScalarType,
-    StaticInterface, UnsupportedFortranType)
+    StaticInterface, Symbol, UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -301,12 +301,14 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
-        :returns: ``(name, container, orig_name, c_type)`` per constant,
-            ordered by the name the kernel body reads.
-        :rtype: list[tuple[str, str, Optional[str], str]]
+        :returns: ``(name, container, orig_name, c_type, symbol)`` per
+            datum, ordered by the name the kernel body reads.
+        :rtype: list[tuple[str, str, Optional[str], str,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]]
 
-        :raises TransformationError: as :py:meth:`_describe_constant` does,
-            for any constant that has no place on the generated C ABI.
+        :raises TransformationError: as :py:meth:`_describe_constant` and
+            :py:meth:`_describe_module_variable` do, for anything that has no
+            place on the generated C ABI.
         """
         table = schedule.symbol_table
         local = {symbol.name for symbol in table.argument_list}
@@ -324,12 +326,22 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
                 continue
             if symbol.name in constants:
                 continue
-            constants[symbol.name] = cls._describe_constant(symbol)
+            if isinstance(symbol.interface, ImportInterface):
+                constants[symbol.name] = cls._describe_constant(symbol)
+            else:
+                constants[symbol.name] = cls._describe_module_variable(
+                    symbol, schedule)
         return [constants[name] for name in sorted(constants)]
 
     @classmethod
     def _describe_constant(cls, symbol):
-        """Resolve one non-local symbol onto the generated C ABI.
+        """Resolve one imported symbol onto the generated C ABI.
+
+        The caller has established that the symbol is imported: a symbol the
+        kernel did not import is the business of
+        :py:meth:`_describe_module_variable`, and :py:meth:`_constants`
+        chooses between the two on the interface, so that each answers about
+        one kind of name.
 
         :param symbol: the imported symbol the captured body reads.
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
@@ -340,14 +352,14 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         rename to import it at all, because ``water_mod`` has no ``lv``.
 
         :returns: the symbol's name, the container it is imported from, the
-            name it has *in* that container if the import renamed it, and the
-            C type it is passed by value as.
-        :rtype: tuple[str, str, Optional[str], str]
+            name it has *in* that container if the import renamed it, the C
+            type it crosses the ABI as, and the symbol itself, which is what
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_call_mixin.LFRicKokkosCallMixin._region_arguments` reads a shape
+            from.
+        :rtype: tuple[str, str, Optional[str], str,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]
 
-        :raises TransformationError: if the symbol is a module-level
-            ``parameter`` whose value is not a literal, such as an array.
-        :raises TransformationError: if the symbol is neither a kernel
-            argument nor imported from a module.
         :raises TransformationError: if its type cannot be resolved, which
             means the source of its container is not on the module search
             path.
@@ -356,17 +368,6 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         :raises TransformationError: if its kind is not one
             :py:attr:`_C_TYPES` maps.
         """
-        if not isinstance(symbol.interface, ImportInterface):
-            if isinstance(symbol.interface, StaticInterface) and getattr(
-                    symbol, "is_constant", False):
-                raise TransformationError(
-                    f"LFRicKokkosTrans cannot capture '{symbol.name}': a "
-                    "module-level constant is written into the region as its "
-                    "value, and this one was not declared with a literal "
-                    "value the region could carry.")
-            raise TransformationError(
-                f"LFRicKokkosTrans cannot capture '{symbol.name}': it is "
-                "neither a kernel argument nor imported from a module.")
         container = symbol.interface.container_symbol.name
         try:
             symbol.resolve_type()
@@ -395,8 +396,135 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
                 f"LFRicKokkosTrans cannot pass '{symbol.name}' from "
                 f"'{container}' by value: only {cls._supported_kinds()} "
                 "scalars have a place on the generated C ABI.")
+        cls._carried_extents(symbol)
         return (symbol.name, container, symbol.interface.orig_name,
-                c_type)
+                c_type, symbol)
+
+    @classmethod
+    def _carried_extents(cls, symbol):
+        """Return the extents a module datum is carried across the ABI with.
+
+        A scalar reports none and crosses by value. An array crosses by
+        reference, as a read-only View the generated region sizes for itself
+        -- and it can only size it from what it can evaluate, which is
+        literals. A name in a declared extent is a name the region has no
+        argument for, so an array declared ``(n_profile)`` is refused where
+        one declared ``(100)`` is carried.
+
+        :param symbol: the module datum the captured body reads.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: one C extent expression per dimension, empty for a scalar.
+        :rtype: tuple[str, ...]
+
+        :raises TransformationError: if a declared extent names a size the
+            region could not evaluate.
+        :raises TransformationError: as
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._bounds` does, for a
+            declaration with no explicit bounds -- a deferred shape among
+            them.
+        """
+        extents = cls._extents(symbol)
+        names = cls._extent_names(symbol) if extents else set()
+        if names:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}': the "
+                f"region would have to size it from "
+                f"{', '.join(sorted(names))}, which it has no argument for. "
+                "Only a module array whose declared extents are literal can "
+                "be carried.")
+        return extents
+
+    @classmethod
+    def _describe_module_variable(cls, symbol, schedule):
+        """Resolve one variable of the kernel's own module onto the C ABI.
+
+        A kernel module may declare state beside its routine and read it from
+        the body -- ``real(r_def), public :: profile_heights(100)`` is
+        gungho's shape. It is not a constant, so the region cannot carry its
+        value; it is not an argument, so the PSy layer is not passing it
+        already. What it *is* is a name the PSy layer can ``use``, so the
+        region takes it as a formal of its own: a by-value scalar for a
+        scalar, and a read-only View of the declared extents for an array.
+        The actual is read where the launch is made, so the value at region
+        entry is the value the region sees.
+
+        That is the whole of the contract, and it is why a write is refused:
+        a by-value scalar could not carry an assignment back to the module,
+        and a region that silently dropped one would be wrong rather than
+        unsupported.
+
+        :param symbol: the non-imported symbol the captured body reads.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+        :param schedule: the kernel schedule being captured, which is what
+            says whether the symbol belongs to the module or to the routine.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: as :py:meth:`_describe_constant` does, with no original
+            name: a module variable is read under the name it is declared
+            with, there being no ``use`` in the kernel to have renamed it.
+        :rtype: tuple[str, str, Optional[str], str,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]
+
+        :raises TransformationError: if the symbol is a module-level
+            ``parameter`` whose value is not one the region could carry.
+        :raises TransformationError: if it belongs to the routine rather than
+            to the module, which a local with an initialiser does, Fortran
+            giving that one the ``SAVE`` attribute.
+        :raises TransformationError: if it is neither, and so is nothing the
+            generated code could reach.
+        :raises TransformationError: if the module declares it ``private``,
+            leaving the PSy layer no name to import.
+        :raises TransformationError: if the region assigns to it.
+        :raises TransformationError: if its declaration is one PSyIR could
+            not model -- ``allocatable`` and a derived type among them -- or
+            states a kind :py:attr:`_C_TYPES` does not map.
+        :raises TransformationError: as :py:meth:`_carried_extents` does.
+        """
+        if isinstance(symbol.interface, StaticInterface) and getattr(
+                symbol, "is_constant", False):
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}': a "
+                "module-level constant is written into the region as its "
+                "value, and this one was not declared with a literal "
+                "value the region could carry.")
+        table = symbol.find_symbol_table(schedule)
+        scope = None if table is None else table.node
+        if not isinstance(scope, Container):
+            if isinstance(symbol.interface, StaticInterface):
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot capture '{symbol.name}': it is "
+                    "declared in the routine with an initialiser, which "
+                    "Fortran gives the SAVE attribute. Nothing outside the "
+                    "routine declares it, so there is no name for the PSy "
+                    "layer to pass and no way for the region to keep a value "
+                    "from one call to the next.")
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}': it is "
+                "neither a kernel argument nor imported from a module.")
+        if symbol.visibility is not Symbol.Visibility.PUBLIC:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}' from "
+                f"'{scope.name}': the module declares it private, so the PSy "
+                "layer cannot import it to pass it to the region.")
+        if any(isinstance(assignment.lhs, Reference)
+               and assignment.lhs.symbol is symbol
+               for assignment in schedule.walk(Assignment)):
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}' from "
+                f"'{scope.name}': the body assigns to it, and the region is "
+                "given the value the module holds at entry rather than a "
+                "share in the module's own storage.")
+        c_type = cls._c_type(symbol)
+        if c_type is None:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{symbol.name}' from "
+                f"'{scope.name}': only {cls._supported_kinds()} scalars and "
+                "arrays of them have a place on the generated C ABI, and "
+                f"'{symbol.datatype}' is not one.")
+        cls._carried_extents(symbol)
+        return (symbol.name, scope.name, None, c_type, symbol)
 
     @classmethod
     def _declared_c_type(cls, symbol):

@@ -21,9 +21,11 @@ from psyclone.parse.algorithm import parse
 from psyclone.psyGen import PSyFactory
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosScalar
 from psyclone.psyir.nodes import (
-    ArrayReference, CodeBlock, IntrinsicCall, Literal, Range)
+    ArrayConstructor, ArrayReference, CodeBlock, IntrinsicCall, Literal,
+    Range, Reference)
 from psyclone.psyir.symbols import (
-    ContainerSymbol, ImportInterface, ScalarType, Symbol)
+    ArrayType, ContainerSymbol, DataSymbol, ImportInterface, ScalarType,
+    StaticInterface, Symbol, SymbolError, UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
 from psyclone.transformations import LFRicColourTrans
 
@@ -1146,7 +1148,8 @@ _ARRAY_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
     "  integer(kind=i_def), parameter :: face_order(4) = [1, 2, 3, 4]\n"
     "  public :: column_solve_kernel_type, column_solve_code").replace(
     "      swept(k) = swept(k + 1) - partial(k)",
-    "      swept(k) = swept(k + 1) - partial(face_order(k))")
+    "      swept(k) = swept(k + 1) - partial(face_order(k)) "
+    "* face_order(1)")
 
 
 # An array parameter whose values are not there to be read: `reshape` is a
@@ -1303,6 +1306,106 @@ _STATIC_VARIABLE_KERNEL = _LOCAL_KERNEL.replace(
     "  public :: column_solve_kernel_type, column_solve_code").replace(
     "      swept(k) = swept(k + 1) - partial(k)",
     "      swept(k) = swept(k + 1) - partial(k) + cached_tol")
+
+
+# A kernel module declaring genuine state beside its routine and making it
+# public, which is how profile_interp_kernel_mod carries the profile it
+# interpolates: a fixed-shape array and a scalar, set by the model before the
+# invoke and read by the kernel. Neither is a constant and neither is an
+# argument, so the region takes both as formals of its own.
+_MODULE_VARIABLE_KERNEL = _LOCAL_KERNEL.replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  real(kind=r_def), public :: profile_heights(100)\n"
+    "  integer(kind=i_def), public :: profile_size\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) * "
+    "profile_heights(profile_size)")
+
+
+# The same module variable, assigned to. The region is handed the value the
+# module holds when the launch is made and has no share in the module's
+# storage, so the assignment would be lost rather than carried back.
+_ASSIGNED_MODULE_VARIABLE_KERNEL = _MODULE_VARIABLE_KERNEL.replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    profile_size = nlayers\n    swept(nlayers) = partial(nlayers)")
+
+
+# The same module variable declared `allocatable`. Its shape is not in the
+# declaration at all, so there is no View for the region to size and nothing
+# the generated interface could state.
+_ALLOCATABLE_MODULE_VARIABLE_KERNEL = _MODULE_VARIABLE_KERNEL.replace(
+    "  real(kind=r_def), public :: profile_heights(100)",
+    "  real(kind=r_def), public, allocatable :: profile_heights(:)")
+
+
+# A module array whose extent is named rather than stated. The region sizes
+# its own View, and it can only size it from what it can evaluate: `n_profile`
+# is not one of its arguments.
+_SIZED_MODULE_VARIABLE_KERNEL = _MODULE_VARIABLE_KERNEL.replace(
+    "  private\n",
+    "  private\n"
+    "  integer(kind=i_def), public :: n_profile = 100\n").replace(
+    "  real(kind=r_def), public :: profile_heights(100)",
+    "  real(kind=r_def), public :: profile_heights(n_profile)")
+
+
+# A variable declared inside the routine with an initialiser, which is
+# rtheta_bd_kernel_mod's `upwind`. Fortran gives it the SAVE attribute, so it
+# is a static of the routine rather than of the module: nothing outside the
+# routine declares it, and the PSy layer has no name to pass.
+_LOCAL_STATIC_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    integer(kind=i_def) :: visits = 0\n").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) + visits")
+
+
+# A module array of a type that has no place on the ABI. A logical crosses by
+# conversion, which is per value, so a logical array has nowhere to go -- the
+# same refusal a logical array argument meets, reached by a module variable.
+_LOGICAL_MODULE_VARIABLE_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, l_def, r_def").replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  logical(kind=l_def), public :: profile_active(100)\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      if (profile_active(k)) swept(k) = swept(k + 1) - partial(k)")
+
+
+# An array parameter of a type the generated unit has no declaration for. A
+# logical crosses the ABI by conversion, which is per value, so an array of
+# them has no C type -- and unlike the cases above the values are perfectly
+# readable, which is why this refusal is separate from being unable to fold.
+_LOGICAL_ARRAY_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, l_def, r_def").replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  logical(kind=l_def), parameter :: sweep(4) = &\n"
+    "      [.true., .false., .true., .false.]\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      if (sweep(k)) swept(k) = swept(k + 1) - partial(k)")
+
+
+# A name reaching the kernel through a wildcard `use`. The import states no
+# name, so PSyIR has no container to resolve the symbol in and no declaration
+# to type it from: it is not an import the PSy layer could repeat, and not
+# anything either module declares as far as the tree can tell.
+_WILDCARD_IMPORT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(k) * recip_epsilon")
 
 
 # The target kernel reading its one imported constant twice. Each reference is
@@ -2091,6 +2194,76 @@ def static_variable_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel module declares a module variable."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _STATIC_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="module_variable_target")
+# pylint: disable-next=unused-argument
+def module_variable_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads public state of its own module."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MODULE_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="assigned_module_variable_target")
+# pylint: disable-next=unused-argument
+def assigned_module_variable_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel assigns to state of its own module."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _ASSIGNED_MODULE_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="allocatable_module_variable_target")
+# pylint: disable-next=unused-argument
+def allocatable_module_variable_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads an allocatable module array."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _ALLOCATABLE_MODULE_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="sized_module_variable_target")
+# pylint: disable-next=unused-argument
+def sized_module_variable_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads a module array of named extent."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _SIZED_MODULE_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="local_static_target")
+# pylint: disable-next=unused-argument
+def local_static_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a routine-local static."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOCAL_STATIC_KERNEL)
+
+
+@pytest.fixture(name="logical_array_constant_target")
+# pylint: disable-next=unused-argument
+def logical_array_constant_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a logical array parameter."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _LOGICAL_ARRAY_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="logical_module_variable_target")
+# pylint: disable-next=unused-argument
+def logical_module_variable_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads a module logical array."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _LOGICAL_MODULE_VARIABLE_KERNEL)
+
+
+@pytest.fixture(name="wildcard_import_target")
+# pylint: disable-next=unused-argument
+def wildcard_import_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads a name from a wildcard import."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _WILDCARD_IMPORT_KERNEL,
+        extra={"planet_config_mod": _PLANET_CONFIG})
 
 
 @pytest.fixture(name="repeated_import_target")
@@ -3952,7 +4125,9 @@ def test_lfric_kokkos_trans_accepts_an_array_parameter(array_constant_target):
     fortran = str(psy.gen)
 
     assert "static const int face_order[4] = {1, 2, 3, 4};" in cpp
+    assert cpp.count("static const int face_order") == 1
     assert "partial((face_order[(k - 1)] - 1))" in cpp
+    assert "face_order[(1 - 1)]" in cpp
     assert "face_order" not in fortran
 
 
@@ -3993,6 +4168,337 @@ def test_lfric_kokkos_trans_accepts_a_folded_parameter_expression(
     assert "(1.0 / (3 + 2))" in cpp
     assert "weight" not in cpp
     assert "n_moist" not in generated
+
+
+def test_lfric_kokkos_trans_accepts_a_module_scalar_variable(
+        module_variable_target):
+    """A public module scalar becomes a formal the PSy layer passes.
+
+    ``profile_size`` is neither a constant nor an argument, so the region
+    can neither carry its value nor find it already in the call. It is a
+    name the PSy layer can ``use``, though, so the region takes it by value
+    and the launch reads it where it is made: what the module holds at
+    region entry is what the region sees.
+    """
+    psy, loop, _ = module_variable_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const int profile_size) {" in cpp
+    assert "integer(c_int), value :: profile_size" in fortran
+    assert ("use column_solve_kernel_mod, only : profile_heights, "
+            "profile_size" in fortran)
+    assert "loop0_stop, profile_heights, profile_size)" in fortran
+
+
+def test_lfric_kokkos_trans_accepts_a_module_array_variable(
+        module_variable_target):
+    """A public module array of literal extents becomes a read-only View.
+
+    An array is state rather than a value, so it crosses by reference as
+    every read-only array formal does -- sized from the extents the
+    declaration states, and indexed with the origin those extents give.
+    """
+    psy, loop, _ = module_variable_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const double *profile_heights_data" in cpp
+    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> profile_heights(profile_heights_data, 100);" in cpp)
+    assert "profile_heights((profile_size - 1))" in cpp
+    assert ("real(c_double), dimension(*), intent(in) :: profile_heights"
+            in fortran)
+
+
+def test_lfric_kokkos_trans_refuses_an_assigned_module_variable(
+        assigned_module_variable_target):
+    """A module variable the body writes is refused rather than dropped.
+
+    The region is given the value the module holds when the launch is made
+    and has no share in the module's storage, so an assignment inside it
+    would be lost. Losing it silently would be a wrong answer rather than an
+    unsupported kernel.
+    """
+    _, loop, _ = assigned_module_variable_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'profile_size' from 'column_solve_kernel_mod': "
+            "the body assigns to it" in str(error.value))
+
+
+def test_lfric_kokkos_trans_rejects_an_allocatable_module_variable(
+        allocatable_module_variable_target):
+    """An allocatable module array states no shape to give the region.
+
+    Its extents are set at run time by whatever allocated it, so there is
+    nothing for the region to size a View from and nothing the generated
+    interface could declare. A deferred shape is a shape with no bounds, so
+    it is refused by the reading of the bounds rather than by a check of its
+    own.
+    """
+    _, loop, _ = allocatable_module_variable_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires 'profile_heights' to be declared with explicit bounds"
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_rejects_a_module_array_of_named_extent(
+        sized_module_variable_target):
+    """A module array sized by a name is refused, not sized by guess.
+
+    The region builds its own View over the pointer it is handed, so the
+    extent has to be something it can evaluate. ``n_profile`` is a module
+    variable rather than one of the region's arguments, and reading it as
+    anything would be inventing a size.
+    """
+    _, loop, _ = sized_module_variable_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'profile_heights': the region would have to "
+            "size it from n_profile" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_routine_local_static(
+        local_static_target):
+    """A local with an initialiser is a static of the routine, not the module.
+
+    ``integer(i_def) :: visits = 0`` is rtheta_bd_kernel_mod's ``upwind``
+    shape: Fortran gives it the SAVE attribute, so it keeps its value from
+    one call to the next and nothing outside the routine declares it. The
+    PSy layer has no name to pass and the region has nowhere to keep it.
+    """
+    _, loop, _ = local_static_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'visits': it is declared in the routine with an "
+            "initialiser, which Fortran gives the SAVE attribute"
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_logical_array_parameter(
+        logical_array_constant_target):
+    """An array parameter with no C type is refused, values or no values.
+
+    ``[.true., .false., .true., .false.]`` states its elements perfectly
+    well. What it has no answer for is the type of the declaration they
+    would go into: a logical is on the ABI by conversion, which is per
+    value, and an array of them is no more declarable at file scope than it
+    is passable.
+    """
+    _, loop, _ = logical_array_constant_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot carry 'sweep': only" in str(error.value))
+    assert "arrays have a place in the generated translation unit" in str(
+        error.value)
+
+
+def test_lfric_kokkos_trans_reads_no_value_it_cannot_resolve(monkeypatch):
+    """A constant whose module cannot be read contributes no value.
+
+    ``_constant_value`` answers ``None`` rather than raising, because the
+    caller that needs the symbol on the ABI is the one that reports the
+    missing module by name -- and it reports it once, rather than every
+    reference to it reporting it again.
+    """
+    symbol = DataSymbol(
+        "eps", ScalarType(ScalarType.Intrinsic.REAL,
+                          ScalarType.Precision.UNDEFINED),
+        interface=ImportInterface(ContainerSymbol("nowhere_mod")))
+    monkeypatch.setattr(
+        DataSymbol, "resolve_type",
+        lambda self: (_ for _ in ()).throw(SymbolError("no such module")))
+
+    assert LFRicKokkosTrans._constant_value(symbol) is None
+
+
+@pytest.mark.parametrize("declaration", [
+    "REAL(KIND = r_def), DIMENSION(3), PUBLIC :: coefficients",
+    "TYPE(field_type), PUBLIC :: state",
+])
+def test_lfric_kokkos_trans_reads_no_c_type_from_a_shape_or_a_type(
+        declaration):
+    """Only a scalar of an intrinsic type is read out of a declaration.
+
+    The declaration text is the last resort for a symbol PSyIR could not
+    model, and it is read for a width to pass a *value* at. A declaration
+    carrying a shape is not one value, and one naming a derived type is not
+    a width, so both are answered ``None`` rather than parsed further.
+    """
+    symbol = DataSymbol(
+        declaration.split("::")[1].strip(),
+        UnsupportedFortranType(declaration))
+
+    assert LFRicKokkosTrans._declared_c_type(symbol) is None
+
+
+def _integer_literal(value):
+    """Return one integer literal for the folding tests.
+
+    :param int value: the value the literal states.
+
+    :returns: the literal.
+    :rtype: :py:class:`psyclone.psyir.nodes.Literal`
+    """
+    return Literal(str(value), ScalarType(
+        ScalarType.Intrinsic.INTEGER, ScalarType.Precision.UNDEFINED))
+
+
+def test_lfric_kokkos_trans_folds_a_reference_to_a_constant():
+    """Folding a bare reference replaces the whole expression.
+
+    Everything else is replaced inside the copy being folded, but an
+    expression that *is* a reference has no parent to be replaced in, so the
+    value becomes the result rather than being written into it.
+    """
+    symbol = DataSymbol(
+        "nfaces", ScalarType(ScalarType.Intrinsic.INTEGER,
+                             ScalarType.Precision.UNDEFINED),
+        is_constant=True, initial_value=_integer_literal(4),
+        interface=StaticInterface())
+
+    folded = LFRicKokkosTrans._fold(Reference(symbol))
+
+    assert isinstance(folded, Literal)
+    assert folded.value == "4"
+
+
+def test_lfric_kokkos_trans_folds_nothing_that_is_not_arithmetic():
+    """An expression holding a node the region could not carry is not folded.
+
+    A subscript-free substitution can put arithmetic over names and literals
+    into the body and have it mean the same thing. It cannot do that for a
+    call: what the compiler would have evaluated is not there to evaluate.
+    """
+    expression = IntrinsicCall.create(
+        IntrinsicCall.Intrinsic.ABS, [_integer_literal(4)])
+
+    assert LFRicKokkosTrans._fold(expression) is None
+
+
+def test_lfric_kokkos_trans_folds_nothing_that_names_a_variable():
+    """A name with no declared value stops the fold rather than surviving it.
+
+    The region has no ``count`` to read, so an expression naming one states
+    no value however much arithmetic surrounds it.
+    """
+    symbol = DataSymbol(
+        "count", ScalarType(ScalarType.Intrinsic.INTEGER,
+                            ScalarType.Precision.UNDEFINED),
+        interface=StaticInterface())
+
+    assert LFRicKokkosTrans._fold(Reference(symbol)) is None
+
+
+def test_lfric_kokkos_trans_reads_no_array_from_an_unresolvable_import():
+    """A constant whose module cannot be read contributes no value.
+
+    ``_constant_value`` answers ``None`` rather than raising, because the
+    caller that needs the symbol on the ABI is the one that reports the
+    missing module by name.
+    """
+    symbol = DataSymbol(
+        "eps", ScalarType(ScalarType.Intrinsic.REAL,
+                          ScalarType.Precision.UNDEFINED),
+        interface=ImportInterface(ContainerSymbol("nowhere_mod")))
+
+    assert LFRicKokkosTrans._constant_value(symbol) is None
+
+
+def _array_parameter(initial_value):
+    """Return one ``parameter`` array symbol with the value given.
+
+    :param initial_value: the initialiser the declaration carries.
+    :type initial_value: :py:class:`psyclone.psyir.nodes.DataNode`
+
+    :returns: the symbol.
+    :rtype: :py:class:`psyclone.psyir.symbols.DataSymbol`
+    """
+    integer = ScalarType(
+        ScalarType.Intrinsic.INTEGER, ScalarType.Precision.UNDEFINED)
+    return DataSymbol(
+        "face_order", ArrayType(integer, [4]), is_constant=True,
+        initial_value=initial_value, interface=StaticInterface())
+
+
+def _absolute_four():
+    """Return ``ABS(4)``, a value the region cannot carry.
+
+    :returns: the call.
+    :rtype: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+    """
+    return IntrinsicCall.create(
+        IntrinsicCall.Intrinsic.ABS, [_integer_literal(4)])
+
+
+@pytest.mark.parametrize("symbol", [
+    Symbol("face_order"),
+    _array_parameter(_absolute_four()),
+    _array_parameter(ArrayConstructor.create([_absolute_four()])),
+])
+def test_lfric_kokkos_trans_declares_no_array_it_cannot_read(symbol):
+    """Only an array whose every element states a value is declared.
+
+    A symbol PSyIR never specialised has no declaration to read at all; one
+    initialised by a call rather than by a constructor has no element list
+    to read; and one whose constructor holds a call has an element that
+    states no value. None of the three has values to write into the
+    generated unit, and each is answered ``None`` rather than
+    half-declared.
+    """
+    assert LFRicKokkosTrans._constant_array(symbol) is None
+
+
+def test_lfric_kokkos_trans_refuses_a_module_logical_array(
+        logical_module_variable_target):
+    """A module array off the ABI is refused as an argument would be.
+
+    A logical crosses by conversion, which is per value; an array crosses by
+    reference, and a ``View<bool*>`` over ``logical(l_def)`` storage would
+    reinterpret its elements rather than convert them. Coming from a module
+    rather than from the argument list changes none of that.
+    """
+    _, loop, _ = logical_module_variable_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'profile_active' from 'column_solve_kernel_mod'"
+            in str(error.value))
+    assert "arrays of them have a place on the generated C ABI" in str(
+        error.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_wildcard_imported_name(
+        wildcard_import_target):
+    """A name from a wildcard ``use`` is not an import the region can repeat.
+
+    ``use planet_config_mod`` states no names, so the symbol carries no
+    container to resolve a kind in and no declaration to read a shape from.
+    It is not the kernel's own module's either, so there is nothing to
+    describe and the refusal says so.
+    """
+    _, loop, _ = wildcard_import_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("cannot capture 'recip_epsilon': it is neither a kernel argument "
+            "nor imported from a module" in str(error.value))
 
 
 def test_lfric_kokkos_trans_casts_at_the_kind_the_body_names(cast_kind_target):
@@ -4157,22 +4663,23 @@ def test_lfric_kokkos_trans_refuses_a_resolved_routine_as_a_constant(
             "rather than data" in str(error.value))
 
 
-def test_lfric_kokkos_trans_refuses_a_declared_module_variable(
+def test_lfric_kokkos_trans_refuses_a_private_module_variable(
         static_variable_target):
-    """A module variable is not a constant however it was initialised.
+    """A module variable the module keeps to itself cannot be passed.
 
-    ``real(kind=r_def) :: cached_tol = 1.0e-9_r_def`` carries a literal in
-    its declaration exactly as the ``parameter`` beside it does, and the
-    module may assign to it afterwards. Writing the initialisation into the
-    region would freeze whatever value the module happened to start with.
+    ``real(kind=r_def) :: cached_tol = 1.0e-9_r_def`` is state rather than a
+    constant however it was initialised, so the region has to be given its
+    value rather than write the initialisation in. A kernel module is
+    ``private`` by default, though, and this one does not name ``cached_tol``
+    in its ``public`` list: there is no name for the PSy layer to import.
     """
     _, loop, _ = static_variable_target
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
-    assert ("cannot capture 'cached_tol': it is neither a kernel argument "
-            "nor imported from a module" in str(error.value))
+    assert ("cannot capture 'cached_tol' from 'column_solve_kernel_mod': the "
+            "module declares it private" in str(error.value))
 
 
 def test_lfric_kokkos_trans_passes_a_repeated_import_once(
@@ -4186,7 +4693,8 @@ def test_lfric_kokkos_trans_passes_a_repeated_import_once(
     psy, loop, kernel = repeated_import_target
     schedule = LFRicKokkosTrans._schedule(kernel)
 
-    assert LFRicKokkosTrans._constants(schedule) == [
+    assert [description[:4]
+            for description in LFRicKokkosTrans._constants(schedule)] == [
         ("recip_epsilon", "planet_config_mod", None, "double")]
 
     LFRicKokkosTrans().apply(loop)
@@ -4207,7 +4715,8 @@ def test_lfric_kokkos_trans_carries_a_renamed_import(renamed_import_target):
     psy, loop, kernel = renamed_import_target
     schedule = LFRicKokkosTrans._schedule(kernel)
 
-    assert LFRicKokkosTrans._constants(schedule) == [
+    assert [description[:4]
+            for description in LFRicKokkosTrans._constants(schedule)] == [
         ("recip", "planet_config_mod", "recip_epsilon", "double")]
 
     cpp = LFRicKokkosTrans().apply(loop)

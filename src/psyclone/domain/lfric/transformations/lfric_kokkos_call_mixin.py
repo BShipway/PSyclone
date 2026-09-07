@@ -159,9 +159,13 @@ class LFRicKokkosCallMixin:
             in call order.
         :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
         :param set[str] per_cell: formals the PSy layer slices by cell.
-        :param constants: the module constants passed by value, as
-            :py:meth:`_constants` returns them.
-        :type constants: list[tuple[str, str, Optional[str], str]]
+        :param constants: the module state the region carries, as
+            :py:meth:`_constants` returns it. A scalar becomes an argument
+            passed by value, and an array of literal extents a read-only
+            View: a module array is state the region reads and never writes,
+            so it crosses as a View exactly as a read-only formal does.
+        :type constants: list[tuple[str, str, Optional[str], str,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]]
         :param str cell_index: the name the launch gives its own cell index,
             which every sliced View is indexed by. It is the region's
             :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
@@ -190,9 +194,15 @@ class LFRicKokkosCallMixin:
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
-        arguments.extend(
-            KokkosScalar(name, c_type)
-            for name, _, _, c_type in constants)
+        for name, _, _, c_type, symbol in constants:
+            extents = cls._extents(symbol)
+            if not extents:
+                arguments.append(KokkosScalar(name, c_type))
+                continue
+            arguments.append(KokkosView(
+                name, f"{name}_data", c_type, extents,
+                index_offsets=cls._origins(symbol),
+                read_only=True, random_access=True))
         return tuple(arguments)
 
     @classmethod
