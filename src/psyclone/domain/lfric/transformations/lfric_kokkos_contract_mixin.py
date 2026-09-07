@@ -48,6 +48,22 @@ what lets ``LFRicKokkosTrans.validate`` be called for its answer alone -- by
 the coverage survey, which asks it of every loop in the model and keeps the
 message.
 
+The survey reports every blocker a loop carries rather than the first, so the
+rules ``_validate_loop`` and ``_validate_kernel_metadata`` bundle are each
+askable on their own:
+:py:meth:`LFRicKokkosContractMixin._validate_iteration_space`,
+:py:meth:`LFRicKokkosContractMixin._validate_halo_depth`,
+:py:meth:`LFRicKokkosContractMixin._validate_evaluator`,
+:py:meth:`LFRicKokkosContractMixin._validate_intergrid`,
+:py:meth:`LFRicKokkosContractMixin._validate_field_types` and
+:py:meth:`LFRicKokkosContractMixin._validate_continuous_write`. The two
+bundling methods call them rather than repeating them, and the last two share
+the per-argument
+:py:meth:`LFRicKokkosContractMixin._validate_field_type` and
+:py:meth:`LFRicKokkosContractMixin._validate_written_space` with the argument
+walk in ``_validate_kernel_metadata``, so the order the bundled refusals come
+in is unchanged by their being nameable apart.
+
 The sibling mixins are reached through ``cls``, resolved on
 ``LFRicKokkosTrans``: :py:meth:`LFRicKokkosContractMixin._validate_sections`
 and :py:meth:`LFRicKokkosContractMixin._validate_bounds` predict
@@ -118,20 +134,37 @@ class LFRicKokkosContractMixin:
     _SUPPORTED_STENCILS = ("cross2d",)
 
     @staticmethod
-    def _validate_loop(node):
-        """Check the loop's own iteration contract.
+    def _validate_iteration_space(node):
+        """Check that the loop iterates over uncoloured cell columns.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
 
-        :raises TransformationError: if the loop is coloured, is not over
-            cell columns, carries a halo depth, is not bounded by the owned
-            cells, or does not hold exactly one kernel.
+        :raises TransformationError: if the loop is coloured or is not over
+            cell columns.
         """
         if node.loop_type or node.iteration_space != "cell_column":
             raise TransformationError(
                 "LFRicKokkosTrans supports only an uncoloured cell-column "
                 "loop.")
+
+    @staticmethod
+    def _validate_halo_depth(node):
+        """Check that the loop visits the owned cells and no others.
+
+        The depth and the bound names are one question rather than two. A
+        loop written over the halo carries a depth; one written over
+        ``cell_halo`` with no depth carries none and is the same fact stated
+        differently, so a survey that reported them apart would count one
+        blocked pattern twice.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :raises TransformationError: if the loop carries a halo depth.
+        :raises TransformationError: if the loop is not bounded by the owned
+            cells.
+        """
         if node.upper_bound_halo_depth is not None:
             raise TransformationError(
                 "LFRicKokkosTrans does not support a halo depth.")
@@ -141,13 +174,149 @@ class LFRicKokkosContractMixin:
                 node.upper_bound_name != "ncells"):
             raise TransformationError(
                 "LFRicKokkosTrans supports only owned-cell bounds.")
+
+    @classmethod
+    def _validate_loop(cls, node):
+        """Check the loop's own iteration contract.
+
+        The two rules about where the loop iterates are
+        :py:meth:`_validate_iteration_space` and
+        :py:meth:`_validate_halo_depth`, called here in the order they have
+        always been checked so that a loop failing more than one of them
+        reports the same refusal as before.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :raises TransformationError: if the loop does not hold exactly one
+            kernel.
+        """
+        cls._validate_iteration_space(node)
+        cls._validate_halo_depth(node)
         if len(node.kernels()) != 1:
             raise TransformationError(
                 "LFRicKokkosTrans requires exactly one kernel in the loop.")
 
+    @staticmethod
+    def _validate_evaluator(kernel):
+        """Check that the kernel asks for no quadrature or evaluator data.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :raises TransformationError: if the kernel needs quadrature or
+            evaluator data.
+        """
+        if kernel.qr_required or kernel.eval_shapes:
+            raise TransformationError(
+                "LFRicKokkosTrans does not support quadrature or evaluator "
+                "data.")
+
+    @staticmethod
+    def _validate_intergrid(kernel):
+        """Check that the kernel iterates over a single mesh.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :raises TransformationError: if the kernel is an inter-grid kernel.
+        """
+        if kernel.is_intergrid:
+            raise TransformationError(
+                "LFRicKokkosTrans does not support inter-grid kernels.")
+
+    @staticmethod
+    def _validate_field_type(argument):
+        """Check one argument's intrinsic type, if it is a field.
+
+        Anything that is not a field is passed over rather than refused, so
+        that the rule can be walked over a whole argument list.
+
+        :param argument: the kernel argument to check.
+        :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
+
+        :raises TransformationError: if the argument is a field whose data is
+            not real.
+        """
+        if argument.argument_type != "gh_field":
+            return
+        if argument.intrinsic_type != "real":
+            raise TransformationError(
+                f"LFRicKokkosTrans supports only real fields, but "
+                f"'{argument.name}' is {argument.intrinsic_type}.")
+
+    @staticmethod
+    def _validate_written_space(argument, discontinuous):
+        """Check one argument's function space, if it is a written field.
+
+        A read field is passed over, as is anything that is not a field:
+        only a written space decides whether cells may run in parallel.
+
+        :param argument: the kernel argument to check.
+        :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param discontinuous: the names of the discontinuous function spaces,
+            as :py:class:`psyclone.domain.lfric.LFRicConstants` gives them.
+        :type discontinuous: List[str]
+
+        :raises TransformationError: if the argument is a field written on a
+            continuous space, where one cell's contribution could overwrite
+            another's.
+        """
+        if argument.argument_type != "gh_field":
+            return
+        if argument.access == AccessType.READ:
+            return
+        space = argument.function_space.orig_name.lower()
+        if space not in discontinuous:
+            raise TransformationError(
+                f"LFRicKokkosTrans requires a discontinuous space for "
+                f"the written field '{argument.name}', but found "
+                f"'{space}': one cell's contribution could overwrite "
+                "another's.")
+
+    @classmethod
+    def _validate_field_types(cls, kernel):
+        """Check that every field the kernel takes is real.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :raises TransformationError: if any field argument's data is not
+            real, for the reason :py:meth:`_validate_field_type` gives.
+        """
+        for argument in kernel.arguments.args:
+            cls._validate_field_type(argument)
+
+    @classmethod
+    def _validate_continuous_write(cls, kernel):
+        """Check every field the kernel writes for a discontinuous space.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :raises TransformationError: if any written field argument is on a
+            continuous space, for the reason
+            :py:meth:`_validate_written_space` gives.
+        """
+        discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
+        for argument in kernel.arguments.args:
+            cls._validate_written_space(argument, discontinuous)
+
     @classmethod
     def _validate_kernel_metadata(cls, kernel):
         """Check the LFRic metadata of the kernel to be captured.
+
+        The order the refusals come in is part of the contract: the checks
+        with no argument of their own run first, and then the argument list
+        is walked once, each argument answering every rule before the next
+        argument is looked at. A kernel with two blockers on two arguments
+        therefore reports the first *argument's*, which is not what running
+        :py:meth:`_validate_field_types` and
+        :py:meth:`_validate_continuous_write` in turn would report. Those two
+        share :py:meth:`_validate_field_type` and
+        :py:meth:`_validate_written_space` with the walk below rather than
+        restating them, so there is one copy of each rule and two ways to ask
+        it.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
@@ -159,16 +328,11 @@ class LFRicKokkosContractMixin:
             a stencil shape outside :py:attr:`_SUPPORTED_STENCILS`, or writes
             to a field on a continuous space.
         """
-        if kernel.qr_required or kernel.eval_shapes:
-            raise TransformationError(
-                "LFRicKokkosTrans does not support quadrature or evaluator "
-                "data.")
+        cls._validate_evaluator(kernel)
         if kernel.cma_operation is not None:
             raise TransformationError(
                 "LFRicKokkosTrans does not support CMA operators.")
-        if kernel.is_intergrid:
-            raise TransformationError(
-                "LFRicKokkosTrans does not support inter-grid kernels.")
+        cls._validate_intergrid(kernel)
 
         discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
         for argument in kernel.arguments.args:
@@ -190,10 +354,7 @@ class LFRicKokkosContractMixin:
                     "would need colouring or atomics.")
             if argument.argument_type != "gh_field":
                 continue
-            if argument.intrinsic_type != "real":
-                raise TransformationError(
-                    f"LFRicKokkosTrans supports only real fields, but "
-                    f"'{argument.name}' is {argument.intrinsic_type}.")
+            cls._validate_field_type(argument)
             if argument.stencil:
                 shape = str(argument.stencil.name).lower()
                 if shape not in cls._SUPPORTED_STENCILS:
@@ -201,15 +362,7 @@ class LFRicKokkosContractMixin:
                         f"LFRicKokkosTrans supports the "
                         f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shape "
                         f"only, but '{argument.name}' has '{shape}'.")
-            if argument.access == AccessType.READ:
-                continue
-            space = argument.function_space.orig_name.lower()
-            if space not in discontinuous:
-                raise TransformationError(
-                    f"LFRicKokkosTrans requires a discontinuous space for "
-                    f"the written field '{argument.name}', but found "
-                    f"'{space}': one cell's contribution could overwrite "
-                    "another's.")
+            cls._validate_written_space(argument, discontinuous)
 
     @staticmethod
     def _validate_body(schedule):
