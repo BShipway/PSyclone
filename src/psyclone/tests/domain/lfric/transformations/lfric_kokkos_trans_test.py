@@ -1527,7 +1527,7 @@ module planet_config_mod
   implicit none
   real(kind=r_def), public, protected :: recip_epsilon = 1.0_r_def
   integer(kind=i_def), public, parameter :: n_moist = 3
-  logical(kind=l_def), public, parameter :: rehabilitate = .false.
+  logical(l_def), public, protected :: rehabilitate = .false.
   logical, public, protected :: quenching = .true.
   real(kind=r_quad) :: unmapped_width
 end module planet_config_mod
@@ -3936,15 +3936,20 @@ def test_lfric_kokkos_trans_casts_at_a_kind_no_declaration_repeats(
     assert "(float)k" not in cpp
 
 
-def test_lfric_kokkos_trans_passes_a_logical_constant_by_conversion(
+def test_lfric_kokkos_trans_accepts_a_protected_logical_constant(
         off_abi_constant_target):
     """An imported logical constant crosses by the same conversion.
 
-    ``rehabilitate`` is an ``l_def`` logical in ``planet_config_mod``, read by
-    the kernel in an ``if``. It reaches the region as an argument rather than a
-    literal, because its value is only known where the PSy layer runs, so the
-    same wrapping applies to it as to a formal -- which is the point of doing
-    the wrapping over ``region.arguments`` rather than over the formals alone.
+    ``rehabilitate`` is declared as gungho's configuration modules declare
+    every namelist logical: ``logical(l_def), public, protected``, its kind
+    stated positionally and its value assigned by the namelist reader rather
+    than by a ``parameter``. PSyIR models none of that, so the type is read
+    back out of the declaration text.
+
+    It reaches the region as an argument rather than a literal, because its
+    value is only known where the PSy layer runs, so the same wrapping applies
+    to it as to a formal -- which is the point of doing the wrapping over
+    ``region.arguments`` rather than over the formals alone.
     """
     psy, loop, _ = off_abi_constant_target
 
