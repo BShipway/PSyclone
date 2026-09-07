@@ -4179,7 +4179,12 @@ used as a value rather than as a whole right-hand side -- an actual argument,
 an operand, or one nested inside another -- is refused by naming the
 position, because C has no array-valued expression and the region creates no
 temporary to hold one. A ``DO WHILE`` loop in the body is generated as a C
-``while``, and is never spread across the team. A name the body reads that is not one of
+``while``, and is never spread across the team. An unlabelled ``EXIT`` is
+generated as a C ``break``, which leaves the same loop the Fortran leaves;
+the loop it leaves is never spread across the team either, since a lambda
+cannot break the loop it was launched over, and an ``EXIT`` that names the
+construct it leaves is refused with the rest of the Fortran the PSyIR does
+not model. A name the body reads that is not one of
 its arguments reaches the region one of four ways. A ``parameter`` declared
 in the kernel's own module is written in as its value, since a kernel module
 is ``private`` by default and the PSy layer could not import the name; the

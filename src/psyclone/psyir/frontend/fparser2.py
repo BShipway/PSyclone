@@ -64,8 +64,8 @@ from psyclone.psyir.nodes import (
     ArrayConstructor,
     ArrayMember, ACCRoutineDirective, ArrayOfStructuresReference,
     ArrayReference, Assignment, BinaryOperation, Call, CodeBlock, Container,
-    DataNode, Directive, FileContainer, IfBlock, IntrinsicCall, Literal, Loop,
-    Member, Node, OMPDeclareTargetDirective, Range, Reference, Return,
+    DataNode, Directive, Exit, FileContainer, IfBlock, IntrinsicCall, Literal,
+    Loop, Member, Node, OMPDeclareTargetDirective, Range, Reference, Return,
     Routine, Schedule, StructureReference, UnaryOperation, WhileLoop,
     Fparser2CodeBlock, ScopingNode, UnknownDirective)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
@@ -1019,6 +1019,7 @@ class Fparser2Reader():
             Fortran2003.Case_Construct: self._case_construct_handler,
             Fortran2003.Select_Type_Construct:
                 self._select_type_construct_handler,
+            Fortran2003.Exit_Stmt: self._exit_handler,
             Fortran2003.Return_Stmt: self._return_handler,
             Fortran2003.UnaryOpBase: self._unary_op_handler,
             Fortran2003.Block_Nonlabel_Do_Construct:
@@ -4948,6 +4949,39 @@ class Fparser2Reader():
         rtn = Return(parent=parent)
         rtn.ast = node
         return rtn
+
+    def _exit_handler(self, node, parent):
+        '''
+        Transforms an fparser2 Exit_Stmt to the PSyIR representation.
+
+        :param node: node in fparser2 parse tree.
+        :type node: :py:class:`fparser.two.Fortran2003.Exit_Stmt`
+        :param parent: Parent node of the PSyIR node we are constructing.
+        :type parent: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: PSyIR representation of node.
+        :rtype: :py:class:`psyclone.psyir.nodes.Exit`
+
+        :raises NotImplementedError: if the EXIT names the construct it
+            leaves, or if there is no PSyIR loop for it to leave.
+
+        '''
+        # An EXIT that names its construct may leave a loop other than the
+        # innermost one, which is the only loop an Exit node can mean.
+        construct_name = node.children[1]
+        if construct_name is not None:
+            raise NotImplementedError(
+                f"EXIT from the named construct '{construct_name}': only an "
+                f"EXIT from the innermost enclosing loop is supported.")
+        # The loop the EXIT leaves has to be in the tree for the statement to
+        # have a meaning. It is missing when the enclosing DO is itself in a
+        # CodeBlock, and then this statement belongs in that CodeBlock too.
+        if parent.ancestor((Loop, WhileLoop)) is None:
+            raise NotImplementedError(
+                "EXIT with no enclosing loop in the PSyIR.")
+        exit_stmt = Exit(parent=parent)
+        exit_stmt.ast = node
+        return exit_stmt
 
     def _assignment_handler(self, node, parent):
         '''

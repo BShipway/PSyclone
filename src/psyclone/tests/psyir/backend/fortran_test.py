@@ -49,8 +49,8 @@ from psyclone.psyir.backend.fortran import (
 )
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
-    ACCEnterDataDirective, Assignment, Node, CodeBlock, Container, Literal,
-    UnaryOperation, BinaryOperation, Reference, Call, KernelSchedule,
+    ACCEnterDataDirective, Assignment, Exit, Node, CodeBlock, Container,
+    Literal, UnaryOperation, BinaryOperation, Reference, Call, KernelSchedule,
     ArrayReference, ArrayOfStructuresReference, Range, StructureReference,
     Schedule, Routine, Return, FileContainer, IfBlock, OMPTaskloopDirective,
     OMPMasterDirective, OMPParallelDirective, Loop, OMPNumTasksClause,
@@ -1706,6 +1706,33 @@ def test_fw_return(fortran_reader, fortran_writer, tmpdir):
     result = fortran_writer(schedule)
     assert "  return\n" in result
     assert Compile(tmpdir).string_compiles(result)
+
+
+def test_fw_exit(fortran_reader, fortran_writer, tmpdir):
+    '''Check the FortranWriter class exit method correctly prints out the
+    Fortran representation, and that the statement it prints reparses to
+    the same node.
+
+    '''
+    code = (
+        "module test\n"
+        "contains\n"
+        "subroutine tmp(a)\n"
+        "  integer, intent(inout) :: a\n"
+        "  integer :: i\n"
+        "  do i = 1, 10\n"
+        "    if (a > i) then\n"
+        "      exit\n"
+        "    end if\n"
+        "  enddo\n"
+        "end subroutine tmp\n"
+        "end module test")
+    psyir = fortran_reader.psyir_from_source(code)
+
+    result = fortran_writer(psyir)
+    assert "      exit\n" in result
+    assert Compile(tmpdir).string_compiles(result)
+    assert len(fortran_reader.psyir_from_source(result).walk(Exit)) == 1
 
 
 def test_fw_codeblock_1(fortran_reader, fortran_writer, tmpdir):

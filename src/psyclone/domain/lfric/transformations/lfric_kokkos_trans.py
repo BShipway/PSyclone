@@ -23,8 +23,8 @@ from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Call, IntrinsicCall, Literal, Loop, Range,
-    Reference, Routine)
+    ArrayReference, Assignment, Call, Exit, IntrinsicCall, Literal, Loop,
+    Range, Reference, Routine, WhileLoop)
 from psyclone.psyir.tools import DependencyTools
 from psyclone.psyir.transformations import (
     ArrayAssignment2LoopsTrans, TransformationError)
@@ -193,6 +193,15 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     is never spread over the team: the loops that are have a counter and a
     step for a ``TeamVectorRange`` to divide, and a while loop states neither.
 
+    **An unlabelled** ``EXIT`` **is accepted** and generated as a C
+    ``break``, which leaves the same loop the Fortran leaves. The loop it
+    leaves is never spread over the team, since a lambda cannot break the
+    loop it was launched over; see :py:meth:`_parallel_loops`. An ``EXIT``
+    that names the construct it leaves is not modelled by the PSyIR
+    frontend, so it arrives as a CodeBlock and is refused with every other
+    CodeBlock -- which is also what happens to the whole ``DO`` a named
+    construct wraps.
+
     ``LBOUND``, ``UBOUND`` and ``SIZE`` are resolved from the declaration
     rather than evaluated. Each is replaced by the bound the kernel's own
     symbol table gives, so ``UBOUND(partial, 1)`` on a local declared
@@ -262,8 +271,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     ``u_e((k - 0))``. The lower bound must satisfy the same grammar as the
     upper -- an integer expression over kernel arguments and literals using
     ``+``, ``-``, ``*`` and ``/`` -- and is refused on the same terms when it
-    does not. A bound of 1 renders exactly the source it rendered before this was
-    accepted, the span folding back to the upper bound alone.
+    does not. A bound of 1 renders exactly the source it rendered before
+    this was accepted, the span folding back to the upper bound alone.
 
     The subtraction is written out even where it is zero, because it is
     applied in one place -- the back-end's generation of an array accessor --
@@ -612,6 +621,13 @@ can_loop_be_parallelised`
         * **A stepped loop is skipped.** ``TeamVectorRange(team, begin, end)``
           counts by one and has no stride, so a loop that does not is left as
           a serial ``for`` even where the analysis would allow it.
+        * **A loop an EXIT leaves is skipped.** The body of a spread loop is
+          a lambda, and C++ has no break that leaves the loop the lambda was
+          launched over. The loop an :py:class:`~psyclone.psyir.nodes.Exit`
+          names -- its innermost enclosing loop -- is therefore left serial,
+          where the break is what the Fortran meant. An EXIT further in
+          leaves a loop of its own inside the lambda and does not disqualify
+          anything.
 
         :param schedule: the kernel schedule being captured, already lowered
             and bound-substituted, since both create loops.
@@ -634,6 +650,9 @@ can_loop_be_parallelised`
                 continue
             step = loop.step_expr
             if not (isinstance(step, Literal) and step.value == "1"):
+                continue
+            if any(statement.ancestor((Loop, WhileLoop)) is loop
+                   for statement in loop.walk(Exit)):
                 continue
             if tools.can_loop_be_parallelised(loop):
                 chosen.append(loop)

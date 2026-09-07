@@ -66,6 +66,23 @@ treesitter:
 
 The frontend is selected with the ``psyclone --frontend <frontend>`` flag.
 
+Loop exits
+----------
+
+The fparser2 frontend maps an unlabelled ``EXIT`` to an
+:ref_guide:`Exit psyclone.psyir.nodes.html#psyclone.psyir.nodes.Exit` node.
+Which loop it leaves is decided by where it sits rather than by anything it
+says, so ``_exit_handler`` accepts one only where the tree being built
+already has an enclosing ``Loop`` or ``WhileLoop``; an ``EXIT`` whose DO is
+itself in a ``CodeBlock`` belongs in that ``CodeBlock`` too.
+
+An ``EXIT`` that names its construct, ``EXIT outer``, is not modelled. It may
+leave a loop other than the innermost one, which no ``Exit`` node can mean.
+In practice the DO handler refuses first -- a named DO whose name is
+referenced inside it becomes a ``CodeBlock`` whole -- so the refusal in
+``_exit_handler`` is what keeps the two consistent rather than what a parsed
+program usually reaches. ``CYCLE`` is not modelled at all, labelled or not.
+
 .. _psyir-backends:
 
 PSyIR Back-ends
@@ -332,8 +349,9 @@ code (a KernelSchedule with all its children), these are:
 Additionally, there are three partially-implemented back-ends
 
 - `CWriter()` in `psyclone.psyir.backend.c` which handles assignments,
-  literals, references, if-blocks, loops, while loops, array constructors,
-  unary and binary operations, a subset of intrinsics, and directives. It
+  literals, references, if-blocks, loops, while loops, exits, array
+  constructors, unary and binary operations, a subset of intrinsics, and
+  directives. It
   has no handler for a `Routine`,
   so it generates the statements and expressions of a body rather than a
   whole kernel. A loop's continuation test follows the sign of its step
@@ -439,6 +457,16 @@ constructors can be written.
 An implied-do constructor is not one of these cases. The fparser2 frontend
 does not model an implied do, so `[ (i, i=1,n) ]` becomes a `CodeBlock`
 holding the whole constructor and never reaches this handler at all.
+
+`CWriter.exit_node` writes an `Exit` as C's `break`. Fortran's unlabelled
+`EXIT` and C's `break` both leave the innermost enclosing loop, so nothing
+else is needed to carry one across, and an `EXIT` that names the construct it
+leaves never reaches this handler: the frontend leaves it in a `CodeBlock`.
+The node validates that it has a loop to leave, so a `break` cannot escape
+into a body that has none. A back-end that puts a loop body somewhere a
+`break` does not mean the same thing -- a lambda, in the Kokkos back-end's
+hierarchical launch -- has to keep such a loop out of that shape itself;
+`LFRicKokkosTrans._parallel_loops` is where that is done.
 
 Kokkos back-end
 +++++++++++++++

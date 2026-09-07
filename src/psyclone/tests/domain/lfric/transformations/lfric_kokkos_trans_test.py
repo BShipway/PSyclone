@@ -21,8 +21,8 @@ from psyclone.parse.algorithm import parse
 from psyclone.psyGen import PSyFactory
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosScalar
 from psyclone.psyir.nodes import (
-    ArrayConstructor, ArrayReference, CodeBlock, IntrinsicCall, Literal,
-    Range, Reference)
+    ArrayConstructor, ArrayReference, CodeBlock, Exit, IntrinsicCall,
+    Literal, Range, Reference)
 from psyclone.psyir.symbols import (
     ArrayType, ContainerSymbol, DataSymbol, ImportInterface, ScalarType,
     StaticInterface, Symbol, SymbolError, UnsupportedFortranType)
@@ -903,6 +903,26 @@ _NESTED_LEVEL_KERNEL = _LEVEL_KERNEL.replace(
 # no stride to give it.
 _STEPPED_LEVEL_KERNEL = _LEVEL_KERNEL.replace(
     "    do k = 1, nlayers - 1", "    do k = 1, nlayers - 1, 2")
+
+
+# The same kernel with an EXIT leaving the level loop. C++ has no way to leave
+# a lambda's enclosing loop, so a spread loop cannot hold the break the EXIT
+# becomes; the loop is left serial and the region keeps the flat launch.
+_EXIT_LEVEL_KERNEL = _LEVEL_KERNEL.replace(
+    "      field_out(map_w3(1) + k - 1) = "
+    "scaling * field_in(map_w3(1) + k - 1)",
+    "      if (field_in(map_w3(1) + k - 1) < 0.0_r_def) exit\n"
+    "      field_out(map_w3(1) + k - 1) = "
+    "scaling * field_in(map_w3(1) + k - 1)")
+
+
+# The nested kernel with the EXIT in the inner loop instead. That break stays
+# inside a serial `for` in the lambda body, which is legal C++, so the outer
+# loop may still be spread.
+_INNER_EXIT_LEVEL_KERNEL = _NESTED_LEVEL_KERNEL.replace(
+    "        work(k, df) = scaling * field_in(map_w3(1) + k - 1)",
+    "        if (field_in(map_w3(1) + k - 1) < 0.0_r_def) exit\n"
+    "        work(k, df) = scaling * field_in(map_w3(1) + k - 1)")
 
 
 # The same kernel with a scalar local named 'team' and no automatic array. The
@@ -1970,6 +1990,22 @@ def nested_level_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel nests one level loop inside another."""
     return _invoke(
         tmp_path, "column_scale", _LEVEL_ALGORITHM, _NESTED_LEVEL_KERNEL)
+
+
+@pytest.fixture(name="exit_level_target")
+# pylint: disable-next=unused-argument
+def exit_level_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel leaves its level loop with an EXIT."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _EXIT_LEVEL_KERNEL)
+
+
+@pytest.fixture(name="inner_exit_level_target")
+# pylint: disable-next=unused-argument
+def inner_exit_level_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel leaves an inner loop with an EXIT."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _INNER_EXIT_LEVEL_KERNEL)
 
 
 @pytest.fixture(name="stepped_level_target")
@@ -5013,6 +5049,55 @@ def test_parallel_loops_skips_a_stepped_loop(stepped_level_target):
     schedule = LFRicKokkosTrans._schedule(kernel)
 
     assert LFRicKokkosTrans._parallel_loops(schedule) == ()
+
+
+def test_parallel_loops_skips_a_loop_an_exit_leaves(exit_level_target):
+    """A loop an EXIT leaves is left alone however independent it is.
+
+    The body of a spread loop is a lambda, and C++ has no break that leaves
+    the loop a lambda was launched over: `break` there is either a compile
+    error or leaves something else. The analysis would accept this loop --
+    it is the level loop of `test_parallel_loops_selects_a_level_loop...`
+    with one statement added -- so the refusal has to be the shape rule it
+    is rather than a dependence.
+    """
+    _, _, kernel = exit_level_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert schedule.walk(Exit)
+    assert LFRicKokkosTrans._parallel_loops(schedule) == ()
+
+
+def test_parallel_loops_keeps_a_loop_an_inner_exit_leaves(
+        inner_exit_level_target):
+    """An EXIT from an inner loop does not stop the outer one being spread.
+
+    The break it becomes sits inside a serial `for` in the lambda body,
+    which compiles and means what the Fortran meant. Only the loop the EXIT
+    actually leaves is disqualified.
+    """
+    _, _, kernel = inner_exit_level_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == ["k"]
+
+
+def test_apply_writes_break_for_an_exit(exit_level_target):
+    """The captured region leaves its loop with a break.
+
+    The EXIT is a node the C writer knows, so nothing about the capture is
+    special-cased for it; what the region has to show is the break in the
+    serial loop the selection left serial.
+    """
+    psy, loop, _ = exit_level_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "break;" in cpp
+    assert "TeamVectorRange" not in cpp
+    assert "call column_scale_kokkos(" in str(psy.gen)
 
 
 def test_parallel_loops_classifies_the_lowered_section(section_target):

@@ -239,9 +239,7 @@ def test_do_inside_while(fortran_reader, fortran_writer, tmpdir):
     WRITE(iu_stdout, '(A)') 'Enter units followed by lower and upper \
 limits and increment:'
     do while (.true.)
-      ! PSyclone CodeBlock (unsupported code) reason:
-      !  - Unsupported statement: Exit_Stmt
-      EXIT
+      exit
     end do
     range_bands = 3
     if (range_bands + i > 3 .AND. range_bands + i < 15) then
@@ -253,9 +251,7 @@ limits and increment:'
       i = i + 1
     enddo
     if (i > 15) then
-      ! PSyclone CodeBlock (unsupported code) reason:
-      !  - Unsupported statement: Exit_Stmt
-      EXIT
+      exit
     end if
   end do
 

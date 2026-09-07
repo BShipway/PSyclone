@@ -50,6 +50,7 @@ from psyclone.psyir.nodes import (
     Assignment,
     Call,
     CodeBlock,
+    Exit,
     IfBlock,
     IntrinsicCall,
     Loop,
@@ -553,14 +554,17 @@ class DefinitionUseChain:
         for sig in self._reference_signatures:
             defs_out[sig] = None
         for region in basic_block_list:
-            for reference in region.walk((Reference, Call, CodeBlock, Return)):
+            for reference in region.walk(
+                    (Reference, Call, CodeBlock, Exit, Return)):
                 # Store the position instead of computing it twice.
                 abs_pos = reference.abs_position
                 if abs_pos <= self._start_point or abs_pos >= self._stop_point:
                     continue
-                if isinstance(reference, Return):
-                    # When we find a return statement any following statements
-                    # can be ignored so we can return.
+                if isinstance(reference, (Exit, Return)):
+                    # When we find a return or exit statement any following
+                    # statements can be ignored so we can return. An Exit is
+                    # the modelled form of the Exit_Stmt CodeBlock handled
+                    # below, and stops the block for the same reason.
                     for sig in self._reference_signatures:
                         if defs_out[sig] is not None:
                             self._defsout[sig].append(defs_out[sig])
@@ -846,7 +850,8 @@ class DefinitionUseChain:
         basic_block_list.reverse()
         stop_position = self._stop_point
         for region in basic_block_list:
-            region_list = region.walk((Reference, Call, CodeBlock, Return))
+            region_list = region.walk(
+                (Reference, Call, CodeBlock, Exit, Return))
             # If the region contains any Return, Exit or Cycle statements then
             # we modify the stop position to only look at statements that
             # occur before this statement.
@@ -855,7 +860,7 @@ class DefinitionUseChain:
             # one of these such statements in a basic block, however
             # since they're unreachable maybe we don't care?
             for reference in region_list:
-                if isinstance(reference, Return):
+                if isinstance(reference, (Exit, Return)):
                     stop_position = min(reference.abs_position, stop_position)
                 if isinstance(reference, CodeBlock):
                     if isinstance(
@@ -865,7 +870,8 @@ class DefinitionUseChain:
                             reference.abs_position, stop_position
                         )
         for region in basic_block_list:
-            region_list = region.walk((Reference, Call, CodeBlock, Return))
+            region_list = region.walk(
+                (Reference, Call, CodeBlock, Exit, Return))
             # Reverse the list
             region_list.reverse()
             for reference in region_list:
