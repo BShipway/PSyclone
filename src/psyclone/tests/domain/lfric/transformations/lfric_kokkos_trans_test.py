@@ -3782,3 +3782,184 @@ def test_team_is_reserved_for_a_hierarchical_kernel_without_scratch(
 
     assert ("generated launch declares 'team', but the kernel declares a "
             "local of that name" in str(error.value))
+
+
+def test_lfric_kokkos_trans_iteration_space_predicate_refuses_a_dof_loop(
+        target):
+    """The iteration-space rule is askable on its own.
+
+    The coverage survey reports every blocker a loop carries rather than the
+    first, so each rule has to be a predicate of its own with the message the
+    bundled check used to give.
+    """
+    _, loop, _ = target
+    loop._iteration_space = "dof"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_iteration_space(loop)
+
+    assert ("LFRicKokkosTrans supports only an uncoloured cell-column loop."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_halo_depth_predicate_refuses_a_depth(target):
+    """A halo depth is one of the two rules about where the loop runs."""
+    _, loop, _ = target
+    loop._upper_bound_halo_depth = Literal(
+        "1", ScalarType(ScalarType.Intrinsic.INTEGER,
+                        ScalarType.Precision.UNDEFINED))
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_halo_depth(loop)
+
+    assert ("LFRicKokkosTrans does not support a halo depth."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_halo_depth_predicate_refuses_halo_bounds(target):
+    """A depthless halo bound is refused by the same predicate.
+
+    'cell_halo' with no depth carries no halo depth to find, so the bounds
+    rule is what catches it. The two belong together: both are about which
+    cells the loop visits, and a survey reporting them apart would count one
+    fact twice.
+    """
+    _, loop, _ = target
+    loop._upper_bound_name = "cell_halo"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_halo_depth(loop)
+
+    assert ("LFRicKokkosTrans supports only owned-cell bounds."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_evaluator_predicate_refuses_quadrature(target):
+    """Quadrature and evaluator data are one rule, asked on its own."""
+    _, _, kernel = target
+    kernel._basis_required = True
+    kernel._qr_rules["gh_quadrature_xyoz"] = object()
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_evaluator(kernel)
+
+    assert ("LFRicKokkosTrans does not support quadrature or evaluator data."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_intergrid_predicate_refuses_two_meshes(target):
+    """The inter-grid rule is askable without the checks around it."""
+    _, _, kernel = target
+    kernel._intergrid_ref = object()
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_intergrid(kernel)
+
+    assert ("LFRicKokkosTrans does not support inter-grid kernels."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_field_type_predicate_refuses_an_integer_field(
+        target):
+    """The field-type rule walks every field argument on its own."""
+    _, _, kernel = target
+    kernel.arguments.args[1]._intrinsic_type = "integer"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_field_types(kernel)
+
+    assert ("LFRicKokkosTrans supports only real fields, but 'mr' is integer."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_continuous_write_predicate_refuses_a_w0_write(
+        target):
+    """The written-space rule walks every field argument on its own."""
+    _, _, kernel = target
+    kernel.arguments.args[0].function_space._orig_name = "w0"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_continuous_write(kernel)
+
+    assert ("LFRicKokkosTrans requires a discontinuous space for the written "
+            "field 'moist_dyn', but found 'w0': one cell's contribution "
+            "could overwrite another's." in str(error.value))
+
+
+def test_lfric_kokkos_trans_predicates_accept_a_supported_loop(target):
+    """Each of the six returns for a loop that does not fail it.
+
+    A predicate that raised for everything would report every pattern as
+    blocked, which is the failure mode a survey cannot see from the inside.
+    """
+    _, loop, kernel = target
+
+    LFRicKokkosTrans._validate_iteration_space(loop)
+    LFRicKokkosTrans._validate_halo_depth(loop)
+    LFRicKokkosTrans._validate_evaluator(kernel)
+    LFRicKokkosTrans._validate_intergrid(kernel)
+    LFRicKokkosTrans._validate_field_types(kernel)
+    LFRicKokkosTrans._validate_continuous_write(kernel)
+
+
+def test_lfric_kokkos_trans_continuous_write_predicate_ignores_intergrid(
+        target):
+    """A predicate answers for its own rule, not for the first blocker.
+
+    This is the whole point of naming the six. A kernel that is inter-grid
+    *and* writes a continuous space is two blocked patterns, and asking
+    through 'validate' would only ever name the inter-grid one because it is
+    checked first.
+    """
+    _, _, kernel = target
+    kernel._intergrid_ref = object()
+    kernel.arguments.args[0].function_space._orig_name = "w0"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_continuous_write(kernel)
+    assert "discontinuous space for the written field 'moist_dyn'" in str(
+        error.value)
+
+    with pytest.raises(TransformationError) as second:
+        LFRicKokkosTrans._validate_intergrid(kernel)
+    assert "does not support inter-grid kernels" in str(second.value)
+
+
+def test_lfric_kokkos_trans_metadata_refuses_by_argument_order(target):
+    """The bundled check still refuses in argument order, not rule order.
+
+    The first argument is written to a continuous space and the second is a
+    non-real field. Walking the arguments -- which is what the transformation
+    has always done -- reports the first argument's blocker; running the two
+    rules as separate passes over all the arguments would report the second
+    argument's instead. The predicates share the per-argument helpers with
+    this loop so that only one answer exists.
+    """
+    _, _, kernel = target
+    kernel.arguments.args[0].function_space._orig_name = "w0"
+    kernel.arguments.args[1]._intrinsic_type = "integer"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_kernel_metadata(kernel)
+
+    assert "discontinuous space for the written field 'moist_dyn'" in str(
+        error.value)
+    assert "real fields" not in str(error.value)
+
+
+def test_lfric_kokkos_trans_field_predicates_pass_over_a_non_field(
+        operator_target):
+    """The two field rules walk the whole argument list and skip the rest.
+
+    Asked through 'validate' they only ever see an argument the walk has
+    already accepted as a field. Asked on their own -- which is how the
+    survey asks them -- they meet the scalars and operators too, and a rule
+    that read a function space off an LMA operator would raise something
+    other than a refusal.
+    """
+    _, _, kernel = operator_target
+    assert any(argument.argument_type != "gh_field"
+               for argument in kernel.arguments.args)
+
+    LFRicKokkosTrans._validate_field_types(kernel)
+    LFRicKokkosTrans._validate_continuous_write(kernel)
