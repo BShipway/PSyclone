@@ -4116,16 +4116,19 @@ def test_lfric_kokkos_trans_accepts_an_array_parameter(array_constant_target):
 
     Its values are in the Fortran and its module is private, so there is
     nothing for the PSy layer to import and no argument worth adding: the
-    generated unit declares it at file scope. It is indexed as C indexes an
-    array, and with the same origin removed that a View subscript has.
+    generated unit declares it itself, among the body's locals rather than at
+    file scope so that a device compiler can read it. It is indexed as C
+    indexes an array, and with the same origin removed that a View subscript
+    has.
     """
     psy, loop, _ = array_constant_target
 
     cpp = LFRicKokkosTrans().apply(loop)
     fortran = str(psy.gen)
 
-    assert "static const int face_order[4] = {1, 2, 3, 4};" in cpp
-    assert cpp.count("static const int face_order") == 1
+    assert "const int face_order[4] = {1, 2, 3, 4};" in cpp
+    assert "static const" not in cpp
+    assert cpp.count("const int face_order") == 1
     assert "partial((face_order[(k - 1)] - 1))" in cpp
     assert "face_order[(1 - 1)]" in cpp
     assert "face_order" not in fortran
@@ -4294,8 +4297,8 @@ def test_lfric_kokkos_trans_refuses_a_logical_array_parameter(
     ``[.true., .false., .true., .false.]`` states its elements perfectly
     well. What it has no answer for is the type of the declaration they
     would go into: a logical is on the ABI by conversion, which is per
-    value, and an array of them is no more declarable at file scope than it
-    is passable.
+    value, and an array of them is no more declarable in the generated body
+    than it is passable.
     """
     _, loop, _ = logical_array_constant_target
 

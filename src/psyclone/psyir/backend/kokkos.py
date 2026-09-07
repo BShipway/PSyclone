@@ -223,7 +223,7 @@ class KokkosRegion:
     #: size the backend recommends for its own functor.
     team_size: Optional[int] = None
     #: One :py:class:`KokkosConstant` per ``parameter`` array the body reads.
-    #: These are declared at file scope and take no place on the ABI, so a
+    #: Declared among the body's locals and taking no place on the ABI, so a
     #: region built before this field existed generates what it did then.
     constants: Tuple[KokkosConstant, ...] = ()
 
@@ -341,15 +341,17 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
                 f"{region.cell_index} + 1;\n") + local_declarations
         body = "".join(
             self._visit(child) for child in region.schedule.children)
-        self._depth = 0
+        constant_indent, self._depth = self._nindent, 0
         self._views, self._kind_types = {}, {}
         self._parallel_loops = ()
 
-        constants = "".join(
-            f"static const {item.c_type} {item.name}[{len(item.values)}] = "
-            f"{{{', '.join(self._visit(value) for value in item.values)}}};"
-            "\n\n"
-            for item in region.constants)
+        # Inside the body, not at file scope: nvcc will not read a namespace
+        # scope array from device code. First, since a constant reads nothing.
+        local_declarations = "".join(
+            f"{constant_indent}const {item.c_type} {item.name}"
+            f"[{len(item.values)}] = "
+            f"{{{', '.join(self._visit(value) for value in item.values)}}};\n"
+            for item in region.constants) + local_declarations
 
         if region.parallel_loops:
             launch = hierarchical_launch(region, local_declarations, body)
@@ -360,7 +362,6 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
-            f"{constants}"
             f'extern "C" void {region.name}(\n'
             f"    {signature}) {{\n"
             # Kokkos does not treat an uninitialised runtime as an error: the
@@ -518,7 +519,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
         for item in region.scratch:
             self._validate_scratch(item, scalar_names, used_names)
             used_names.add(item.name)
-        # A file-scope constant is one dimensional, because that is what a
+        # A carried constant is one dimensional, because that is what a
         # Fortran parameter array the region can index in C storage order is.
         for item in region.constants:
             if (not isinstance(item, KokkosConstant)

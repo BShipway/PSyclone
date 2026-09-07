@@ -287,8 +287,10 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
 
     An array ``parameter`` has no single value to substitute -- its subscripts
     are computed where a scalar's use is not -- so its elements are declared
-    at file scope of the generated translation unit as a ``static const``
-    array, which is what a ``parameter`` is. One built by a call, ``reshape``
+    in the generated launch body as a ``const`` array of its own, beside the
+    body's other locals. Not at file scope, which is what a ``parameter``
+    beside a kernel most resembles: a namespace-scope array is host data and
+    a device compiler will not read one. One built by a call, ``reshape``
     among them, states no elements to declare and is refused, as is one of
     rank above one, a C array being written in the one storage order that
     agrees with Fortran's subscripts only in one dimension.

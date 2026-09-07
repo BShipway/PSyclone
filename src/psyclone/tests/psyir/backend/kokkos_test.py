@@ -963,7 +963,7 @@ def test_kokkos_writer_rejects_invalid_scratch(scratch, message):
 
 
 def _constant(**kwargs):
-    """Return a one-dimensional file-scope constant description."""
+    """Return a one-dimensional carried-constant description."""
     integer = ScalarType(ScalarType.Intrinsic.INTEGER,
                          ScalarType.Precision.UNDEFINED)
     fields = {"name": "x_dofs", "c_type": "int",
@@ -973,8 +973,14 @@ def _constant(**kwargs):
     return KokkosConstant(**fields)
 
 
-def test_kokkos_writer_declares_a_constant_at_file_scope():
-    """A constant array is declared once, above the region, and not taken.
+def test_kokkos_writer_declares_a_constant_inside_the_body():
+    """A constant array is declared among the body's locals, and not taken.
+
+    Not at file scope, which is what a Fortran ``parameter`` beside a kernel
+    most resembles: a namespace-scope array is host data, and nvcc rejects a
+    device lambda that subscripts one. Inside the body it is a local of
+    whichever execution space the launch runs in, and that is the only
+    spelling both accept.
 
     The values are generated rather than held as text, so they cross the same
     literal path the body's own literals do; and nothing about the constant
@@ -987,8 +993,9 @@ def test_kokkos_writer_declares_a_constant_at_file_scope():
 
     assert generated.startswith(
         "#include <Kokkos_Core.hpp>\n\n"
-        "static const int x_dofs[2] = {1, 3};\n\n"
         'extern "C" void moist_dyn_gas_kokkos(')
+    assert "static const" not in generated
+    assert "    const int x_dofs[2] = {1, 3};\n" in generated
     assert "x_dofs" not in generated.split("(", 1)[1].split(") {", 1)[0]
 
 
@@ -1029,7 +1036,7 @@ def test_kokkos_writer_indexes_a_constant_with_brackets():
      "index offset."),
 ])
 def test_kokkos_writer_rejects_an_invalid_constant(constant, message):
-    """Every way of describing a file-scope constant wrongly is refused."""
+    """Every way of describing a carried constant wrongly is refused."""
     region = replace(_region(), constants=(constant,))
     with pytest.raises((ValueError, TypeError)) as error:
         KokkosWriter()(region)

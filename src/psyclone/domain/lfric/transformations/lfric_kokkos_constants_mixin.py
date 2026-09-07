@@ -216,7 +216,7 @@ class LFRicKokkosConstantsMixin:
     def _constant_arrays(cls, schedule):
         """Describe the ``parameter`` arrays the body reads.
 
-        Each becomes a file-scope constant of the generated translation unit
+        Each becomes a constant the generated launch body declares for itself
         rather than an argument: its values are in the Fortran, and a kernel
         module is ``private`` by default, so there is nothing for the PSy
         layer to import and pass even if passing it were worth the argument.

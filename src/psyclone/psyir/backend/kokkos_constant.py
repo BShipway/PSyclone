@@ -48,12 +48,15 @@ from psyclone.psyir.nodes import Node
 
 @dataclass(frozen=True)
 class KokkosConstant:
-    """A compile-time array declared at file scope in the generated unit.
+    """A compile-time array the generated body declares among its locals.
 
     A Fortran ``parameter`` array declared beside the kernel body -- ``integer
     (i_def), parameter :: x_dofs(2) = (/ 1, 3 /)`` -- states its own values,
-    so the region carries them and adds no formal to the C ABI. Its subscripts
-    are C's, and ``index_offsets`` removes the declared origin from each
+    so the region carries them and adds no formal to the C ABI. It is
+    declared inside the launch body rather than at file scope, because a
+    namespace-scope array is host data and nvcc refuses to read one from
+    device code. Its subscripts are C's, and ``index_offsets`` removes the
+    declared origin from each
     exactly as a View's does; ``extra_indices`` is carried and always empty,
     so that one array-reference table holds Views, scratch and constants
     alike.
