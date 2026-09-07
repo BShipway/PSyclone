@@ -643,9 +643,10 @@ A View's and a scratch array's `extents` are strings written into the
 generated C++ verbatim, one per dimension. An extent may be an integer
 expression over named sizes: `nlayers`, `4` and `(nlayers + 1)` are all
 accepted, built from identifiers, decimal literals, `+`, `-`, `*` and
-balanced parentheses. `KokkosWriter._is_extent` is the predicate, and
-`KokkosWriter._extent_names` reports the identifiers an extent is sized
-from.
+balanced parentheses. `is_extent` is the predicate, and `extent_names`
+reports the identifiers an extent is sized from; both are module-level
+functions of `psyclone.psyir.backend.kokkos`, because the transformation
+that builds a region has to apply the same grammar before it gets here.
 
 Division is refused rather than merely unsupported. Fortran and C++ can
 disagree about the rounding of an integer division, and an extent is one of
@@ -656,10 +657,20 @@ A scratch array is restricted further than a View: every name in its extents
 must be a scalar argument of the region. A scratch size is computed on the
 host before the launch, where only the region's scalars are in scope.
 
-Both shapes still assume a lower bound of 1, because `index_offsets` are
-integers and every caller supplies 1. A Fortran local declared
-`dimension(0:nlayers-1)` therefore cannot be described here; the driving
-transformation refuses it rather than passing it through.
+Neither shape assumes a lower bound of 1. `index_offsets` carries one value
+per dimension, subtracted from each Fortran subscript on the way to the
+zero-based element, and it may be an integer or an extent expression --
+`is_offset` is the predicate, and admits both. A Fortran local declared
+`dimension(0:nlayers-1)` is described by an extent of `nlayers` and an offset
+of `0`; one declared `dimension(1:nlayers)` by an extent of `nlayers` and an
+offset of `1`. The offset is applied in `arrayreference_node` and nowhere
+else, so no path can reach an element of a View without it.
+
+The offset is written out even when it is zero -- `u_e(k - 0)` rather than
+`u_e(k)` -- because the alternative is a special case in the one routine
+where a missing subtraction is a silent wrong answer rather than a compile
+error. The optimiser folds it; a reader of the generated source can see which
+origin each subscript was written against.
 
 Lowering order
 ~~~~~~~~~~~~~~

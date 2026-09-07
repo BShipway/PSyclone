@@ -41,6 +41,27 @@ def extent_names(value):
     return set(_IDENTIFIER.findall(value))
 
 
+def is_offset(value):
+    """Return whether ``value`` may be written as an index offset.
+
+    An offset is the declared origin of one dimension, subtracted from every
+    Fortran subscript of that dimension. It is an integer where the origin is
+    a constant -- ``1`` for the Fortran default -- and an integer expression
+    over named sizes where it is not, as for an array declared
+    ``dimension(-stencil:stencil)``. The expression grammar is
+    :py:func:`is_extent`'s, and deliberately the same one: an origin and an
+    extent are two readings of one declaration, and a rule that admitted a
+    shape into the extent and refused it in the origin would size a View
+    correctly and index it from the wrong place.
+
+    :param value: the candidate offset, which need not be a string.
+
+    :returns: whether it can be written into generated C++ as an offset.
+    :rtype: bool
+    """
+    return isinstance(value, int) or is_extent(value)
+
+
 def is_extent(value):
     """Return whether ``value`` may be written as a Kokkos extent.
 
@@ -97,7 +118,12 @@ class KokkosView:
     #: arguments and integer literals: ``nlayers``, ``4``, ``(nlayers + 1)``.
     #: They are emitted into the generated C++ verbatim.
     extents: Tuple[str, ...]
-    index_offsets: Tuple[int, ...] = ()
+    #: The declared origin of each dimension: the value subtracted from a
+    #: Fortran subscript to reach the zero-based View element it names. An
+    #: integer, or an integer expression over the region's scalar arguments
+    #: for an array whose origin is not a constant. ``1`` for the Fortran
+    #: default, ``0`` for an array declared ``dimension(0:nlayers)``.
+    index_offsets: Tuple[Union[int, str], ...] = ()
     extra_indices: Tuple[str, ...] = ()
     read_only: bool = False
     random_access: bool = False
@@ -125,7 +151,8 @@ class KokkosScratch:
     name: str
     c_type: str
     extents: Tuple[str, ...]
-    index_offsets: Tuple[int, ...] = ()
+    #: As :py:attr:`KokkosView.index_offsets`.
+    index_offsets: Tuple[Union[int, str], ...] = ()
     extra_indices: Tuple[str, ...] = ()
 
 
@@ -591,8 +618,8 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             that is not a scalar argument of the region; or if its rank does
             not match the index offsets supplied for it.
         :raises TypeError: if its C type is not in
-            :py:attr:`_SUPPORTED_TYPES`, or its index offsets are not
-            integers.
+            :py:attr:`_SUPPORTED_TYPES`, or an index offset is neither an
+            integer nor an integer expression over named sizes.
         """
         if not isinstance(scratch, KokkosScratch):
             raise ValueError(
@@ -629,11 +656,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             raise ValueError(
                 f"Kokkos scratch '{scratch.name}' dimensions do not match its "
                 "kernel indices.")
-        if not all(isinstance(offset, int)
-                   for offset in scratch.index_offsets):
+        if not all(is_offset(offset) for offset in scratch.index_offsets):
             raise TypeError(
                 f"Kokkos scratch '{scratch.name}' index offsets must be "
-                "integers.")
+                "integers or integer expressions over named sizes.")
 
     def _validate_view(self, view):
         """Validate the ownership and dimensional contract for one View.
@@ -647,7 +673,8 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             sizes; if its rank does not match the kernel and region indices
             supplied for it; or if it is writable while asking for
             ``RandomAccess``.
-        :raises TypeError: if its index offsets are not integers.
+        :raises TypeError: if an index offset is neither an integer nor an
+            integer expression over named sizes.
         """
         if view.managed:
             raise ValueError(f"Kokkos View '{view.name}' must be unmanaged.")
@@ -664,9 +691,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             raise ValueError(
                 f"Kokkos View '{view.name}' dimensions do not match its "
                 "kernel and region indices.")
-        if not all(isinstance(offset, int) for offset in view.index_offsets):
+        if not all(is_offset(offset) for offset in view.index_offsets):
             raise TypeError(
-                f"Kokkos View '{view.name}' index offsets must be integers.")
+                f"Kokkos View '{view.name}' index offsets must be integers or "
+                "integer expressions over named sizes.")
         if not all(self._is_identifier(index)
                    for index in view.extra_indices):
             raise ValueError(
@@ -838,6 +866,18 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
     def arrayreference_node(self, node: ArrayReference) -> str:
         """Emit an indexed View access with Fortran lower bounds removed.
 
+        This is the one place a subscript of a described array is written, so
+        it is the one place the array's declared origin is applied: no path
+        through the writer can reach an element of a View without subtracting
+        the offset its description carries. That matters more than it reads.
+        An array whose origin the region has right and whose subscripts it has
+        wrong compiles, links and runs, and returns the wrong answer.
+
+        The subtraction is emitted whenever the offset is non-empty, which
+        includes an origin of ``0``: ``u_e(k - 0)`` states the origin the
+        access was written against, where ``u_e(k)`` would be
+        indistinguishable from a subscript the offset had never reached.
+
         :param node: the array reference in the captured body.
 
         :returns: the equivalent zero-based View access.
@@ -868,4 +908,4 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
 
 
 __all__ = ["KokkosRegion", "KokkosScalar", "KokkosScratch", "KokkosView",
-           "KokkosWriter", "extent_names", "is_extent"]
+           "KokkosWriter", "extent_names", "is_extent", "is_offset"]

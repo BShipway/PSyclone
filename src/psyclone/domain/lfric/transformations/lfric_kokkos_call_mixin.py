@@ -41,10 +41,10 @@ instantiated. It holds no instance state and every method is a
 is a namespace with an inheritable ``cls``, not an object.
 
 The one constraint that follows is that a method reaching a helper of the
-sibling mixin ``LFRicKokkosTypesMixin`` does so through ``cls``, resolved on
-``LFRicKokkosTrans``. Calling such a method directly on either mixin is
-therefore not supported, and several methods here do reach across:
-:py:meth:`LFRicKokkosCallMixin._region_arguments` and
+sibling mixins ``LFRicKokkosTypesMixin`` and ``LFRicKokkosBoundsMixin`` does
+so through ``cls``, resolved on ``LFRicKokkosTrans``. Calling such a method
+directly on any of them is therefore not supported, and several methods here
+do reach across: :py:meth:`LFRicKokkosCallMixin._region_arguments` and
 :py:meth:`LFRicKokkosCallMixin._local_arrays` both ask ``cls._c_type`` and
 ``cls._extents``, and :py:meth:`LFRicKokkosCallMixin._kind_assertions` reads
 ``cls._C_TYPES`` and ``cls._KIND_PROBES``.
@@ -186,7 +186,7 @@ class LFRicKokkosCallMixin:
             arguments.append(KokkosView(
                 symbol.name, f"{symbol.name}_data", c_type,
                 extents + ((cls._CELL_COUNT,) if sliced else ()),
-                index_offsets=(1,) * len(extents),
+                index_offsets=cls._origins(symbol),
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
@@ -220,7 +220,7 @@ class LFRicKokkosCallMixin:
             extents = cls._extents(symbol)
             scratch.append(KokkosScratch(
                 symbol.name, cls._c_type(symbol), extents,
-                index_offsets=(1,) * len(extents)))
+                index_offsets=cls._origins(symbol)))
         return tuple(scratch)
 
     @staticmethod

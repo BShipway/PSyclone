@@ -4148,7 +4148,11 @@ of an array argument or of such a
 temporary -- is read as a declared bound rather than as a name, so
 ``dimension(max_length,4)`` and ``dimension(nlayers+1)`` are accepted as
 readily as ``dimension(nlayers)``; what is required is an integer expression
-over the kernel's own arguments and literals. A body that asks an array for
+over the kernel's own arguments and literals. The declared *lower* bound is
+read the same way and need not be 1: ``dimension(0:nlayers-1)`` is generated
+as a View of ``nlayers`` elements with ``0`` subtracted from every subscript
+of that array, so an origin the Fortran chose is carried through rather than
+refused. A body that asks an array for
 its shape -- ``LBOUND``, ``UBOUND`` or ``SIZE`` -- is answered from that same
 declaration rather than at run time, so the region carries the declared bound
 instead of querying a View. Most such calls are written by PSyclone rather
