@@ -4148,8 +4148,21 @@ of an array argument or of such a
 temporary -- is read as a declared bound rather than as a name, so
 ``dimension(max_length,4)`` and ``dimension(nlayers+1)`` are accepted as
 readily as ``dimension(nlayers)``; what is required is an integer expression
-over the kernel's own arguments and literals. The declared *lower* bound is
-read the same way and need not be 1: ``dimension(0:nlayers-1)`` is generated
+over the kernel's own arguments and literals, built with ``+``, ``-``, ``*``
+and ``/``. A quotient is carried rather than refused, because Fortran and C++
+both truncate an integer quotient toward zero, so
+``dimension((stencil_size+1)/2)`` is sized as the Fortran declaring it meant;
+a launch whose scratch extent divides also states that rule and stops an
+extent that has come out negative, which is an allocation neither language
+defines. A name a ``parameter`` beside the array gives a value to is resolved
+to that value rather than asked of the launch, so
+``integer(kind=i_def), parameter :: nfaces = 4`` sizing
+``dimension(nfaces)`` needs nothing passed. A declaration that states no
+shape at all is refused by name -- an ``allocatable`` local is sized by an
+``ALLOCATE`` in the body and an assumed-shape one by its caller, and scratch
+bytes are asked for before the launch enters the region -- as is a shape with
+no C form, such as ``dimension(MAX(nlayers-n,1))``. The declared *lower*
+bound is read the same way and need not be 1: ``dimension(0:nlayers-1)`` is generated
 as a View of ``nlayers`` elements with ``0`` subtracted from every subscript
 of that array, so an origin the Fortran chose is carried through rather than
 refused. A body that asks an array for

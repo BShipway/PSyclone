@@ -80,6 +80,54 @@ def _scratch_text(region, allocation, indent):
     return aliases, sizes, constructions
 
 
+def scratch_guard(region):
+    """Return the C++ that stops a divided scratch extent going negative.
+
+    A kernel-local array may be declared over an integer division --
+    ``real(kind=r_tran), dimension((stencil_size + 1) / 2) :: u_local_x_1``
+    is a GungHo shape -- and
+    :py:func:`~psyclone.psyir.backend.kokkos.is_extent` admits one because
+    Fortran and C++ round an integer quotient the same way: both truncate
+    toward zero. The generated size is therefore the size the kernel
+    declared.
+
+    Two things are still owed to a reader of the generated source. The first
+    is that sentence, which is emitted as a comment rather than left to be
+    known: a scratch size is one of the few places where a rounding rule
+    silently taken on trust would produce a wrong allocation rather than a
+    compile error. The second is the case neither language defines, an
+    allocation of negative size, which is stopped where it is requested
+    instead of being handed to ``shmem_size``.
+
+    Nothing is emitted for a region whose scratch does not divide, so every
+    region generated before division was admitted generates what it did then.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the comment and one guard per dividing extent, or the empty
+        string where no scratch extent divides.
+    :rtype: str
+    """
+    divided = [(item.name, extent) for item in region.scratch
+               for extent in item.extents if "/" in extent]
+    if not divided:
+        return ""
+    checks = "".join(
+        f"  if (({extent}) < 0) {{\n"
+        f'    Kokkos::abort("{region.name}: scratch extent for '
+        f"'{name}' is negative\");\n"
+        "  }\n"
+        for name, extent in divided)
+    return (
+        "  // A scratch extent below divides. Fortran and C++ both\n"
+        "  // truncate an integer quotient toward zero, so the sizes\n"
+        "  // computed here are the sizes the kernel declared. What\n"
+        "  // neither language defines is an allocation of negative size,\n"
+        "  // so that is stopped rather than requested.\n"
+        f"{checks}")
+
+
 def range_launch(region, local_declarations, body):
     """Return the ``RangePolicy`` launch, one cell per iteration.
 
@@ -138,14 +186,16 @@ def team_launch(region, local_declarations, body):
     :param body: the generated kernel body, already indented.
     :type body: str
 
-    :returns: the scratch type aliases, the size computation, the bound
-        body, the team-size probe and the ``parallel_for``.
+    :returns: the scratch type aliases, :py:func:`scratch_guard`, the size
+        computation, the bound body, the team-size probe and the
+        ``parallel_for``.
     :rtype: str
     """
     aliases, sizes, constructions = _scratch_text(
         region, "team.thread_scratch(0)", "      ")
     return (
         f"{aliases}\n"
+        f"{scratch_guard(region)}"
         f"  const size_t scratch_bytes = {sizes};\n\n"
         "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
         "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
@@ -208,14 +258,16 @@ def hierarchical_launch(region, local_declarations, body):
     :param body: the generated kernel body, already indented.
     :type body: str
 
-    :returns: the scratch type aliases and size computation where the region
-        has scratch, and the ``parallel_for`` over one team per cell.
+    :returns: the scratch type aliases, :py:func:`scratch_guard` and the
+        size computation where the region has scratch, and the
+        ``parallel_for`` over one team per cell.
     :rtype: str
     """
     aliases, sizes, constructions = _scratch_text(
         region, "team.team_scratch(0)", "    ")
     preamble = (
-        f"{aliases}\n  const size_t scratch_bytes = {sizes};\n\n"
+        f"{aliases}\n{scratch_guard(region)}"
+        f"  const size_t scratch_bytes = {sizes};\n\n"
         if region.scratch else "")
     team_size = (
         "Kokkos::AUTO" if region.team_size is None

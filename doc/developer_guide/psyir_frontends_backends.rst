@@ -713,16 +713,27 @@ Extents
 A View's and a scratch array's `extents` are strings written into the
 generated C++ verbatim, one per dimension. An extent may be an integer
 expression over named sizes: `nlayers`, `4` and `(nlayers + 1)` are all
-accepted, built from identifiers, decimal literals, `+`, `-`, `*` and
+accepted, built from identifiers, decimal literals, `+`, `-`, `*`, `/` and
 balanced parentheses. `is_extent` is the predicate, and `extent_names`
 reports the identifiers an extent is sized from; both are module-level
 functions of `psyclone.psyir.backend.kokkos`, because the transformation
 that builds a region has to apply the same grammar before it gets here.
 
-Division is refused rather than merely unsupported. Fortran and C++ can
-disagree about the rounding of an integer division, and an extent is one of
-the few places where that disagreement would produce a wrongly sized
-allocation instead of a compile error.
+Division is carried rather than refused. Fortran and C++ agree about the
+rounding of an integer quotient -- both truncate toward zero -- so
+`(stencil_size + 1) / 2` sizes a View as the Fortran declaring it meant. What
+neither language defines is an allocation of negative size, and division is
+the only operator in the grammar that can reach one from operands a Fortran
+declaration would accept. `scratch_guard` therefore emits, for a region whose
+scratch extents divide and for no other, a comment stating the truncation
+rule it relies on and a `Kokkos::abort` on a negative extent. A region whose
+scratch does not divide generates exactly the source it generated before
+division was admitted.
+
+What the grammar still refuses is a call. `max(nlayers, 1)` and
+`pow(nlayers, 2)` are rejected on the comma, which a `shmem_size` argument
+list may not carry, and the refusal is reported rather than left to the C++
+compiler.
 
 A scratch array is restricted further than a View: every name in its extents
 must be a scalar argument of the region. A scratch size is computed on the

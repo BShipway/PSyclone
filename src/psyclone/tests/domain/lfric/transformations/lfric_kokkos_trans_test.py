@@ -1005,20 +1005,83 @@ _NEGATIVE_ORIGIN_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "dimension(-nlayers:nlayers) :: u_e").replace("swept(", "u_e(")
 
 
+# A second local sized by a `parameter` the kernel declares beside it. This is
+# the commonest shape the catalogue's `local-array` row counts:
+# `integer(kind=i_def), parameter :: nfaces = 4` sizing
+# `real(kind=r_tran), dimension(nfaces) :: v_dot_n` in five GungHo kernels.
+# The value is in the Fortran, so the extent is resolved to it rather than
+# refused for naming something the launch has no argument for.
+_NAMED_CONSTANT_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k",
+    "    integer(kind=i_def), parameter :: nfaces = 4\n"
+    "    integer(kind=i_def) :: k").replace(
+    "    real(kind=r_def), dimension(nlayers) :: swept",
+    "    real(kind=r_def), dimension(nfaces) :: v_dot_n\n"
+    "    real(kind=r_def), dimension(nlayers) :: swept").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    do k = 1, nfaces\n"
+    "      v_dot_n(k) = partial(1)\n"
+    "    end do\n"
+    "    swept(nlayers) = partial(nlayers) + v_dot_n(nfaces)")
+
+
+# A second local whose extent divides. `dimension((stencil_size + 1) / 2)` is
+# what hori_dep_dist_midpoint_kernel_mod declares and what the catalogue's
+# `local-array` row counts twice. Fortran and C++ both truncate an integer
+# quotient toward zero, so the extent is carried rather than refused, and the
+# launch says so where it sizes the scratch.
+_DIVIDED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "    real(kind=r_def), dimension(nlayers) :: swept",
+    "    real(kind=r_def), dimension((nlayers + 1)/2) :: u_local\n"
+    "    real(kind=r_def), dimension(nlayers) :: swept").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    do k = 1, (nlayers + 1)/2\n"
+    "      u_local(k) = partial(k)\n"
+    "    end do\n"
+    "    swept(nlayers) = partial(nlayers) + u_local(1)")
+
+
+# A local whose shape its declaration does not carry. Every one of the fifteen
+# rows the catalogue counts under "explicit bounds" is this: an allocatable
+# whose size is stated by an ALLOCATE in the body, over values the kernel
+# computes for itself. A scratch size is computed before the launch enters the
+# region, so there is nowhere for such a size to come from.
+_SHAPELESS_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "    real(kind=r_def), dimension(nlayers) :: swept",
+    "    real(kind=r_def), allocatable, dimension(:) :: swept").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    allocate( swept(nlayers) )\n"
+    "    swept(nlayers) = partial(nlayers)").replace(
+    "  end subroutine column_solve_code",
+    "    deallocate( swept )\n"
+    "  end subroutine column_solve_code")
+
+
 # An extent that is not an integer expression over named sizes. The origin is
 # the Fortran default here, so this is the extent grammar's own refusal rather
 # than the origin's, asserted apart from it because the two are checked in
-# order and the first to fire hides the second.
+# order and the first to fire hides the second. `nlayers**2` is written as
+# `pow(nlayers, 2)`, and the comma is what a `shmem_size` argument may not
+# carry.
 _UNRENDERABLE_EXTENT_KERNEL = _LOCAL_KERNEL.replace(
-    "dimension(nlayers) :: swept", "dimension(nlayers/2) :: swept")
+    "dimension(nlayers) :: swept", "dimension(nlayers**2) :: swept")
 
 
-# An origin that is not an integer expression over named sizes. Division is
-# refused in an origin for the reason it is refused in an extent: Fortran and
-# C++ can disagree about the rounding, and an origin that rounds the other way
-# shifts every subscript of the array by one.
+# An origin that is not an integer expression over named sizes. The grammar is
+# the extent's, and it is applied to the origin for the reason the two are
+# read together: an origin the region cannot write shifts every subscript of
+# the array rather than sizing it wrongly.
 _UNRENDERABLE_ORIGIN_KERNEL = _LOCAL_KERNEL.replace(
-    "dimension(nlayers) :: swept", "dimension(nlayers/2:nlayers) :: swept")
+    "dimension(nlayers) :: swept", "dimension(nlayers**2:nlayers) :: swept")
+
+
+# A declared shape the C writer has no way to render at all. GungHo writes
+# one: ffsl_flux_z_nirvana_kernel_mod declares
+# `field_local_upper(MAX(nlayers-monotone_above,1), 3)`. The back-end's own
+# failure is a VisitorError, which `validate` may not raise, so it is turned
+# into a refusal that names the array.
+_UNWRITABLE_SHAPE_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(max(nlayers,1)) :: swept")
 
 
 # Arithmetic over a module constant rather than over a formal. Accepting
@@ -2006,7 +2069,7 @@ def negative_origin_local_target_fixture(tmp_path,
 # pylint: disable-next=unused-argument
 def unrenderable_extent_target_fixture(tmp_path,
                                        clear_module_manager_instance):
-    """Create an invoke whose kernel divides in a declared upper bound."""
+    """Create an invoke whose kernel squares in a declared upper bound."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM,
         _UNRENDERABLE_EXTENT_KERNEL)
@@ -2016,10 +2079,44 @@ def unrenderable_extent_target_fixture(tmp_path,
 # pylint: disable-next=unused-argument
 def unrenderable_origin_target_fixture(tmp_path,
                                        clear_module_manager_instance):
-    """Create an invoke whose kernel divides in a declared lower bound."""
+    """Create an invoke whose kernel squares in a declared lower bound."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM,
         _UNRENDERABLE_ORIGIN_KERNEL)
+
+
+@pytest.fixture(name="named_constant_local_target")
+# pylint: disable-next=unused-argument
+def named_constant_local_target_fixture(tmp_path,
+                                        clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local by its own parameter."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _NAMED_CONSTANT_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="divided_local_target")
+# pylint: disable-next=unused-argument
+def divided_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local by a division."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _DIVIDED_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="shapeless_local_target")
+# pylint: disable-next=unused-argument
+def shapeless_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates a local in its body."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _SHAPELESS_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="unwritable_shape_target")
+# pylint: disable-next=unused-argument
+def unwritable_shape_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes a MAX in a declared bound."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNWRITABLE_SHAPE_KERNEL)
 
 
 @pytest.fixture(name="unsized_expression_target")
@@ -3748,7 +3845,7 @@ def test_lfric_kokkos_trans_accepts_a_negative_lower_bound(
 
 def test_lfric_kokkos_trans_rejects_an_unrenderable_extent(
         unrenderable_extent_target):
-    """``dimension(nlayers/2)`` is refused, naming the extent.
+    """``dimension(nlayers**2)`` is refused, naming the extent.
 
     The origin is the Fortran default here, so the refusal is the extent
     grammar's own. The two checks run in order and the first to fire hides
@@ -3761,7 +3858,7 @@ def test_lfric_kokkos_trans_rejects_an_unrenderable_extent(
         LFRicKokkosTrans().validate(loop)
 
     assert "extents of 'swept'" in str(error.value)
-    assert "found '(nlayers / 2)'" in str(error.value)
+    assert "found 'pow(nlayers, 2)'" in str(error.value)
 
 
 def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
@@ -3769,11 +3866,11 @@ def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
     """A declared origin that is not an integer expression is still refused.
 
     Widening the origin from "must be 1" to "any integer expression over
-    named sizes" is not a widening to anything at all. ``dimension(nlayers/2:
-    nlayers)`` divides, and integer division is refused in an origin for the
-    reason it is refused in an extent -- Fortran and C++ can disagree about
-    the rounding, and here the disagreement shifts every subscript of the
-    array by one instead of failing to compile.
+    named sizes" is not a widening to anything at all.
+    ``dimension(nlayers**2:nlayers)`` is written ``pow(nlayers, 2)``, which
+    the grammar refuses in an origin exactly as it refuses it in an extent --
+    and here the consequence is a subscript shifted by a value the launch
+    cannot evaluate rather than a wrongly sized View.
     """
     _, loop, _ = unrenderable_origin_target
 
@@ -3782,7 +3879,7 @@ def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
 
     assert "'swept'" in str(error.value)
     assert "declared origin" in str(error.value)
-    assert "found '(nlayers / 2)'" in str(error.value)
+    assert "found 'pow(nlayers, 2)'" in str(error.value)
 
 
 def test_lfric_kokkos_trans_moves_an_origin_and_an_extent_together(
@@ -3826,10 +3923,133 @@ def test_lfric_kokkos_trans_refuses_an_unsizable_expression(
     assert "kernel argument" in str(error.value)
 
 
+def test_lfric_kokkos_trans_places_a_local_sized_by_a_named_constant(
+        named_constant_local_target):
+    """``parameter :: nfaces = 4`` sizing a local is read from its value.
+
+    This is the commonest kernel-local shape GungHo has, and before the
+    extent was resolved it was refused: ``nfaces`` is not a kernel argument,
+    so the launch was told it could not compute the size. It does not have
+    to. The value is stated by the declaration standing beside the array, so
+    it is substituted into the extent exactly as the same value is already
+    substituted into the body wherever the kernel names it.
+
+    The constant is a routine-local ``parameter``, which is the shape the
+    kernels use, rather than one of the module's own; both reach the same
+    resolution, and the module case is covered by
+    ``test_lfric_kokkos_trans_folds_a_static_constant``.
+    """
+    psy, loop, kernel = named_constant_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("v_dot_n")
+
+    assert LFRicKokkosTrans._extents(symbol) == ("4",)
+    # Nothing is left for the launch to be asked for.
+    assert LFRicKokkosTrans._extent_names(symbol) == set()
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "v_dot_n_scratch_t::shmem_size(4)" in cpp
+    assert "v_dot_n_scratch_t v_dot_n(team.team_scratch(0), 4);" in cpp
+    # The name is nowhere in the generated unit: not in the extent, not in
+    # the body, and not across the interface.
+    assert "nfaces" not in cpp
+    assert "nfaces" not in str(psy.gen)
+
+
+def test_lfric_kokkos_trans_places_a_local_sized_by_a_division(
+        divided_local_target):
+    """``dimension((nlayers + 1)/2)`` is carried, and the truncation is said.
+
+    A quotient is the last shape the catalogue's ``local-array`` row counted
+    that the extent grammar refused outright, and refusing it was
+    conservative rather than correct: Fortran and C++ both truncate an
+    integer quotient toward zero, so the extent computed at the launch is the
+    extent the kernel declared.
+
+    What neither language defines is an allocation of negative size, which a
+    division can reach where subtraction is in the numerator. So the launch
+    states the rule it is relying on in a comment and stops a negative extent
+    rather than requesting it -- the guard is emitted because this extent
+    divides, and no region without a division gains one.
+    """
+    _, loop, kernel = divided_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("u_local")
+
+    assert LFRicKokkosTrans._extents(symbol) == ("((nlayers + 1) / 2)",)
+    assert LFRicKokkosTrans._extent_names(symbol) == {"nlayers"}
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "u_local_scratch_t::shmem_size(((nlayers + 1) / 2))" in cpp
+    assert ("u_local_scratch_t u_local(team.team_scratch(0), "
+            "((nlayers + 1) / 2));" in cpp)
+    # The guard is over the extent that divides, and it aborts rather than
+    # allocating.
+    assert "if ((((nlayers + 1) / 2)) < 0) {" in cpp
+    assert "Kokkos::abort(" in cpp
+    # The array that does not divide gains no guard of its own.
+    assert "if ((nlayers) < 0)" not in cpp
+
+
+def test_lfric_kokkos_trans_rejects_a_shapeless_local(shapeless_local_target):
+    """An allocatable local is refused, saying whose statement its size is.
+
+    Every row the catalogue counts under this refusal is an allocatable whose
+    ALLOCATE stands in the kernel body over values the kernel computes for
+    itself. Scratch bytes are requested before the launch enters the region,
+    so there is no point at which such a size could be known -- this is a
+    limit of the model rather than a gap in the reading, and the message says
+    which of the two it is.
+
+    The check is asked of the schedule directly, which is how the coverage
+    survey asks it and therefore what the catalogue's ``local-array`` row
+    counts. Asking ``validate`` instead would answer about a different
+    refusal: an ALLOCATE carries a ``Range`` for the shape it is requesting,
+    so the array-section check fires first and hides this one. Such a kernel
+    is blocked twice over, and the second blocker is the one measured here.
+    """
+    _, loop, kernel = shapeless_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    with pytest.raises(TransformationError) as error:
+        # pylint: disable-next=protected-access
+        LFRicKokkosTrans._validate_locals(schedule)
+
+    assert "'swept' to be declared with explicit bounds" in str(error.value)
+    assert "a deferred shape" in str(error.value)
+    assert "ALLOCATE in the kernel body" in str(error.value)
+
+    # The loop is refused as a whole as well, so no caller sees it accepted.
+    with pytest.raises(TransformationError):
+        LFRicKokkosTrans().validate(loop)
+
+
+def test_lfric_kokkos_trans_reports_an_unwritable_shape(
+        unwritable_shape_target):
+    """A declared shape the C writer cannot render is refused, not raised.
+
+    ``dimension(max(nlayers,1))`` is what ffsl_flux_z_nirvana_kernel_mod
+    declares, and MAX has no C operator: the writer's own failure is a
+    ``VisitorError``, which ``validate`` may not raise, so a caller asking
+    whether the loop was capturable got an exception of the wrong type from
+    inside the backend instead of an answer. The refusal names the array and
+    carries the writer's reason.
+    """
+    _, loop, _ = unwritable_shape_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "declared shape of 'swept' as C" in str(error.value)
+
+
 @pytest.mark.parametrize("fixture_name", [
     "literal_local_target", "arithmetic_local_target",
     "explicit_one_local_target", "lower_bound_local_target",
-    "zero_based_local_target", "negative_origin_local_target"])
+    "zero_based_local_target", "negative_origin_local_target",
+    "named_constant_local_target", "divided_local_target"])
 def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
         fixture_name, request):
     """Every widened shape passes ``validate`` as well as ``apply``.
@@ -3848,7 +4068,8 @@ def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
 
 @pytest.mark.parametrize("fixture_name", [
     "unsized_local_target", "unmapped_local_target",
-    "unrenderable_origin_target", "unsized_expression_target"])
+    "unrenderable_origin_target", "unsized_expression_target",
+    "unwritable_shape_target"])
 def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
         fixture_name, request):
     """Both refusals are made by ``validate``, not discovered by ``apply``.
@@ -4019,7 +4240,7 @@ def test_lfric_kokkos_trans_inherits_the_bounds_grammar_refusal(
         LFRicKokkosTrans().validate(loop)
 
     assert ("requires the declared origin of 'swept' to be an integer "
-            "expression over named sizes, but found '(nlayers / 2)'"
+            "expression over named sizes, but found 'pow(nlayers, 2)'"
             in str(error.value))
 
 

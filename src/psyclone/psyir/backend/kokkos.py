@@ -54,7 +54,9 @@ def is_offset(value):
     :py:func:`is_extent`'s, and deliberately the same one: an origin and an
     extent are two readings of one declaration, and a rule that admitted a
     shape into the extent and refused it in the origin would size a View
-    correctly and index it from the wrong place.
+    correctly and index it from the wrong place. Division is admitted here
+    for that reason rather than for symmetry alone: an origin that rounded
+    the other way would shift every subscript of the array by one.
 
     :param value: the candidate offset, which need not be a string.
 
@@ -68,11 +70,23 @@ def is_extent(value):
     """Return whether ``value`` may be written as a Kokkos extent.
 
     An extent is an integer expression over named sizes, so a bare name is
-    accepted as before and so are ``max_length``, ``4`` and
-    ``(nlayers + 1)``. Division is refused rather than merely unsupported:
-    Fortran and C++ can disagree about the rounding of an integer division,
-    and an extent is one of the few places where that disagreement would
-    produce a wrongly sized allocation instead of a compile error.
+    accepted and so are ``max_length``, ``4``, ``(nlayers + 1)`` and
+    ``((stencil_size + 1) / 2)``.
+
+    Division was refused here until a GungHo kernel declared a local with
+    one, on the ground that Fortran and C++ might round an integer quotient
+    differently and that a wrongly sized allocation would not announce
+    itself. They do not differ: both truncate toward zero, Fortran by
+    ``13.7.2`` of its standard and C++ by ``[expr.mul]`` since C++11. What
+    remains true is that a reader should not have to know that, which is why
+    a launch sizing scratch from a divided extent says so in the generated
+    source and stops on an extent that has come out negative; see
+    :py:func:`~psyclone.psyir.backend.kokkos_launch.scratch_guard`.
+
+    What is still refused is anything that is not arithmetic over names and
+    integers -- a call such as ``pow(nlayers, 2)`` or ``max(nlayers, 1)``,
+    which is where a comma reaches an extent -- because the generated
+    ``shmem_size`` argument is this text and nothing rewrites it.
 
     :param value: the candidate extent, which need not be a string.
 
@@ -81,7 +95,7 @@ def is_extent(value):
     """
     if not isinstance(value, str) or not value.strip():
         return False
-    if not re.fullmatch(r"[A-Za-z0-9_ ()+\-*]+", value):
+    if not re.fullmatch(r"[A-Za-z0-9_ ()+\-*/]+", value):
         return False
     depth = 0
     for character in value:
@@ -93,7 +107,7 @@ def is_extent(value):
     # Split on the operators rather than searching for names, so that a
     # malformed token such as ``4nlayers`` is seen whole and refused instead
     # of reading as a literal beside an identifier.
-    for token in re.split(r"[ ()+\-*]+", value):
+    for token in re.split(r"[ ()+\-*/]+", value):
         if token and not (token.isdigit()
                           or _IDENTIFIER.fullmatch(token)):
             return False
