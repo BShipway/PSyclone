@@ -1280,6 +1280,17 @@ _REPEATED_IMPORT_KERNEL = _KERNEL.replace(
     "            recip_epsilon + recip_epsilon * mr_v_at_dof")
 
 
+# The target kernel renaming its imported constant, as LFRic's moisture
+# kernels rename the latent heats they read. The module declares one name and
+# the body reads another, so the generated PSy layer has to repeat the rename
+# rather than import either name alone.
+_RENAMED_IMPORT_KERNEL = _KERNEL.replace(
+    "  use planet_config_mod, only : recip_epsilon",
+    "  use planet_config_mod, only : recip => recip_epsilon").replace(
+    "            1.0_r_def + recip_epsilon * mr_v_at_dof",
+    "            1.0_r_def + recip * mr_v_at_dof")
+
+
 # dg_matrix_vector's shape: an LMA operator read as a rank-3 array, a leading
 # cell argument LFRic supplies to every kernel that takes one, and the column
 # addressed by array section on the operator's first dimension. That is what
@@ -2055,6 +2066,14 @@ def repeated_import_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel reads one imported constant twice."""
     return _invoke(
         tmp_path, "moist_dyn_gas", _ALGORITHM, _REPEATED_IMPORT_KERNEL)
+
+
+@pytest.fixture(name="renamed_import_target")
+# pylint: disable-next=unused-argument
+def renamed_import_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel renames the constant it imports."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _RENAMED_IMPORT_KERNEL)
 
 
 @pytest.fixture(name="polymorphic_target")
@@ -4073,12 +4092,35 @@ def test_lfric_kokkos_trans_passes_a_repeated_import_once(
     schedule = LFRicKokkosTrans._schedule(kernel)
 
     assert LFRicKokkosTrans._constants(schedule) == [
-        ("recip_epsilon", "planet_config_mod", "double")]
+        ("recip_epsilon", "planet_config_mod", None, "double")]
 
     LFRicKokkosTrans().apply(loop)
 
     generated = str(psy.gen)
     assert generated.count("map_wtheta, loop0_stop, recip_epsilon)") == 1
+
+
+def test_lfric_kokkos_trans_carries_a_renamed_import(renamed_import_target):
+    """A constant renamed on import is typed, and the rename is repeated.
+
+    ``use planet_config_mod, only : recip => recip_epsilon`` leaves the body
+    reading ``recip``, a name ``planet_config_mod`` does not declare. Typing
+    it means looking it up in the module under the name it has there, and
+    importing it into the PSy layer means writing the rename out again: a
+    plain ``use planet_config_mod, only : recip`` would not compile.
+    """
+    psy, loop, kernel = renamed_import_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._constants(schedule) == [
+        ("recip", "planet_config_mod", "recip_epsilon", "double")]
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "const double recip" in cpp
+    assert "use planet_config_mod, only : recip=>recip_epsilon" in fortran
+    assert "map_wtheta, loop0_stop, recip)" in fortran
 
 
 def test_parallel_loops_selects_a_level_loop_the_analysis_accepts(

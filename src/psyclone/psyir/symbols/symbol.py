@@ -214,6 +214,12 @@ class Symbol(CommentableMixin):
         Looks-up and returns the Symbol referred to by this Symbol's
         Import Interface.
 
+        A symbol renamed on import -- ``use some_mod, only: b => a`` -- is
+        looked up in the Container under the name it has *there*, which the
+        interface records as its ``orig_name``. Looking it up under the local
+        name would fail to find a definition that is present, so the rename
+        would be reported as a missing symbol.
+
         :raises SymbolError: if the module pointed to by the symbol interface
                              does not contain the symbol (or the symbol is
                              not public).
@@ -227,6 +233,9 @@ class Symbol(CommentableMixin):
                 f"not supported.")
 
         csym = self.interface.container_symbol
+        # The name in the Container, which is the local name unless the import
+        # renamed it.
+        orig_name = self.interface.orig_name or self.name
 
         try:
             container = csym.find_container_psyir()
@@ -236,13 +245,13 @@ class Symbol(CommentableMixin):
                     f"'{self.name}'. The interface points to module "
                     f"'{csym.name}' but could not obtain its PSyIR.")
             return container.symbol_table.lookup(
-                self.name, visibility=self.Visibility.PUBLIC)
+                orig_name, visibility=self.Visibility.PUBLIC)
         except KeyError as kerr:
             raise SymbolError(
                 f"Error trying to resolve the properties of symbol "
                 f"'{self.name}'. The interface points to module "
                 f"'{csym.name}' but could not find the definition of "
-                f"'{self.name}' in that module.") from kerr
+                f"'{orig_name}' in that module.") from kerr
         except SymbolError as err:
             raise SymbolError(
               f"Error trying to resolve the properties of symbol "

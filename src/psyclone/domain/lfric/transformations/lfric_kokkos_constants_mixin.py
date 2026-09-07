@@ -155,8 +155,9 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
-        :returns: ``(name, container, c_type)`` per constant, name-ordered.
-        :rtype: list[tuple[str, str, str]]
+        :returns: ``(name, container, orig_name, c_type)`` per constant,
+            ordered by the name the kernel body reads.
+        :rtype: list[tuple[str, str, Optional[str], str]]
 
         :raises TransformationError: as :py:meth:`_describe_constant` does,
             for any constant that has no place on the generated C ABI.
@@ -185,9 +186,15 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         :param symbol: the imported symbol the captured body reads.
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
 
-        :returns: the symbol's name, the container it is imported from, and
-            the C type it is passed by value as.
-        :rtype: tuple[str, str, str]
+        A name the kernel renamed on import -- ``use water_mod, only: lv =>
+        latent_heat`` -- is carried under both names: the region and the
+        kernel body know it as ``lv``, and the PSy layer has to repeat the
+        rename to import it at all, because ``water_mod`` has no ``lv``.
+
+        :returns: the symbol's name, the container it is imported from, the
+            name it has *in* that container if the import renamed it, and the
+            C type it is passed by value as.
+        :rtype: tuple[str, str, Optional[str], str]
 
         :raises TransformationError: if the symbol is a module-level
             ``parameter`` whose value is not a literal, such as an array.
@@ -240,7 +247,8 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
                 f"LFRicKokkosTrans cannot pass '{symbol.name}' from "
                 f"'{container}' by value: only {cls._supported_kinds()} "
                 "scalars have a place on the generated C ABI.")
-        return (symbol.name, container, c_type)
+        return (symbol.name, container, symbol.interface.orig_name,
+                c_type)
 
     @classmethod
     def _declared_c_type(cls, symbol):

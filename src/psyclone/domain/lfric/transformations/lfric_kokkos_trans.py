@@ -723,8 +723,9 @@ can_loop_be_parallelised`
         launch = self._launch_symbol(symbol_table, region)
         actuals.append(cell_count)
         actuals.extend(
-            Reference(self._import_constant(symbol_table, name, container))
-            for name, container, _ in constants)
+            Reference(self._import_constant(
+                symbol_table, name, container, orig_name))
+            for name, container, orig_name, _ in constants)
         # region.arguments is the formals, then the cell count, then the
         # constants -- which is exactly the order 'actuals' is in once both
         # appends above have run. The two are therefore index-aligned, and one
