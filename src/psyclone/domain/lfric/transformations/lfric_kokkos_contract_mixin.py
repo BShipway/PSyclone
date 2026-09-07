@@ -64,14 +64,17 @@ the per-argument
 walk in ``_validate_kernel_metadata``, so the order the bundled refusals come
 in is unchanged by their being nameable apart.
 
+One predicate of that set is not here: ``_validate_bounds`` lives beside the
+declaration reading it predicts, in ``LFRicKokkosBoundsMixin``. It is asked of
+``LFRicKokkosTrans`` exactly as these are.
+
 The sibling mixins are reached through ``cls``, resolved on
 ``LFRicKokkosTrans``: :py:meth:`LFRicKokkosContractMixin._validate_sections`
-and :py:meth:`LFRicKokkosContractMixin._validate_bounds` predict
-``cls._lower_sections`` and ``cls._substitute_bounds`` over copies, and
+predicts ``cls._lower_sections`` over a copy, and
 :py:meth:`LFRicKokkosContractMixin._validate_formals` and
 :py:meth:`LFRicKokkosContractMixin._validate_locals` ask ``cls._c_type``,
-``cls._extents`` and ``cls._CELL_COUNT``. Calling a method here directly on
-this mixin is therefore not supported.
+``cls._extent_names`` and ``cls._CELL_COUNT``. Calling a method here directly
+on this mixin is therefore not supported.
 """
 
 from psyclone.core import AccessType
@@ -86,8 +89,9 @@ class LFRicKokkosContractMixin:
 
     Every question here is whether a loop, a kernel or a schedule is inside
     what the generated region can express. What a symbol is in C terms is
-    ``LFRicKokkosTypesMixin``; how the region and its call are built is
-    ``LFRicKokkosCallMixin``.
+    ``LFRicKokkosTypesMixin``; what its declaration says its shape is, and
+    the one predicate that asks, is ``LFRicKokkosBoundsMixin``; how the
+    region and its call are built is ``LFRicKokkosCallMixin``.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
@@ -428,51 +432,6 @@ class LFRicKokkosContractMixin:
             raise TransformationError(
                 "LFRicKokkosTrans cannot lower an array section to a "
                 f"loop: {err}") from err
-
-    @classmethod
-    def _validate_bounds(cls, schedule):
-        """Check that every shape enquiry resolves to a declared bound.
-
-        Predicts :py:meth:`_substitute_bounds` over a copy, as
-        :py:meth:`_validate_sections` predicts the lowering, because that
-        substitution mutates the schedule and :py:meth:`validate` must leave
-        it as it found it.
-
-        The copy is lowered first. ``ArrayAssignment2LoopsTrans`` is a
-        *producer* of ``LBOUND`` and ``UBOUND``, writing them into the loop
-        bounds of every full-extent section it rewrites, so checking before
-        the lowering would miss the calls the transformation itself creates.
-        On a schedule that is already lowered -- which is what the coverage
-        survey hands this method -- the lowering is a no-op, so the one
-        method serves both callers. The cost is a second schedule copy per
-        validation, taken so that each predicate stays readable alone.
-
-        A schedule whose sections cannot be lowered says nothing about its
-        bounds that :py:meth:`_validate_sections` has not already said, so
-        that failure is passed over rather than re-reported. Reaching it means
-        this method was called on its own, as the coverage survey calls each
-        predicate independently; from :py:meth:`validate` the section check
-        has refused the schedule before this runs.
-
-        :param schedule: the kernel schedule to be captured.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-
-        :raises TransformationError: if a shape enquiry cannot be resolved
-            from the declaration, for any of the reasons
-            :py:meth:`~psyclone.domain.lfric.transformations.\
-LFRicKokkosTypesMixin._substitute_bounds` gives.
-        """
-        probe = schedule.copy()
-        try:
-            cls._lower_sections(probe)
-        except TransformationError:
-            return
-        try:
-            cls._substitute_bounds(probe)
-        except TransformationError as err:
-            raise TransformationError(
-                "LFRicKokkosTrans cannot resolve an array bound from its "
-                f"declaration: {err}") from err
 
     @classmethod
     def _validate_formals(cls, schedule):

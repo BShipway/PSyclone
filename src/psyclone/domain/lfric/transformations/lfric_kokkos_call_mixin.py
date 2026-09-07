@@ -41,10 +41,10 @@ instantiated. It holds no instance state and every method is a
 is a namespace with an inheritable ``cls``, not an object.
 
 The one constraint that follows is that a method reaching a helper of the
-sibling mixin ``LFRicKokkosTypesMixin`` does so through ``cls``, resolved on
-``LFRicKokkosTrans``. Calling such a method directly on either mixin is
-therefore not supported, and several methods here do reach across:
-:py:meth:`LFRicKokkosCallMixin._region_arguments` and
+sibling mixins ``LFRicKokkosTypesMixin`` and ``LFRicKokkosBoundsMixin`` does
+so through ``cls``, resolved on ``LFRicKokkosTrans``. Calling such a method
+directly on any of them is therefore not supported, and several methods here
+do reach across: :py:meth:`LFRicKokkosCallMixin._region_arguments` and
 :py:meth:`LFRicKokkosCallMixin._local_arrays` both ask ``cls._c_type`` and
 ``cls._extents``, and :py:meth:`LFRicKokkosCallMixin._kind_assertions` reads
 ``cls._C_TYPES`` and ``cls._KIND_PROBES``.
