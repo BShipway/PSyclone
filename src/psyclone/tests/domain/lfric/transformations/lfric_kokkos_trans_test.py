@@ -882,11 +882,57 @@ _EXPLICIT_ONE_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "dimension(nlayers) :: swept", "dimension(1:nlayers) :: swept")
 
 
-# The same kernel with a lower bound that is not 1. KokkosView and
-# KokkosScratch subtract a fixed 1 from each Fortran index, so this cannot be
-# described without index offsets becoming expressions.
+# The same kernel with a lower bound that is not 1, and an upper bound that
+# is an expression. Both the extent and the origin are read from the one
+# declaration, so a shape that moves the origin and computes the extent at
+# once is the case where reading them apart would disagree.
 _LOWER_BOUND_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "dimension(nlayers) :: swept", "dimension(0:nlayers-1) :: swept")
+
+
+# The shape the catalogue's `array-bound` row actually counts. `u_e`, `u_av`
+# and `pert` are each declared `dimension(0:nlayers)` in the kernels that row
+# blocks, so the View is one element longer than its upper bound and every
+# subscript of it is shifted by nothing rather than by one.
+_ZERO_BASED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(0:nlayers) :: u_e").replace(
+    "swept(", "u_e(")
+
+
+# The same array asked for all three of its shape enquiries. Each is answered
+# from the declaration, and each answer moves with the origin: LBOUND is no
+# longer the constant 1 and SIZE is no longer the upper bound.
+_ZERO_BASED_ENQUIRY_KERNEL = _ZERO_BASED_LOCAL_KERNEL.replace(
+    "    do k = 2, nlayers",
+    "    do k = lbound(u_e, 1) + 2, ubound(u_e, 1)").replace(
+    "      field_out(map_w3(1) + k - 1) = u_e(k)",
+    "      field_out(map_w3(1) + k - 1) = u_e(k) + size(u_e, 1)")
+
+
+# An array centred on zero rather than based at it. This is the shape stage
+# 3b's defect note names: the extent and the origin are different expressions
+# over the same name, so a region that sized the View correctly and shifted
+# its subscripts by the Fortran default would index a View of the right size
+# from the wrong place -- a wrong answer rather than a refusal.
+_NEGATIVE_ORIGIN_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept",
+    "dimension(-nlayers:nlayers) :: u_e").replace("swept(", "u_e(")
+
+
+# An extent that is not an integer expression over named sizes. The origin is
+# the Fortran default here, so this is the extent grammar's own refusal rather
+# than the origin's, asserted apart from it because the two are checked in
+# order and the first to fire hides the second.
+_UNRENDERABLE_EXTENT_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(nlayers/2) :: swept")
+
+
+# An origin that is not an integer expression over named sizes. Division is
+# refused in an origin for the reason it is refused in an extent: Fortran and
+# C++ can disagree about the rounding, and an origin that rounds the other way
+# shifts every subscript of the array by one.
+_UNRENDERABLE_ORIGIN_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(nlayers/2:nlayers) :: swept")
 
 
 # Arithmetic over a module constant rather than over a formal. Accepting
@@ -969,10 +1015,11 @@ _OUT_OF_RANGE_BOUND_KERNEL = _LOCAL_KERNEL.replace(
     "    do k = 2, nlayers", "    do k = 2, ubound(partial, 2)")
 
 
-# UBOUND of an array whose lower bound is not 1. The extent grammar already
-# refuses that declaration, and the enquiry inherits the refusal rather than
-# paraphrasing it, because the answer depends on the same bounds.
-_LOWER_BOUND_ENQUIRY_KERNEL = _LOWER_BOUND_LOCAL_KERNEL.replace(
+# UBOUND of an array whose declared origin cannot be written. The bounds
+# grammar already refuses that declaration, and the enquiry inherits the
+# refusal rather than paraphrasing it, because the answer depends on the same
+# bounds.
+_LOWER_BOUND_ENQUIRY_KERNEL = _UNRENDERABLE_ORIGIN_KERNEL.replace(
     "    swept(nlayers) = partial(nlayers)",
     "    swept(ubound(swept, 1)) = partial(nlayers)")
 
@@ -1646,6 +1693,54 @@ def lower_bound_local_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel declares a local from zero."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOWER_BOUND_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="zero_based_local_target")
+# pylint: disable-next=unused-argument
+def zero_based_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local from zero."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ZERO_BASED_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="zero_based_enquiry_target")
+# pylint: disable-next=unused-argument
+def zero_based_enquiry_target_fixture(tmp_path,
+                                      clear_module_manager_instance):
+    """Create an invoke asking all three enquiries of a zero-based local."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _ZERO_BASED_ENQUIRY_KERNEL)
+
+
+@pytest.fixture(name="negative_origin_local_target")
+# pylint: disable-next=unused-argument
+def negative_origin_local_target_fixture(tmp_path,
+                                         clear_module_manager_instance):
+    """Create an invoke whose kernel centres a local on zero."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _NEGATIVE_ORIGIN_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="unrenderable_extent_target")
+# pylint: disable-next=unused-argument
+def unrenderable_extent_target_fixture(tmp_path,
+                                       clear_module_manager_instance):
+    """Create an invoke whose kernel divides in a declared upper bound."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _UNRENDERABLE_EXTENT_KERNEL)
+
+
+@pytest.fixture(name="unrenderable_origin_target")
+# pylint: disable-next=unused-argument
+def unrenderable_origin_target_fixture(tmp_path,
+                                       clear_module_manager_instance):
+    """Create an invoke whose kernel divides in a declared lower bound."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _UNRENDERABLE_ORIGIN_KERNEL)
 
 
 @pytest.fixture(name="unsized_expression_target")
@@ -2906,8 +3001,10 @@ def test_lfric_kokkos_trans_describes_each_local_array(local_target):
     assert [item.name for item in scratch] == ["partial", "swept"]
     assert all(item.c_type == "double" for item in scratch)
     assert all(item.extents == ("nlayers",) for item in scratch)
-    # Fortran declares from 1 and C indexes from 0, as for a formal.
-    assert all(item.index_offsets == (1,) for item in scratch)
+    # Fortran declares from 1 and C indexes from 0, as for a formal. The
+    # offset is the declared origin rendered as C, not an assumed 1, so it is
+    # the string the backend writes into the subscript.
+    assert all(item.index_offsets == ("1",) for item in scratch)
 
 
 def test_lfric_kokkos_trans_refuses_a_local_named_after_the_launch(
@@ -3062,23 +3159,159 @@ def test_lfric_kokkos_trans_takes_an_explicit_lower_bound_of_one(
     assert "swept_scratch_t swept(team.team_scratch(0), nlayers);" in cpp
 
 
-def test_lfric_kokkos_trans_refuses_a_lower_bound_that_is_not_one(
-        lower_bound_local_target):
-    """``dimension(0:nlayers-1)`` is refused, naming the lower bound.
+def test_lfric_kokkos_trans_accepts_a_zero_based_local(
+        zero_based_local_target):
+    """``dimension(0:nlayers)`` is captured, sized and shifted by its origin.
 
-    The generated View subtracts a fixed 1 from each Fortran index, so a
-    different base would need index offsets to become expressions. That is a
-    capability of its own; this is the boundary it starts at, asserted rather
-    than assumed.
+    This is the shape the catalogue's ``array-bound`` row counts. The View is
+    one element longer than the upper bound, because the extent is
+    ``ub - lb + 1`` and not ``ub``; and every subscript of it is shifted by
+    the declared origin rather than by the Fortran default of 1.
+
+    The shift is emitted even though it is zero. ``u_e(k - 0)`` is the origin
+    stated in the generated code, and a subscript that read ``u_e(k)`` would
+    be indistinguishable from one the offset had never reached -- which is
+    the failure this capability is at risk of, since it is a wrong answer
+    rather than a refusal.
     """
-    _, loop, _ = lower_bound_local_target
+    psy, loop, kernel = zero_based_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("u_e")
+
+    assert LFRicKokkosTrans._extents(symbol) == ("(nlayers + 1)",)
+    assert LFRicKokkosTrans._origins(symbol) == ("0",)
+    assert LFRicKokkosTrans._extent_names(symbol) == {"nlayers"}
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "u_e_scratch_t::shmem_size((nlayers + 1))" in cpp
+    assert "u_e_scratch_t u_e(team.team_scratch(0), (nlayers + 1));" in cpp
+    # Every subscript of it, not only the one the assignment writes.
+    assert "u_e((k - 0))" in cpp
+    assert "u_e((nlayers - 0))" in cpp
+    assert "u_e(((k + 1) - 0))" in cpp
+    # A subscript that never met the offset would read exactly this.
+    assert "u_e(k)" not in cpp
+    # Scratch reaches no interface, as for any other kernel-local array.
+    assert "u_e" not in str(psy.gen)
+
+
+def test_lfric_kokkos_trans_zero_based_bounds_enquiries(
+        zero_based_enquiry_target):
+    """LBOUND, UBOUND and SIZE of a zero-based array move with its origin.
+
+    Each is answered from the declaration, so each has to be answered from
+    *both* declared bounds: ``LBOUND`` is the origin rather than the constant
+    1, and ``SIZE`` is the extent rather than the upper bound. Getting either
+    from the old assumption gives an answer that is wrong by one.
+    """
+    _, loop, _ = zero_based_enquiry_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    # LBOUND(u_e, 1) is 0 and UBOUND(u_e, 1) is nlayers, from the
+    # declaration; the loop the kernel wrote them into is the evidence.
+    assert "for(k=(0 + 2); k<=nlayers; k+=1)" in cpp
+    # SIZE(u_e, 1) is the extent, which is one more than the upper bound.
+    assert "(u_e((k - 0)) + (nlayers + 1))" in cpp
+    for name in ("LBOUND", "UBOUND", "SIZE", "lbound(", "ubound(", "size(u_e"):
+        assert name not in cpp
+
+
+def test_lfric_kokkos_trans_accepts_a_negative_lower_bound(
+        negative_origin_local_target):
+    """``dimension(-nlayers:nlayers)`` is sized and shifted symbolically.
+
+    The origin is an expression rather than a literal, which is the case
+    where the extent and the origin are genuinely different readings of the
+    same declaration: a region that sized the View correctly and shifted its
+    subscripts by 1 would index a View of the right size from the wrong
+    place.
+
+    The extent is rendered as the writer builds it, ``((nlayers -
+    (-nlayers)) + 1)``, which is ``2 * nlayers + 1`` unsimplified; the
+    back-end emits an extent verbatim rather than folding it, so what is
+    asserted is what is compiled.
+    """
+    _, loop, kernel = negative_origin_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("u_e")
+
+    assert LFRicKokkosTrans._extents(symbol) == (
+        "((nlayers - (-nlayers)) + 1)",)
+    assert LFRicKokkosTrans._origins(symbol) == ("(-nlayers)",)
+    # The origin is named in the generated C++ too, so it has to be reachable
+    # there as well as at the launch.
+    assert LFRicKokkosTrans._extent_names(symbol) == {"nlayers"}
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("u_e_scratch_t u_e(team.team_scratch(0), "
+            "((nlayers - (-nlayers)) + 1));" in cpp)
+    assert "u_e((k - (-nlayers)))" in cpp
+    assert "u_e((nlayers - (-nlayers)))" in cpp
+
+
+def test_lfric_kokkos_trans_rejects_an_unrenderable_extent(
+        unrenderable_extent_target):
+    """``dimension(nlayers/2)`` is refused, naming the extent.
+
+    The origin is the Fortran default here, so the refusal is the extent
+    grammar's own. The two checks run in order and the first to fire hides
+    the second, which is why the origin refusal is asserted over a separate
+    declaration rather than over this one.
+    """
+    _, loop, _ = unrenderable_extent_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "extents of 'swept'" in str(error.value)
+    assert "found '(nlayers / 2)'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
+        unrenderable_origin_target):
+    """A declared origin that is not an integer expression is still refused.
+
+    Widening the origin from "must be 1" to "any integer expression over
+    named sizes" is not a widening to anything at all. ``dimension(nlayers/2:
+    nlayers)`` divides, and integer division is refused in an origin for the
+    reason it is refused in an extent -- Fortran and C++ can disagree about
+    the rounding, and here the disagreement shifts every subscript of the
+    array by one instead of failing to compile.
+    """
+    _, loop, _ = unrenderable_origin_target
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
     assert "'swept'" in str(error.value)
-    assert "lower bound of 1" in str(error.value)
-    assert "found '0'" in str(error.value)
+    assert "declared origin" in str(error.value)
+    assert "found '(nlayers / 2)'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_moves_an_origin_and_an_extent_together(
+        lower_bound_local_target):
+    """``dimension(0:nlayers-1)`` moves the origin and computes the extent.
+
+    Both answers come out of one reading of one declaration, and this is the
+    shape where reading them apart would disagree: the upper bound is itself
+    an expression, so an extent taken as ``ub`` and an origin taken as 1 are
+    each wrong by one and in opposite directions.
+    """
+    _, loop, kernel = lower_bound_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("swept")
+
+    assert LFRicKokkosTrans._extents(symbol) == ("((nlayers - 1) + 1)",)
+    assert LFRicKokkosTrans._origins(symbol) == ("0",)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("swept_scratch_t swept(team.team_scratch(0), "
+            "((nlayers - 1) + 1));" in cpp)
+    assert "swept((k - 0))" in cpp
 
 
 def test_lfric_kokkos_trans_refuses_an_unsizable_expression(
@@ -3101,7 +3334,8 @@ def test_lfric_kokkos_trans_refuses_an_unsizable_expression(
 
 @pytest.mark.parametrize("fixture_name", [
     "literal_local_target", "arithmetic_local_target",
-    "explicit_one_local_target"])
+    "explicit_one_local_target", "lower_bound_local_target",
+    "zero_based_local_target", "negative_origin_local_target"])
 def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
         fixture_name, request):
     """Every widened shape passes ``validate`` as well as ``apply``.
@@ -3120,7 +3354,7 @@ def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
 
 @pytest.mark.parametrize("fixture_name", [
     "unsized_local_target", "unmapped_local_target",
-    "lower_bound_local_target", "unsized_expression_target"])
+    "unrenderable_origin_target", "unsized_expression_target"])
 def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
         fixture_name, request):
     """Both refusals are made by ``validate``, not discovered by ``apply``.
@@ -3277,11 +3511,11 @@ def test_lfric_kokkos_trans_refuses_a_whole_size_above_rank_one(
             "declared with rank 2" in str(error.value))
 
 
-def test_lfric_kokkos_trans_inherits_the_extent_grammar_refusal(
+def test_lfric_kokkos_trans_inherits_the_bounds_grammar_refusal(
         lower_bound_enquiry_target):
-    """A bound of an array based other than at 1 gets the grammar's message.
+    """A bound of an array with an unwritable origin gets that message.
 
-    ``_extents`` already refuses that declaration, and the enquiry depends on
+    ``_bounds`` already refuses that declaration, and the enquiry depends on
     the same bounds, so its refusal is passed through rather than paraphrased
     -- a reader gets the sentence that says which rule was broken.
     """
@@ -3290,8 +3524,9 @@ def test_lfric_kokkos_trans_inherits_the_extent_grammar_refusal(
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
-    assert ("requires 'swept' to be declared with a lower bound of 1, but "
-            "found '0'" in str(error.value))
+    assert ("requires the declared origin of 'swept' to be an integer "
+            "expression over named sizes, but found '(nlayers / 2)'"
+            in str(error.value))
 
 
 @pytest.mark.parametrize("fixture_name", [

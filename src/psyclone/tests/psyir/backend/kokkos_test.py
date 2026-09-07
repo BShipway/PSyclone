@@ -14,7 +14,7 @@ import pytest
 
 from psyclone.psyir.backend.kokkos import (
     KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
-    extent_names, is_extent)
+    extent_names, is_extent, is_offset)
 from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
@@ -940,8 +940,13 @@ def test_kokkos_writer_views_are_never_managed():
      "expression over named sizes."),
     (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1, 1)),
      "Kokkos scratch 'x_new' dimensions do not match its kernel indices."),
-    (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=("1",)),
-     "Kokkos scratch 'x_new' index offsets must be integers."),
+    (KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1.5,)),
+     "Kokkos scratch 'x_new' index offsets must be integers or integer "
+     "expressions over named sizes."),
+    (KokkosScratch("x_new", "double", ("nlayers",),
+                   index_offsets=("nlayers / 2",)),
+     "Kokkos scratch 'x_new' index offsets must be integers or integer "
+     "expressions over named sizes."),
     (KokkosScratch("y", "double", ("nlayers",), index_offsets=(1,)),
      "Kokkos scratch 'y' collides with an existing region name."),
     (KokkosScratch("nlayers", "double", ("nlayers",), index_offsets=(1,)),
@@ -1041,6 +1046,23 @@ def test_is_extent(extent, accepted):
     only checked the total would accept it.
     """
     assert is_extent(extent) is accepted
+
+
+@pytest.mark.parametrize("offset, accepted", [
+    (1, True), (0, True), (-3, True), ("1", True), ("0", True),
+    ("(-nlayers)", True), ("2 * nlayers", True),
+    (1.5, False), ("nlayers / 2", False), ("", False), (None, False),
+])
+def test_is_offset(offset, accepted):
+    """An offset is an integer, or an extent expression standing in for one.
+
+    The grammar is the extent grammar because an origin and an extent are two
+    readings of one declaration: a shape admitted into the extent and refused
+    in the origin would size a View correctly and index it from the wrong
+    place. A negative integer is accepted, since an array centred on zero has
+    a negative origin.
+    """
+    assert is_offset(offset) is accepted
 
 
 @pytest.mark.parametrize("extent, names", [

@@ -186,7 +186,7 @@ class LFRicKokkosCallMixin:
             arguments.append(KokkosView(
                 symbol.name, f"{symbol.name}_data", c_type,
                 extents + ((cls._CELL_COUNT,) if sliced else ()),
-                index_offsets=(1,) * len(extents),
+                index_offsets=cls._origins(symbol),
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
@@ -220,7 +220,7 @@ class LFRicKokkosCallMixin:
             extents = cls._extents(symbol)
             scratch.append(KokkosScratch(
                 symbol.name, cls._c_type(symbol), extents,
-                index_offsets=(1,) * len(extents)))
+                index_offsets=cls._origins(symbol)))
         return tuple(scratch)
 
     @staticmethod

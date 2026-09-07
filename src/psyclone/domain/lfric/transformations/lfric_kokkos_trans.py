@@ -175,11 +175,26 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     kernel arguments and literals using ``+``, ``-`` and ``*``: division is
     refused, because Fortran and C++ can disagree about the rounding of an
     integer division and a wrongly sized allocation would not announce
-    itself. A lower bound other than 1 is refused as well -- the generated
-    View subtracts a fixed 1 from each Fortran index -- so
-    ``dimension(0:nlayers-1)`` is out of reach while ``dimension(1:nlayers)``
-    is not. Every one of these is refused by :py:meth:`validate` rather than
+    itself. Every one of these is refused by :py:meth:`validate` rather than
     discovered by :py:meth:`apply`.
+
+    **A declared lower bound need not be 1.** ``dimension(0:nlayers-1)`` and
+    ``dimension(-nlayers:nlayers)`` are accepted alongside
+    ``dimension(nlayers)``: the View is sized by the span the declaration
+    gives, ``ub - lb + 1``, and every subscript of that array has ``lb``
+    subtracted from it on the way to the zero-based element, so
+    ``u_e(k)`` over a local declared ``dimension(0:nlayers)`` becomes
+    ``u_e((k - 0))``. The lower bound must satisfy the same grammar as the
+    upper -- an integer expression over kernel arguments and literals using
+    ``+``, ``-`` and ``*`` -- and is refused on the same terms when it does
+    not. A bound of 1 renders exactly the source it rendered before this was
+    accepted, the span folding back to the upper bound alone.
+
+    The subtraction is written out even where it is zero, because it is
+    applied in one place -- the back-end's generation of an array accessor --
+    and a subscript that escaped it would compile and give a wrong answer
+    rather than fail. What is gained by omitting it is what the C++ optimiser
+    removes anyway.
 
     **A loop inside the kernel body may be spread over the team**, and which
     loops those are is PSyclone's own judgement rather than this
