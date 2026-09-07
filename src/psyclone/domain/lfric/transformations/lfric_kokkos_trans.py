@@ -95,6 +95,36 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     storage would reinterpret 4-byte elements as 1-byte ones rather than
     convert them, which is the very failure conversion removes for a scalar.
 
+    **A formal declared with no kind at all is accepted if it is an integer
+    or a logical, and refused if it is a real.** GungHo writes plenty of
+    both: ``logical, intent(in) :: include_surface``, and the whole of the
+    integer housekeeping ``nlayers, ndf_w0, undf_w0, map_w0`` that LFRic's
+    argument ordering supplies. The two are admitted for different reasons.
+    A logical needs no width at all, by the conversion above, so an unnamed
+    logical kind is the ``l_def`` case with the name taken off -- ``l_def``
+    *is* ``kind(.false.)``, so the two declarations say the same thing.
+
+    An integer does cross at a width, and the default integer's width is
+    named by no kind parameter the precision map could be asked about. It is
+    therefore measured rather than assumed: the generated interface carries
+    ``storage_size(1) == storage_size(1_c_int)`` as a compile-time assertion
+    like any other kind's, so a build whose default integer is not ``c_int``
+    fails to compile rather than losing half of every value. The assertion is
+    labelled ``assert_kind_default_integer``, and that name is this
+    transformation's own -- ``constants_mod`` declares no such kind, being
+    unnamed being the whole of what makes it the default -- so it is written
+    into no ``use`` statement.
+
+    A **real** declared with no kind stays refused, and the asymmetry is
+    deliberate. LFRic names a kind on every real it means: ``r_def``,
+    ``r_solver``, ``r_single`` and ``r_tran`` are all in use and all
+    different, so the kind is the whole of what a real declaration says about
+    its width, and one that says nothing is more likely an oversight than a
+    default. A **width stated in place of a kind name** -- ``integer*8``, or
+    ``real(kind=8)`` -- is refused too, for all three intrinsics: that
+    declaration did say which width it wanted, and reading it as the default
+    would be the silent narrowing this whole contract exists to prevent.
+
     **An LMA operator is accepted; a CMA operator is not.** An LMA
     operator reaches the kernel as ``ncell_3d`` and a rank-3 array
     ``dimension(ncell_3d, ndf1, ndf2)`` holding every cell's local stencil

@@ -47,7 +47,7 @@ directly on any of them is therefore not supported, and several methods here
 do reach across: :py:meth:`LFRicKokkosCallMixin._region_arguments` and
 :py:meth:`LFRicKokkosCallMixin._local_arrays` both ask ``cls._c_type`` and
 ``cls._extents``, and :py:meth:`LFRicKokkosCallMixin._kind_assertions` reads
-``cls._C_TYPES`` and ``cls._KIND_PROBES``.
+``cls._C_TYPES``, ``cls._KIND_PROBES`` and ``cls._DEFAULT_KINDS``.
 """
 
 import textwrap
@@ -284,6 +284,15 @@ class LFRicKokkosCallMixin:
         not a supported integer kind, so a mismatch is a hard compile error
         naming the parameter and therefore the kind.
 
+        A kind ``cls._DEFAULT_KINDS`` named because the declaration did not is
+        written without the two things a name would otherwise buy: it is left
+        out of the ``use`` line, since ``constants_mod`` declares no such kind,
+        and its probe is the bare literal rather than a suffixed one, since
+        ``1_default_integer`` would name a kind parameter that does not exist
+        where ``1`` is the very kind in question. A region whose only asserted
+        kind is that one therefore imports nothing from ``constants_mod``
+        rather than importing nothing by name.
+
         :param kind_types: one ``(kind name, C type)`` pair per kind, as
             :py:meth:`_kind_types` returns them.
         :type kind_types: tuple[tuple[str, str], ...]
@@ -304,14 +313,16 @@ class LFRicKokkosCallMixin:
                     if c_type in intrinsics]
         if not asserted:
             return ""
-        names = ", ".join(kind for kind, _ in asserted)
-        lines = [f"    use constants_mod, only : {names}"]
+        defaults = {name for _, name in cls._DEFAULT_KINDS.values()}
+        names = ", ".join(kind for kind, _ in asserted if kind not in defaults)
+        lines = [f"    use constants_mod, only : {names}"] if names else []
         for kind, c_type in asserted:
             probe = cls._KIND_PROBES[intrinsics[c_type]]
             c_kind = cls._FORTRAN_TYPES[c_type][1]
+            suffix = "" if kind in defaults else f"_{kind}"
             lines.append(
                 f"    integer(kind=merge(4, -1, "
-                f"storage_size({probe}_{kind}) == &\n"
+                f"storage_size({probe}{suffix}) == &\n"
                 f"        storage_size({probe}_{c_kind}))), parameter :: "
                 f"assert_kind_{kind} = 0")
         return "\n".join(lines) + "\n"

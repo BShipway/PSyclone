@@ -117,24 +117,57 @@ class LFRicKokkosTypesMixin:
         ScalarType.Intrinsic.REAL: "1.0",
     }
 
+    #: What a declaration naming no kind is on the ABI, by intrinsic: the C
+    #: type it crosses as, and the name this transformation gives the kind the
+    #: declaration did not name.
+    #:
+    #: A default kind cannot be looked up the way :py:attr:`_C_TYPES` looks up
+    #: a named one, because the precision map is keyed by kind name and a
+    #: default kind is exactly the one with no name to key it by. Its width is
+    #: asserted instead, by the compiler that builds the generated code: the
+    #: name here labels a ``storage_size`` check of the bare literal
+    #: :py:attr:`_KIND_PROBES` gives against its ``iso_c_binding``
+    #: counterpart, so the width below is measured where it is used rather
+    #: than assumed here. LFRic's ``constants_mod`` declares no such kind --
+    #: being unnamed is the whole of what makes it the default -- so
+    #: :py:meth:`~psyclone.domain.lfric.transformations.\
+    #: lfric_kokkos_call_mixin.LFRicKokkosCallMixin._kind_assertions` keeps
+    #: the name out of the ``use`` line it writes and out of the literal's
+    #: kind suffix.
+    #:
+    #: ``REAL`` has no entry and is refused: LFRic names a kind on every real
+    #: it means -- ``r_def``, ``r_solver``, ``r_single`` and ``r_tran`` are all
+    #: in use and all different -- so an unkinded real is more likely an
+    #: oversight than a default, and the assertion above would only pin down a
+    #: width nobody chose. ``LOGICAL`` has no entry either, for the opposite
+    #: reason: it is admitted without one, ahead of any width, by
+    #: :py:attr:`_C_LOGICAL_TYPE`.
+    _DEFAULT_KINDS = {
+        ScalarType.Intrinsic.INTEGER: ("int", "default_integer"),
+    }
+
     @classmethod
     def _supported_kinds(cls):
         """Name the widths on the ABI, in the order :py:attr:`_C_TYPES` has.
 
         Derived from the table rather than spelt out, so the two refusal
         messages that quote it cannot drift from what is actually accepted.
-        The logical clause is appended rather than derived, because a logical
-        is on the ABI without a width and so cannot come from a table keyed by
-        one; see :py:attr:`_C_LOGICAL_TYPE`.
+        The two clauses after the widths are appended rather than derived,
+        because neither is a row of a table keyed by width: a logical is on
+        the ABI without one at all (:py:attr:`_C_LOGICAL_TYPE`), and a
+        declaration naming no kind is on it under a width the generated code
+        asserts rather than looks up (:py:attr:`_DEFAULT_KINDS`).
 
         :returns: a phrase such as ``4-byte integer, 4-byte real and 8-byte
-            real, and logical of any kind``.
+            real, logical of any kind, and integer or logical declared with no
+            kind``.
         :rtype: str
         """
         widths = [f"{width}-byte {intrinsic.name.lower()}"
                   for intrinsic, width in cls._C_TYPES]
-        return " and ".join(
-            [", ".join(widths[:-1]), widths[-1]]) + ", and logical of any kind"
+        return (" and ".join([", ".join(widths[:-1]), widths[-1]])
+                + ", logical of any kind, and integer or logical declared "
+                  "with no kind")
 
     @staticmethod
     def _kind_name(symbol):
@@ -157,6 +190,64 @@ class LFRicKokkosTypesMixin:
         if not isinstance(precision, Reference):
             return None
         return precision.symbol.name
+
+    @staticmethod
+    def _unnamed_kind(datatype):
+        """Return whether a scalar type's kind was left unstated entirely.
+
+        PSyIR records a precision three ways: a
+        :py:class:`~psyclone.psyir.nodes.Reference` to a kind parameter, as
+        ``integer(kind=i_def)`` gives; a width in bytes, as ``integer*8`` and
+        ``real(kind=8)`` give; and ``UNDEFINED``, which is what is left when
+        the declaration said nothing. Only the last is a default kind.
+
+        The distinction is the point of the routine. A width is a kind the
+        declaration did state, just not by name, so reading it as the default
+        would put an ``integer*8`` on the ABI as a C ``int`` and drop four
+        bytes of every value without saying so -- the precise failure
+        :py:attr:`_DEFAULT_KINDS` exists to assert against.
+
+        :param datatype: the scalar type whose precision is in question.
+        :type datatype: :py:class:`psyclone.psyir.symbols.ScalarType`
+
+        :returns: whether the declaration named no kind and stated no width.
+        :rtype: bool
+        """
+        return datatype.precision is ScalarType.Precision.UNDEFINED
+
+    @classmethod
+    def _default_kind_name(cls, symbol):
+        """Return the name given to the kind a symbol's declaration omits.
+
+        The companion of :py:meth:`_kind_name`, and asked only where that has
+        returned ``None``: a symbol declared ``integer, intent(in) :: nlayers``
+        names no kind, but the generated body still fixes a width for it, so
+        the region carries a kind under the name :py:attr:`_DEFAULT_KINDS`
+        gives it and asserts that width like any other.
+
+        A logical is not named here even though it too is admitted without a
+        kind. It crosses by conversion and so fixes no width, and a name
+        returned here is a name an assertion would be written for; see
+        :py:attr:`_C_LOGICAL_TYPE`.
+
+        Asked only of a symbol :py:meth:`_c_type` has already admitted without
+        a kind name, which is what makes the question answerable from the
+        intrinsic alone: a width stated in place of a name has been refused by
+        then, so a symbol reaching here stated neither.
+
+        :param symbol: the symbol whose declaration named no kind.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: the name this transformation gives the unnamed kind, such as
+            ``default_integer``, or ``None`` if its intrinsic is not one that
+            crosses the ABI at a width, a logical being the case in point.
+        :rtype: Optional[str]
+        """
+        datatype = symbol.datatype
+        if isinstance(datatype, ArrayType):
+            datatype = datatype.elemental_type
+        default = cls._DEFAULT_KINDS.get(datatype.intrinsic)
+        return default[1] if default else None
 
     @staticmethod
     def _kind_argument(reference):
@@ -273,7 +364,8 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
 
         :returns: the C type name, such as ``float``, or ``None`` if the
             symbol is not of a scalar or array-of-scalar type, or its kind is
-            not one :py:attr:`_C_TYPES` maps, or it is a ``logical`` array.
+            not one :py:attr:`_C_TYPES` maps, or its declaration stated a
+            width in place of a kind name, or it is a ``logical`` array.
         :rtype: Optional[str]
         """
         datatype = symbol.datatype
@@ -282,14 +374,21 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
             datatype = datatype.elemental_type
         if not isinstance(datatype, ScalarType):
             return None
-        if array and datatype.intrinsic is ScalarType.Intrinsic.BOOLEAN:
+        boolean = datatype.intrinsic is ScalarType.Intrinsic.BOOLEAN
+        if array and boolean:
             # A logical is on the ABI by conversion, which is per value. An
             # array crosses by reference: a View<bool*> over logical(l_def)
             # storage would reinterpret 4-byte elements as 1-byte ones rather
             # than convert them, which is the very failure conversion removes
             # for a scalar. See _C_LOGICAL_TYPE.
             return None
-        return cls._map_kind(datatype.intrinsic, cls._kind_name(symbol))
+        kind = cls._kind_name(symbol)
+        if kind is None and not boolean and not cls._unnamed_kind(datatype):
+            # A width stated in place of a kind name. _map_kind reads a missing
+            # name as the default kind, which this one is not, so it is not
+            # asked. A logical is exempt because it crosses at no width at all.
+            return None
+        return cls._map_kind(datatype.intrinsic, kind)
 
     @classmethod
     def _map_kind(cls, intrinsic, kind):
@@ -301,20 +400,30 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         :param intrinsic: the Fortran intrinsic type the kind qualifies.
         :type intrinsic:
             :py:class:`psyclone.psyir.symbols.ScalarType.Intrinsic`
-        :param str kind: the LFRic kind parameter, such as ``r_tran``.
+        :param kind: the LFRic kind parameter, such as ``r_tran``, or ``None``
+            where the declaration named none.
+        :type kind: Optional[str]
 
         :returns: the C type name, such as ``float``, or
-            :py:attr:`_C_LOGICAL_TYPE` for any ``logical`` kind, or ``None``
-            if the intrinsic and width together are not on the ABI.
+            :py:attr:`_C_LOGICAL_TYPE` for any ``logical`` kind, or the type
+            :py:attr:`_DEFAULT_KINDS` gives the intrinsic where no kind was
+            named, or ``None`` if the intrinsic and width together are not on
+            the ABI.
         :rtype: Optional[str]
         """
-        if kind is None:
-            return None
         if intrinsic is ScalarType.Intrinsic.BOOLEAN:
             # Answered before the precision map is opened, not merely without
             # using the answer: the map's l_def entry is wrong (#1941) and
-            # this is what makes that irrelevant rather than survivable.
+            # this is what makes that irrelevant rather than survivable. It is
+            # also answered before the kind is looked at, which is what admits
+            # a plain 'logical': l_def is kind(.false.), so naming it and
+            # leaving it out say the same thing, and neither says a width.
             return cls._C_LOGICAL_TYPE
+        if kind is None:
+            # No name for the precision map to be keyed by, so the width comes
+            # from the assertion _DEFAULT_KINDS describes instead of from here.
+            default = cls._DEFAULT_KINDS.get(intrinsic)
+            return default[0] if default else None
         precision = Config.get().api_conf("lfric").precision_map
         return cls._C_TYPES.get((intrinsic, precision.get(kind)))
 
@@ -341,6 +450,12 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         the precision map does not carry is still left out, and still written
         at that default, because there is no width to write instead.
 
+        A declaration naming no kind is collected under the name
+        :py:attr:`_DEFAULT_KINDS` gives it, for the same reason and with more
+        force: the width it fixes is not written down anywhere at all, so
+        leaving it out would be the one case where nothing -- neither this
+        table nor the compiler's own argument check -- had looked at it.
+
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
@@ -352,9 +467,16 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         kinds = {}
         for symbol in list(table.argument_list) + list(
                 table.automatic_datasymbols):
+            c_type = cls._c_type(symbol)
             kind = cls._kind_name(symbol)
+            if kind is None and c_type is not None:
+                # On the ABI with no kind named at all, since _c_type refuses
+                # a width stated in place of a name. The region carries it
+                # under the name _DEFAULT_KINDS gives it so that the width it
+                # fixes can be asserted like any other.
+                kind = cls._default_kind_name(symbol)
             if kind is not None:
-                kinds[kind] = cls._c_type(symbol)
+                kinds[kind] = c_type
         for literal in schedule.walk(Literal):
             datatype = literal.datatype
             precision = getattr(datatype, "precision", None)
@@ -507,13 +629,23 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         is still stated there, so read it rather than give up; anything with a
         shape is refused, because only scalars are passed by value.
 
+        A declaration that names no kind is read too, and handed to
+        :py:meth:`_map_kind` with ``None`` so that it is answered by the one
+        table the typed path is answered by. What that costs is a regular
+        expression that has to tell ``INTEGER, PUBLIC`` from ``INTEGER(i_def)``
+        rather than only looking for ``KIND=``: a positional kind is a kind,
+        and reading it as the default would put a silently narrowed value on
+        the ABI, so the type name is accepted bare only where the declaration
+        goes straight on to its attributes or its ``::``.
+
         :param symbol: the imported symbol whose declaration is to be read.
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
 
         :returns: the C type named by the declaration text, or ``None`` if
             the declaration is not one PSyIR failed to model, has a shape, is
-            of no intrinsic the ABI carries, or names a kind
-            :py:attr:`_C_TYPES` does not map.
+            of no intrinsic the ABI carries, names a kind :py:attr:`_C_TYPES`
+            does not map, states one positionally rather than as ``KIND=``, or
+            names none where :py:attr:`_DEFAULT_KINDS` admits none.
         :rtype: Optional[str]
         """
         datatype = getattr(symbol, "datatype", None)
@@ -523,15 +655,18 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         if "DIMENSION" in attributes.upper():
             return None
         match = re.match(
-            r"\s*(REAL|INTEGER)\s*\(\s*KIND\s*=\s*(\w+)\s*\)",
+            r"\s*(REAL|INTEGER|LOGICAL)\s*"
+            r"(?:\(\s*KIND\s*=\s*(\w+)\s*\)|(?=,|$))",
             attributes, re.IGNORECASE)
         if not match:
             return None
         intrinsic = {
             "real": ScalarType.Intrinsic.REAL,
             "integer": ScalarType.Intrinsic.INTEGER,
+            "logical": ScalarType.Intrinsic.BOOLEAN,
         }[match.group(1).lower()]
-        return cls._map_kind(intrinsic, match.group(2).lower())
+        kind = match.group(2)
+        return cls._map_kind(intrinsic, kind.lower() if kind else None)
 
 
 __all__ = ["LFRicKokkosTypesMixin"]
