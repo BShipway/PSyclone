@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
+from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.nodes import (
@@ -221,6 +222,10 @@ class KokkosRegion:
     #: it: the range launch has no team, and the flat team launch takes the
     #: size the backend recommends for its own functor.
     team_size: Optional[int] = None
+    #: One :py:class:`KokkosConstant` per ``parameter`` array the body reads.
+    #: These are declared at file scope and take no place on the ABI, so a
+    #: region built before this field existed generates what it did then.
+    constants: Tuple[KokkosConstant, ...] = ()
 
 
 class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
@@ -289,6 +294,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
         # Scratch joins the same table so that ``arrayreference_node`` resolves
         # ``x_new(k)`` and ``mr_v(df)`` by one lookup.
         self._views.update({item.name: item for item in region.scratch})
+        self._views.update({item.name: item for item in region.constants})
         self._kind_types = dict(region.kind_types)
         self._parallel_loops = region.parallel_loops
 
@@ -339,6 +345,12 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
         self._views, self._kind_types = {}, {}
         self._parallel_loops = ()
 
+        constants = "".join(
+            f"static const {item.c_type} {item.name}[{len(item.values)}] = "
+            f"{{{', '.join(self._visit(value) for value in item.values)}}};"
+            "\n\n"
+            for item in region.constants)
+
         if region.parallel_loops:
             launch = hierarchical_launch(region, local_declarations, body)
         elif region.scratch:
@@ -348,6 +360,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
 
         return (
             "#include <Kokkos_Core.hpp>\n\n"
+            f"{constants}"
             f'extern "C" void {region.name}(\n'
             f"    {signature}) {{\n"
             # Kokkos does not treat an uninitialised runtime as an error: the
@@ -397,7 +410,9 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             :py:class:`KokkosView`, if an argument's or a kind's C type is not
             in :py:attr:`_SUPPORTED_TYPES`, if a View's index offsets are
             not integers, if a :py:attr:`KokkosRegion.parallel_loops` entry is
-            not a :py:class:`~psyclone.psyir.nodes.Loop`, or if the region's
+            not a :py:class:`~psyclone.psyir.nodes.Loop`, if a constant is
+            not a :py:class:`KokkosConstant` of a supported C type, or if the
+            region's
             :py:attr:`KokkosRegion.team_size` is neither ``None`` nor an
             ``int`` -- ``bool`` among them, since ``TeamPolicy(ncells, True)``
             is a legal team of one that nothing downstream would report.
@@ -414,10 +429,13 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
             :py:meth:`_validate_view` states; if a scratch array breaks the
             contract :py:meth:`_validate_scratch` states; if a parallel loop
             is not in the region's schedule, is nested inside another of them,
-            or has a step other than the literal ``1``; or if the team size is
-            not positive.
+            or has a step other than the literal ``1``; if a constant has no
+            values or is not one dimensional; or if the team size is not
+            positive.
         """
-        # pylint: disable=too-many-branches
+        # A validator is a list of checks, and reads better as one than as an
+        # arbitrary split into halves that share every name they compute.
+        # pylint: disable=too-many-branches, too-many-statements
         if not isinstance(region, KokkosRegion):
             raise TypeError(
                 "KokkosWriter expects a KokkosRegion but found "
@@ -500,6 +518,18 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
         for item in region.scratch:
             self._validate_scratch(item, scalar_names, used_names)
             used_names.add(item.name)
+        # A file-scope constant is one dimensional, because that is what a
+        # Fortran parameter array the region can index in C storage order is.
+        for item in region.constants:
+            if (not isinstance(item, KokkosConstant)
+                    or item.c_type not in self._SUPPORTED_TYPES):
+                raise TypeError(
+                    "KokkosRegion constants must be KokkosConstant instances "
+                    f"of a supported C type, found '{item}'.")
+            if not item.values or len(item.index_offsets) != 1:
+                raise ValueError(
+                    f"Kokkos constant '{item.name}' must have at least one "
+                    "value and exactly one index offset.")
 
         self._validate_launch(region)
 
@@ -878,6 +908,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
         access was written against, where ``u_e(k)`` would be
         indistinguishable from a subscript the offset had never reached.
 
+        A :py:class:`KokkosConstant` is a plain C array rather than a View, so
+        it is subscripted with brackets; everything else about the access,
+        including the origin, is the same.
+
         :param node: the array reference in the captured body.
 
         :returns: the equivalent zero-based View access.
@@ -904,8 +938,11 @@ class KokkosWriter(KokkosIntrinsicsMixin, CWriter):
                 expression = f"({expression} - {offset})"
             indices.append(expression)
         indices.extend(view.extra_indices)
+        if isinstance(view, KokkosConstant):
+            return f"{node.name}[{indices[0]}]"
         return f"{node.name}({', '.join(indices)})"
 
 
-__all__ = ["KokkosRegion", "KokkosScalar", "KokkosScratch", "KokkosView",
+__all__ = ["KokkosConstant", "KokkosRegion", "KokkosScalar",
+           "KokkosScratch", "KokkosView",
            "KokkosWriter", "extent_names", "is_extent", "is_offset"]

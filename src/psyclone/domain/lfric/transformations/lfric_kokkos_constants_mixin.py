@@ -54,10 +54,13 @@ therefore not supported.
 
 import re
 
-from psyclone.psyir.nodes import Literal, Reference
+from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.nodes import (
+    ArrayConstructor, ArrayReference, BinaryOperation, Literal, Node,
+    Reference, UnaryOperation)
 from psyclone.psyir.symbols import (
-    DataSymbol, ImportInterface, RoutineSymbol, ScalarType, StaticInterface,
-    UnsupportedFortranType)
+    ArrayType, DataSymbol, ImportInterface, RoutineSymbol, ScalarType,
+    StaticInterface, UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -72,9 +75,81 @@ class LFRicKokkosConstantsMixin:
     # design; the class it is mixed into carries the public interface.
     # pylint: disable=too-few-public-methods
 
+    #: The nodes a value the region can carry is built from. Anything else --
+    #: a call, an array constructor, a code block -- is not something a
+    #: subscript-free substitution could put into the body and have mean the
+    #: same thing, so an initialiser containing one is not folded at all.
+    _FOLDABLE = (Literal, Reference, UnaryOperation, BinaryOperation)
+
     @staticmethod
-    def _static_constant(symbol):
-        """Return the literal value a module-level ``parameter`` was given.
+    def _constant_value(symbol):
+        """Return the value a named constant was declared with.
+
+        An imported constant is resolved first, which is what makes a value
+        declared in one module readable from the kernel that reads a second
+        constant defined in terms of it.
+
+        :param symbol: the symbol a value is wanted for.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+
+        :returns: the declared value, or ``None`` if the symbol is not a
+            constant, or is one whose module could not be read.
+        :rtype: Optional[:py:class:`psyclone.psyir.nodes.Node`]
+        """
+        if isinstance(symbol.interface, ImportInterface):
+            try:
+                symbol = symbol.resolve_type()
+            except Exception:                    # pylint: disable=W0703
+                # Untypeable here is untypeable everywhere: the caller that
+                # needs this symbol on the ABI reports it by name.
+                return None
+        if not isinstance(symbol, DataSymbol) or not symbol.is_constant:
+            return None
+        return symbol.initial_value
+
+    @classmethod
+    def _fold(cls, expression):
+        """Return a copy of ``expression`` with each named constant replaced.
+
+        ``face_order(n_faces) = [W, S, E, N, B]`` names five constants of
+        another module, and ``half = 1.0_r_def / 2.0_r_def`` names an
+        arithmetic the compiler will do. Both are values the generated region
+        can carry, but only once every name in them has been replaced by what
+        it was declared as: the region has no ``W`` to read.
+
+        The replacement is recursive, because a constant may be declared in
+        terms of another, and stops at anything that is not arithmetic over
+        names and literals. It is a copy throughout: an initial value is a
+        live piece of a symbol, and substituting it without copying would move
+        it out of the symbol table and into the body.
+
+        :param expression: the declared value to fold.
+        :type expression: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: the folded copy, or ``None`` if the expression is not
+            arithmetic over constants and literals, or names a constant whose
+            own value could not be read.
+        :rtype: Optional[:py:class:`psyclone.psyir.nodes.Node`]
+        """
+        folded = expression.copy()
+        if any(not isinstance(node, cls._FOLDABLE)
+               or isinstance(node, ArrayReference)
+               for node in folded.walk(Node)):
+            return None
+        for reference in folded.walk(Reference):
+            value = cls._constant_value(reference.symbol)
+            value = None if value is None else cls._fold(value)
+            if value is None:
+                return None
+            if reference is folded:
+                folded = value
+            else:
+                reference.replace_with(value)
+        return folded
+
+    @classmethod
+    def _static_constant(cls, symbol):
+        """Return the value a module-level scalar ``parameter`` was given.
 
         A kernel module routinely declares its own constants -- ``nfaces = 4``,
         ``tol = 1.0e-9_r_def`` -- beside the routine that reads them. These
@@ -83,25 +158,98 @@ class LFRicKokkosConstantsMixin:
         compile, since a kernel module is ``private`` by default and makes
         only its ``_code`` routine public.
 
+        The value need not be a literal. One written as an expression over
+        other constants is folded by :py:meth:`_fold` and carried in the same
+        way, because what the region cannot carry is a *name* it has no
+        declaration for, not an arithmetic the compiler will do for it.
+
         An array ``parameter`` such as ``x_dofs(2) = (/ 1, 3 /)`` has no
-        literal to substitute and is not a scalar the ABI could carry either,
-        so it is left for :py:meth:`_describe_constant` to refuse.
+        single value to substitute; it is carried by
+        :py:meth:`_constant_arrays` instead.
 
         :param symbol: the symbol the captured body reads.
         :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
 
-        :returns: the declared value, or ``None`` if this symbol is not a
-            module-level constant declared with a literal.
-        :rtype: Optional[:py:class:`psyclone.psyir.nodes.Literal`]
+        :returns: the declared value, folded, or ``None`` if this symbol is
+            not a module-level scalar constant with one.
+        :rtype: Optional[:py:class:`psyclone.psyir.nodes.Node`]
         """
         if not isinstance(symbol, DataSymbol):
             return None
         if not isinstance(symbol.interface, StaticInterface):
             return None
-        if not symbol.is_constant:
+        if not symbol.is_constant or isinstance(symbol.datatype, ArrayType):
             return None
         value = symbol.initial_value
-        return value if isinstance(value, Literal) else None
+        return None if value is None else cls._fold(value)
+
+    @classmethod
+    def _constant_array(cls, symbol):
+        """Return the values of a module-level ``parameter`` array.
+
+        :param symbol: the symbol the captured body reads.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+
+        :returns: one folded value per element, or ``None`` if this symbol is
+            not a one-dimensional ``parameter`` array declared from its
+            origin with a constructor of values the region can carry. A rank
+            above one is excluded because the generated declaration is a C
+            array in Fortran storage order, which only agrees with the
+            subscripts the body writes while there is one dimension.
+        :rtype: Optional[tuple[:py:class:`psyclone.psyir.nodes.Node`, ...]]
+        """
+        if not (isinstance(symbol, DataSymbol)
+                and isinstance(symbol.interface, StaticInterface)
+                and symbol.is_constant):
+            return None
+        datatype = symbol.datatype
+        if not (isinstance(datatype, ArrayType) and len(datatype.shape) == 1
+                and isinstance(datatype.shape[0].lower, Literal)):
+            return None
+        value = symbol.initial_value
+        if not isinstance(value, ArrayConstructor):
+            return None
+        values = tuple(cls._fold(child) for child in value.children)
+        return None if any(item is None for item in values) else values
+
+    @classmethod
+    def _constant_arrays(cls, schedule):
+        """Describe the ``parameter`` arrays the body reads.
+
+        Each becomes a file-scope constant of the generated translation unit
+        rather than an argument: its values are in the Fortran, and a kernel
+        module is ``private`` by default, so there is nothing for the PSy
+        layer to import and pass even if passing it were worth the argument.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: one description per array, name-ordered.
+        :rtype: tuple[
+            :py:class:`psyclone.psyir.backend.kokkos_constant.KokkosConstant`,
+            ...]
+
+        :raises TransformationError: for an array of a kind the generated
+            unit has no type for.
+        """
+        described = {}
+        for reference in schedule.walk(Reference):
+            symbol = reference.symbol
+            if symbol.name in described:
+                continue
+            values = cls._constant_array(symbol)
+            if values is None:
+                continue
+            c_type = cls._c_type(symbol)
+            if c_type is None:
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot carry '{symbol.name}': only "
+                    f"{cls._supported_kinds()} arrays have a place in the "
+                    "generated translation unit.")
+            described[symbol.name] = KokkosConstant(
+                symbol.name, c_type, values,
+                index_offsets=(int(symbol.datatype.shape[0].lower.value),))
+        return tuple(described[name] for name in sorted(described))
 
     @classmethod
     def _substitute_constants(cls, schedule):
@@ -123,10 +271,7 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
             value = cls._static_constant(reference.symbol)
             if value is None:
                 continue
-            # The initial value is a live piece of the symbol, as a declared
-            # bound is; substituting it without copying would move it out of
-            # the symbol table and into the body.
-            reference.replace_with(value.copy())
+            reference.replace_with(value)
 
     @classmethod
     def _constants(cls, schedule):
@@ -143,8 +288,9 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
         * the routine of a ``Call``, which names something to call. Before
           ``resolve_type`` is reached these arrive as a plain ``Symbol``
           rather than a ``RoutineSymbol``, so the check is structural;
-        * a module-level ``parameter`` declared with a literal value, which
-          :py:meth:`_substitute_constants` writes into the body instead.
+        * a module-level ``parameter``, which :py:meth:`_substitute_constants`
+          writes into the body or :py:meth:`_constant_arrays` declares in the
+          generated unit instead.
 
         The first two are refused by :py:meth:`_validate_body` and by the
         backend well before this, so skipping them here loses no check. What
@@ -173,6 +319,8 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
             if cls._called_routine(reference) or cls._kind_argument(reference):
                 continue
             if cls._static_constant(symbol) is not None:
+                continue
+            if cls._constant_array(symbol) is not None:
                 continue
             if symbol.name in constants:
                 continue

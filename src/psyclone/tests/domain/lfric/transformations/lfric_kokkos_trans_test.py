@@ -1134,17 +1134,50 @@ _STATIC_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
     "      swept(k) = swept(k + 1) - partial(k) * nfaces + tol")
 
 
-# The same, with the constant declared as an array. `x_dofs(2) = (/ 1, 3 /)`
-# is what fractional_horizontal_wind writes, and there is no single literal to
-# substitute for a reference into it.
+# The same, with the constant declared as an array. `face_order(4)` is
+# gungho's shape: a parameter array of a kernel's own module, indexed by a
+# value the loop computes, so there is no single element to substitute. The
+# module is private, as a kernel module is, which is why the values go into
+# the generated unit rather than across the ABI.
 _ARRAY_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
     "  implicit none",
     "  implicit none\n"
     "  private\n"
-    "  integer(kind=i_def), parameter :: x_dofs(2) = (/ 1, 3 /)\n"
+    "  integer(kind=i_def), parameter :: face_order(4) = [1, 2, 3, 4]\n"
     "  public :: column_solve_kernel_type, column_solve_code").replace(
     "      swept(k) = swept(k + 1) - partial(k)",
-    "      swept(k) = swept(k + 1) - partial(x_dofs(1))")
+    "      swept(k) = swept(k + 1) - partial(face_order(k))")
+
+
+# An array parameter whose values are not there to be read: `reshape` is a
+# call, so there is no element list to fold and nothing to declare.
+_RESHAPED_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  integer(kind=i_def), parameter :: point(2, 2) = &\n"
+    "      reshape((/ 1, 2, 3, 4 /), (/ 2, 2 /))\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(point(1, 1))")
+
+
+# A scalar parameter declared as an arithmetic over other parameters, one of
+# them from another module. None of the names is data the region could read,
+# but the value they state is one it can carry.
+_FOLDED_CONSTANT_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use planet_config_mod, only : n_moist").replace(
+    "  implicit none",
+    "  implicit none\n"
+    "  private\n"
+    "  integer(kind=i_def), parameter :: n_extra = 2\n"
+    "  real(kind=r_def), parameter :: weight = &\n"
+    "      1.0_r_def / (n_moist + n_extra)\n"
+    "  public :: column_solve_kernel_type, column_solve_code").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - weight * partial(k)")
 
 
 # A kernel spelling a kind in its body rather than only in its declarations.
@@ -2066,6 +2099,23 @@ def repeated_import_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel reads one imported constant twice."""
     return _invoke(
         tmp_path, "moist_dyn_gas", _ALGORITHM, _REPEATED_IMPORT_KERNEL)
+
+
+@pytest.fixture(name="reshaped_constant_target")
+# pylint: disable-next=unused-argument
+def reshaped_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads a reshaped parameter array."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _RESHAPED_CONSTANT_KERNEL)
+
+
+@pytest.fixture(name="folded_constant_target")
+# pylint: disable-next=unused-argument
+def folded_constant_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a parameter as an expression."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _FOLDED_CONSTANT_KERNEL,
+        extra={"planet_config_mod": _PLANET_CONFIG})
 
 
 @pytest.fixture(name="renamed_import_target")
@@ -3888,21 +3938,61 @@ def test_lfric_kokkos_trans_does_not_import_a_declared_constant(
     assert "tol" not in generated
 
 
-def test_lfric_kokkos_trans_refuses_a_declared_array_constant(
-        array_constant_target):
-    """An array parameter has no single literal to write in.
+def test_lfric_kokkos_trans_accepts_an_array_parameter(array_constant_target):
+    """An array parameter is declared in the unit, not passed to it.
 
-    It is not a scalar the ABI could carry either, so it is refused rather
-    than silently reaching the region as one element of itself.
+    Its values are in the Fortran and its module is private, so there is
+    nothing for the PSy layer to import and no argument worth adding: the
+    generated unit declares it at file scope. It is indexed as C indexes an
+    array, and with the same origin removed that a View subscript has.
     """
-    _, loop, _ = array_constant_target
+    psy, loop, _ = array_constant_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "static const int face_order[4] = {1, 2, 3, 4};" in cpp
+    assert "partial((face_order[(k - 1)] - 1))" in cpp
+    assert "face_order" not in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_reshaped_array_parameter(
+        reshaped_constant_target):
+    """An array parameter built by a call states no values to declare.
+
+    ``reshape`` is evaluated by the compiler, not by PSyIR, so there is no
+    element list to write into the generated unit -- and a rank above one
+    would not be indexed in C by the subscripts the body writes in any case.
+    """
+    _, loop, _ = reshaped_constant_target
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
-    assert ("cannot capture 'x_dofs': a module-level constant is written "
+    assert ("cannot capture 'point': a module-level constant is written "
             "into the region as its value, and this one was not declared "
             "with a literal value" in str(error.value))
+
+
+def test_lfric_kokkos_trans_accepts_a_folded_parameter_expression(
+        folded_constant_target):
+    """A parameter declared as an expression is carried as that expression.
+
+    ``weight = 1.0_r_def / (n_moist + n_extra)`` names two other
+    parameters, one of them another module's. None of the three names is
+    anything the region could read, but between them they state a value it
+    can carry, so each is replaced by what it was declared as and the
+    arithmetic is left for the C++ compiler to do exactly as the Fortran
+    compiler would have.
+    """
+    psy, loop, _ = folded_constant_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    generated = str(psy.gen)
+
+    assert "(1.0 / (3 + 2))" in cpp
+    assert "weight" not in cpp
+    assert "n_moist" not in generated
 
 
 def test_lfric_kokkos_trans_casts_at_the_kind_the_body_names(cast_kind_target):

@@ -704,6 +704,7 @@ can_loop_be_parallelised`
             cell_position=cell_position,
             arguments=self._region_arguments(
                 formals, per_cell, constants, cell_index),
+            constants=self._constant_arrays(schedule),
             kind_types=self._kind_types(schedule),
             scratch=self._local_arrays(schedule),
             parallel_loops=parallel_loops,
