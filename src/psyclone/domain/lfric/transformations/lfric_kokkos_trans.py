@@ -11,6 +11,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_bounds_mixin import (
     LFRicKokkosBoundsMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
     LFRicKokkosCallMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
+    import LFRicKokkosConstantsMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin import (
     LFRicKokkosContractMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
@@ -30,7 +32,7 @@ from psyclone.psyir.transformations import (
 
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosBoundsMixin, LFRicKokkosCallMixin,
-                       Transformation):
+                       LFRicKokkosConstantsMixin, Transformation):
     """Replace one supported LFRic cell-column loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
@@ -298,20 +300,50 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     kernel declaring ``cell`` is a real GungHo shape and the fix is one name
     in two places rather than seven threaded through two launch shapes.
 
-    **A constant the body reads reaches the region one of three ways.** A
-    module-level ``parameter`` declared beside the kernel with a literal value
-    -- ``integer(kind=i_def), parameter :: nfaces = 4`` -- is written into the
-    region as that value. It has to be: a kernel module is ``private`` by
-    default and publishes only its ``_code`` routine, so importing the name
-    into the PSy layer would not compile. One declared with anything other
-    than a literal, an array ``parameter`` among them, is refused. A constant
-    *imported* from another module is passed by value instead, which needs its
-    kind, and so needs the source of its container on PSyclone's module search
-    path; without that it is refused with a message naming the module to add
-    rather than a guess at its width. Last, a name appearing only as an
-    intrinsic's ``kind`` argument -- the ``r_def`` of ``real(x, r_def)`` -- is
-    neither: it names a type, the cast consumes it, and the region carries the
-    width rather than the name.
+    **A name the body reads that is not one of its arguments reaches the
+    region one of four ways.** A module-level ``parameter`` declared beside
+    the kernel -- ``integer(kind=i_def), parameter :: nfaces = 4`` -- is
+    written into the region as its value. It has to be: a kernel module is
+    ``private`` by default and publishes only its ``_code`` routine, so
+    importing the name into the PSy layer would not compile. The value need
+    not be a literal: one written as an arithmetic over other parameters is
+    folded to what those state, and every name in it goes with it.
+
+    An array ``parameter`` has no single value to substitute -- its subscripts
+    are computed where a scalar's use is not -- so its elements are declared
+    in the generated launch body as a ``const`` array of its own, beside the
+    body's other locals. Not at file scope, which is what a ``parameter``
+    beside a kernel most resembles: a namespace-scope array is host data and
+    a device compiler will not read one. One built by a call, ``reshape``
+    among them, states no elements to declare and is refused, as is one of
+    rank above one, a C array being written in the one storage order that
+    agrees with Fortran's subscripts only in one dimension.
+
+    A constant *imported* from another module is passed by value, which needs
+    its kind, and so needs the source of its container on PSyclone's module
+    search path; without that it is refused with a message naming the module
+    to add rather than a guess at its width.
+
+    A **variable** of the kernel's own module -- ``real(kind=r_def), public ::
+    profile_heights(100)``, which is how the profile reaches
+    ``profile_interp_kernel_mod`` -- is state rather than a value, so the
+    region takes it as a formal of its own and the PSy layer imports it from
+    the kernel module to pass it: a scalar by value, an array as a read-only
+    View of the extents the declaration states. What the module holds when the
+    launch is made is what the region sees, which is why a body that assigns
+    to one is refused rather than quietly losing the assignment. So is one the
+    module keeps ``private``, since there is no name to import; one whose
+    declared extents name a size the region has no argument for; and one with
+    no declared extents at all, ``allocatable`` among them. A variable
+    declared inside the *routine* with an initialiser is refused for a
+    different reason: Fortran gives that one the ``SAVE`` attribute, so it
+    keeps a value from one call to the next that the region has nowhere to
+    put, and nothing outside the routine declares it for the PSy layer to
+    pass.
+
+    Last, a name appearing only as an intrinsic's ``kind`` argument -- the
+    ``r_def`` of ``real(x, r_def)`` -- is none of these: it names a type, the
+    cast consumes it, and the region carries the width rather than the name.
 
     It captures all information needed by the Kokkos backend before lowering
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
@@ -415,6 +447,10 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         self._substitute_bounds(probe)
         self._validate_locals(schedule, self._parallel_loops(probe))
         self._constants(schedule)
+        # The file-scope constants are described here as well as in apply(),
+        # so that an array parameter the generated unit could not declare is
+        # a refusal rather than a failure part-way through the capture.
+        self._constant_arrays(schedule)
 
     @classmethod
     def _schedule(cls, kernel):
@@ -726,6 +762,7 @@ can_loop_be_parallelised`
             cell_position=cell_position,
             arguments=self._region_arguments(
                 formals, per_cell, constants, cell_index),
+            constants=self._constant_arrays(schedule),
             kind_types=self._kind_types(schedule),
             scratch=self._local_arrays(schedule),
             parallel_loops=parallel_loops,
@@ -745,8 +782,9 @@ can_loop_be_parallelised`
         launch = self._launch_symbol(symbol_table, region)
         actuals.append(cell_count)
         actuals.extend(
-            Reference(self._import_constant(symbol_table, name, container))
-            for name, container, _ in constants)
+            Reference(self._import_constant(
+                symbol_table, name, container, orig_name))
+            for name, container, orig_name, _, _ in constants)
         # region.arguments is the formals, then the cell count, then the
         # constants -- which is exactly the order 'actuals' is in once both
         # appends above have run. The two are therefore index-aligned, and one

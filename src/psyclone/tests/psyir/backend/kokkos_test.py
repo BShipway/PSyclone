@@ -13,8 +13,8 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter,
-    extent_names, is_extent, is_offset)
+    KokkosConstant, KokkosRegion, KokkosScalar, KokkosScratch, KokkosView,
+    KokkosWriter, extent_names, is_extent, is_offset)
 from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
@@ -22,7 +22,7 @@ from psyclone.psyir.nodes import (
     Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Literal, Loop,
     Reference, Routine)
 from psyclone.psyir.symbols import (
-    ArgumentInterface, DataSymbol, ScalarType)
+    ArgumentInterface, ArrayType, DataSymbol, ScalarType)
 
 
 def _kernel_schedule():
@@ -957,6 +957,87 @@ def test_kokkos_writer_views_are_never_managed():
 def test_kokkos_writer_rejects_invalid_scratch(scratch, message):
     """Every way of describing scratch wrongly is refused by name."""
     region = _scratch_region(scratch=(scratch,))
+    with pytest.raises((ValueError, TypeError)) as error:
+        KokkosWriter()(region)
+    assert message in str(error.value)
+
+
+def _constant(**kwargs):
+    """Return a one-dimensional carried-constant description."""
+    integer = ScalarType(ScalarType.Intrinsic.INTEGER,
+                         ScalarType.Precision.UNDEFINED)
+    fields = {"name": "x_dofs", "c_type": "int",
+              "values": (Literal("1", integer), Literal("3", integer)),
+              "index_offsets": (1,)}
+    fields.update(kwargs)
+    return KokkosConstant(**fields)
+
+
+def test_kokkos_writer_declares_a_constant_inside_the_body():
+    """A constant array is declared among the body's locals, and not taken.
+
+    Not at file scope, which is what a Fortran ``parameter`` beside a kernel
+    most resembles: a namespace-scope array is host data, and nvcc rejects a
+    device lambda that subscripts one. Inside the body it is a local of
+    whichever execution space the launch runs in, and that is the only
+    spelling both accept.
+
+    The values are generated rather than held as text, so they cross the same
+    literal path the body's own literals do; and nothing about the constant
+    reaches the ABI, which is the point of describing it here rather than as
+    an argument.
+    """
+    region = replace(_region(), constants=(_constant(),))
+
+    generated = KokkosWriter()(region)
+
+    assert generated.startswith(
+        "#include <Kokkos_Core.hpp>\n\n"
+        'extern "C" void moist_dyn_gas_kokkos(')
+    assert "static const" not in generated
+    assert "    const int x_dofs[2] = {1, 3};\n" in generated
+    assert "x_dofs" not in generated.split("(", 1)[1].split(") {", 1)[0]
+
+
+def test_kokkos_writer_indexes_a_constant_with_brackets():
+    """A constant is a C array, so its subscript is one too.
+
+    The origin is removed exactly as a View's is: the constant is described
+    in the same table and read by the same code, and only the punctuation of
+    the access differs.
+    """
+    schedule = _kernel_schedule()
+    integer = ScalarType(ScalarType.Intrinsic.INTEGER,
+                         ScalarType.Precision.UNDEFINED)
+    schedule.symbol_table.add(DataSymbol("x_dofs", ArrayType(integer, [2])))
+    body = schedule.walk(Assignment)[0]
+    body.rhs.replace_with(
+        FortranReader().psyir_from_expression(
+            "mr_v(x_dofs(df))", schedule.symbol_table))
+    region = replace(_region(), schedule=schedule,
+                     constants=(_constant(),))
+
+    generated = KokkosWriter()(region)
+
+    assert "mr_v((x_dofs[(df - 1)] - 1))" in generated
+
+
+@pytest.mark.parametrize("constant, message", [
+    ("x_dofs", "KokkosRegion constants must be KokkosConstant instances of a "
+     "supported C type, found 'x_dofs'."),
+    (_constant(c_type="quad"),
+     "KokkosRegion constants must be KokkosConstant instances of a supported "
+     "C type,"),
+    (_constant(values=()),
+     "Kokkos constant 'x_dofs' must have at least one value and exactly one "
+     "index offset."),
+    (_constant(index_offsets=(1, 1)),
+     "Kokkos constant 'x_dofs' must have at least one value and exactly one "
+     "index offset."),
+])
+def test_kokkos_writer_rejects_an_invalid_constant(constant, message):
+    """Every way of describing a carried constant wrongly is refused."""
+    region = replace(_region(), constants=(constant,))
     with pytest.raises((ValueError, TypeError)) as error:
         KokkosWriter()(region)
     assert message in str(error.value)

@@ -159,9 +159,13 @@ class LFRicKokkosCallMixin:
             in call order.
         :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
         :param set[str] per_cell: formals the PSy layer slices by cell.
-        :param constants: the module constants passed by value, as
-            :py:meth:`_constants` returns them.
-        :type constants: list[tuple[str, str, str]]
+        :param constants: the module state the region carries, as
+            :py:meth:`_constants` returns it. A scalar becomes an argument
+            passed by value, and an array of literal extents a read-only
+            View: a module array is state the region reads and never writes,
+            so it crosses as a View exactly as a read-only formal does.
+        :type constants: list[tuple[str, str, Optional[str], str,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]]
         :param str cell_index: the name the launch gives its own cell index,
             which every sliced View is indexed by. It is the region's
             :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
@@ -190,8 +194,15 @@ class LFRicKokkosCallMixin:
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
-        arguments.extend(
-            KokkosScalar(name, c_type) for name, _, c_type in constants)
+        for name, _, _, c_type, symbol in constants:
+            extents = cls._extents(symbol)
+            if not extents:
+                arguments.append(KokkosScalar(name, c_type))
+                continue
+            arguments.append(KokkosView(
+                name, f"{name}_data", c_type, extents,
+                index_offsets=cls._origins(symbol),
+                read_only=True, random_access=True))
         return tuple(arguments)
 
     @classmethod
@@ -224,13 +235,20 @@ class LFRicKokkosCallMixin:
         return tuple(scratch)
 
     @staticmethod
-    def _import_constant(symbol_table, name, container):
+    def _import_constant(symbol_table, name, container, orig_name=None):
         """Return the PSy-layer import for one kernel module constant.
+
+        Where the kernel renamed the constant on import, the PSy layer has to
+        rename it too: it is the module's name that the module declares, and
+        the local one that the generated call passes.
 
         :param symbol_table: the PSy-layer table the import is added to.
         :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
-        :param str name: the constant's name in its own module.
+        :param str name: the name the generated code knows the constant by.
         :param str container: the module it is imported from.
+        :param orig_name: the name the module declares it under, where that
+            differs from ``name``, and ``None`` otherwise.
+        :type orig_name: Optional[str]
 
         :returns: the existing symbol if the PSy layer already has one, and a
             new imported symbol otherwise.
@@ -243,7 +261,7 @@ class LFRicKokkosCallMixin:
             container, symbol_type=ContainerSymbol)
         return symbol_table.find_or_create(
             name, symbol_type=DataSymbol, datatype=UnresolvedType(),
-            interface=ImportInterface(module))
+            interface=ImportInterface(module, orig_name=orig_name))
 
     @classmethod
     def _launch_symbol(cls, symbol_table, region):

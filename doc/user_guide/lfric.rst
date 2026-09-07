@@ -4166,16 +4166,35 @@ used as a value rather than as a whole right-hand side -- an actual argument,
 an operand, or one nested inside another -- is refused by naming the
 position, because C has no array-valued expression and the region creates no
 temporary to hold one. A ``DO WHILE`` loop in the body is generated as a C
-``while``, and is never spread across the team. A constant the body reads reaches
-the region one of three ways: a ``parameter`` declared in the kernel's own
-module is written in as its value, since a kernel module is ``private`` by
-default and the PSy layer could not import the name; a constant imported from
-elsewhere is passed by value, which needs the source of its module on
-PSyclone's search path so that its kind can be read rather than guessed; and
-a name appearing only as an intrinsic's ``kind`` argument, as the ``r_def``
-of ``real(x, r_def)``, is neither, being a type rather than data -- it is
-the width the cast is generated at, so it joins the precisions the region
-records rather than its arguments. A ``logical`` scalar -- an argument or an
+``while``, and is never spread across the team. A name the body reads that is not one of
+its arguments reaches the region one of four ways. A ``parameter`` declared
+in the kernel's own module is written in as its value, since a kernel module
+is ``private`` by default and the PSy layer could not import the name; the
+value need not be a literal, one written as an arithmetic over other
+parameters being folded to what they state. An array ``parameter`` is indexed
+by something the loop computes rather than used whole, so there is no single
+value to write in: its elements are declared instead inside the generated
+launch body, as a ``const`` array beside the body's other locals rather than
+at file scope, because a namespace-scope array is host data and a device
+compiler will not read one. A constant imported from elsewhere is passed by
+value, which needs the
+source of its module on PSyclone's search path so that its kind can be read
+rather than guessed. A *variable* of the kernel's own module -- the profile
+``real(kind=r_def), public :: profile_heights(100)`` that
+``profile_interp_kernel_mod`` interpolates from is the shape -- is state
+rather than a value, so the region takes it as a formal of its own and the
+PSy layer ``use``\ s the kernel module to pass it, a scalar by value and an
+array as a read-only View of the extents its declaration states; what the
+module holds where the launch is made is what the region sees, so a body that
+assigns to one is refused rather than losing the assignment, as is one the
+module keeps ``private``, one sized by a name the region has no argument for,
+one with no declared extents at all, and one declared inside the routine
+rather than the module, which Fortran gives the ``SAVE`` attribute and
+nothing outside the routine names. Last, a name appearing only as an
+intrinsic's ``kind`` argument, as the ``r_def`` of ``real(x, r_def)``, is
+none of these, being a type rather than data -- it is the width the cast is
+generated at, so it joins the precisions the region records rather than its
+arguments. A ``logical`` scalar -- an argument or an
 imported constant -- is the one thing on that ABI whose width is never
 consulted: it is declared ``logical(c_bool), value`` on the interface and the
 call site wraps the actual in ``LOGICAL(..., c_bool)``, so the compiler

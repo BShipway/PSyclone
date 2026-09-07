@@ -376,6 +376,36 @@ def test_get_external_symbol_missing(monkeypatch):
     assert new_sym.datatype == ScalarType.integer_single_type()
 
 
+def test_get_external_symbol_renamed():
+    '''
+    Test that get_external_symbol() looks a renamed import up in the Container
+    under the name it has there, and names that name if it is missing.
+
+    '''
+    ctable = SymbolTable()
+    some_mod = Container.create("some_mod", ctable,
+                                [KernelSchedule.create("dummy")])
+    container = ContainerSymbol("some_mod")
+    container._reference = some_mod
+    # 'use some_mod, only: b => a' - the Container knows the symbol as 'a'.
+    bsym = Symbol("b", interface=ImportInterface(container, orig_name="a"))
+    with pytest.raises(SymbolError) as err:
+        bsym.get_external_symbol()
+    assert ("trying to resolve the properties of symbol 'b'. The interface "
+            "points to module 'some_mod' but could not find the definition of "
+            "'a' in that module." in str(err.value))
+    # A definition under the local name is not the one the import names.
+    ctable.add(DataSymbol("b", ScalarType.integer_single_type()))
+    with pytest.raises(SymbolError) as err:
+        bsym.get_external_symbol()
+    assert "could not find the definition of 'a'" in str(err.value)
+    # The definition under the original name is.
+    ctable.add(DataSymbol("a", ScalarType.real_single_type()))
+    new_sym = bsym.resolve_type()
+    assert isinstance(new_sym, DataSymbol)
+    assert new_sym.datatype == ScalarType.real_single_type()
+
+
 def test_symbol_resolve_type(monkeypatch):
     ''' Test the resolve_type method. '''
     # resolve_type() for a local symbol has nothing to do so should
