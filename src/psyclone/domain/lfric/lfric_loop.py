@@ -153,11 +153,16 @@ class LFRicLoop(PSyLoop):
         :rtype: :py:class:`psyclone.psyir.node.Node`
 
         '''
-        if (not Config.get().distributed_memory and
+        kernels = self.kernels()
+        if (not Config.get().distributed_memory and kernels and
             all(kern.iterates_over == "halo_cell_column" for
-                kern in self.kernels())):
+                kern in kernels)):
             # No distributed memory and thus no halo cells but all kernels
             # only operate on halo cells => nothing to do.
+            # The emptiness matters: a loop with no kernels left in it -- an
+            # outer loop over colours whose inner loop a transformation has
+            # replaced with a call, which LFRicKokkosTrans does -- satisfies
+            # 'all' vacuously, and detaching it would drop the call.
             self.detach()
             return None
 

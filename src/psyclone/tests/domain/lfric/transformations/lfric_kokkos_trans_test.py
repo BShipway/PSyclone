@@ -8975,3 +8975,49 @@ def test_lfric_kokkos_trans_atomics_reach_every_component_of_a_vector(
         assert f"Kokkos::atomic_add(&{component}(" in cpp
     # The field it reads is not shared, and stays a plain load.
     assert "Kokkos::atomic_add(&src(" not in cpp
+
+
+def test_lfric_kokkos_trans_coloured_capture_looks_the_colourmap_up_once(
+        shared_write_target):
+    """The completion pass adds no look-up the set-up pass already made.
+
+    Colouring before capturing means the set-up pass runs against a coloured
+    Schedule and emits the colourmap look-ups itself. The completion pass
+    exists for the other order and must find nothing to do here: emitting
+    them again would assign the same pointer twice, in a preamble the
+    coloured arm generates for every one of its captures.
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    LFRicKokkosTrans().apply(_coloured_inner(schedule))
+    fortran = str(psy.gen)
+
+    assert fortran.count("cmap => mesh%get_colour_map()") == 1
+    assert fortran.count("ncolour = mesh%get_ncolours()") == 1
+
+
+def test_lfric_kokkos_trans_captures_a_coloured_meshless_invoke(
+        tmp_path, clear_module_manager_instance):
+    # pylint: disable=unused-argument
+    """An Invoke with no mesh of its own may be coloured and then captured.
+
+    The mesh symbol a colouring creates is assigned by the set-up pass, from
+    a kernel argument. Capturing first removes that kernel and leaves the
+    assignment impossible, which is refused elsewhere; colouring first does
+    not, because the set-up pass runs from the capture and the kernel is
+    still in the tree when it does.
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL,
+        dist_mem=False)
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    LFRicKokkosTrans().apply(_coloured_inner(schedule))
+    fortran = str(psy.gen)
+
+    assert "mesh => acc_proxy%vspace%get_mesh()" in fortran
+    assert "cmap => mesh%get_colour_map()" in fortran
+    assert "call inc_probe_kokkos(" in fortran
