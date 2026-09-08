@@ -847,6 +847,24 @@ the same answer while striding across memory on every step; no compiler
 warns, no test fails, and nothing downstream can tell. The order is asserted
 by a test of its own, because there is nowhere else it could be caught.
 
+A destination need not carry a section for any of this. Fortran lets a name
+stand for the whole of the array it was declared as, and `lhs_e = MATMUL(a,
+b)` means what `lhs_e(:) = MATMUL(a, b)` means, so the two are lowered to the
+same nest. The rule that makes them agree is applied to every array-valued
+name in the statement rather than to the destination alone: a name carrying
+no subscripts is given the nest's index in each of its dimensions, on the
+right of the assignment as well as on the left. So `lhs_e = MATMUL(a, b) +
+2.0 * c_e` becomes `lhs_e((_kae_i0 - 1)) = (_kae_r0 + (2.0 * c_e((_kae_i0 -
+1))))`, because a View is not a value: assigning a `double` to one, or adding
+one to a `double`, is an operation Kokkos does not define, and a translation
+unit that asked for either would not compile. A name whose rank is not the
+nest's is left as it stands, which only non-conforming source can produce.
+
+Because each iteration reads the element it writes, `lhs_e = lhs_e +
+MATMUL(a, b)` is lowered rather than refused by the rule below: it is the one
+shape in which Fortran's evaluate-then-assign and the nest's element-by-
+element order agree.
+
 Given no `into`, the value has to go somewhere, and where it goes depends on
 whether the expression is a section that could be named rather than copied. A
 section taking its leading dimensions whole -- `jac(:,1,df)`, and any slice
