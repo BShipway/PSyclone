@@ -140,6 +140,21 @@ class LFRicKokkosContractMixin:
     #: No executed GungHo loop asks for one, so they are refused by name.
     _SUPPORTED_STENCILS = ("cross2d",)
 
+    #: Evaluator shapes whose basis data the region already carries. XYoZ
+    #: quadrature adds two point counts, two weight arrays and one basis
+    #: array per function space that asks for one, shaped
+    #: ``(dim, ndf, np_xy, np_z)``. Every one of those is an argument the PSy
+    #: layer has computed before the loop and every extent of it is a formal
+    #: of the same kernel, so the existing scalar and View descriptions cover
+    #: them whole.
+    #:
+    #: Face and edge quadrature are absent. They carry a face or edge count
+    #: and a single point count in place of the XYoZ pair, and while the
+    #: same descriptions look as though they would cover those too, nothing
+    #: here has been measured against the model for them. They are refused by
+    #: name rather than accepted on the strength of the resemblance.
+    _SUPPORTED_SHAPES = ("gh_quadrature_xyoz",)
+
     @staticmethod
     def _validate_iteration_space(node):
         """Check that the loop iterates over uncoloured cell columns.
@@ -204,20 +219,26 @@ class LFRicKokkosContractMixin:
             raise TransformationError(
                 "LFRicKokkosTrans requires exactly one kernel in the loop.")
 
-    @staticmethod
-    def _validate_evaluator(kernel):
-        """Check that the kernel asks for no quadrature or evaluator data.
+    @classmethod
+    def _validate_evaluator(cls, kernel):
+        """Check that every basis shape the kernel asks for is modelled.
+
+        A kernel may name more than one shape, in which case each function
+        space it declares carries a basis array per shape. They are checked
+        one at a time so that the refusal names the shape that is not
+        modelled rather than the whole set.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
 
-        :raises TransformationError: if the kernel needs quadrature or
-            evaluator data.
+        :raises TransformationError: if the kernel asks for a basis shape
+            outside :py:attr:`_SUPPORTED_SHAPES`.
         """
-        if kernel.qr_required or kernel.eval_shapes:
-            raise TransformationError(
-                "LFRicKokkosTrans does not support quadrature or evaluator "
-                "data.")
+        for shape in kernel.eval_shapes:
+            if shape not in cls._SUPPORTED_SHAPES:
+                raise TransformationError(
+                    f"LFRicKokkosTrans does not support the '{shape}' "
+                    f"evaluator shape.")
 
     @staticmethod
     def _validate_intergrid(kernel):
