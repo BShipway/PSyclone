@@ -1355,14 +1355,20 @@ def _array_probe(body):
     :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
     """
     source = f"""
-subroutine array_probe(nlayers, df, a, b, m, jac)
+subroutine array_probe(nlayers, df, a, b, m, jac, p, q, w, f, g)
   use constants_mod, only : i_def, r_def
   integer(kind=i_def), intent(in) :: nlayers, df
   real(kind=r_def), dimension(nlayers), intent(inout) :: a
   real(kind=r_def), dimension(nlayers), intent(in) :: b
   real(kind=r_def), dimension(3,nlayers), intent(inout) :: m
   real(kind=r_def), dimension(3,3,nlayers), intent(in) :: jac
+  real(kind=r_def), dimension(3), intent(inout) :: p
+  real(kind=r_def), dimension(3), intent(in) :: q
+  real(kind=r_def), dimension(3,3), intent(in) :: w
+  real(kind=r_def), dimension(6), intent(in) :: f
+  real(kind=r_def), dimension(2,3), intent(inout) :: g
   real(kind=r_def), dimension(3,3) :: v
+  real(kind=r_def) :: x
 {body}
 end subroutine array_probe
 """
@@ -1397,6 +1403,15 @@ def _array_region(body):
                        index_offsets=(1, 1)),
             KokkosView("jac", "jac_data", "double", ("3", "3", "nlayers"),
                        index_offsets=(1, 1, 1), read_only=True),
+            KokkosView("p", "p_data", "double", ("3",), index_offsets=(1,)),
+            KokkosView("q", "q_data", "double", ("3",), index_offsets=(1,),
+                       read_only=True),
+            KokkosView("w", "w_data", "double", ("3", "3"),
+                       index_offsets=(1, 1), read_only=True),
+            KokkosView("f", "f_data", "double", ("6",), index_offsets=(1,),
+                       read_only=True),
+            KokkosView("g", "g_data", "double", ("2", "3"),
+                       index_offsets=(1, 1)),
             KokkosScalar("ncells", "int"),
         ))
 
@@ -1671,3 +1686,363 @@ def test_kokkos_writer_refuses_an_array_described_with_the_wrong_rank():
 
     assert "Array 'a' has 1 kernel indices but 2 offsets were supplied." \
         in str(error.value)
+
+
+# ---------------------------------------------------------------------------
+# The array-valued intrinsic tier
+# ---------------------------------------------------------------------------
+def test_kokkos_matmul_rank2_by_rank1():
+    """``MATMUL`` of a matrix and a vector becomes a nest and a reduction.
+
+    The result is one loop over the matrix's leading dimension, and inside it
+    a scalar accumulator summed over the contracted dimension. Nothing is
+    allocated: an element of a contraction is a scalar, so there is no
+    intermediate array for the temporary a naive lowering would need.
+    """
+    lowering, statements = _lowering("  p(:) = matmul(w, q)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "for (int _kae_i0 = 1; _kae_i0 <= (1 + 3 - 1); _kae_i0++) {" in text
+    assert "double _kae_r0 = Kokkos::reduction_identity<double>::sum();" \
+        in text
+    assert "for (int _kae_j0 = 1; _kae_j0 <= (1 + 3 - 1); _kae_j0++) {" in text
+    assert "_kae_r0 += w((_kae_i0 - 1), (_kae_j0 - 1)) * q((_kae_j0 - 1));" \
+        in text
+    assert "p((_kae_i0 - 1)) = _kae_r0;" in text
+    assert "_kae_tmp" not in text
+    assert not lowering.temporaries
+
+
+def test_kokkos_matmul_rank2_by_rank2():
+    """``MATMUL`` of two matrices nests two result loops round one sum.
+
+    The result's dimensions come from different operands -- the first from
+    the left matrix and the second from the right -- so a shape taken from
+    either operand alone would be wrong for a non-square product.
+    """
+    lowering, statements = _lowering("  v(:,:) = matmul(w, w)\n")
+
+    text = lowering.lower(statements[0].rhs)
+
+    assert text.count("for (int _kae_i") == 2
+    assert "_kae_r0 += w((_kae_i0 - 1), (_kae_j0 - 1)) * " \
+        "w((_kae_j0 - 1), (_kae_i1 - 1));" in text
+
+
+def test_kokkos_matmul_rank1_by_rank2():
+    """``MATMUL`` of a vector and a matrix takes its shape from the matrix."""
+    lowering, statements = _lowering("  p(:) = matmul(q, w)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert text.count("for (int _kae_i") == 1
+    assert "_kae_r0 += q((_kae_j0 - 1)) * w((_kae_j0 - 1), (_kae_i0 - 1));" \
+        in text
+
+
+def test_kokkos_matmul_of_a_transpose_emits_no_temporary():
+    """``MATMUL(TRANSPOSE(m), x)`` swaps subscripts, it does not transpose.
+
+    Materialising the transpose would need a rank-2 temporary, which the
+    launch would have to have asked the run time for before the body that
+    discovered it. Swapping the two subscripts of the operand computes the
+    same product out of the storage the region already has, so this shape --
+    which the model writes wherever it changes basis -- costs nothing.
+    """
+    lowering, statements = _lowering("  p(:) = matmul(transpose(w), q)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "_kae_r0 += w((_kae_j0 - 1), (_kae_i0 - 1)) * q((_kae_j0 - 1));" \
+        in text
+    assert "_kae_tmp" not in text
+    assert not lowering.temporaries
+
+
+def test_kokkos_transpose_on_its_own_swaps_the_shape():
+    """A bare ``TRANSPOSE`` is a nest whose shape is its operand's, reversed.
+
+    Nothing in the model writes one -- every ``TRANSPOSE`` it has feeds a
+    ``MATMUL`` -- but a shape that is only ever reached through another
+    intrinsic is a shape no test would otherwise state.
+    """
+    lowering, statements = _lowering("  v(:,:) = transpose(m)\n")
+
+    assert lowering.ranks(statements[0].rhs) == ("nlayers", "3")
+
+
+def test_kokkos_dot_product():
+    """``DOT_PRODUCT`` is a scalar, so it is a reduction and no nest at all.
+
+    The statement it belongs to is an ordinary scalar assignment, generated
+    after the loop that accumulates the sum rather than inside one.
+    """
+    lowering, statements = _lowering("  x = dot_product(p, q)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "for (int _kae_i" not in text
+    assert "double _kae_r0 = Kokkos::reduction_identity<double>::sum();" \
+        in text
+    assert "for (int _kae_j0 = 1; _kae_j0 <= (1 + 3 - 1); _kae_j0++) {" in text
+    assert "_kae_r0 += p((_kae_j0 - 1)) * q((_kae_j0 - 1));" in text
+    assert "x = _kae_r0;" in text
+
+
+def test_kokkos_dot_product_inside_a_larger_expression():
+    """A reduction is hoisted out of the expression that reads its value.
+
+    The generated accumulator is a name, so the rest of the statement is
+    written exactly as it would have been: the reduction's loop cannot appear
+    where the operand did, because a loop is not an expression in C++.
+    """
+    lowering, statements = _lowering(
+        "  x = 0.5_r_def * dot_product(p, q) + b(1)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "x = ((0.5 * _kae_r0) + b((1 - 1)));" in text
+
+
+def test_kokkos_minval_uses_the_reduction_identity():
+    """A reduction starts from ``Kokkos::reduction_identity``, not a literal.
+
+    A written ``-DBL_MAX`` would be wrong for every kind but one and would
+    have to be spelt again for each; the trait is ``constexpr`` and device
+    callable, and is right for whatever type the accumulator has.
+    """
+    lowering, statements = _lowering("  x = minval(b)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "double _kae_r0 = Kokkos::reduction_identity<double>::min();" \
+        in text
+    assert "_kae_r0 = Kokkos::min(_kae_r0, b((_kae_j0 - 1)));" in text
+    assert "x = _kae_r0;" in text
+
+
+def test_kokkos_maxval_uses_the_reduction_identity():
+    """``MAXVAL`` takes the matching identity and the matching fold."""
+    lowering, statements = _lowering("  x = maxval(b)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "double _kae_r0 = Kokkos::reduction_identity<double>::max();" \
+        in text
+    assert "_kae_r0 = Kokkos::max(_kae_r0, b((_kae_j0 - 1)));" in text
+
+
+def test_kokkos_sum_reduces_every_dimension_of_a_rank_2_operand():
+    """A whole-array ``SUM`` runs one loop per dimension of its operand."""
+    lowering, statements = _lowering("  x = sum(m)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert text.count("for (int _kae_j") == 2
+    assert "_kae_r0 += m((_kae_j0 - 1), (_kae_j1 - 1));" in text
+
+
+def test_kokkos_sum_with_a_dim_argument():
+    """``SUM(x, dim=)`` reduces one axis and leaves the rest as a shape.
+
+    The result is array-valued, so it is a nest over the dimensions that
+    survive with the reduction inside it, rather than the single accumulator
+    a whole-array ``SUM`` gives.
+    """
+    lowering, statements = _lowering("  p(:) = sum(m, dim=2)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert lowering.ranks(statements[0].rhs) == ("3",)
+    assert "for (int _kae_i0 = 1; _kae_i0 <= (1 + 3 - 1); _kae_i0++) {" in text
+    assert "for (int _kae_j0 = 1; _kae_j0 <= (1 + nlayers - 1); _kae_j0++)" \
+        in text
+    assert "_kae_r0 += m((_kae_i0 - 1), (_kae_j0 - 1));" in text
+    assert "p((_kae_i0 - 1)) = _kae_r0;" in text
+
+
+def test_kokkos_reduction_refuses_a_dim_that_is_not_a_literal():
+    """A ``dim`` that is not a constant names no axis at generation time."""
+    lowering, statements = _lowering("  p(:) = sum(m, dim=df)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'SUM' takes its 'dim' from 'df'" in str(error.value)
+    assert "a literal" in str(error.value)
+
+
+def test_kokkos_reduction_refuses_a_dim_out_of_range():
+    """A ``dim`` larger than the operand's rank names no axis at all."""
+    lowering, statements = _lowering("  p(:) = sum(m, dim=3)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'dim' of 3" in str(error.value)
+    assert "rank 2" in str(error.value)
+
+
+def test_kokkos_matmul_refuses_operands_that_are_not_matrices():
+    """``MATMUL`` of two vectors is not Fortran, and is refused as such."""
+    lowering, statements = _lowering("  x = matmul(q, q)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'MATMUL' of a rank-1 and a rank-1 operand" in str(error.value)
+
+
+def test_kokkos_array_intrinsic_refuses_an_undescribed_operand():
+    """An operand with no View description has no extents to loop over."""
+    lowering, statements = _lowering("  x = sum(v)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'v'" in str(error.value)
+    assert "the region described no array of that name" in str(error.value)
+
+
+def test_kokkos_array_intrinsic_refuses_a_nested_reduction():
+    """A reduction inside a reduction is refused rather than mis-nested.
+
+    Its accumulator would have to be declared outside the loop that indexes
+    it, which is a second hoisting this tier does not perform. No kernel in
+    the model writes one.
+    """
+    lowering, statements = _lowering("  x = sum(matmul(w, q))\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'MATMUL' inside 'SUM'" in str(error.value)
+
+
+def test_kokkos_array_intrinsic_refuses_an_undescribed_kind():
+    """An accumulator of an undescribed kind is refused, not guessed."""
+    lowering, statements = _lowering("  x = dot_product(p, q)\n")
+    # pylint: disable=protected-access
+    lowering._writer._kind_types = {}
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'DOT_PRODUCT'" in str(error.value)
+    assert "the region described no C type for its kind" in str(error.value)
+
+
+def test_kokkos_reshape_as_a_review_when_contiguous():
+    """A contiguous ``RESHAPE`` is an index map over the source's storage.
+
+    ``LayoutLeft`` and Fortran's column-major element order agree, so the
+    element the reshaped array holds at one subscript is the element the
+    source holds at the same linear position. Nothing is copied: the
+    subscript arithmetic is generated instead.
+    """
+    lowering, statements = _lowering("  g(:,:) = reshape(f, [2,3])\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "g((_kae_i0 - 1), (_kae_i1 - 1)) = " \
+        "f(((1 + ((_kae_i0 - 1) + 2 * (_kae_i1 - 1))) - 1));" in text
+    assert "_kae_tmp" not in text
+
+
+def test_kokkos_reshape_refused_when_reordering():
+    """A ``RESHAPE`` with an ``order`` is not the identity map, and is refused.
+
+    ``pad`` is refused with it: both change which source element a result
+    subscript names, and the whole reason a reshape costs nothing here is
+    that it changes neither.
+    """
+    lowering, statements = _lowering(
+        "  g(:,:) = reshape(f, [2,3], order=[2,1])\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'RESHAPE' with a 'pad' or an 'order'" in str(error.value)
+
+
+def test_kokkos_reshape_refused_when_the_source_is_not_rank_1():
+    """A reshape of a rank-2 source is refused, with the rank named."""
+    lowering, statements = _lowering("  p(:) = reshape(w, [9])\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'RESHAPE' of a rank-2 source" in str(error.value)
+
+
+def test_kokkos_reshape_refused_when_the_shape_is_not_a_constructor():
+    """A reshape whose shape is a named array has no extents to read."""
+    lowering, statements = _lowering("  g(:,:) = reshape(f, p)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'RESHAPE' takes its shape from 'p'" in str(error.value)
+
+
+def test_kokkos_epsilon():
+    """``EPSILON`` generates inside a region, whatever a bare probe says.
+
+    The survey's probe replaces every argument with a kindless literal, which
+    leaves ``EPSILON`` with no width to instantiate its trait at and so
+    reports it unsupported. Every kind a region uses is on its ABI, so the
+    generated region has the width and the intrinsic is written.
+    """
+    code = KokkosWriter()(_array_region("  a(:) = b(:) + epsilon(b(1))\n"))
+
+    assert "Kokkos::Experimental::epsilon_v<double>" in code
+
+
+def test_kokkos_nint_with_a_kind_argument():
+    """``NINT(x, kind)`` is the one-argument cast with its kind checked.
+
+    The C writer's cast formatter takes exactly one child, so the
+    two-argument form reached it and was refused. The kind is not generated
+    -- the cast is already ``(int)`` -- but it is checked, because a kind the
+    region maps to some other width would be silently discarded otherwise.
+    """
+    assert _written_expressions("  i = nint(a, i_def)\n") \
+        == ["(int)Kokkos::round(a)"]
+
+    with pytest.raises(VisitorError) as error:
+        _written_expressions("  i = nint(a, i_def)\n",
+                             (("i_def", "long"), ("r_def", "double")))
+    assert "'NINT' is written as a cast to 'int'" in str(error.value)
+    assert "'long'" in str(error.value)
+
+
+def test_kokkos_writer_reports_an_intrinsic_it_cannot_spell():
+    """The writer answers which of a body's intrinsics it cannot write.
+
+    ``validate`` has to refuse a body the writer will refuse, and the only
+    thing that knows what the writer can spell is the writer: a second list
+    beside it would be a list to keep in step. Every argument is replaced by
+    a reference of its own type, so that an intrinsic answered from its
+    argument's kind is still answered while an array the region never
+    described is not looked up.
+    """
+    schedule = _array_probe("""
+  a(:) = b(:) + epsilon(b(1))
+  x = dot_product(p, q)
+  x = tiny(x)
+  a(1) = sqrt(b(1))
+""")
+
+    refusals = KokkosWriter().unsupported_intrinsics(
+        schedule, _ARRAY_KINDS)
+
+    assert list(refusals) == ["TINY/1"]
+
+
+def test_kokkos_writer_reports_nothing_for_a_body_it_can_write():
+    """A body of intrinsics the writer knows reports none."""
+    schedule = _array_probe("  a(:) = matmul(w, q(1:3)) * sqrt(b(:))\n")
+
+    assert KokkosWriter().unsupported_intrinsics(
+        schedule, _ARRAY_KINDS) == ()
