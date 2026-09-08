@@ -750,6 +750,10 @@ KernelModuleInlineTrans`.
         # declaration carried.
         self._validate_locals(probe, self._parallel_loops(probe))
         self._validate_intrinsics(probe)
+        # On the probe, and after the lowering, because the shape of an
+        # update is what decides whether an atomic can carry it out and the
+        # lowering is what settles that shape.
+        self._validate_shared_updates(kernel, probe)
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
         # so that an array parameter the generated unit could not declare is

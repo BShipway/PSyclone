@@ -112,7 +112,8 @@ LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
 import re
 from dataclasses import replace
 
-from psyclone.domain.lfric import KernCallArgList
+from psyclone.core import AccessType
+from psyclone.domain.lfric import KernCallArgList, KernStubArgList
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
@@ -121,6 +122,84 @@ from psyclone.psyir.nodes import (
     ArrayReference, Call, IntrinsicCall, Literal, Reference, Routine)
 from psyclone.psyir.symbols import ArgumentInterface, ScalarType
 from psyclone.psyir.transformations import TransformationError
+
+
+class _SharedArgumentPositions(KernStubArgList):
+    """A stub argument list recording which formals cells share.
+
+    The question it answers is which *formal* of the kernel carries an
+    argument whose metadata says two cells may update one element of it --
+    ``gh_inc`` and ``gh_readinc``. Nothing already in PSyclone answers it
+    without side effects.
+    :py:meth:`~psyclone.domain.lfric.ArgOrdering.\
+metadata_index_from_actual_index`
+    would, but only
+    :py:class:`~psyclone.domain.lfric.KernCallArgList` records the positions
+    it reads, and that builder creates PSy-layer symbols as it walks: running
+    it inside :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosTrans.validate`
+    would leave those symbols behind in invokes whose loops validation then
+    refuses.
+
+    :py:class:`~psyclone.domain.lfric.KernStubArgList` walks the same order
+    and creates nothing, so recording the positions here gives the same
+    answer with no cost to the tree. The positions are recorded by bracketing
+    each field with the public
+    :py:attr:`~psyclone.domain.lfric.ArgOrdering.num_args`, which covers a
+    field vector's several entries as it covers a field's one.
+
+    :param kernel: the kernel whose argument list is to be walked.
+    :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+    """
+    # Inherited verbatim from KernStubArgList, which carries the same
+    # disable for the same reason: ArgOrdering declares handlers a subclass
+    # is free to leave to the base, and this one adds no coverage of its own.
+    # pylint: disable=abstract-method
+
+    #: The accesses under which one cell's contribution to an element has to
+    #: be combined with another's rather than replacing it.
+    _SHARED = (AccessType.INC, AccessType.READINC)
+
+    def __init__(self, kernel):
+        super().__init__(kernel)
+        #: The positions in the argument list that carry shared data.
+        self.shared_positions = set()
+
+    def _record(self, argument, first):
+        """Record the entries one argument added, if cells share it.
+
+        :param argument: the argument just appended.
+        :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param int first: the argument count before it was appended.
+        """
+        if argument.access in self._SHARED:
+            self.shared_positions.update(range(first, self.num_args))
+
+    def field(self, arg, var_accesses=None):
+        """Append a field and record whether cells share it.
+
+        :param arg: the field to be added.
+        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param var_accesses: optional map in which to store the accesses.
+        :type var_accesses:
+            Optional[:py:class:`psyclone.core.VariablesAccessMap`]
+        """
+        first = self.num_args
+        super().field(arg, var_accesses)
+        self._record(arg, first)
+
+    def field_vector(self, argvect, var_accesses=None):
+        """Append a field vector and record whether cells share it.
+
+        :param argvect: the field vector to be added.
+        :type argvect: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param var_accesses: optional map in which to store the accesses.
+        :type var_accesses:
+            Optional[:py:class:`psyclone.core.VariablesAccessMap`]
+        """
+        first = self.num_args
+        super().field_vector(argvect, var_accesses)
+        self._record(argvect, first)
 
 
 class LFRicKokkosArgumentMixin:
@@ -282,7 +361,51 @@ class LFRicKokkosArgumentMixin:
             for bound in bounds)
 
     @classmethod
-    def _region_arguments(cls, formals, per_cell, cell_index, renames):
+    def _shared_formals(cls, kernel, schedule):
+        """Return the names of the formals two cells may both update.
+
+        The names, and not the positions, because the caller has by then
+        dropped the cell-position formal from the front of its list and
+        appended the extents it measured to the back. A name survives both.
+
+        :param kernel: the kernel being captured.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param schedule: the kernel schedule, whose argument list is in the
+            order :py:meth:`~psyclone.domain.lfric.ArgOrdering.generate`
+            fixes -- which is what makes the positions comparable.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: the names of the kernel's own formals that carry data an
+            element of which more than one cell contributes to.
+        :rtype: set[str]
+
+        :raises TransformationError: if the kernel declares a different
+            number of formals than its metadata describes, so that no
+            position can be trusted.
+        """
+        builder = _SharedArgumentPositions(kernel)
+        builder.generate()
+        if not builder.shared_positions:
+            return set()
+        implicit = cls._implicit_extents(schedule.symbol_table)
+        formals = [symbol.name
+                   for symbol in schedule.symbol_table.argument_list
+                   if symbol.name not in implicit]
+        if builder.num_args != len(formals):
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot say which formals of "
+                f"'{kernel.name}' are shared between cells: the kernel "
+                f"declares {len(formals)} of them and its metadata describes "
+                f"{builder.num_args}.")
+        return {formals[position] for position in builder.shared_positions}
+
+    @classmethod
+    def _region_arguments(cls, formals, per_cell, cell_index, renames,
+                          shared=frozenset()):
+        # Five descriptions of one argument list, which is what describing an
+        # argument list takes; grouping them into an object would only move
+        # the count into its constructor.
+        # pylint: disable=too-many-arguments, too-many-positional-arguments
         """Describe the generated signature down to the cell count.
 
         The formals are passed in rather than read from the schedule because
@@ -312,6 +435,14 @@ class LFRicKokkosArgumentMixin:
             argument of its own, appended after the kernel's formals and
             before the cell count so that the order here and the order
             :py:meth:`_region` extends the actuals in are one order.
+        :param shared: the names of the formals more than one cell of the
+            launch may update, as :py:meth:`_shared_formals` gives them. Each
+            becomes an atomic View, so that the contributions of two cells to
+            one element are combined rather than one of them lost. Empty is
+            the answer for every kernel whose writes are its own cell's, and
+            is what makes such a region generate the source it generated
+            before this argument existed.
+        :type shared: Container[str]
 
         :returns: one description per generated C argument, in call order, up
             to and including the cell count.
@@ -337,7 +468,8 @@ class LFRicKokkosArgumentMixin:
                 index_offsets=cls._rename_extents(
                     cls._origins(symbol), renames),
                 extra_indices=(cell_index,) if sliced else (),
-                read_only=read_only, random_access=read_only))
+                read_only=read_only, random_access=read_only,
+                atomic=symbol.name in shared))
         for renamed in renames.values():
             arguments.append(KokkosScalar(renamed, "int"))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
@@ -531,7 +663,8 @@ LFRicKokkosTrans.apply` makes.
             cell_index=cell_index,
             cell_position=cell_position,
             arguments=(cls._region_arguments(
-                formals, per_cell, cell_index, renames)
+                formals, per_cell, cell_index, renames,
+                cls._shared_formals(kernel, schedule))
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),

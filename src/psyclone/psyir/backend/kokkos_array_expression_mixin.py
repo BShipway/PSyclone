@@ -68,9 +68,66 @@ writer, so that these handlers are found first.
 from psyclone.psyir.backend.kokkos_array_expression import (
     KokkosArrayExpression)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayConstructor, ArrayReference, Range, Reference)
+    ArrayConstructor, ArrayReference, BinaryOperation, Range, Reference)
 from psyclone.psyir.symbols import ArrayType
+
+#: The read-modify-write shapes an atomic answers, as the PSyIR operator
+#: joining an element to its own contribution -> the Kokkos function that
+#: applies it indivisibly, and whether the element may appear on either side
+#: of that operator. ``a = a + x`` and ``a = x + a`` are one update; ``a =
+#: a - x`` and ``a = x - a`` are two different ones, and only the first is an
+#: ``atomic_sub``, so subtraction and division are matched on the left alone.
+#:
+#: All four functions are declared by Kokkos for every arithmetic element
+#: type. The value converts to the View's element type at the call, because
+#: Kokkos deduces the type from the pointer and from nothing else -- so a
+#: ``double`` expression accumulated into a single-precision field is rounded
+#: once, where a generated ``float`` temporary would have rounded it twice.
+ATOMIC_UPDATES = {
+    BinaryOperation.Operator.ADD: ("Kokkos::atomic_add", True),
+    BinaryOperation.Operator.MUL: ("Kokkos::atomic_mul", True),
+    BinaryOperation.Operator.SUB: ("Kokkos::atomic_sub", False),
+    BinaryOperation.Operator.DIV: ("Kokkos::atomic_div", False),
+}
+
+
+def atomic_update_operands(assignment):
+    """Return the operands of a read-modify-write of the assignment's target.
+
+    The shape recognised is an assignment whose right-hand side joins the
+    left-hand side to one other expression by one of the operators in
+    :py:data:`ATOMIC_UPDATES`. That is the whole of what an atomic can do:
+    anything else naming the target on the right -- two occurrences of it,
+    an occurrence under a function call, a different element of it -- is a
+    computation the hardware has no single indivisible instruction for.
+
+    Matching is on the PSyIR, not on the field's LFRic metadata, because the
+    metadata says only that the argument is shared. ``gh_inc`` is carried by
+    kernels that multiply as well as by kernels that add, so what the update
+    *is* can only be read from the body.
+
+    :param assignment: the statement to inspect.
+    :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
+
+    :returns: the Kokkos function and the expression contributed to the
+        target, or None if the statement is not a recognised update.
+    :rtype: Optional[Tuple[str, :py:class:`psyclone.psyir.nodes.Node`]]
+    """
+    right = assignment.rhs
+    if not isinstance(right, BinaryOperation):
+        return None
+    entry = ATOMIC_UPDATES.get(right.operator)
+    if entry is None:
+        return None
+    function, commutative = entry
+    left, other = right.children[0], right.children[1]
+    if left == assignment.lhs:
+        return (function, other)
+    if commutative and other == assignment.lhs:
+        return (function, left)
+    return None
 
 
 class KokkosArrayExpressionMixin:
@@ -214,6 +271,62 @@ class KokkosArrayExpressionMixin:
             f"{declarations}{body}{self._nindent}}});\n"
             f"{self._nindent}team.team_barrier();\n")
 
+    def _atomic_update(self, node, lowered):
+        """Return the atomic call this assignment needs, if it needs one.
+
+        :param node: the assignment in the captured body.
+        :type node: :py:class:`psyclone.psyir.nodes.Assignment`
+        :param bool lowered: whether the statement is an array expression
+            that :py:class:`KokkosArrayExpression` will lower to a nest.
+
+        :returns: the Kokkos function and the expression contributed to the
+            target, or None if the target is not shared between cells.
+        :rtype: Optional[Tuple[str, :py:class:`psyclone.psyir.nodes.Node`]]
+
+        :raises VisitorError: if the target is shared but the statement is
+            not a read-modify-write an atomic can carry out, or is a whole
+            section rather than one element.
+        """
+        target = node.lhs
+        if not isinstance(target, ArrayReference):
+            return None
+        if not getattr(self._views.get(target.name), "atomic", False):
+            return None
+        if lowered:
+            raise VisitorError(
+                f"Kokkos region updates shared array '{target.name}' with a "
+                "whole-array expression, which no single atomic carries out. "
+                "Capture it as an element assignment or colour the loop.")
+        operands = atomic_update_operands(node)
+        if operands is None:
+            shapes = ", ".join(
+                sorted(name for name, _ in ATOMIC_UPDATES.values()))
+            raise VisitorError(
+                f"Kokkos region writes shared array '{target.name}' with a "
+                "statement that is not one of the read-modify-write shapes "
+                f"an atomic answers ({shapes}). Colour the loop instead.")
+        return operands
+
+    def _atomic_statement(self, node, function, value):
+        """Return one indivisible update as a generated statement.
+
+        The target is passed by address, which is how Kokkos names the
+        element to update and also why the update's type is the View's: the
+        value's type takes no part in the deduction, so a contribution
+        computed more widely than the field is rounded once, at the call.
+
+        :param node: the assignment being generated.
+        :type node: :py:class:`psyclone.psyir.nodes.Assignment`
+        :param str function: the ``Kokkos::atomic_*`` to call.
+        :param value: the expression contributed to the target.
+        :type value: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: the call, indented as a statement of the captured body.
+        :rtype: str
+        """
+        return (f"{self._nindent}{function}(&{self._visit(node.lhs)}, "
+                f"{self._visit(value)});\n")
+
     def assignment_node(self, node) -> str:
         """Let one member make a team-level write to an array.
 
@@ -245,12 +358,25 @@ class KokkosArrayExpressionMixin:
         assignments, for the same reason it applies to a constructor: the
         Fortran statement is one assignment.
 
+        An assignment that updates an element of a View the region marks
+        atomic is generated as a ``Kokkos::atomic_*`` call instead, by
+        :py:meth:`_atomic_update`. That is a different race from the one
+        above and is answered separately: the team rule protects the members
+        of one team from each other, and the atomic protects the cells of the
+        whole launch, which are on different teams and share a dof. Both
+        apply where both are needed -- an atomic executed redundantly by
+        every member of a team would accumulate the contribution once per
+        member -- so the atomic is what goes inside the ``Kokkos::single``.
+
         :param node: the assignment in the captured body.
         :type node: :py:class:`psyclone.psyir.nodes.Assignment`
 
         :returns: the assignment, wrapped in ``Kokkos::single`` and followed
             by a barrier where the team would otherwise race.
         :rtype: str
+
+        :raises VisitorError: if an atomic View is written by a statement no
+            atomic can carry out.
         """
         writes_an_array = isinstance(node.lhs, ArrayReference) or isinstance(
             node.rhs, ArrayConstructor)
@@ -263,15 +389,22 @@ class KokkosArrayExpressionMixin:
         lowered = (bool(node.walk(Range))
                    or self.array_expressions.holds(node.rhs)) and not \
             isinstance(node.rhs, ArrayConstructor)
+        atomic = self._atomic_update(node, lowered)
         if (not self._parallel_loops or self._parallel_depth
                 or not writes_an_array):
+            if atomic:
+                return self._atomic_statement(node, *atomic)
             if lowered:
                 return self.array_expressions.lower(node.rhs, node.lhs)
             return super().assignment_node(node)
 
         self._depth += 1
-        inner = (self.array_expressions.lower(node.rhs, node.lhs) if lowered
-                 else super().assignment_node(node))
+        if atomic:
+            inner = self._atomic_statement(node, *atomic)
+        elif lowered:
+            inner = self.array_expressions.lower(node.rhs, node.lhs)
+        else:
+            inner = super().assignment_node(node)
         self._depth -= 1
         return (
             f"{self._nindent}Kokkos::single(Kokkos::PerTeam(team), "

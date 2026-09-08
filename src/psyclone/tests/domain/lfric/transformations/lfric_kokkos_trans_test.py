@@ -361,6 +361,65 @@ end program kokkos_coloured_test
 """
 
 
+# The shared-write shape, in the smallest form that carries both halves of
+# it. 'acc' is 'gh_inc' onto W2 and its statement is a read-modify-write, so
+# two cells sharing one of its dofs both accumulate into it; 'out' is
+# 'gh_write' onto W3, which no other cell touches. A kernel with only the
+# first could not tell an atomic applied per argument from one applied to
+# every write the region makes.
+_SHARED_WRITE_KERNEL = """
+module inc_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           gh_write, cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: inc_probe_kernel_type
+    type(arg_type) :: meta_args(3) = (/                        &
+         arg_type(gh_field, gh_real, gh_inc,   w2),            &
+         arg_type(gh_field, gh_real, gh_write, w3),            &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: inc_probe_code
+  end type inc_probe_kernel_type
+contains
+  subroutine inc_probe_code(nlayers, acc, out, src, &
+                            ndf_w2, undf_w2, map_w2, &
+                            ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: src
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        out(map_w3(df) + k) = 2.0_r_def*src(map_w3(df) + k)
+      end do
+      do df = 1, ndf_w2
+        acc(map_w2(df) + k) = acc(map_w2(df) + k) + src(map_w3(1) + k)
+      end do
+    end do
+  end subroutine inc_probe_code
+end module inc_probe_kernel_mod
+"""
+
+
+_SHARED_WRITE_ALGORITHM = """
+program kokkos_shared_write_test
+  use field_mod, only : field_type
+  use inc_probe_kernel_mod, only : inc_probe_kernel_type
+  implicit none
+  type(field_type) :: acc, src, out
+  call invoke(inc_probe_kernel_type(acc, out, src))
+end program kokkos_shared_write_test
+"""
+
+
 # A whole-column section in the shape the finite-volume family uses, reduced
 # to the part that matters: a slice assigned as a unit, with a different lower
 # bound on each side so that a lowering which ignored the offsets would give a
@@ -3180,6 +3239,14 @@ def coloured_target_fixture(tmp_path, clear_module_manager_instance):
         extra={"assemble_w2_kernel_mod": _COLOURED_KERNEL})
 
 
+@pytest.fixture(name="shared_write_target")
+# pylint: disable-next=unused-argument
+def shared_write_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel accumulates into a shared dof."""
+    return _invoke(
+        tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL)
+
+
 @pytest.fixture(name="section_target")
 # pylint: disable-next=unused-argument
 def section_target_fixture(tmp_path, clear_module_manager_instance):
@@ -5126,12 +5193,60 @@ def test_lfric_kokkos_trans_operator_cell_actual_must_be_the_counter(
         LFRicKokkosTrans().apply(loop)
 
 
-def test_lfric_kokkos_trans_rejects_incremented_field(target):
-    """An incremented field needs colouring or atomics, not a bare launch."""
+def test_lfric_kokkos_trans_rejects_an_unmodelled_shared_update(target):
+    """A shared field written by something no atomic carries out is refused.
+
+    ``gh_inc`` says two cells contribute to one element; it does not say how,
+    and this kernel's body simply assigns to the element. Assignment is not a
+    contribution, so an atomic cannot express it and a coloured launch would
+    still leave the answer depending on which cell ran last. The refusal is
+    raised by validate rather than by the backend, so that a whole-model
+    capture leaves the loop as Fortran instead of failing part-way through
+    it.
+
+    Monkeypatching the access rather than writing a kernel for it is
+    deliberate: what is under test is the pairing of the metadata with the
+    body, and no LFRic kernel in the tree carries that pairing -- a real
+    ``gh_inc`` kernel accumulates.
+    """
     _, loop, kernel = target
     kernel.arguments.args[0]._access = AccessType.INC
-    with pytest.raises(TransformationError, match="colouring or atomics"):
+    with pytest.raises(TransformationError) as err:
         LFRicKokkosTrans().validate(loop)
+    assert "read-modify-write" in str(err.value)
+    assert "Kokkos::atomic_add" in str(err.value)
+
+
+def test_lfric_kokkos_trans_atomics_reach_a_continuous_gh_inc(
+        shared_write_target):
+    """The default arm captures a continuous ``gh_inc`` with an atomic.
+
+    The end-to-end claim the two backend tests cannot make: that an LFRic
+    loop whose kernel accumulates into a field on a continuous space is
+    accepted, that the accumulation is generated as an atomic, and that
+    nothing else about the capture changes. The field's own actual is passed
+    exactly as any other written field's is -- an atomic is a property of the
+    update, not of the interface -- and the write beside it, to a
+    discontinuous space no neighbour reaches, stays a plain assignment.
+    """
+    psy, loop, _ = shared_write_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::atomic_add(&acc(" in cpp
+    assert cpp.count("Kokkos::atomic") == 1
+    # The View is declared as any other written field's is. An 'Atomic'
+    # memory trait would have been the other way to spell this, and is not
+    # used: it would make every access to the field atomic, including the
+    # plain reads a 'gh_readinc' kernel makes, and it would change the type
+    # the region declares rather than the statement that needed changing.
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged> acc(acc_data, undf_w2);" in cpp)
+    assert "Kokkos::Atomic" not in cpp
+
+    fortran = str(psy.gen)
+    assert "real(c_double), dimension(*), intent(inout) :: acc" in fortran
+    assert "call inc_probe_kokkos(" in fortran
 
 
 def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
@@ -8558,3 +8673,34 @@ def test_lfric_kokkos_trans_validate_probe_is_not_the_schedule(section_target):
     assert kernel.get_callees()[0] is schedule
     assert schedule.debug_string() == before
     assert schedule.walk(Range)
+
+
+def test_lfric_kokkos_trans_refuses_an_unmodelled_access(
+        shared_write_target):
+    """An access neither arm answers is refused by name.
+
+    'gh_inc' and 'gh_readinc' are read-modify-writes of a field at a shared
+    dof, which is what an atomic update and a colouring both answer. A
+    reduction is not: every cell accumulates into one value, and where that
+    value lives -- a PSy-layer scalar the invoke finishes with a global sum --
+    is somewhere the region has no View for.
+
+    There is no such kernel to write. PSyclone's own metadata parser refuses
+    'gh_reduction' on a user-supplied kernel outright, so a reduction reaches
+    a coded LFRic loop by no route at all, and the access has to be put on the
+    argument here to ask the question. That is the point of the test: the
+    refusal is a claim about what this transformation does with an access it
+    does not model, and it should not depend on which accesses LFRic happens
+    to admit this year.
+
+    """
+    _, loop, kernel = shared_write_target
+    kernel.arguments.args[0]._access = AccessType.REDUCTION
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "'REDUCTION'" in str(err.value)
+    assert "'acc'" in str(err.value)
+    # And it names what is modelled, so the reader is not left to infer it
+    # from the absence of their access.
+    assert "gh_readinc" in str(err.value)

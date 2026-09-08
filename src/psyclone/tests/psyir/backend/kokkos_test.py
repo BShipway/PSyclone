@@ -2832,3 +2832,169 @@ def test_kokkos_writer_writes_a_power_at_its_operands_width():
         "  a = b ** c\n") == [
             "Kokkos::pow(s, s)",
             "Kokkos::pow(b, c)"]
+
+
+def _shared_write_schedule():
+    """Create a body updating a shared dof and writing an unshared one.
+
+    Both statements are in one kernel because the question the two tests
+    below ask is not whether an atomic can be generated but whether it is
+    generated for the argument that needs it and for no other. A body with
+    only the shared update could not tell an atomic applied per argument from
+    one applied to every write the region makes.
+    """
+    source = """
+subroutine inc_probe_code(nlayers, acc, out, src, ndf_w2, undf_w2, map_w2, &
+                          ndf_w3, undf_w3, map_w3)
+  use constants_mod, only : i_def, r_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+  integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+  real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+  real(kind=r_def), dimension(undf_w3), intent(inout) :: out
+  real(kind=r_def), dimension(undf_w3), intent(in) :: src
+  integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+  integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+  integer(kind=i_def) :: k, df
+  do k = 0, nlayers - 1
+    do df = 1, ndf_w3
+      out(map_w3(df) + k) = 2.0_r_def * src(map_w3(df) + k)
+    end do
+    do df = 1, ndf_w2
+      acc(map_w2(df) + k) = acc(map_w2(df) + k) + src(map_w3(1) + k)
+    end do
+  end do
+end subroutine inc_probe_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inc_probe_code", symbol_table=symbol_table, children=children)
+
+
+def _shared_write_region(**overrides):
+    """Return a region whose first field is written at a shared dof.
+
+    ``acc`` carries ``atomic=True`` and ``out`` does not, which is the whole
+    of the difference between the two writes as far as the writer is
+    concerned: what an LFRic ``gh_inc`` means is decided by the driving
+    transformation and reaches here as that flag.
+    """
+    region = KokkosRegion(
+        name="inc_probe_kokkos",
+        schedule=_shared_write_schedule(),
+        cell_count="ncells",
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosView("acc", "acc_data", "double", ("undf_w2",),
+                       index_offsets=(1,), atomic=True),
+            KokkosView("out", "out_data", "double", ("undf_w3",),
+                       index_offsets=(1,)),
+            KokkosView("src", "src_data", "double", ("undf_w3",),
+                       index_offsets=(1,), read_only=True,
+                       random_access=True),
+            KokkosScalar("ndf_w2", "int"),
+            KokkosScalar("undf_w2", "int"),
+            KokkosView("map_w2", "map_w2_data", "int",
+                       ("ndf_w2", "ncells"), index_offsets=(1,),
+                       extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ndf_w3", "int"),
+            KokkosScalar("undf_w3", "int"),
+            KokkosView("map_w3", "map_w3_data", "int",
+                       ("ndf_w3", "ncells"), index_offsets=(1,),
+                       extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ncells", "int"),
+        ))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_atomic_add_for_a_shared_write():
+    """A View marked atomic is updated by ``Kokkos::atomic_add``, alone.
+
+    Two cells sharing a dof both read-modify-write it, so the update has to
+    be indivisible. The write beside it is to a dof no other cell touches and
+    is generated as the plain assignment it was before atomics existed: the
+    flag is a property of one argument, not of the region, and a region that
+    atomicised every write would pay for a lock on data nothing else reaches.
+    """
+    code = KokkosWriter()(_shared_write_region())
+
+    shared = "(((map_w2((df - 1), cell) + k) - 1))"
+    unshared = "(((map_w3((df - 1), cell) + k) - 1))"
+    assert f"Kokkos::atomic_add(&acc{shared}, " \
+        "src(((map_w3((1 - 1), cell) + k) - 1)));" in code
+    assert f"out{unshared} = (2.0 * src{unshared});" in code
+
+    # The self-read is consumed by the update rather than left beside it.
+    assert f"acc{shared} = " not in code
+    assert code.count("Kokkos::atomic") == 1
+
+
+def _read_inc_schedule():
+    """Create a body that reads a shared dof before incrementing it."""
+    source = """
+subroutine damped_inc_code(nlayers, acc, damping, ndf_w2, undf_w2, map_w2)
+  use constants_mod, only : i_def, r_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+  real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+  real(kind=r_def), intent(in) :: damping
+  integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+  integer(kind=i_def) :: k, df
+  real(kind=r_def) :: previous
+  do k = 0, nlayers - 1
+    do df = 1, ndf_w2
+      previous = acc(map_w2(df) + k)
+      acc(map_w2(df) + k) = acc(map_w2(df) + k) + damping * previous
+    end do
+  end do
+end subroutine damped_inc_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "damped_inc_code", symbol_table=symbol_table, children=children)
+
+
+def _read_inc_region():
+    """Return a region whose one field is both read and updated atomically."""
+    return KokkosRegion(
+        name="damped_inc_kokkos",
+        schedule=_read_inc_schedule(),
+        cell_count="ncells",
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosView("acc", "acc_data", "double", ("undf_w2",),
+                       index_offsets=(1,), atomic=True),
+            KokkosScalar("damping", "double"),
+            KokkosScalar("ndf_w2", "int"),
+            KokkosScalar("undf_w2", "int"),
+            KokkosView("map_w2", "map_w2_data", "int",
+                       ("ndf_w2", "ncells"), index_offsets=(1,),
+                       extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ncells", "int"),
+        ))
+
+
+def test_kokkos_atomic_add_for_read_inc():
+    """A ``gh_readinc`` reads the shared dof plainly and updates it atomically.
+
+    LFRic's ``gh_readinc`` differs from ``gh_inc`` in reading the field's
+    incoming value as well as accumulating into it. That read is an ordinary
+    load: making it atomic would cost an instruction and buy nothing, because
+    what has to be indivisible is the update's read-modify-write and not a
+    read standing on its own. The kernel is racy in the same way LFRic's own
+    coloured OpenMP path is racy for the same statement, and no atomic in any
+    memory model repairs that; what the atomic guarantees is that no
+    contribution is lost.
+    """
+    code = KokkosWriter()(_read_inc_region())
+
+    shared = "(((map_w2((df - 1), cell) + k) - 1))"
+    assert f"previous = acc{shared};" in code
+    assert f"Kokkos::atomic_add(&acc{shared}, (damping * previous));" in code
+    assert "Kokkos::atomic_load" not in code
+    assert code.count("Kokkos::atomic") == 1

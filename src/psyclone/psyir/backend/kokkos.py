@@ -151,6 +151,15 @@ class KokkosView:
     read_only: bool = False
     random_access: bool = False
     managed: bool = False
+    #: Whether an element of this View may be updated by more than one cell
+    #: of one launch, so that every read-modify-write of it is generated as a
+    #: ``Kokkos::atomic_*`` call rather than as an assignment. It describes
+    #: the *sharing*, not the arithmetic: which updates exist is read from the
+    #: kernel body, and a plain read of an element stays a plain read. False
+    #: is the answer for every argument no other cell reaches, which is every
+    #: argument of every region captured before this field existed, so those
+    #: regions generate the source they generated then, byte for byte.
+    atomic: bool = False
 
 
 @dataclass(frozen=True)
@@ -757,8 +766,10 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             storage; if its data name or region indices are not C++
             identifiers; if an extent is not an integer expression over named
             sizes; if its rank does not match the kernel and region indices
-            supplied for it; or if it is writable while asking for
-            ``RandomAccess``.
+            supplied for it; if it is writable while asking for
+            ``RandomAccess``; or if it is read only while asking for atomic
+            updates, which would be a description of an update that cannot
+            happen.
         :raises TypeError: if an index offset is neither an integer nor an
             integer expression over named sizes.
         """
@@ -789,6 +800,9 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             raise ValueError(
                 f"Kokkos View '{view.name}' uses RandomAccess but is "
                 "writable.")
+        if view.atomic and view.read_only:
+            raise ValueError(
+                f"Kokkos View '{view.name}' is atomic but read only.")
 
     @staticmethod
     def _argument_declaration(argument):
