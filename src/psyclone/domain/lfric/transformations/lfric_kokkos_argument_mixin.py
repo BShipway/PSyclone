@@ -96,7 +96,8 @@ therefore not supported, and most of them do reach across:
 LFRicKokkosArgumentMixin._kind_assertions` reads ``cls._C_TYPES``,
 ``cls._KIND_PROBES`` and ``cls._DEFAULT_KINDS``, and :py:meth:`\
 LFRicKokkosArgumentMixin._region` calls ``cls._cell_position``,
-``cls._constants`` and ``cls._constant_arrays``, and :py:meth:`\
+``cls._constants``, ``cls._constant_arrays`` and
+``cls._implicit_extent_actuals``, and :py:meth:`\
 LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
 """
 
@@ -299,8 +300,11 @@ class LFRicKokkosArgumentMixin:
         The module state the region carries follows what this returns, and is
         described by :py:meth:`_constant_arguments`.
 
-        :param formals: the kernel formals the generated signature carries,
-            in call order.
+        :param formals: the formals the generated signature carries, in call
+            order: the kernel's own, and then each extent
+            :py:meth:`LFRicKokkosBoundsMixin._implicit_extent_actuals`
+            measured, which is a scalar argument of the region as any other
+            integer formal is.
         :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
         :param set[str] per_cell: formals the PSy layer slices by cell.
         :param str cell_index: the name the launch gives its own cell index,
@@ -399,9 +403,12 @@ class LFRicKokkosArgumentMixin:
 LFRicKokkosTrans.apply` makes.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
-        :returns: the formals the generated signature carries, the actuals the
-            PSy layer passes for them, and the name of the cell-position
-            formal the region declares instead of taking, or ``None``.
+        :returns: the kernel's own formals, the actuals the PSy layer passes
+            for them, and the name of the cell-position formal the region
+            declares instead of taking, or ``None``. Any measured extent is
+            left out of both, for
+            :py:meth:`LFRicKokkosBoundsMixin._implicit_extent_actuals` to add
+            back to the two together.
         :rtype: tuple[list[:py:class:`psyclone.psyir.symbols.DataSymbol`],
             list[:py:class:`psyclone.psyir.nodes.DataNode`], Optional[str]]
 
@@ -413,7 +420,15 @@ LFRicKokkosTrans.apply` makes.
         node.ancestor(InvokeSchedule).invoke.setup_psy_layer_symbols()
         argument_builder = KernCallArgList(kernel)
         argument_builder.generate()
-        formals = schedule.symbol_table.argument_list
+        # An extent :py:meth:`LFRicKokkosBoundsMixin._resolve_assumed_shapes`
+        # measured is a formal the region declares and the kernel never wrote,
+        # so the PSy layer has no actual for it and
+        # ``cls._implicit_extent_actuals`` writes the one it would have
+        # passed. Held back here so that the count compared is the kernel's
+        # own, and so that the two lists below stay index-aligned.
+        implicit = cls._implicit_extents(schedule.symbol_table)
+        formals = [symbol for symbol in schedule.symbol_table.argument_list
+                   if symbol.name not in implicit]
         actuals = [argument.copy()
                    for argument in argument_builder.psyir_arglist]
         if len(actuals) != len(formals):
@@ -482,9 +497,10 @@ LFRicKokkosTrans.apply` makes.
 
         :returns: the region, the actuals the PSy layer passes for its
             formals, and the module state it carries. The actuals returned
-            already carry the storage extent of every per-cell size, appended
-            after the kernel's own, because
-            :py:meth:`_region_arguments` puts those scalars in the same place.
+            already carry every measured assumed shape and then the storage
+            extent of every per-cell size, appended after the kernel's own,
+            because :py:meth:`_region_arguments` puts those scalars in the
+            same place and in the same order.
         :rtype: tuple[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`,
             list[:py:class:`psyclone.psyir.nodes.DataNode`],
@@ -501,6 +517,12 @@ LFRicKokkosTrans.apply` makes.
             formals, actuals, cls._per_cell_scalars(formals, per_cell),
             schedule.symbol_table)
         renames = {name: renamed for name, (renamed, _) in storage.items()}
+        # Appended to both lists at once, and before the region is described,
+        # because _region_arguments reads them from the formals: a measured
+        # extent is a scalar of the generated signature like any other.
+        formals, measurements = cls._implicit_extent_actuals(
+            formals, actuals, schedule.symbol_table)
+        actuals.extend(measurements)
         constants = cls._constants(schedule)
         # The launch index shares a C++ scope with the kernel's own
         # declarations, so a kernel declaring 'cell' would collide with it.

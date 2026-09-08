@@ -402,12 +402,13 @@ KernelModuleInlineTrans`.
     does not carry; and a second allocation of an array already allocated,
     scratch being reserved once with one shape for the whole region.
 
-    An assumed-shape local -- one sized by its caller rather than by a
-    statement in the body -- states no shape anywhere the region can read,
-    and is refused by name. A shape the C writer
-    cannot render at all, such as ``dimension(MAX(nlayers-n,1))``, is refused
-    with the writer's own reason attached. Every one of these is refused by
-    :py:meth:`validate` rather than discovered by :py:meth:`apply`.
+    An assumed-shape local -- one carrying ``dimension(:)`` and no
+    ``ALLOCATE`` -- states no shape anywhere the region can read, and is
+    refused by name; a *formal* declared the same way is measured at the call
+    instead, below. A shape the C writer cannot render at all, such as
+    ``dimension(MAX(nlayers-n,1))``, is refused with the writer's own reason
+    attached. Every one of these is refused by :py:meth:`validate` rather
+    than discovered by :py:meth:`apply`.
 
     **A declared lower bound need not be 1.** ``dimension(0:nlayers-1)`` and
     ``dimension(-nlayers:nlayers)`` are accepted alongside
@@ -426,6 +427,30 @@ KernelModuleInlineTrans`.
     and a subscript that escaped it would compile and give a wrong answer
     rather than fail. What is gained by omitting it is what the C++ optimiser
     removes anyway.
+
+    **An assumed-shape formal is measured rather than refused.** A
+    boundary-condition kernel writes ``real(kind=r_def), intent(in) ::
+    normals(:,:)`` and lets Fortran take the extent from the actual. That
+    extent is nowhere in the kernel, but it is not unknown: the PSy layer
+    holds the array it is the shape of. So the region carries one integer
+    formal per dimension the declaration left out, appended after the
+    kernel's own and passed as ``SIZE(actual, dim=n)``, and the declaration
+    is rewritten over it before anything else reads the shape. The View is
+    sized by that formal, and every ``SIZE``, ``LBOUND`` and ``UBOUND`` the
+    body asks of the array resolves to it exactly as a declared extent does.
+
+    The origin, however, is not taken from the call. Fortran gives an
+    assumed-shape dummy a lower bound of 1 whatever the actual was declared
+    from, the dummy being a new descriptor over the actual's elements rather
+    than the actual itself, so the shift of the paragraph above is the
+    declaration's own 1 and the caller contributes only the size.
+
+    A formal that states one bound and leaves the other -- ``dimension(0:)``
+    -- is refused by name for that reason: its origin would come from the
+    kernel and its extent from the caller, and a View shaped out of two
+    places at once is what reading one declaration once exists to prevent.
+    The refusal says which of the shapeless declarations it found, so a
+    reader knows whether to look at the kernel or at its caller.
 
     **A loop inside the kernel body may be spread over the team**, and which
     loops those are is PSyclone's own judgement rather than this
@@ -627,6 +652,10 @@ KernelModuleInlineTrans`.
         schedule = self._inlined_copy(self._schedule(kernel))
         self._validate_body(schedule)
         self._validate_sections(schedule)
+        # The formals are judged with every assumed shape already measured,
+        # because that is the shape apply() describes; on the copy taken
+        # above, and so not on the kernel.
+        self._resolve_assumed_shapes(schedule)
         self._validate_bounds(schedule)
         self._validate_formals(schedule)
         # Which names the launch reserves depends on which launch is selected,
