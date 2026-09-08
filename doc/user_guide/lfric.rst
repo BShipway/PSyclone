@@ -4170,7 +4170,19 @@ its shape -- ``LBOUND``, ``UBOUND`` or ``SIZE`` -- is answered from that same
 declaration rather than at run time, so the region carries the declared bound
 instead of querying a View. Most such calls are written by PSyclone rather
 than by the kernel author: lowering a whole-array assignment to an explicit
-loop puts a pair of them into its bounds. A body may also fill an array from a
+loop puts a pair of them into its bounds. That lowering is what admits an
+assignment over a whole array or a section of one -- ``a(i:j) = ...``, which
+the finite-volume kernels use to write a column as a unit, and
+``vector = 0.0_r_def`` over an array declared with a shape -- since C++ has
+no whole-array assignment and the region has to say the loop instead. What
+the lowering declines is refused here with its reason quoted: an assignment
+reading the array it writes, for which no order of loops means what the
+Fortran meant, and one whose right-hand side calls something neither
+scalar-valued nor elemental, ``MATMUL`` and the other contractions among
+them. A section that is not in an assignment is judged by where it is
+instead: as an actual argument it is left to the rule about calls, and
+anywhere else -- in the bounds of an ``ALLOCATE``, most often -- it is
+refused. A body may also fill an array from a
 constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
 dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
 generated as one assignment per element, into the array the kernel has

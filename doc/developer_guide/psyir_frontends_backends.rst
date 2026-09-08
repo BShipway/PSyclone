@@ -376,7 +376,10 @@ Additionally, there are three partially-implemented back-ends
   `psyclone.psyir.backend.kokkos_intrinsics_mixin` holds the intrinsics,
   inherited ahead of `CWriter` so its handlers are found first and fall
   through to `CWriter`'s. `KokkosConstant` in
-  `psyclone.psyir.backend.kokkos_constant` is a third, described below. The
+  `psyclone.psyir.backend.kokkos_constant` is a third, and
+  `KokkosArrayExpressionMixin` in
+  `psyclone.psyir.backend.kokkos_array_expression` a fourth; both are
+  described below. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -781,6 +784,93 @@ The offset is written out even when it is zero -- `u_e(k - 0)` rather than
 where a missing subtraction is a silent wrong answer rather than a compile
 error. The optimiser folds it; a reader of the generated source can see which
 origin each subscript was written against.
+
+Array-valued expressions
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Kokkos has no whole-array assignment. `a(:) = b(:) + 1.0` and `m(:,:) = 0.0`
+therefore have to become explicit loops before they can be generated at all,
+and `KokkosArrayExpression` in
+`psyclone.psyir.backend.kokkos_array_expression` is what generates them. Its
+public surface is two methods: `ranks(node)` reports the shape an expression
+produces, one extent per dimension in the same string form a View's `extents`
+take, and `lower(node, into=None)` generates the source that evaluates it.
+`KokkosArrayExpressionMixin` supplies the writer's `assignment_node` and the
+handlers the nest needs, and is inherited ahead of `CWriter` for the same
+reason `KokkosIntrinsicsMixin` is.
+
+The destination decides which of two shapes is generated. Given an `into`,
+the value is written straight into it and nothing is allocated:
+
+.. code-block:: c++
+
+    for (int _kae_i1 = 1; _kae_i1 <= (1 + nlayers - 1); _kae_i1++) {
+      for (int _kae_i0 = 1; _kae_i0 <= (1 + 3 - 1); _kae_i0++) {
+        m((_kae_i0 - 1), (_kae_i1 - 1)) = 0.0;
+      }
+    }
+
+**The leading subscript is the innermost loop**, and that is not a matter of
+taste. Every View this back-end declares is `Kokkos::LayoutLeft`, whose
+leading dimension is the contiguous one, so the leading subscript is the one
+that must vary fastest. A nest written the other way round computes exactly
+the same answer while striding across memory on every step; no compiler
+warns, no test fails, and nothing downstream can tell. The order is asserted
+by a test of its own, because there is nowhere else it could be caught.
+
+Given no `into`, the value has to go somewhere, and where it goes depends on
+whether the expression is a section that could be named rather than copied. A
+section taking its leading dimensions whole -- `jac(:,1,df)`, and any slice
+whose `Kokkos::ALL` subscripts come first -- is contiguous in `LayoutLeft`,
+so it is passed as a subview:
+
+.. code-block:: c++
+
+    auto _kae_sub0 = Kokkos::subview(jac, Kokkos::ALL, (1 - 1), (df - 1));
+
+`auto` because the type `Kokkos::subview` returns is not one this back-end
+can spell: it carries the layout the slice inherits, and a callee taking it
+by template parameter is what keeps the write reaching the storage the caller
+named. Nothing is allocated and no element is read.
+
+Anything else is copied into a temporary, and the generated C++ says why:
+
+.. code-block:: c++
+
+    // jac(df,:,:) is copied rather than passed as a Kokkos::subview
+    // because it is not contiguous in this View's LayoutLeft.
+    for (int _kae_i1 = 1; ...) {
+      for (int _kae_i0 = 1; ...) {
+        _kae_tmp0((_kae_i0 - 1), (_kae_i1 - 1)) =
+            jac((df - 1), (_kae_i0 - 1), (_kae_i1 - 1));
+      }
+    }
+
+The comment is generated rather than left to the reader because a reader who
+sees a nest where the neighbouring section got a subview has no way to tell
+whether the difference was reasoned about. Three shapes reach it: a section
+that skips the leading dimension, one that narrows any dimension it takes --
+`Kokkos::subview` is generated with `Kokkos::ALL` and nothing narrower -- and
+an expression that is not a section at all.
+
+A temporary is described as a `KokkosScratch` and reported through
+`temporaries`, rather than declared by this class, because that is what the
+launch asks the run time for: an array allocated behind the launch's back
+would not be in its `shmem_size` sum. `result` names where the last value
+went. Names are generated `_kae_sub0`, `_kae_tmp0` and so on from one
+counter, and `_kae_i0` upwards for the loop indices; the prefix is
+`KokkosArrayExpression.PREFIX`.
+
+An assignment reading the array it writes is refused. Fortran evaluates the
+whole right-hand side before assigning any of it and a nest does not, so
+`a(2:nlayers) = a(1:nlayers-1)` has no order of generated loops that means
+what the Fortran meant. The refusal names the array and both subscripts.
+
+On the LFRic path most array assignments never reach this class:
+`LFRicKokkosTrans` applies `ArrayAssignment2LoopsTrans` first, which rewrites
+them into PSyIR loops the back-end then generates as any other loop. What is
+left for the lowering here is the shapes that transformation declines, and
+the sections that are arguments rather than assignments.
 
 Lowering order
 ~~~~~~~~~~~~~~

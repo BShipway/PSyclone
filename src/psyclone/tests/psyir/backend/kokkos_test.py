@@ -1337,3 +1337,337 @@ def test_kokkos_writer_leaves_an_unknown_intrinsic_to_the_c_writer():
         _written_expressions("  a = tiny(a)\n")
     assert "The C backend does not support the 'TINY' intrinsic." \
         in str(error.value)
+
+
+# The kinds the array-expression probe below declares. A lowered nest
+# generates its own loop index, which has no Fortran kind at all, so a region
+# that described none would not distinguish "int, because the region says so"
+# from "int, because nothing said otherwise".
+_ARRAY_KINDS = (("i_def", "int"), ("r_def", "double"))
+
+
+def _array_probe(body):
+    """Return a kernel schedule holding array-valued statements.
+
+    :param str body: the statements, indented, over the arrays declared here.
+
+    :returns: the body, detached from the routine that parsed it.
+    :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+    """
+    source = f"""
+subroutine array_probe(nlayers, df, a, b, m, jac)
+  use constants_mod, only : i_def, r_def
+  integer(kind=i_def), intent(in) :: nlayers, df
+  real(kind=r_def), dimension(nlayers), intent(inout) :: a
+  real(kind=r_def), dimension(nlayers), intent(in) :: b
+  real(kind=r_def), dimension(3,nlayers), intent(inout) :: m
+  real(kind=r_def), dimension(3,3,nlayers), intent(in) :: jac
+  real(kind=r_def), dimension(3,3) :: v
+{body}
+end subroutine array_probe
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "array_probe", symbol_table=symbol_table, children=children)
+
+
+def _array_region(body):
+    """Return a region over the array probe's body.
+
+    :param str body: the statements, indented, over the probe's arrays.
+
+    :returns: the region description the writer is given.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    return KokkosRegion(
+        name="array_probe_kokkos",
+        schedule=_array_probe(body),
+        cell_count="ncells",
+        kind_types=_ARRAY_KINDS,
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosScalar("df", "int"),
+            KokkosView("a", "a_data", "double", ("nlayers",),
+                       index_offsets=(1,)),
+            KokkosView("b", "b_data", "double", ("nlayers",),
+                       index_offsets=(1,), read_only=True),
+            KokkosView("m", "m_data", "double", ("3", "nlayers"),
+                       index_offsets=(1, 1)),
+            KokkosView("jac", "jac_data", "double", ("3", "3", "nlayers"),
+                       index_offsets=(1, 1, 1), read_only=True),
+            KokkosScalar("ncells", "int"),
+        ))
+
+
+def _lowering(body):
+    """Return a lowering over a writer holding the probe's arrays.
+
+    Driven directly rather than through a region, as
+    :py:func:`_written_expressions` is and for the same reason: a value the
+    region asks for by name is lowered the same way whatever launch shape
+    encloses it, and the paths a caller reaches by naming no destination are
+    not reachable through a statement at all.
+
+    :param str body: the statements, indented, over the probe's arrays.
+
+    :returns: the lowering, and the statements it was built over.
+    :rtype: tuple[
+        :py:class:`psyclone.psyir.backend.kokkos_array_expression.\
+KokkosArrayExpression`,
+        list[:py:class:`psyclone.psyir.nodes.Assignment`]]
+    """
+    region = _array_region(body)
+    writer = KokkosWriter()
+    writer._views = {argument.name: argument
+                     for argument in region.arguments
+                     if isinstance(argument, KokkosView)}
+    writer._kind_types = dict(region.kind_types)
+    return writer.array_expressions, region.schedule.walk(Assignment)
+
+
+def test_kae_lowers_a_whole_array_assignment():
+    """``a(:) = b(:) + 1.0`` becomes one loop and allocates nothing.
+
+    The extents of a whole dimension are the View's own, so the loop runs
+    from the array's declared origin for its declared extent without the
+    ``LBOUND`` and ``UBOUND`` calls the frontend wrote there, neither of
+    which this back-end can generate.
+    """
+    code = KokkosWriter()(_array_region("  a(:) = b(:) + 1.0_r_def\n"))
+
+    assert code.count("for (int _kae_i") == 1
+    assert "for (int _kae_i0 = 1; _kae_i0 <= (1 + nlayers - 1); _kae_i0++)" \
+        in code
+    assert "a((_kae_i0 - 1)) = (b((_kae_i0 - 1)) + 1.0);" in code
+    assert "_kae_tmp" not in code
+
+
+def test_kae_lowers_a_rank_2_assignment():
+    """A rank-2 assignment nests its loops in the layout's own fast order.
+
+    Every View this back-end declares is ``Kokkos::LayoutLeft``, whose
+    leading dimension is the contiguous one, so the leading subscript is the
+    one that must vary fastest and therefore the innermost loop. A nest
+    written the other way round computes exactly the same answer while
+    striding across memory on every step, so no later gate would catch it:
+    the order is asserted here or nowhere.
+    """
+    code = KokkosWriter()(_array_region("  m(:,:) = 0.0_r_def\n"))
+
+    assert code.count("for (int _kae_i") == 2
+    assert code.index("for (int _kae_i1") < code.index("for (int _kae_i0")
+    assert "for (int _kae_i1 = 1; _kae_i1 <= (1 + nlayers - 1); _kae_i1++)" \
+        in code
+    assert "for (int _kae_i0 = 1; _kae_i0 <= (1 + 3 - 1); _kae_i0++)" in code
+    assert "m((_kae_i0 - 1), (_kae_i1 - 1)) = 0.0;" in code
+
+
+def test_kae_passes_a_contiguous_section_as_a_subview():
+    """A slice taking the leading dimensions whole is a View, not a copy.
+
+    ``Kokkos::subview`` over those dimensions of a ``LayoutLeft`` View names
+    the same storage, so nothing is allocated and no element is read: the
+    result is a rank-2 View that a callee's formal takes directly.
+    """
+    lowering, statements = _lowering("  m(:,1) = jac(:,1,df)\n")
+
+    text = lowering.lower(statements[0].rhs)
+
+    assert "auto _kae_sub0 = Kokkos::subview(jac, Kokkos::ALL, (1 - 1), " \
+        "(df - 1));" in text
+    assert "for (" not in text
+    assert lowering.result == "_kae_sub0"
+    assert not lowering.temporaries
+
+
+def test_kae_copies_a_non_contiguous_section():
+    """A slice that is not contiguous is gathered, and says so in the source.
+
+    ``jac(df,:,:)`` skips the leading dimension, which is the contiguous one
+    in ``LayoutLeft``, so no subview describes it. The elements are copied
+    into a temporary instead, and the generated C++ carries the reason: a
+    reader who sees a nest where the other section got a subview would
+    otherwise have to read this back-end to find out why.
+    """
+    lowering, statements = _lowering("  v(:,:) = jac(df,:,:)\n")
+
+    text = lowering.lower(statements[0].rhs)
+
+    assert "is copied rather than passed as a Kokkos::subview" in text
+    assert "contiguous in this View's LayoutLeft" in text
+    # Named in the comment and nowhere else: no subview is taken.
+    assert "auto _kae_sub" not in text
+    assert lowering.result == "_kae_tmp0"
+    assert text.count("for (int _kae_i") == 2
+    assert "_kae_tmp0((_kae_i0 - 1), (_kae_i1 - 1)) = " \
+        "jac((df - 1), (_kae_i0 - 1), (_kae_i1 - 1));" in text
+
+
+def test_kae_allocates_a_temporary_for_an_unnamed_result():
+    """A value with nowhere to go is written into scratch of its own shape.
+
+    The temporary is a
+    :py:class:`~psyclone.psyir.backend.kokkos_array_expression.KokkosScratch`
+    rather than a declaration of this class's own, because that is what the
+    launch asks the run time for: an array the body allocated behind the
+    launch's back would not be in its ``shmem_size`` sum.
+    """
+    lowering, statements = _lowering("  a(:) = b(:) + 1.0_r_def\n")
+    expression = statements[0].rhs
+
+    text = lowering.lower(expression)
+
+    assert lowering.result == "_kae_tmp0"
+    assert len(lowering.temporaries) == 1
+    temporary = lowering.temporaries[0]
+    assert isinstance(temporary, KokkosScratch)
+    assert temporary.name == "_kae_tmp0"
+    assert temporary.c_type == "double"
+    assert temporary.extents == lowering.ranks(expression) == ("nlayers",)
+    assert temporary.index_offsets == ("1",)
+    assert "_kae_tmp0((_kae_i0 - 1)) = (b((_kae_i0 - 1)) + 1.0);" in text
+
+
+def test_kae_refuses_a_loop_carried_dependency():
+    """A section reading what it writes elsewhere is refused, by name.
+
+    Fortran evaluates the whole right-hand side before assigning any of it,
+    and a nest does not, so there is no order of the generated loops that
+    means what the Fortran meant. The refusal names the array and both of the
+    subscripts, because "a loop-carried dependency" alone leaves the reader
+    to find which of the statement's arrays carries it.
+    """
+    lowering, statements = _lowering(
+        "  a(2:nlayers) = a(1:nlayers - 1)\n")
+    assignment = statements[0]
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(assignment.rhs, assignment.lhs)
+
+    assert "'a' is written at 'a(2:)' and read at 'a(:nlayers - 1)'" \
+        in str(error.value)
+    assert "dependence from one iteration to the next" in str(error.value)
+
+
+def test_kae_refuses_an_expression_that_is_not_array_valued():
+    """A scalar with nowhere to be spread names no space, and is refused.
+
+    A caller that has to be told the shape of what it asked for is a caller
+    that asked for the wrong thing, so this is a back-end error rather than
+    an empty result: an empty nest around a scalar would generate C++ that
+    compiles and assigns nothing.
+    """
+    lowering, statements = _lowering("  a(1) = b(1) + 1.0_r_def\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs)
+
+    assert "is not an array-valued expression" in str(error.value)
+
+
+def test_kae_slices_no_array_the_region_did_not_describe():
+    """An array with no View to slice is not a subview, whatever its shape.
+
+    ``Kokkos::subview`` takes a View, and an array the region did not
+    describe is not one. The shape asked about here is contiguous in every
+    other respect, so the description is the only thing deciding it, and the
+    judgement is asserted directly: a body that read an undescribed array
+    would be refused before it reached the lowering, which leaves nothing
+    but this to keep a later caller from generating a subview of a name the
+    generated C++ never declares.
+    """
+    lowering, statements = _lowering("  v(:,:) = 1.0_r_def\n")
+    # pylint: disable=protected-access
+    assert lowering._is_contiguous(statements[0].lhs) is False
+
+
+def test_kae_copies_a_partial_section():
+    """A slice taking no dimension whole is copied rather than sliced.
+
+    ``Kokkos::subview`` is generated with ``Kokkos::ALL`` and nothing
+    narrower, so a section with bounds of its own has no subview to be, even
+    where the elements it names happen to be adjacent.
+    """
+    lowering, statements = _lowering(
+        "  a(2:nlayers - 1) = b(2:nlayers - 1)\n")
+
+    text = lowering.lower(statements[0].rhs)
+
+    assert "auto _kae_sub" not in text
+    assert lowering.result == "_kae_tmp0"
+    assert lowering.ranks(statements[0].rhs) \
+        == ("(((nlayers - 1)) - (2) + 1)",)
+
+
+def test_kae_copies_a_section_whose_leading_dimension_is_whole():
+    """A whole leading dimension does not save a narrowed trailing one.
+
+    ``m(:,1:2)`` is contiguous in ``LayoutLeft`` and could in principle be
+    sliced, but only by a subview carrying bounds this back-end does not
+    generate, so it is copied. The refusal is the narrowness of the second
+    subscript and not the order of the two.
+    """
+    lowering, statements = _lowering("  m(:,1:2) = 0.0_r_def\n")
+
+    text = lowering.lower(statements[0].lhs)
+
+    assert "auto _kae_sub" not in text
+    assert lowering.result == "_kae_tmp0"
+    assert "_kae_tmp0((_kae_i0 - 1), (_kae_i1 - 1)) = " \
+        "m((_kae_i0 - 1), (_kae_i1 - 1));" in text
+
+
+def test_kae_refuses_a_temporary_whose_kind_the_region_did_not_describe():
+    """A temporary of an undescribed kind is refused rather than guessed.
+
+    The alternative is a View of some default type, which would compile, and
+    would silently narrow or widen every value the array carried.
+    """
+    lowering, statements = _lowering("  a(:) = b(:) + 1.0_r_def\n")
+    # pylint: disable=protected-access
+    lowering._writer._kind_types = {}
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs)
+
+    assert "the region described no C type for its kind" in str(error.value)
+
+
+def test_kokkos_writer_refuses_an_array_it_was_given_no_description_of():
+    """An array reference the region did not describe is an error.
+
+    Every array the body reads is a View, a scratch array or a constant, and
+    the region names all three. One that is none of them has no origin, so
+    there is no subscript to generate rather than a wrong one to guess.
+    """
+    lowering, statements = _lowering("  v(:,:) = 1.0_r_def\n")
+    # pylint: disable=protected-access
+    writer = lowering._writer
+
+    with pytest.raises(ValueError) as error:
+        writer._visit(statements[0].lhs.copy())
+
+    assert "Array 'v' has no Kokkos View description." in str(error.value)
+
+
+def test_kokkos_writer_refuses_an_array_described_with_the_wrong_rank():
+    """A description whose offsets do not count the subscripts is an error.
+
+    Each subscript is shifted by the offset beside it, so a description that
+    supplied a different number of them would shift some subscripts and
+    leave the rest, which is an access to the wrong element rather than a
+    failure to generate one.
+    """
+    lowering, statements = _lowering("  a(1) = b(1) + 1.0_r_def\n")
+    # pylint: disable=protected-access
+    writer = lowering._writer
+    writer._views["a"] = KokkosView("a", "a_data", "double",
+                                    ("3", "nlayers"), index_offsets=(1, 1))
+
+    with pytest.raises(ValueError) as error:
+        writer._visit(statements[0].lhs.copy())
+
+    assert "Array 'a' has 1 kernel indices but 2 offsets were supplied." \
+        in str(error.value)
