@@ -171,6 +171,32 @@ class LFRicKokkosTypesMixin:
                 + ", logical of any kind, and integer or logical declared "
                   "with no kind")
 
+    @classmethod
+    def _view_intrinsics(cls):
+        """Name the Fortran intrinsics a View's elements may have.
+
+        Derived from :py:attr:`_C_TYPES` rather than listed, so that widening
+        that table reaches the refusal quoting this -- :py:meth:`\
+~psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin.\
+LFRicKokkosContractMixin._validate_field_type` -- without a second edit. It
+        is the intrinsics that are asked for and not the widths, because a
+        field's declaration states its own kind and that kind is checked
+        where every other formal's is, by :py:meth:`\
+~psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin.\
+LFRicKokkosContractMixin._validate_formals`.
+
+        ``logical`` is absent, and must stay absent while
+        :py:attr:`_C_LOGICAL_TYPE` is what puts a logical on the ABI: it
+        crosses by conversion, which is per value, so an array of them is
+        refused rather than reinterpreted.
+
+        :returns: the intrinsic names, lower-cased and in alphabetical order,
+            as ``('integer', 'real')``.
+        :rtype: tuple[str, ...]
+        """
+        return tuple(sorted(
+            {intrinsic.name.lower() for intrinsic, _ in cls._C_TYPES}))
+
     @staticmethod
     def _kind_name(symbol):
         """Return the name of a scalar or array element's kind symbol.

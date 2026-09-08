@@ -73,8 +73,10 @@ The sibling mixins are reached through ``cls``, resolved on
 predicts ``cls._lower_sections`` over a copy, and
 :py:meth:`LFRicKokkosContractMixin._validate_formals` and
 :py:meth:`LFRicKokkosContractMixin._validate_locals` ask ``cls._c_type``,
-``cls._extent_names`` and ``cls._CELL_COUNT``. Calling a method here directly
-on this mixin is therefore not supported.
+``cls._extent_names`` and ``cls._CELL_COUNT``, and
+:py:meth:`LFRicKokkosContractMixin._validate_field_type` asks
+``cls._view_intrinsics``. Calling a method here directly on this mixin is
+therefore not supported.
 """
 
 from psyclone.core import AccessType
@@ -255,24 +257,42 @@ class LFRicKokkosContractMixin:
             raise TransformationError(
                 "LFRicKokkosTrans does not support inter-grid kernels.")
 
-    @staticmethod
-    def _validate_field_type(argument):
+    @classmethod
+    def _validate_field_type(cls, argument):
         """Check one argument's intrinsic type, if it is a field.
 
         Anything that is not a field is passed over rather than refused, so
         that the rule can be walked over a whole argument list.
 
+        A field's data reaches the region as the elements of a View, so what
+        it may be is what ``cls._view_intrinsics`` says a View's elements may
+        be rather than a list kept here. LFRic's
+        :py:attr:`~psyclone.domain.lfric.LFRicConstants.\
+VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
+        intrinsic, so no kernel in the model reaches this refusal; it is kept
+        because what it states is a property of the ABI rather than of
+        today's metadata, and a field intrinsic LFRic added would otherwise
+        reach the backend as a type it has no row for.
+
+        The kind is a separate question, asked of the kernel's own
+        declaration by :py:meth:`_validate_formals`: an integer field
+        declared at a width the ABI carries no C type for is refused there,
+        naming the kind.
+
         :param argument: the kernel argument to check.
         :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
 
         :raises TransformationError: if the argument is a field whose data is
-            not real.
+            of an intrinsic no View can hold.
         """
         if argument.argument_type != "gh_field":
             return
-        if argument.intrinsic_type != "real":
+        intrinsics = list(cls._view_intrinsics())
+        if argument.intrinsic_type not in intrinsics:
+            phrase = " and ".join(
+                [", ".join(intrinsics[:-1]), intrinsics[-1]])
             raise TransformationError(
-                f"LFRicKokkosTrans supports only real fields, but "
+                f"LFRicKokkosTrans supports only {phrase} fields, but "
                 f"'{argument.name}' is {argument.intrinsic_type}.")
 
     @staticmethod
@@ -306,13 +326,14 @@ class LFRicKokkosContractMixin:
 
     @classmethod
     def _validate_field_types(cls, kernel):
-        """Check that every field the kernel takes is real.
+        """Check every field the kernel takes for an intrinsic a View holds.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
 
-        :raises TransformationError: if any field argument's data is not
-            real, for the reason :py:meth:`_validate_field_type` gives.
+        :raises TransformationError: if any field argument's data is of an
+            intrinsic no View can hold, for the reason
+            :py:meth:`_validate_field_type` gives.
         """
         for argument in kernel.arguments.args:
             cls._validate_field_type(argument)
@@ -354,9 +375,10 @@ class LFRicKokkosContractMixin:
         :raises TransformationError: if the kernel needs quadrature or
             evaluator data, is a CMA or inter-grid kernel, takes an argument
             that is not a field, a scalar or an LMA operator, takes an access
-            a cell-parallel launch cannot honour, takes a non-real field, uses
-            a stencil shape outside :py:attr:`_SUPPORTED_STENCILS`, or writes
-            to a field on a continuous space.
+            a cell-parallel launch cannot honour, takes a field of an
+            intrinsic no View can hold, uses a stencil shape outside
+            :py:attr:`_SUPPORTED_STENCILS`, or writes to a field on a
+            continuous space.
         """
         cls._validate_evaluator(kernel)
         if kernel.cma_operation is not None:
