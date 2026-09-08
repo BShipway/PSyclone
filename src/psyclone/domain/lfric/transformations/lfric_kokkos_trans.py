@@ -668,6 +668,18 @@ KernelModuleInlineTrans`.
     are correct; which is faster is a measurement on a GPU, and neither this
     class nor the branch that added the second answer has taken it.
 
+    **They do differ in one property that is not a measurement.**
+    Floating-point addition is not associative, so the order in which the
+    contributions to a shared dof arrive is part of the answer. An atomic
+    launch adds them in the order its threads reach the dof, which is cell
+    order on one thread and an order that varies between runs on more; a
+    coloured launch adds them in colour order, which is fixed whatever the
+    concurrency. So an atomic region reproduces a serial Fortran run bit for
+    bit on one thread and not on several, and a coloured region reproduces
+    itself on any thread count and a serial Fortran run on none. Measured
+    over a ten-timestep LFRic model run, the differences are one part in
+    1e10 or smaller, and neither is a defect.
+
     One thing a coloured region does is worth stating, because a debug build
     will say so. Its per-cell Views are strided by the launch's cell count,
     which for a coloured launch is the cells of *this* colour, while the

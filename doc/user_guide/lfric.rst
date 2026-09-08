@@ -4433,7 +4433,16 @@ on an uncoloured loop whose kernel writes a shared field being the one
 combination that would generate a race. The two are alternatives
 and not a ranking. Both are correct, and which is faster is a measurement on
 a GPU that has not been taken here, so the default is the one that needs
-nothing of the algorithm layer. An access that is neither of those and
+nothing of the algorithm layer. They do differ in one property that is not a
+measurement: floating-point addition is not associative, so the order the
+contributions to a shared dof arrive in is part of the answer. An atomic
+launch adds them in the order its threads reach the dof, which is cell order
+on one thread and an order that varies between runs on more; a coloured
+launch adds them in colour order, which is fixed whatever the concurrency.
+So an atomic region reproduces a serial Fortran run bit for bit on one
+thread and not on several, and a coloured region reproduces itself on any
+thread count and a serial Fortran run on none.
+An access that is neither of those and
 neither safe nor read-only -- a reduction, of which GungHo has none in a
 coded kernel today -- is refused by naming it.
 A kernel symbol whose name Fortran allows and C++ reserves is refused,
