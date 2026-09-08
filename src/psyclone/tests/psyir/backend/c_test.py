@@ -1026,3 +1026,134 @@ def test_cw_array_constructor_needing_a_temporary(fortran_reader):
             "dimension 1 of its declaration has no literal lower bound, so "
             "the Fortran index of each element of the constructor is not "
             "known here." in str(err.value))
+
+
+# What the writer renders ``x ** n`` as, for the exponents whose answer has
+# been measured against gfortran. The strings are the assertion: a tree with
+# the same operands in a different association rounds differently, so a test
+# that only counted the multiplications would pass on a wrong one.
+_INTEGER_POWER_TREES = {
+    1: "x",
+    2: "(x * x)",
+    3: "((x * x) * x)",
+    4: "((x * x) * (x * x))",
+    5: "(((x * x) * (x * x)) * x)",
+    6: "(((x * x) * (x * x)) * (x * x))",
+    7: "(((x * x) * (x * x)) * ((x * x) * x))",
+    8: "(((x * x) * (x * x)) * ((x * x) * (x * x)))",
+    }
+
+
+def _real_power(exponent):
+    '''Build ``x ** exponent`` over a real ``x``.
+
+    :param exponent: the exponent, already a PSyIR node.
+    :type exponent: :py:class:`psyclone.psyir.nodes.DataNode`
+
+    :returns: the power operation.
+    :rtype: :py:class:`psyclone.psyir.nodes.BinaryOperation`
+
+    '''
+    return BinaryOperation.create(
+        BinaryOperation.Operator.POW,
+        Reference(DataSymbol("x", ScalarType.real_type())), exponent)
+
+
+def test_cw_integer_power_two_is_a_product():
+    '''``x ** 2`` is a product rather than a call to 'pow'.
+
+    gfortran does not call the C library for an integer exponent: it
+    multiplies, and each multiplication is correctly rounded. 'pow' is not
+    required to be, and glibc's is measurably not -- it differs from ``x * x``
+    for about one operand in a thousand -- so a region that called it would
+    disagree with the Fortran it replaced in the last bit.
+
+    '''
+    assert CWriter()(_real_power(
+        Literal("2", ScalarType.integer_type()))) == "(x * x)"
+
+
+def test_cw_integer_power_three_is_a_product_tree():
+    '''``x ** 3`` is ``((x * x) * x)``, the tree gfortran builds.
+
+    This is the exponent the C16_MG checksum difference was traced to: 'pow'
+    disagrees with the product tree for about a quarter of all operands at
+    ``x ** 3``, against one in a thousand at ``x ** 2``, which is why the
+    fourth-order kernel drifted where its third-order sibling did not.
+
+    '''
+    assert CWriter()(_real_power(
+        Literal("3", ScalarType.integer_type()))) == "((x * x) * x)"
+
+
+@pytest.mark.parametrize("exponent", sorted(_INTEGER_POWER_TREES))
+def test_cw_integer_power_up_to_eight(exponent):
+    '''Every exponent the writer renders as a tree renders as the measured one.
+
+    Eight is the limit because eight is as far as the comparison against
+    gfortran was taken; nine and above stay with 'pow', which is what they
+    were.
+
+    '''
+    assert CWriter()(_real_power(
+        Literal(str(exponent), ScalarType.integer_type()))) == \
+        _INTEGER_POWER_TREES[exponent]
+
+
+def test_cw_integer_power_signed_literal(fortran_reader):
+    '''A negative literal exponent is the reciprocal of the tree.
+
+    That is what gfortran does with it, and it is written over the real base
+    only: Fortran evaluates an integer raised to a negative power as an
+    integer, which is zero for every base but one and minus one, and a
+    reciprocal would not be that.
+
+    The numerator is the integer one so that C++'s arithmetic conversions
+    give the quotient the base's own type; a '1.0' would compute a
+    single-precision reciprocal in double and round it twice.
+
+    An explicitly positive exponent is the same tree as a bare one. The front
+    end writes both signs as a unary operation over an unsigned literal, so
+    neither reaches the writer as a signed value.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp()
+          real*8 :: a, x
+          integer :: i, j
+          a = x ** (-2)
+          j = i ** (-2)
+          a = x ** (+3)
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+    cwriter = CWriter()
+
+    assert cwriter(module[0].rhs) == "(1 / (x * x))"
+    assert cwriter(module[1].rhs) == "pow(i, (-2))"
+    assert cwriter(module[2].rhs) == "((x * x) * x)"
+
+
+def test_cw_integer_power_real_exponent_stays_pow():
+    '''A real exponent is a call to 'pow', which is what Fortran does too.'''
+    assert CWriter()(_real_power(
+        Literal("3.0", ScalarType.real_type()))) == "pow(x, 3.0)"
+
+
+def test_cw_integer_power_variable_exponent_stays_pow():
+    '''An exponent that is not a literal is a call to 'pow'.
+
+    Its value is not known here, so there is no tree to write; and a zero
+    exponent keeps 'pow' as well, whose answer is exactly one.
+
+    '''
+    cwriter = CWriter()
+
+    assert cwriter(_real_power(
+        Reference(DataSymbol("n", ScalarType.integer_type())))) == "pow(x, n)"
+    assert cwriter(_real_power(
+        Literal("0", ScalarType.integer_type()))) == "pow(x, 0)"
+    assert cwriter(_real_power(
+        Literal("9", ScalarType.integer_type()))) == "pow(x, 9)"

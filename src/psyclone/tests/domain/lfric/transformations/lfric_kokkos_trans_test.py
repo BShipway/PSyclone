@@ -1080,10 +1080,22 @@ _SHAPELESS_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
 # An extent that is not an integer expression over named sizes. The origin is
 # the Fortran default here, so this is the extent grammar's own refusal rather
 # than the origin's, asserted apart from it because the two are checked in
-# order and the first to fire hides the second. `nlayers**2` is written as
-# `pow(nlayers, 2)`, and the comma is what a `shmem_size` argument may not
-# carry.
+# order and the first to fire hides the second. The exponent is a name rather
+# than a literal because a literal one is not unrenderable any more: the C
+# writer expands `nlayers**2` into `(nlayers * nlayers)`, which is an integer
+# expression over named sizes and is accepted. `nlayers**nlayers` still has to
+# be written `pow(nlayers, nlayers)`, and the comma is what a `shmem_size`
+# argument may not carry.
 _UNRENDERABLE_EXTENT_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(nlayers**nlayers) :: swept")
+
+
+# The same declaration with a literal exponent, which is not unrenderable.
+# `nlayers**2` was refused as long as the C writer wrote an integer power as
+# `pow`; it is written as a product now, and a product over named sizes is
+# exactly what a `shmem_size` argument may be. The pair is here so that the
+# refusal above is read as being about the comma rather than about the power.
+_SQUARED_EXTENT_KERNEL = _LOCAL_KERNEL.replace(
     "dimension(nlayers) :: swept", "dimension(nlayers**2) :: swept")
 
 
@@ -1092,7 +1104,8 @@ _UNRENDERABLE_EXTENT_KERNEL = _LOCAL_KERNEL.replace(
 # read together: an origin the region cannot write shifts every subscript of
 # the array rather than sizing it wrongly.
 _UNRENDERABLE_ORIGIN_KERNEL = _LOCAL_KERNEL.replace(
-    "dimension(nlayers) :: swept", "dimension(nlayers**2:nlayers) :: swept")
+    "dimension(nlayers) :: swept",
+    "dimension(nlayers**nlayers:nlayers) :: swept")
 
 
 # A declared shape the C writer has no way to render at all. GungHo writes
@@ -2692,6 +2705,16 @@ def unrenderable_extent_target_fixture(tmp_path,
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM,
         _UNRENDERABLE_EXTENT_KERNEL)
+
+
+@pytest.fixture(name="squared_extent_target")
+# pylint: disable-next=unused-argument
+def squared_extent_target_fixture(tmp_path,
+                                  clear_module_manager_instance):
+    """Create an invoke whose kernel squares a name in a declared extent."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _SQUARED_EXTENT_KERNEL)
 
 
 @pytest.fixture(name="unrenderable_origin_target")
@@ -4758,12 +4781,16 @@ def test_lfric_kokkos_trans_accepts_a_negative_lower_bound(
 
 def test_lfric_kokkos_trans_rejects_an_unrenderable_extent(
         unrenderable_extent_target):
-    """``dimension(nlayers**2)`` is refused, naming the extent.
+    """``dimension(nlayers**nlayers)`` is refused, naming the extent.
 
     The origin is the Fortran default here, so the refusal is the extent
     grammar's own. The two checks run in order and the first to fire hides
     the second, which is why the origin refusal is asserted over a separate
     declaration rather than over this one.
+
+    The exponent is a name because a literal one is written as a product now
+    and is accepted; ``pow`` reaches an extent only through an exponent whose
+    value is not known where the launch is written.
     """
     _, loop, _ = unrenderable_extent_target
 
@@ -4771,7 +4798,28 @@ def test_lfric_kokkos_trans_rejects_an_unrenderable_extent(
         LFRicKokkosTrans().validate(loop)
 
     assert "extents of 'swept'" in str(error.value)
-    assert "found 'pow(nlayers, 2)'" in str(error.value)
+    assert "found 'pow(nlayers, nlayers)'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_sizes_scratch_from_a_squared_extent(
+        squared_extent_target):
+    """``dimension(nlayers**2)`` sizes the scratch from a product.
+
+    The extent grammar refuses a call because a `shmem_size` argument is the
+    text the launch writes and nothing rewrites it. An integer power with a
+    literal exponent is no longer a call, so this declaration crossed from
+    the refusal above into the region without the grammar being touched.
+    """
+    _, loop, kernel = squared_extent_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._extents(
+        schedule.symbol_table.lookup("swept")) == ("(nlayers * nlayers)",)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "(nlayers * nlayers)" in cpp
+    assert "pow(" not in cpp
 
 
 def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
@@ -4780,10 +4828,11 @@ def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
 
     Widening the origin from "must be 1" to "any integer expression over
     named sizes" is not a widening to anything at all.
-    ``dimension(nlayers**2:nlayers)`` is written ``pow(nlayers, 2)``, which
-    the grammar refuses in an origin exactly as it refuses it in an extent --
-    and here the consequence is a subscript shifted by a value the launch
-    cannot evaluate rather than a wrongly sized View.
+    ``dimension(nlayers**nlayers:nlayers)`` is written
+    ``pow(nlayers, nlayers)``, which the grammar refuses in an origin exactly
+    as it refuses it in an extent -- and here the consequence is a subscript
+    shifted by a value the launch cannot evaluate rather than a wrongly sized
+    View.
     """
     _, loop, _ = unrenderable_origin_target
 
@@ -4792,7 +4841,7 @@ def test_lfric_kokkos_trans_rejects_an_unrenderable_lower_bound(
 
     assert "'swept'" in str(error.value)
     assert "declared origin" in str(error.value)
-    assert "found 'pow(nlayers, 2)'" in str(error.value)
+    assert "found 'pow(nlayers, nlayers)'" in str(error.value)
 
 
 def test_lfric_kokkos_trans_moves_an_origin_and_an_extent_together(
@@ -5152,7 +5201,7 @@ def test_lfric_kokkos_trans_inherits_the_bounds_grammar_refusal(
         LFRicKokkosTrans().validate(loop)
 
     assert ("requires the declared origin of 'swept' to be an integer "
-            "expression over named sizes, but found 'pow(nlayers, 2)'"
+            "expression over named sizes, but found 'pow(nlayers, nlayers)'"
             in str(error.value))
 
 

@@ -2286,3 +2286,31 @@ def test_kae_leaves_a_whole_array_name_of_another_rank_alone():
     text = lowering.lower(statements[0].rhs, statements[0].lhs)
 
     assert "p((_kae_i0 - 1)) = (b((1 - 1)) * w);" in text
+
+
+def test_kokkos_writer_inherits_the_integer_power_tree():
+    """The Kokkos writer renders ``**`` as the C writer does.
+
+    It has no handler of its own for a binary operation, and that is what is
+    being asserted: the rounding fix belongs to the C writer, and the Kokkos
+    writer must not quietly acquire a ``pow`` of its own on the way past a
+    kernel's ``edge_height ** 3``.
+
+    A single-precision base keeps its width. Every operand of the tree is the
+    base itself, and the reciprocal's numerator is the integer one, so C++'s
+    arithmetic conversions never widen the expression to double and round it
+    back.
+    """
+    assert _written_expressions(
+        "  a = b ** 2\n"
+        "  a = b ** 3\n"
+        "  s = s ** 3\n"
+        "  a = b ** (-2)\n"
+        "  a = b ** i\n"
+        "  i = j ** 2\n") == [
+            "(b * b)",
+            "((b * b) * b)",
+            "((s * s) * s)",
+            "(1 / (b * b))",
+            "pow(b, i)",
+            "(j * j)"]
