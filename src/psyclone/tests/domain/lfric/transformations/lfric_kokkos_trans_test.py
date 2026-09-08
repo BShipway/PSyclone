@@ -9021,3 +9021,24 @@ def test_lfric_kokkos_trans_captures_a_coloured_meshless_invoke(
     assert "mesh => acc_proxy%vspace%get_mesh()" in fortran
     assert "cmap => mesh%get_colour_map()" in fortran
     assert "call inc_probe_kokkos(" in fortran
+
+
+def test_lfric_kokkos_trans_declares_each_ndf_once(shared_write_target):
+    """Asking which formals are shared declares nothing in the Invoke.
+
+    The walk that answers it is an ArgOrdering, and an ArgOrdering writes
+    the scalars it names into the Invoke's own symbol table whenever the
+    kernel it is given is in a Schedule. Doing that here created
+    ``ndf_<space>`` before LFRicFunctionSpaces did, whose declarations are
+    made with ``new_symbol``: the space was then declared a second time as
+    ``ndf_<space>_1`` and never assigned or read. LFRic builds the PSy layer
+    with ``-Werror=unused-variable``, so the whole model stopped compiling.
+    """
+    psy, loop, _ = shared_write_target
+
+    LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    for space in ("w2", "w3"):
+        assert f"integer(kind=i_def) :: ndf_{space}\n" in fortran
+        assert f"ndf_{space}_1" not in fortran

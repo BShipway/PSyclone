@@ -120,7 +120,7 @@ from psyclone.psyir.backend.kokkos import (
     KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView)
 from psyclone.psyir.nodes import (
     ArrayReference, Call, IntrinsicCall, Literal, Reference, Routine)
-from psyclone.psyir.symbols import ArgumentInterface, ScalarType
+from psyclone.psyir.symbols import ArgumentInterface, ScalarType, SymbolTable
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -141,10 +141,21 @@ LFRicKokkosTrans.validate`
     would leave those symbols behind in invokes whose loops validation then
     refuses.
 
-    :py:class:`~psyclone.domain.lfric.KernStubArgList` walks the same order
-    and creates nothing, so recording the positions here gives the same
-    answer with no cost to the tree. The positions are recorded by bracketing
-    each field with the public
+    :py:class:`~psyclone.domain.lfric.KernStubArgList` walks the same order,
+    so recording the positions here gives the same answer. It is not free of
+    the same side effect, though: every
+    :py:class:`~psyclone.domain.lfric.ArgOrdering` writes its scalars into
+    :py:attr:`~psyclone.domain.lfric.ArgOrdering._symtab`, which is the
+    Invoke's own table whenever the kernel it is given is in a Schedule
+    rather than a stub. Walking a real kernel that way created ``ndf_<space>``
+    ahead of :py:class:`~psyclone.lfric.LFRicFunctionSpaces`, whose
+    declarations are made with ``new_symbol`` and so became ``ndf_<space>_1``,
+    declared and never used -- which the LFRic build rejects under
+    ``-Werror=unused-variable``. This class therefore forces a private table,
+    as :py:class:`~psyclone.domain.lfric.KernelInterface` does, and the walk
+    leaves the tree untouched.
+
+    The positions are recorded by bracketing each field with the public
     :py:attr:`~psyclone.domain.lfric.ArgOrdering.num_args`, which covers a
     field vector's several entries as it covers a field's one.
 
@@ -162,6 +173,8 @@ LFRicKokkosTrans.validate`
 
     def __init__(self, kernel):
         super().__init__(kernel)
+        # Everything this walk declares goes here and is dropped with it.
+        self._forced_symtab = SymbolTable()
         #: The positions in the argument list that carry shared data.
         self.shared_positions = set()
 
