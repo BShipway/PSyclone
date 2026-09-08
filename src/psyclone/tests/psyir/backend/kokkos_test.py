@@ -13,8 +13,9 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosConstant, KokkosRegion, KokkosScalar, KokkosScratch, KokkosView,
-    KokkosWriter, extent_names, is_extent, is_offset)
+    KokkosColourMap, KokkosConstant, KokkosRegion, KokkosScalar,
+    KokkosScratch, KokkosView, KokkosWriter, extent_names, is_extent,
+    is_offset)
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.backend.visitor import VisitorError
@@ -2998,3 +2999,148 @@ def test_kokkos_atomic_add_for_read_inc():
     assert f"Kokkos::atomic_add(&acc{shared}, (damping * previous));" in code
     assert "Kokkos::atomic_load" not in code
     assert code.count("Kokkos::atomic") == 1
+
+
+def _coloured_region(**overrides):
+    """Return the first region's contract, captured from a coloured loop.
+
+    The body is unchanged: colouring changes which cells one launch runs, not
+    what it does to a cell. What the region gains is the map from the
+    launch's own index to a mesh cell, and the three arguments that lookup
+    reads.
+
+    :param overrides: fields to replace on the region.
+    :type overrides: unwrapped dict
+
+    :returns: the coloured region.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    base = _region(cell_count="ncells_in_colour")
+    fields = {
+        "arguments": base.arguments + (
+            KokkosView("cmap", "cmap_data", "int",
+                       ("ncolours", "ncells_in_colour"), index_offsets=(1, 1),
+                       read_only=True, random_access=True),
+            KokkosScalar("colour", "int"),
+            KokkosScalar("ncolours", "int"),
+        ),
+        "colour_map": KokkosColourMap(
+            name="cmap", colour="colour", index="cell_in_colour"),
+    }
+    fields.update(overrides)
+    return replace(base, **fields)
+
+
+def test_kokkos_coloured_region_looks_its_cell_up_in_the_map():
+    """A coloured launch runs one colour and finds each cell in the map.
+
+    This is the second of the two answers to a write two cells share, and it
+    is the one that generates no atomic: the caller enters the region once
+    per colour, cells of one colour meet at no dof, and so the update inside
+    is a plain read-modify-write. Everything below the first declaration is
+    the source the uncoloured region generates, because the body is indexed
+    by the mesh cell either way and the map is what supplies it.
+    """
+    code = KokkosWriter()(_coloured_region())
+
+    assert "KOKKOS_LAMBDA(const int cell_in_colour) {" in code
+    assert "const int cell = cmap(colour - 1, cell_in_colour) - 1;" in code
+    # The launch counts this colour's cells, not the mesh's.
+    assert "Kokkos::RangePolicy<>(0, ncells_in_colour)" in code
+    # The map is one-based Fortran on both axes, so both subscripts are
+    # adjusted where they are written and nowhere else.
+    assert code.count("- 1;") == 1
+    assert "Kokkos::atomic" not in code
+    # The body still reads the mesh cell.
+    assert "map_wtheta((df - 1), cell)" in code
+
+
+def test_kokkos_coloured_region_declares_its_map_and_colour():
+    """The map crosses the ABI as a read-only View and the colour as an int."""
+    code = KokkosWriter()(_coloured_region())
+
+    assert "const int *cmap_data" in code
+    assert "const int colour" in code
+    assert "const int ncolours" in code
+    # The first extent is the one that has to be exact: under LayoutLeft
+    # it is the stride, and it is the number of colours.
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> cmap(cmap_data, ncolours, ncells_in_colour);") in code
+
+
+def test_kokkos_uncoloured_region_declares_no_cell():
+    """A region with no colour map generates what it did before there was one.
+
+    The lookup is the whole of the coloured arm's effect on generated source,
+    so its absence is what every capture already in the model depends on.
+    """
+    code = KokkosWriter()(_region())
+
+    assert "KOKKOS_LAMBDA(const int cell) {" in code
+    assert "cmap" not in code
+    assert "const int cell =" not in code
+
+
+def test_kokkos_team_launches_index_the_colour_too():
+    """Both team shapes count this colour's cells, not the mesh's.
+
+    The flat shape's past-the-end guard is the reason this is asserted rather
+    than assumed: a guard left comparing the mesh cell against a count of one
+    colour's cells would return early for most of the cells it was given.
+    """
+    colours = KokkosColourMap(
+        name="cmap", colour="colour", index="cell_in_colour")
+    flat = team_launch(replace(_scratch_region(), colour_map=colours), "", "")
+    assert ("const int cell_in_colour = team.league_rank() * "
+            "team.team_size() + rank;") in flat
+    assert "if (cell_in_colour >= ncells)" in flat
+
+    hierarchical = hierarchical_launch(
+        replace(_level_region(), colour_map=colours), "", "")
+    assert "const int cell_in_colour = team.league_rank();" in hierarchical
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("name", "cmap data", "Kokkos colour map 'cmap data' is not a C++"),
+    ("colour", "", "Kokkos colour colour '' is not a C++"),
+    ("index", "0th", "Kokkos colour index '0th' is not a C++"),
+    ("name", "ncolours", "Kokkos colour map 'ncolours' is not a View"),
+    ("colour", "cmap", "Kokkos colour 'cmap' is not a scalar"),
+    ("index", "cell", "is also the region's cell index"),
+    ("index", "nlayers", "Kokkos colour index 'nlayers' is also a region"),
+])
+def test_kokkos_writer_rejects_a_broken_colour_map(field, value, message):
+    """Each way the map could be wrong is refused where it is described.
+
+    None of the seven announces itself downstream. Three are not identifiers
+    and generate text that does not compile, which is the mild case. The
+    other four compile: a map that is not a View, or a colour that is not a
+    scalar, indexes something that is not the map; an index equal to the cell
+    index declares the cell from itself; and an index that is also an
+    argument is shadowed by the declaration, so the launch would read the
+    argument's value for every cell.
+    """
+    region = _coloured_region()
+    colours = replace(region.colour_map, **{field: value})
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(replace(region, colour_map=colours))
+    assert message in str(err.value)
+
+
+def test_kokkos_writer_rejects_an_atomic_read_only_view():
+    """A View cannot be both updated by several cells and never updated.
+
+    The two flags are set from different facts -- the access LFRic declares
+    and whether the region writes through the argument -- so a description
+    holding both is a mistake in the transformation rather than in the
+    kernel, and it would generate a ``Kokkos::atomic_add`` through a
+    ``const`` pointer.
+    """
+    region = _read_inc_region()
+    arguments = list(region.arguments)
+    arguments[1] = replace(arguments[1], read_only=True)
+
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(replace(region, arguments=tuple(arguments)))
+
+    assert "Kokkos View 'acc' is atomic but read only." in str(err.value)

@@ -188,11 +188,24 @@ class LFRicKokkosContractMixin:
     #: :py:meth:`~psyclone.domain.lfric.LFRicLoop.upper_bound_psyir`'s
     #: business, and the region takes its value rather than its expression.
     #:
-    #: The coloured bounds -- ``ncolours``, ``ncolour``, ``ntilecolours`` and
-    #: the rest -- are absent. They index a colour map rather than counting
-    #: from the first cell, and a loop carrying one is refused by
+    #: The last two are the coloured pair, and they count the same way the
+    #: others do: ``ncolour`` is the number of cells of the colour the
+    #: enclosing loop is on, ``colour_halo`` that number to a halo depth.
+    #: What differs is what the count is of -- cells of one colour rather
+    #: than cells of the mesh -- and the region reads its cells through
+    #: :py:class:`~psyclone.psyir.backend.kokkos.KokkosColourMap` for that
+    #: reason. The tiled bounds, ``ntilecolours`` and the rest, remain
+    #: absent: a tiled loop is refused by
     #: :py:meth:`_validate_iteration_space` before this is asked.
-    _COUNTED_BOUNDS = ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo")
+    _COUNTED_BOUNDS = ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo",
+                       "ncolour", "colour_halo")
+
+    #: The one :py:attr:`~psyclone.psyGen.Loop.loop_type` a captured loop may
+    #: carry besides none at all. It is the inner loop of a colouring, whose
+    #: iterations are the cells of one colour; the enclosing ``colour`` loop
+    #: is left as Fortran and is what runs the colours in sequence, which is
+    #: where the safety of a shared write without atomics comes from.
+    _COLOURED_LOOP_TYPE = "cells_in_colour"
 
     #: Names a kernel symbol may not carry into the generated region. Fortran
     #: and C++ do not reserve the same words, so a perfectly ordinary Fortran
@@ -245,20 +258,28 @@ class LFRicKokkosContractMixin:
                 f"'{symbol.name}' in the generated region, because it is a "
                 "C++ keyword.")
 
-    @staticmethod
-    def _validate_iteration_space(node):
-        """Check that the loop iterates over uncoloured cell columns.
+    @classmethod
+    def _validate_iteration_space(cls, node):
+        """Check the loop iterates over cell columns, of one colour or all.
+
+        A coloured loop is the inner of the two a colouring leaves behind,
+        and it is accepted for one reason: it is the alternative to an atomic
+        update, and the caller running the colours one after another is what
+        makes a write two cells share safe without one. Any other
+        ``loop_type`` -- the enclosing ``colour`` loop, a tiled colouring's
+        loops, a dof loop -- is refused as before.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
 
-        :raises TransformationError: if the loop is coloured or is not over
-            cell columns.
+        :raises TransformationError: if the loop is neither an uncoloured
+            cell-column loop nor the inner loop of a colouring.
         """
-        if node.loop_type or node.iteration_space != "cell_column":
+        if (node.loop_type not in ("", None, cls._COLOURED_LOOP_TYPE)
+                or node.iteration_space != "cell_column"):
             raise TransformationError(
-                "LFRicKokkosTrans supports only an uncoloured cell-column "
-                "loop.")
+                "LFRicKokkosTrans supports only a cell-column loop, coloured "
+                "or not.")
 
     @classmethod
     def _validate_halo_depth(cls, node):
@@ -522,6 +543,24 @@ LFRicKokkosTrans._uses_atomics`,
                         f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shapes "
                         f"only, but '{argument.name}' has '{shape}'.")
             cls._validate_written_space(argument, discontinuous)
+
+    @classmethod
+    def _shared_arguments(cls, kernel):
+        """Return the kernel arguments more than one cell of a launch updates.
+
+        Read from the kernel's metadata rather than from its body, and so
+        askable before any rewrite: what makes an argument shared is the
+        access LFRic declares for it, ``gh_inc`` or ``gh_readinc``, and not
+        the statement that carries out the update.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :returns: the shared arguments, in metadata order.
+        :rtype: list[:py:class:`psyclone.lfric.LFRicKernelArgument`]
+        """
+        return [argument for argument in kernel.arguments.args
+                if argument.access in cls._SHARED_ACCESSES]
 
     @classmethod
     def _validate_shared_updates(cls, kernel, schedule):

@@ -117,7 +117,7 @@ from psyclone.domain.lfric import KernCallArgList, KernStubArgList
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosView)
+    KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView)
 from psyclone.psyir.nodes import (
     ArrayReference, Call, IntrinsicCall, Literal, Reference, Routine)
 from psyclone.psyir.symbols import ArgumentInterface, ScalarType
@@ -399,9 +399,147 @@ class LFRicKokkosArgumentMixin:
                 f"{builder.num_args}.")
         return {formals[position] for position in builder.shared_positions}
 
+    @staticmethod
+    def _colour_symbols(kernel):
+        """Return the PSy-layer symbols a coloured launch is described from.
+
+        LFRic creates each of the three where it first needs one, and the
+        number of colours is the one a coloured schedule can be missing:
+        nothing in the PSy layer names it until a bound or a declaration
+        asks. It is not optional here, because the generated colour map is a
+        View and that number is its ``LayoutLeft`` stride.
+
+        :param kernel: the kernel being captured.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :returns: the colour map, the colour being launched, and the number
+            of colours.
+        :rtype: tuple[:py:class:`psyclone.psyir.symbols.DataSymbol`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]
+
+        :raises TransformationError: if the PSy layer has no name for the
+            number of colours.
+        """
+        table = kernel.ancestor(InvokeSchedule).symbol_table
+        ncolours_name = kernel.ncolours_var
+        if not ncolours_name:
+            raise TransformationError(
+                "LFRicKokkosTrans cannot capture a coloured loop whose "
+                "invoke has no number of colours: the generated colour map "
+                "is a View and that number is the extent it is addressed "
+                "by.")
+        return (kernel.colourmap, table.lookup_with_tag("colours_loop_idx"),
+                table.lookup(ncolours_name))
+
+    @classmethod
+    def _colouring(cls, kernel, node, schedule, cell_index):
+        """Describe how a coloured launch finds the mesh cell of each index.
+
+        A colouring leaves two loops, and the one captured is the inner: the
+        outer loop over colours stays as Fortran and enters the region once
+        per colour, which is what makes a write two cells share safe without
+        an atomic. The launch therefore counts the cells of one colour and
+        the region's own cell index is no longer what it iterates over, so
+        three things cross the ABI that an uncoloured region does not carry:
+        LFRic's colour map, the colour this launch is on, and the number of
+        colours.
+
+        The last of those looks redundant beside the map itself and is not.
+        The map is passed as bare storage and rebuilt as a View inside the
+        region, and its first extent is the ``LayoutLeft`` stride: get that
+        wrong and every lookup reads the wrong cell. The second extent has
+        no such duty -- under ``LayoutLeft`` it takes no part in the address
+        -- so the cell count is reused for it rather than a fourth argument
+        added.
+
+        Nothing is described for an uncoloured loop, so such a region
+        generates exactly the source it generated before this existed.
+
+        :param kernel: the kernel being captured, which owns LFRic's colour
+            map and colour count.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param node: the loop being captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param schedule: the kernel schedule, whose names the launch index is
+            generated clear of.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param str cell_index: the name the region gives the mesh cell, which
+            the launch index must not also be.
+
+        :returns: the region's colour map or ``None``, the descriptions of
+            the three generated arguments, and the actuals the PSy layer
+            passes for them.
+        :rtype: tuple[
+            Optional[
+                :py:class:`psyclone.psyir.backend.kokkos.KokkosColourMap`],
+            tuple[Union[
+                :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
+                :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...],
+            list[:py:class:`psyclone.psyir.nodes.Reference`]]
+
+        :raises TransformationError: if the PSy layer has no name for the
+            number of colours, as :py:meth:`_colour_symbols` raises it.
+        """
+        if node.loop_type != cls._COLOURED_LOOP_TYPE:
+            return None, (), []
+        map_symbol, colour_symbol, ncolours_symbol = cls._colour_symbols(
+            kernel)
+        # Generated clear of the kernel's own names for the reason the cell
+        # index is: the launch index and the map are declared in the scope
+        # the kernel's locals are declared in.
+        taken = {cell_index}
+        map_name, colour_name, ncolours, index = (
+            cls._clear_name(schedule.symbol_table, candidate, taken)
+            for candidate in (map_symbol.name, colour_symbol.name,
+                              ncolours_symbol.name, "cell_in_colour"))
+        colours = KokkosColourMap(
+            name=map_name, colour=colour_name, index=index)
+        arguments = (
+            # Both origins are Fortran's: the colour is one-based, and the
+            # launch's zero-based index names the cell one past it. The
+            # writer subtracts them where it writes the lookup, because this
+            # is the one View no PSyIR reference reaches, but they are stated
+            # here rather than left at nothing so the description is true.
+            KokkosView(map_name, f"{map_name}_data", "int",
+                       (ncolours, cls._CELL_COUNT), index_offsets=(1, 1),
+                       read_only=True, random_access=True),
+            KokkosScalar(colour_name, "int"),
+            KokkosScalar(ncolours, "int"),
+        )
+        return colours, arguments, [
+            Reference(map_symbol), Reference(colour_symbol),
+            Reference(ncolours_symbol)]
+
+    @staticmethod
+    def _clear_name(table, candidate, taken):
+        """Return a name clear of the kernel's own and of the names beside it.
+
+        ``next_available_name`` answers for the symbol table alone, and the
+        generated region declares two names the table does not hold: its cell
+        index, and each name generated just before this one. A launch that
+        declared its index under the cell's name would initialise the cell
+        from itself, and one that gave two of the three colour arguments the
+        same name would not compile.
+
+        :param table: the kernel's symbol table.
+        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+        :param str candidate: the name to start from, which is LFRic's own
+            where there is one.
+        :param set[str] taken: the names already generated, added to here.
+
+        :returns: a name no symbol and no earlier generated name carries.
+        :rtype: str
+        """
+        name = table.next_available_name(candidate)
+        while name in taken:
+            name = table.next_available_name(f"{name}_")
+        taken.add(name)
+        return name
+
     @classmethod
     def _region_arguments(cls, formals, per_cell, cell_index, renames,
-                          shared=frozenset()):
+                          shared=frozenset(), colour=()):
         # Five descriptions of one argument list, which is what describing an
         # argument list takes; grouping them into an object would only move
         # the count into its constructor.
@@ -443,6 +581,15 @@ class LFRicKokkosArgumentMixin:
             is what makes such a region generate the source it generated
             before this argument existed.
         :type shared: Container[str]
+        :param colour: the descriptions of the colour map, the colour and the
+            number of colours, as :py:meth:`_colouring` builds them, or the
+            empty tuple for a loop that is not coloured. They go after the
+            renamed extents and before the cell count for the reason those
+            go where they do: :py:meth:`_region` extends the actuals in this
+            order and the two lists are read as one.
+        :type colour: tuple[Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
 
         :returns: one description per generated C argument, in call order, up
             to and including the cell count.
@@ -472,6 +619,7 @@ class LFRicKokkosArgumentMixin:
                 atomic=symbol.name in shared))
         for renamed in renames.values():
             arguments.append(KokkosScalar(renamed, "int"))
+        arguments.extend(colour)
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
         return tuple(arguments)
 
@@ -623,10 +771,11 @@ LFRicKokkosTrans.apply` makes.
 
         :returns: the region, the actuals the PSy layer passes for its
             formals, and the module state it carries. The actuals returned
-            already carry every measured assumed shape and then the storage
-            extent of every per-cell size, appended after the kernel's own,
-            because :py:meth:`_region_arguments` puts those scalars in the
-            same place and in the same order.
+            already carry every measured assumed shape, then the storage
+            extent of every per-cell size, and then the colour map, colour
+            and colour count of a coloured loop, appended after the kernel's
+            own because :py:meth:`_region_arguments` puts those arguments in
+            the same place and in the same order.
         :rtype: tuple[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`,
             list[:py:class:`psyclone.psyir.nodes.DataNode`],
@@ -636,6 +785,12 @@ LFRicKokkosTrans.apply` makes.
         :raises TransformationError: if the PSy layer supplies a different
             number of actual arguments than the kernel has formals.
         """
+        # Each local here names one thing the region is described from, and
+        # the description has more parts than pylint's default allows a
+        # routine to hold. Splitting it would divide the argument list from
+        # the actuals that must match it position for position, which is the
+        # one property this routine exists to keep.
+        # pylint: disable=too-many-locals
         formals, actuals, cell_position = cls._argument_lists(
             kernel, node, schedule)
         per_cell = cls._per_cell(formals, actuals)
@@ -656,15 +811,20 @@ LFRicKokkosTrans.apply` makes.
         # that has not taken the name still generates 'cell'.
         cell_index = schedule.symbol_table.next_available_name(
             KokkosRegion.cell_index)
+        colours, colour_arguments, colour_actuals = cls._colouring(
+            kernel, node, schedule, cell_index)
         region = KokkosRegion(
             name=cls._region_name(schedule),
             schedule=schedule,
             cell_count=cls._CELL_COUNT,
             cell_index=cell_index,
             cell_position=cell_position,
+            colour_map=colours,
             arguments=(cls._region_arguments(
                 formals, per_cell, cell_index, renames,
-                cls._shared_formals(kernel, schedule))
+                cls._shared_formals(kernel, schedule)
+                if cls._uses_atomics(node, options) else frozenset(),
+                colour_arguments)
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
@@ -672,6 +832,7 @@ LFRicKokkosTrans.apply` makes.
             parallel_loops=cls._parallel_loops(schedule),
             team_size=(options or {}).get(cls._TEAM_SIZE_OPTION))
         actuals.extend(actual.copy() for _, actual in storage.values())
+        actuals.extend(colour_actuals)
         return region, actuals, constants
 
     @classmethod

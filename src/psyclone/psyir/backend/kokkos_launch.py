@@ -43,6 +43,30 @@ writer is the only caller; nothing here visits PSyIR.
 """
 
 
+def launch_index(region):
+    """Return the name a launch gives the index it iterates over.
+
+    Every shape below counts from zero to
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_count`, and
+    for all but one region that count is the mesh cells and the index is
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`. A
+    region captured from a coloured loop counts the cells of one colour
+    instead, and the mesh cell is looked up from that through its
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.colour_map`; the
+    writer emits that lookup as the region's first local declaration, so
+    what each shape here has to change is only the name it declares.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the launch's own index name.
+    :rtype: str
+    """
+    if region.colour_map is None:
+        return region.cell_index
+    return region.colour_map.index
+
+
 def _scratch_text(region, allocation, indent):
     """Return the three pieces of C++ a region's scratch arrays generate.
 
@@ -149,7 +173,7 @@ def range_launch(region, local_declarations, body):
     return (
         f'  Kokkos::parallel_for("{region.name}", '
         f"Kokkos::RangePolicy<>(0, {region.cell_count}),\n"
-        f"      KOKKOS_LAMBDA(const int {region.cell_index}) {{\n"
+        f"      KOKKOS_LAMBDA(const int {launch_index(region)}) {{\n"
         f"{local_declarations}{body}"
         "      });\n")
 
@@ -201,12 +225,12 @@ def team_launch(region, local_declarations, body):
         "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
         "team.team_size()),\n"
         "        [&](const int rank) {\n"
-        f"      const int {region.cell_index} = team.league_rank() * "
-        "team.team_size() + rank;\n"
+        f"      const int {launch_index(region)} = "
+        "team.league_rank() * team.team_size() + rank;\n"
         # The league is sized by rounding up, so the last team runs with
         # ranks that have no cell. Without this they would run the body
         # for a cell past the end of every View.
-        f"      if ({region.cell_index} >= {region.cell_count}) {{\n"
+        f"      if ({launch_index(region)} >= {region.cell_count}) {{\n"
         "        return;\n"
         "      }\n"
         f"{constructions}"
@@ -280,6 +304,6 @@ def hierarchical_launch(region, local_declarations, body):
         f'  Kokkos::parallel_for("{region.name}",\n'
         f"      {policy},\n"
         "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
-        f"    const int {region.cell_index} = team.league_rank();\n"
+        f"    const int {launch_index(region)} = team.league_rank();\n"
         f"{constructions}{local_declarations}{body}"
         "  });\n")

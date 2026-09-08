@@ -20,8 +20,8 @@ from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.backend.kokkos_region import (
-    KokkosRegion, KokkosScalar, KokkosView, extent_names, is_extent,
-    is_identifier, is_offset)
+    KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView,
+    extent_names, is_extent, is_identifier, is_offset)
 from psyclone.psyir.backend.kokkos_team_scalars import (
     team_private_scalars)
 from psyclone.psyir.backend.kokkos_launch import (
@@ -167,6 +167,16 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             local_declarations = (
                 f"{self._nindent}const int {region.cell_position} = "
                 f"{region.cell_index} + 1;\n") + local_declarations
+        if region.colour_map is not None:
+            # Ahead of the line above, which reads the cell index this one
+            # establishes, and prepended here for the same reason: all three
+            # launch shapes want it immediately after their own index, and
+            # each of them has just declared that.
+            colours = region.colour_map
+            local_declarations = (
+                f"{self._nindent}const int {region.cell_index} = "
+                f"{colours.name}({colours.colour} - 1, {colours.index}) "
+                "- 1;\n") + local_declarations
         body = "".join(
             self._visit(child) for child in region.schedule.children)
         constant_indent, self._depth = self._nindent, 0
@@ -273,7 +283,9 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
             share a C ABI name; if the cell count is not itself a scalar
             argument; if the cell position breaks the contract
-            :py:meth:`_validate_cell_position` states; if a kernel argument
+            :py:meth:`_validate_cell_position` states; if a colour map
+            breaks the contract :py:meth:`_validate_colour_map` states; if a
+            kernel argument
             has no description; if a View
             breaks the ownership or dimensional contract
             :py:meth:`_validate_view` states; if a scratch array breaks the
@@ -343,6 +355,8 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         if region.cell_count not in scalar_names:
             raise ValueError(
                 f"Cell count '{region.cell_count}' is not a scalar argument.")
+        if region.colour_map is not None:
+            self._validate_colour_map(region, view_names, scalar_names)
 
         schedule_arguments = {
             symbol.name
@@ -541,6 +555,53 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
                 f"Kokkos scratch '{scratch.name}' index offsets must be "
                 "integers or integer expressions over named sizes.")
 
+    def _validate_colour_map(self, region, view_names, scalar_names):
+        """Validate the names a coloured launch generates and reads.
+
+        Checked rather than trusted for the reason
+        :py:meth:`_validate_cell_position` gives, and with one addition that
+        is worse than any of those: a colour map that is not passed, or is
+        passed as something other than a View, generates a lookup of a name
+        the translation unit does not hold, and the region would run every
+        cell of every colour at once if the lookup were quietly dropped.
+
+        :param region: the region whose colour map is to be checked.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+        :param view_names: the names ``region.arguments`` passes as Views.
+        :type view_names: Set[str]
+        :param scalar_names: the names ``region.arguments`` passes as
+            scalars.
+        :type scalar_names: Set[str]
+
+        :raises ValueError: if any of the three names is not a C++
+            identifier; if the map is not passed as a View or the colour is
+            not passed as a scalar; if the launch's own index is the cell
+            index, which would declare the cell from itself; or if that index
+            is also a region argument, which the declaration would shadow.
+        """
+        colours = region.colour_map
+        for description, name in (("map", colours.name),
+                                  ("colour", colours.colour),
+                                  ("index", colours.index)):
+            if not is_identifier(name):
+                raise ValueError(
+                    f"Kokkos colour {description} '{name}' is not a C++ "
+                    "identifier.")
+        if colours.name not in view_names:
+            raise ValueError(
+                f"Kokkos colour map '{colours.name}' is not a View argument.")
+        if colours.colour not in scalar_names:
+            raise ValueError(
+                f"Kokkos colour '{colours.colour}' is not a scalar argument.")
+        if colours.index == region.cell_index:
+            raise ValueError(
+                f"Kokkos colour index '{colours.index}' is also the region's "
+                "cell index, so the cell would be declared from itself.")
+        if colours.index in view_names | scalar_names:
+            raise ValueError(
+                f"Kokkos colour index '{colours.index}' is also a region "
+                "argument.")
+
     def _validate_view(self, view):
         """Validate the ownership and dimensional contract for one View.
 
@@ -627,6 +688,7 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             f"{view.data_name}, {extents});")
 
 
-__all__ = ["KokkosConstant", "KokkosRegion", "KokkosScalar",
+__all__ = ["KokkosColourMap", "KokkosConstant", "KokkosRegion",
+           "KokkosScalar",
            "KokkosScratch", "KokkosView",
            "KokkosWriter", "extent_names", "is_extent", "is_offset"]

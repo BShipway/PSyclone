@@ -208,6 +208,39 @@ class KokkosView:
 
 
 @dataclass(frozen=True)
+class KokkosColourMap:
+    """Where a coloured launch finds the mesh cell each of its indices names.
+
+    A launch given this runs the cells of one colour, and its own index runs
+    over those rather than over the mesh: the map is what turns one into the
+    other. It is the second of the two answers to a write two cells share --
+    the first being
+    :py:attr:`KokkosView.atomic` -- and the two are alternatives, not a
+    sequence: cells of one colour meet at no dof, so the update they make is
+    a plain read-modify-write and no atomic is generated for it.
+
+    The launch is one colour's, not the whole loop's. What runs the colours
+    one after another is the caller, which enters the region once per colour;
+    that ordering is where the safety comes from and it is deliberately not
+    inside the region, so that the generated unit stays one ``parallel_for``
+    as every other capture is.
+    """
+
+    #: The rank-2 View of the map, indexed by colour and then by the launch's
+    #: own index. Its first extent is the number of colours, which is the
+    #: stride under ``LayoutLeft`` and so the extent that has to be exact.
+    name: str
+    #: The scalar naming which colour this launch runs, as the caller's
+    #: one-based Fortran colour index.
+    colour: str
+    #: The name the launch gives its own index, which counts the cells of
+    #: this colour. It is not
+    #: :py:attr:`KokkosRegion.cell_index`: that one names the mesh cell, and
+    #: is what the body's dofmaps are indexed by.
+    index: str
+
+
+@dataclass(frozen=True)
 class KokkosRegion:
     """All information required to generate one Kokkos translation unit."""
     # A description carries as many fields as the thing it describes has
@@ -265,6 +298,11 @@ class KokkosRegion:
     #: functor. Taking it across the ABI instead would compile and run, and
     #: give every cell whatever the caller passed once.
     cell_position: Optional[str] = None
+    #: The map from this launch's index to a mesh cell, for a region captured
+    #: from an already-coloured loop; ``None`` for every other region, which
+    #: launches over the mesh cells themselves and generates exactly the
+    #: source it generated before colouring was accepted.
+    colour_map: Optional[KokkosColourMap] = None
     #: The team size the hierarchical launch asks for. ``None`` renders
     #: ``Kokkos::AUTO`` and lets the backend choose; a positive integer
     #: renders itself, which is how a host build reaches the team-level
@@ -278,6 +316,6 @@ class KokkosRegion:
     constants: Tuple[KokkosConstant, ...] = ()
 
 
-__all__ = ["KokkosRegion", "KokkosScalar", "KokkosView",
-           "extent_names", "is_extent", "is_identifier",
+__all__ = ["KokkosColourMap", "KokkosRegion", "KokkosScalar",
+           "KokkosView", "extent_names", "is_extent", "is_identifier",
            "is_offset"]

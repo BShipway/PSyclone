@@ -672,6 +672,78 @@ KernelModuleInlineTrans`.
     #: reaches the team-level concurrency only by setting this.
     _TEAM_SIZE_OPTION = "team_size"
 
+    #: The option choosing between the two answers to a write two cells of
+    #: one launch share. ``True`` generates a ``Kokkos::atomic_*`` update for
+    #: every read-modify-write of a shared field; ``False`` generates none
+    #: and requires the loop to have been coloured first, so that the cells
+    #: meeting at a dof are in different launches. Absent, the choice follows
+    #: the loop: a coloured loop takes the coloured arm and every other loop
+    #: takes atomics, which is what makes atomics the default and makes every
+    #: capture predating this option generate the source it generated then.
+    #:
+    #: The two are alternatives rather than a ranking. Both are correct, and
+    #: which is faster is a measurement neither this class nor the branch
+    #: that added it has made.
+    _ATOMICS_OPTION = "atomics"
+
+    @classmethod
+    def _uses_atomics(cls, node, options):
+        """Say which of the two answers to a shared write is in force.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: the transformation options.
+        :type options: Optional[Dict[str, Any]]
+
+        :returns: whether a shared update is to be generated as an atomic.
+        :rtype: bool
+        """
+        requested = (options or {}).get(cls._ATOMICS_OPTION)
+        if requested is None:
+            return node.loop_type != cls._COLOURED_LOOP_TYPE
+        return bool(requested)
+
+    def _validate_atomics_option(self, node, options):
+        """Check the ``"atomics"`` option against the loop it is given with.
+
+        Each arm answers a shared write on its own, and the two together
+        answer it twice: an atomic on data colouring has already made private
+        to one launch costs an instruction and buys nothing. Asking for both
+        is therefore a contradiction in what the caller stated rather than a
+        preference to be resolved quietly, and so is asking for neither on a
+        loop that has a shared write and has not been coloured -- which would
+        generate a race.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: the transformation options.
+        :type options: Optional[Dict[str, Any]]
+
+        :raises TransformationError: if the option is neither absent nor a
+            bool; if it is ``True`` on a coloured loop; or if it is ``False``
+            on an uncoloured loop whose kernel has a shared write.
+        """
+        requested = (options or {}).get(self._ATOMICS_OPTION)
+        if requested is not None and not isinstance(requested, bool):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option must be "
+                f"absent or a bool, but found '{requested}'.")
+        coloured = node.loop_type == self._COLOURED_LOOP_TYPE
+        if requested and coloured:
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is True "
+                "on a coloured loop. Colouring has already made every write "
+                "the launch's own, so an atomic would guard data no other "
+                "cell of the launch reaches; ask for one answer to a shared "
+                "write or the other.")
+        if (requested is False and not coloured
+                and self._shared_arguments(node.kernels()[0])):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is False "
+                "on a loop that is not coloured, whose kernel writes a field "
+                "two cells share. Colour the loop first, or leave the option "
+                "out and take the atomic update.")
+
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
 
@@ -685,7 +757,8 @@ KernelModuleInlineTrans`.
         :param node: the loop that is to be captured as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations. The
-            one read here is ``"team_size"``; see :py:meth:`apply`.
+            two read here are ``"team_size"`` and ``"atomics"``; see
+            :py:meth:`apply`.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.validate`.
@@ -698,12 +771,16 @@ KernelModuleInlineTrans`.
             class's description.
         :raises TransformationError: if the ``"team_size"`` option is neither
             absent nor a positive integer.
+        :raises TransformationError: if the ``"atomics"`` option and the
+            loop's colouring contradict each other, as
+            :py:meth:`_validate_atomics_option` states.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
                 "LFRicKokkosTrans expects an LFRicLoop but found "
                 f"'{type(node).__name__}'.")
 
+        self._validate_atomics_option(node, options)
         team_size = (options or {}).get(self._TEAM_SIZE_OPTION)
         if team_size is not None and (
                 isinstance(team_size, bool) or not isinstance(team_size, int)
@@ -753,7 +830,8 @@ KernelModuleInlineTrans`.
         # On the probe, and after the lowering, because the shape of an
         # update is what decides whether an atomic can carry it out and the
         # lowering is what settles that shape.
-        self._validate_shared_updates(kernel, probe)
+        if self._uses_atomics(node, options):
+            self._validate_shared_updates(kernel, probe)
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
         # so that an array parameter the generated unit could not declare is
