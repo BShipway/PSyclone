@@ -2044,5 +2044,117 @@ def test_kokkos_writer_reports_nothing_for_a_body_it_can_write():
     """A body of intrinsics the writer knows reports none."""
     schedule = _array_probe("  a(:) = matmul(w, q(1:3)) * sqrt(b(:))\n")
 
-    assert KokkosWriter().unsupported_intrinsics(
-        schedule, _ARRAY_KINDS) == ()
+    refusals = KokkosWriter().unsupported_intrinsics(schedule, _ARRAY_KINDS)
+
+    assert isinstance(refusals, tuple)
+    assert not refusals
+
+
+def test_kokkos_array_intrinsic_over_a_section():
+    """An operand may be a section, which is the form the model writes.
+
+    ``matmul(m3(ik,:,:), p_e)`` and ``sum(t(1:n))`` take their extents from
+    the ranges the subscript states rather than from the whole View, and the
+    subscripts the section fixes are carried through to every element the
+    generated loop reads.
+    """
+    lowering, statements = _lowering("  x = sum(m(:, 1))\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert text.count("for (int _kae_j") == 1
+    assert "_kae_j0 <= (1 + 3 - 1)" in text
+    assert "_kae_r0 += m((_kae_j0 - 1), (1 - 1));" in text
+
+
+def test_kokkos_array_intrinsic_refuses_an_expression_operand():
+    """An operand that is computed rather than stored has no elements.
+
+    Reading one element of it would mean generating the expression once per
+    index, which is a rewrite of the operand rather than a subscript of it,
+    so this tier takes a whole array or a section of one and nothing else.
+    """
+    lowering, statements = _lowering("  x = sum(q + b(1))\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "must be a whole array or a section of one" in str(error.value)
+
+
+def test_kokkos_array_intrinsic_refuses_an_element_of_an_expression():
+    """The same rule holds where the shape came from somewhere else.
+
+    ``element`` is reached with whatever the shape was taken from, so it
+    restates the rule rather than trusting it: an operand this tier accepted
+    the shape of and cannot subscript would otherwise generate a loop with
+    no body.
+    """
+    lowering, statements = _lowering("  x = sum(q + b(1))\n")
+    # pylint: disable=protected-access
+    intrinsics = lowering._intrinsics
+
+    with pytest.raises(VisitorError) as error:
+        intrinsics.element(statements[0].rhs.arguments[0], ["_kae_j0"])
+
+    assert "cannot read an element of" in str(error.value)
+
+
+def test_kokkos_transpose_refuses_an_operand_that_is_not_a_matrix():
+    """``TRANSPOSE`` is defined over a matrix and over nothing else."""
+    lowering, statements = _lowering("  p(:) = transpose(q)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'TRANSPOSE' of a rank-1 operand" in str(error.value)
+
+
+def test_kokkos_reduction_refuses_an_argument_beside_its_dim():
+    """A ``mask`` folds part of a dimension, which this tier cannot write.
+
+    The generated loop runs over whole extents and accumulates every element
+    it reads. A mask would have to become a condition inside it, evaluated
+    from an array the reduction never declared it read, so it is refused by
+    name rather than dropped.
+    """
+    lowering, statements = _lowering("  x = sum(q, mask=q > 0.0_r_def)\n")
+
+    with pytest.raises(VisitorError) as error:
+        lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "'SUM' with a 'mask' argument" in str(error.value)
+
+
+def test_kokkos_array_intrinsic_inside_an_intrinsic_of_its_own():
+    """A reduction under an elemental intrinsic is still hoisted.
+
+    The hoist looks for the outermost *handled* call, not the outermost call:
+    ``abs(sum(q))`` has no enclosing reduction to nest inside, so the sum is
+    hoisted and the ``abs`` is written over the scalar it leaves behind.
+    """
+    lowering, statements = _lowering("  x = abs(sum(q))\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "double _kae_r0 = Kokkos::reduction_identity<double>::sum();" \
+        in text
+    assert "x = Kokkos::abs(_kae_r0);" in text
+
+
+def test_kae_steps_over_the_sections_a_reduction_consumed():
+    """A section inside a scalar reduction is not a section of the statement.
+
+    ``a(:) = b(:) * dot_product(m(:,1), q)`` is rank 1 and the reduction's
+    operand is a section of a different array with a different extent. The
+    shape has to come from the sections the statement itself has, so the
+    operands of the reduction are stepped over while looking for one.
+    """
+    lowering, statements = _lowering(
+        "  a(:) = b(:) * dot_product(m(:, 1), q)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert text.count("for (int _kae_i") == 1
+    assert "_kae_i0 = 1; _kae_i0 <= (1 + nlayers - 1)" in text
+    assert "a((_kae_i0 - 1)) = (b((_kae_i0 - 1)) * _kae_r0);" in text

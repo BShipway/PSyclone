@@ -4249,7 +4249,9 @@ def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
     "unsized_local_target", "unmapped_local_target",
     "unrenderable_origin_target", "unsized_expression_target",
     "unwritable_shape_target", "unknown_allocate_target",
-    "looped_allocate_target", "tiny_target"])
+    "looped_allocate_target", "option_allocate_target",
+    "twice_allocate_target", "shapeless_allocate_target",
+    "module_allocate_target", "tiny_target"])
 def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
         fixture_name, request):
     """Both refusals are made by ``validate``, not discovered by ``apply``.
@@ -5748,3 +5750,133 @@ def test_lfric_kokkos_trans_refuses_an_intrinsic_the_writer_lacks(
         LFRicKokkosTrans().validate(loop)
 
     assert "TINY/1" in str(error.value)
+
+
+# An allocation carrying an option beside the arrays it names. `mold=` states
+# where the shape and type come from, and a literal is used for it so that the
+# refusal has to name an argument that is not a reference to anything.
+_OPTION_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial(nlayers), swept(nlayers), mold=0.0_r_def )")
+
+
+# The same local allocated twice, which two shapes over one name. Scratch is
+# reserved once with one size, so this is a refusal rather than a choice
+# between the two.
+_TWICE_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial(nlayers), swept(nlayers) )\n"
+    "    allocate( partial(nlayers) )")
+
+
+# An allocation naming its array and stating no bounds for it. Fortran would
+# not accept this of a deferred-shape array, and the frontend does not judge
+# it, so the conversion says why it has no size to reserve rather than
+# reserving nothing.
+_SHAPELESS_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial, swept(nlayers) )")
+
+
+# A kernel allocating the module's own workspace rather than its own, which
+# is how a module-scope allocatable acquires a shape. The storage outlives the
+# region and is shared with whatever else the module lets at it, so it is not
+# the automatic array the scratch reservation stands in for.
+_MODULE_ALLOCATE_KERNEL = _ALLOCATABLE_MODULE_VARIABLE_KERNEL.replace(
+    "    partial(1) = field_in(map_w3(1))",
+    "    allocate( profile_heights(nlayers) )\n"
+    "    partial(1) = field_in(map_w3(1))").replace(
+    "  end subroutine column_solve_code",
+    "    deallocate( profile_heights )\n"
+    "  end subroutine column_solve_code")
+
+
+@pytest.fixture(name="option_allocate_target")
+# pylint: disable-next=unused-argument
+def option_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates with an option argument."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _OPTION_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="twice_allocate_target")
+# pylint: disable-next=unused-argument
+def twice_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates one local twice."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _TWICE_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="shapeless_allocate_target")
+# pylint: disable-next=unused-argument
+def shapeless_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates without stating a shape."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _SHAPELESS_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="module_allocate_target")
+# pylint: disable-next=unused-argument
+def module_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates a module-scope array."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MODULE_ALLOCATE_KERNEL)
+
+
+def test_kokkos_allocate_refused_when_it_carries_an_option(
+        option_allocate_target):
+    """An option beside the arrays says something scratch cannot say.
+
+    ``stat=``, ``errmsg=``, ``source=`` and ``mold=`` each state part of what
+    the allocation is to do, and the reserved scratch carries none of it.
+    Dropping the statement would drop the option with it, so the refusal
+    names it, and names the arguments as they were written.
+    """
+    _, loop, _ = option_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'mold'" in str(error.value)
+    assert "'0.0_r_def'" in str(error.value)
+
+
+def test_kokkos_allocate_refused_when_allocated_twice(twice_allocate_target):
+    """Two allocations of one local are two shapes over one reservation."""
+    _, loop, _ = twice_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'partial'" in str(error.value)
+    assert "allocated more than once" in str(error.value)
+
+
+def test_kokkos_allocate_refused_when_it_states_no_shape(
+        shapeless_allocate_target):
+    """An allocation stating no bounds leaves nothing to reserve."""
+    _, loop, _ = shapeless_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'partial'" in str(error.value)
+    assert "states no explicit shape" in str(error.value)
+
+
+def test_kokkos_allocate_refused_for_a_module_array(module_allocate_target):
+    """Allocating module storage is not the kernel-local case.
+
+    A module-scope allocatable outlives the region and is shared with
+    whatever else the module lets at it, so giving it the shape the statement
+    states and reserving scratch for it would move storage the model reads
+    after the invoke.
+    """
+    _, loop, _ = module_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'profile_heights'" in str(error.value)
+    assert "not a kernel-local allocatable array" in str(error.value)

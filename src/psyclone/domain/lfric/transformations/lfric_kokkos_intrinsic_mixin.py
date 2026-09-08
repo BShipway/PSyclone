@@ -92,7 +92,9 @@ class LFRicKokkosIntrinsicMixin:
     #: Arguments of an ``ALLOCATE`` that say something beyond the shape.
     #: ``source`` and ``mold`` state the value or the type as well, and
     #: ``stat`` and ``errmsg`` ask about a failure the region cannot have,
-    #: scratch being reserved by the launch and never by the body.
+    #: scratch being reserved by the launch and never by the body. The
+    #: frontend upper-cases the keyword it read, so the comparison folds
+    #: case rather than assuming either spelling.
     _ALLOCATE_OPTIONS = ("stat", "errmsg", "source", "mold")
 
     @classmethod
@@ -175,12 +177,12 @@ class LFRicKokkosIntrinsicMixin:
                 "allocation made afresh on each trip is a different array "
                 "each time.")
         for name in call.argument_names:
-            if name in cls._ALLOCATE_OPTIONS:
+            if name is not None and name.lower() in cls._ALLOCATE_OPTIONS:
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot convert the allocation of "
-                    f"{names} to scratch: it carries a '{name}' argument, "
-                    "which says something the reserved scratch does not "
-                    "carry.")
+                    f"{names} to scratch: it carries a '{name.lower()}' "
+                    "argument, which says something the reserved scratch "
+                    "does not carry.")
         arrays = []
         for argument in call.arguments:
             symbol = cls._allocatable(call, argument, names)
