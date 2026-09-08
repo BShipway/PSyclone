@@ -710,6 +710,112 @@ _STENCIL_REGION_KERNEL = _STENCIL_1D_KERNEL.replace(
     "stencil_line", "stencil_region").replace("cross", "region")
 
 
+_IMPLICIT_ALGORITHM = """
+program kokkos_implicit_test
+  use field_mod, only : field_type
+  use normals_sum_kernel_mod, only : normals_sum_kernel_type
+  implicit none
+  type(field_type) :: field_out, field_in
+  call invoke(normals_sum_kernel_type(field_out, field_in))
+end program kokkos_implicit_test
+"""
+
+
+# The boundary-condition shape: a reference-element property and a mesh
+# property, each declared by the kernel with the extent left out. Every one of
+# the six loops the catalogue counts under "implicit extent" is this --
+# 'weighted_div_bd_code' writes 'real(kind=r_def), intent(in) ::
+# outward_normals(:,:)' beside 'integer(kind=i_def), intent(in) ::
+# adjacent_face(:)' -- and the extent the declaration leaves out is not
+# unknown: the PSy layer holds the array it passes and can measure it.
+#
+# The two are here together because they are measured differently. The
+# reference-element array is passed whole, so the region's View has the two
+# extents the actual has; the mesh property is passed one cell's column at a
+# time, so the region takes it whole and the extent measured is the one the
+# slice leaves. 'nfaces_re_h' is declared and unused, as LFRic's own kernels
+# declare it: the argument order is the metadata's rather than the body's.
+_IMPLICIT_KERNEL = """
+module normals_sum_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column, reference_element_data_type,       &
+                           mesh_data_type, adjacent_face,                  &
+                           outward_normals_to_horizontal_faces
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: normals_sum_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                &
+         arg_type(gh_field, gh_real, gh_write, w3),                    &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    type(reference_element_data_type) :: meta_reference_element(1) = (/ &
+         reference_element_data_type(                                   &
+             outward_normals_to_horizontal_faces) /)
+    type(mesh_data_type) :: meta_mesh(1) = (/                           &
+         mesh_data_type(adjacent_face) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: normals_sum_code
+  end type normals_sum_kernel_type
+contains
+  subroutine normals_sum_code(nlayers, field_out, field_in,   &
+                              ndf_w3, undf_w3, map_w3,        &
+                              nfaces_re_h, outward_normals,   &
+                              adjacent_face)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: nfaces_re_h
+    real(kind=r_def), intent(in) :: outward_normals(:,:)
+    integer(kind=i_def), intent(in) :: adjacent_face(:)
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df, face
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = field_in(map_w3(df) + k)
+        do face = 1, size(adjacent_face, 1)
+          field_out(map_w3(df) + k) = field_out(map_w3(df) + k) + &
+              outward_normals(1, face) *                         &
+              outward_normals(2, adjacent_face(face))
+        end do
+      end do
+    end do
+  end subroutine normals_sum_code
+end module normals_sum_kernel_mod
+"""
+
+
+# The same kernel asking for the bounds themselves rather than for the size.
+# Fortran fixes the lower bound of an assumed-shape dummy at 1 whatever the
+# actual was declared with, so 'lbound' is the literal 1 and 'ubound' is the
+# measured extent -- the one place where the declared origin A3 reads is the
+# dummy's own and not the actual's.
+_IMPLICIT_BOUND_KERNEL = _IMPLICIT_KERNEL.replace(
+    "do face = 1, size(adjacent_face, 1)",
+    "do face = lbound(adjacent_face, 1), ubound(adjacent_face, 1)")
+
+
+# An assumed shape whose declaration states its lower bound. Fortran allows
+# it, and it is the one assumed shape that stays refused: the extent would be
+# taken from the actual and the origin from the declaration, so the View's
+# shape would be read out of two places at once.
+_IMPLICIT_ORIGIN_KERNEL = _IMPLICIT_KERNEL.replace(
+    "intent(in) :: adjacent_face(:)",
+    "intent(in) :: adjacent_face(0:)")
+
+
+# An assumed shape that is not a kernel argument, and so has no call to be
+# measured through. The declaration is not legal Fortran outside a dummy
+# argument list, which is the point: there is no route by which a local can
+# acquire a shape from a caller, so the region has nothing to size a scratch
+# View by and refuses rather than guessing one.
+_IMPLICIT_LOCAL_KERNEL = _IMPLICIT_KERNEL.replace(
+    "    integer(kind=i_def) :: k, df, face\n",
+    "    integer(kind=i_def) :: k, df, face\n"
+    "    real(kind=r_def), dimension(:) :: loose\n")
+
+
 # A column solve reduced to its shape: two automatic arrays over nlayers, a
 # forward sweep and a backward one. It is sci_tri_solve_kernel_mod's structure
 # without its algebra. The arrays are what the region has to place in team
@@ -2860,6 +2966,38 @@ def stencil_region_target_fixture(tmp_path, clear_module_manager_instance):
         _STENCIL_REGION_KERNEL)
 
 
+@pytest.fixture(name="implicit_target")
+# pylint: disable-next=unused-argument
+def implicit_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel leaves two formals' extents out."""
+    return _invoke(
+        tmp_path, "normals_sum", _IMPLICIT_ALGORITHM, _IMPLICIT_KERNEL)
+
+
+@pytest.fixture(name="implicit_bound_target")
+# pylint: disable-next=unused-argument
+def implicit_bound_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel asks an assumed shape for its bounds."""
+    return _invoke(
+        tmp_path, "normals_sum", _IMPLICIT_ALGORITHM, _IMPLICIT_BOUND_KERNEL)
+
+
+@pytest.fixture(name="implicit_origin_target")
+# pylint: disable-next=unused-argument
+def implicit_origin_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel states one bound of an assumed shape."""
+    return _invoke(
+        tmp_path, "normals_sum", _IMPLICIT_ALGORITHM, _IMPLICIT_ORIGIN_KERNEL)
+
+
+@pytest.fixture(name="implicit_local_target")
+# pylint: disable-next=unused-argument
+def implicit_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel declares a local of no stated shape."""
+    return _invoke(
+        tmp_path, "normals_sum", _IMPLICIT_ALGORITHM, _IMPLICIT_LOCAL_KERNEL)
+
+
 @pytest.fixture(name="local_target")
 # pylint: disable-next=unused-argument
 def local_target_fixture(tmp_path, clear_module_manager_instance):
@@ -4467,6 +4605,122 @@ def test_lfric_kokkos_trans_accepts_a_cross_stencil_with_a_variable_extent(
     assert "STENCIL_CROSS, extent" in fortran
     assert fortran.index("halo_exchange(depth=extent)") < fortran.index(
         "call stencil_line_kokkos(")
+
+
+def test_lfric_kokkos_trans_sizes_an_assumed_shape_from_the_actual(
+        implicit_target):
+    """A formal declared '(:)' is sized by the array the PSy layer passes.
+
+    The declaration states no extent, but the extent is not unknown: Fortran
+    takes it from the actual at the call, and the PSy layer holds that array.
+    So the region carries the measurement -- 'SIZE' of the actual -- as a
+    scalar of its own and sizes the View from that, which is the same route
+    C2 measures a stencil dofmap's storage extent by.
+
+    The kernel's own 'size(adjacent_face, 1)' has to resolve to that same
+    scalar. A View sized by one reading of the shape and a loop bounded by
+    another is a wrong answer rather than a refusal, which is why the two are
+    asserted together.
+    """
+    psy, loop, _ = implicit_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> adjacent_face(adjacent_face_data, "
+            "adjacent_face_extent_1, ncells);" in cpp)
+    assert "const int adjacent_face_extent_1" in cpp
+    assert "for(face=1; face<=adjacent_face_extent_1; face+=1)" in cpp
+
+    fortran = str(psy.gen)
+    assert "integer(c_int), value :: adjacent_face_extent_1" in fortran
+    assert "SIZE(adjacent_face, dim=1)" in fortran
+
+
+def test_lfric_kokkos_trans_sizes_a_rank_2_assumed_shape(implicit_target):
+    """Every dimension left out of the declaration is measured, in order.
+
+    A rank-2 assumed shape carries two extents and both are the actual's, so
+    the region takes two scalars and the PSy layer measures the same array
+    twice. The call is asserted whole because the scalars are positional: two
+    measurements of one array in the wrong order size the View wrongly in a
+    way that still compiles.
+    """
+    psy, loop, _ = implicit_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("Kokkos::View<const double**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> outward_normals(outward_normals_data, "
+            "outward_normals_extent_1, outward_normals_extent_2);" in cpp)
+    assert "const int outward_normals_extent_1" in cpp
+    assert "const int outward_normals_extent_2" in cpp
+
+    fortran = str(psy.gen)
+    assert ("call normals_sum_kokkos(nlayers_field_out, field_out_data, "
+            "field_in_data, ndf_w3, undf_w3, map_w3, nfaces_re_h, "
+            "out_normals_to_horiz_faces, adjacent_face, "
+            "SIZE(out_normals_to_horiz_faces, dim=1), "
+            "SIZE(out_normals_to_horiz_faces, dim=2), "
+            "SIZE(adjacent_face, dim=1), loop0_stop)" in fortran)
+
+
+def test_lfric_kokkos_trans_refuses_an_assumed_shape_with_no_actual(
+        implicit_local_target):
+    """An assumed shape is only measurable where there is a call to measure.
+
+    A kernel-local array declared '(:)' has no actual anywhere, so there is
+    nothing to read its extent from and the region refuses it rather than
+    choosing one. The refusal names the array and says which of the two
+    shapeless declarations it carries, so a reader knows whether to look at
+    the kernel or at its caller.
+    """
+    _, loop, _ = implicit_local_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires 'loose' to be declared with explicit bounds, but it is "
+            "declared with an assumed shape" in str(error.value))
+
+
+def test_lfric_kokkos_trans_refuses_an_assumed_shape_with_a_stated_origin(
+        implicit_origin_target):
+    """A shape half declared and half measured is not read from two places.
+
+    'dimension(0:)' takes its extent from the actual and its origin from the
+    declaration. Honouring both would give the View a shape assembled out of
+    the caller and the callee at once, which is the confusion the declared
+    bounds exist to avoid, so the measurement is not attempted and the
+    refusal says which of the two it found.
+    """
+    _, loop, _ = implicit_origin_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("requires 'adjacent_face' to be declared with explicit bounds, "
+            "but it is declared with an assumed shape whose lower bound its "
+            "declaration states, so its origin and its size would be read "
+            "from two different places" in str(error.value))
+
+
+def test_lfric_kokkos_trans_assumed_shape_lower_bound_is_one(
+        implicit_bound_target):
+    """An assumed-shape formal is 1-based whatever the actual was declared as.
+
+    Fortran gives the dummy the actual's *extent* and its own lower bound,
+    which is 1 unless the dummy states otherwise. The origin A3 shifts every
+    subscript by is therefore the declaration's own and must not be taken from
+    the actual: 'lbound' is the literal 1, 'ubound' is the measured extent,
+    and the subscripts are shifted by one like any other 1-based array's.
+    """
+    _, loop, _ = implicit_bound_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "for(face=1; face<=adjacent_face_extent_1; face+=1)" in cpp
+    assert "adjacent_face((face - 1), cell)" in cpp
 
 
 def test_lfric_kokkos_trans_refuses_an_unsupported_stencil_type(target):

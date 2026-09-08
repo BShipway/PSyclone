@@ -52,6 +52,18 @@ array each enquiry asks about.
 predicate the capture contract and the coverage survey ask, and it predicts
 that rewrite over a copy.
 
+A declaration that states no shape at all is the exception, and there is one
+of it: a formal declared ``(:)`` or ``(:,:)``, whose extent Fortran takes from
+the actual at the call.
+:py:meth:`LFRicKokkosBoundsMixin._resolve_assumed_shapes` puts that extent back
+into the declaration -- one integer formal per dimension, measured by the PSy
+layer and appended to the kernel's own arguments -- so that every reader below
+still reads one shape out of one declaration.
+:py:meth:`LFRicKokkosBoundsMixin._implicit_extents` names those formals again
+and :py:meth:`LFRicKokkosBoundsMixin._implicit_extent_actuals` writes the
+``SIZE`` the PSy layer passes for each, the argument mixin appending the two
+to the region's signature and to its call.
+
 The sibling mixins are reached through ``cls``, resolved on
 ``LFRicKokkosTrans``: ``_validate_bounds`` predicts ``cls._lower_sections``
 and ``_bounds`` asks ``cls._resolve_constants`` for a declaration written
@@ -59,12 +71,14 @@ over a ``parameter``. Calling a method here directly on this mixin is
 therefore not supported.
 """
 
+from psyclone.domain.lfric import LFRicTypes
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos import extent_names, is_extent
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     BinaryOperation, IntrinsicCall, Literal, Reference)
-from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
+from psyclone.psyir.symbols import (
+    ArgumentInterface, ArrayType, DataSymbol, ScalarType)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -90,30 +104,226 @@ class LFRicKokkosBoundsMixin:
                          IntrinsicCall.Intrinsic.UBOUND,
                          IntrinsicCall.Intrinsic.SIZE)
 
+    #: The tag each scalar carrying an assumed shape's extent is created
+    #: under, followed by the formal it measures and the dimension of it. The
+    #: tag is what :py:meth:`_implicit_extents` finds them again by: nothing
+    #: else tells a formal this transformation added from one the kernel
+    #: declared, and the argument mixin has to know which is which to supply
+    #: the measurement only for the ones it added.
+    _IMPLICIT_EXTENT_TAG = "kokkos-implicit-extent"
+
     #: What a declaration carrying no bounds carries instead, and where the
     #: shape it does not state is stated. Both are refusals, and the reason
     #: they are refusals is different, so a reader who is told which of the
     #: two this is knows whether to look at the kernel or at its caller.
+    #:
+    #: An assumed shape reaches a refusal only where
+    #: :py:meth:`_resolve_assumed_shapes` could not have measured it, which is
+    #: where it is not a kernel argument: a formal's is measured at the call
+    #: and put back into its declaration before anything here reads it.
     _SHAPELESS_WORDING = {
         ArrayType.Extent.DEFERRED:
             "a deferred shape, so its size is stated by an ALLOCATE in the "
             "kernel body and not by its declaration",
         ArrayType.Extent.ATTRIBUTE:
-            "an assumed shape, so its size is stated by its caller and not "
-            "by its declaration",
+            "an assumed shape and is not one of the kernel's arguments, so "
+            "there is no call for its size to be stated by",
     }
+
+    #: The wording for the one assumed shape that is a kernel argument and is
+    #: still refused. A dummy declared ``dimension(0:)`` is legal Fortran and
+    #: takes its extent from the actual and its origin from itself, so the
+    #: shape a View would be given would be read out of two places at once --
+    #: the very thing :py:meth:`_bounds` exists to prevent. No GungHo kernel
+    #: writes one.
+    _STATED_ORIGIN_WORDING = (
+        "an assumed shape whose lower bound its declaration states, so its "
+        "origin and its size would be read from two different places")
 
     @classmethod
     def _shapeless_wording(cls, dimension):
         """Name the shape a dimension carries in place of declared bounds.
 
-        :param dimension: the entry of the array's shape that has no bounds.
-        :type dimension: :py:class:`psyclone.psyir.symbols.ArrayType.Extent`
+        :param dimension: the entry of the array's shape that has no bounds,
+            which is an ``Extent`` where the declaration stated neither bound
+            and an ``ArrayBounds`` where it stated the lower one alone.
+        :type dimension: Union[
+            :py:class:`psyclone.psyir.symbols.ArrayType.Extent`,
+            :py:class:`psyclone.psyir.symbols.ArrayType.ArrayBounds`]
 
         :returns: what the Fortran declared, worded for a refusal.
         :rtype: str
         """
+        if isinstance(dimension, ArrayType.ArrayBounds):
+            return cls._STATED_ORIGIN_WORDING
         return cls._SHAPELESS_WORDING.get(dimension, f"'{dimension}'")
+
+    @classmethod
+    def _resolve_assumed_shapes(cls, schedule):
+        """Give every assumed-shape formal an extent it can be sized by.
+
+        A formal declared ``(:)`` states no extent, but its extent is not
+        unknown: Fortran takes it from the actual at the call, and the PSy
+        layer holds that actual. So the measurement is added to the kernel's
+        arguments -- one integer formal per dimension left out, named
+        ``<formal>_extent_<dimension>`` -- and written into the declaration in
+        place of the extent that is missing. Everything below this reads a
+        declared shape as it always did, and the one place that knows the
+        shape came from the call is the argument mixin, which passes ``SIZE``
+        of the actual for each formal added here.
+
+        This is C2's mechanism turned around. There, a *declared* extent --
+        a stencil's per-cell size -- was the wrong length for a View, and a
+        scalar carrying the array's storage extent was added beside it and
+        substituted into the generated bounds by name. Here the extent is not
+        declared at all, so the scalar is written into the declaration itself
+        and no substitution is needed; both carry a ``SIZE`` of a PSy-layer
+        array as a new region argument, and
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosArgumentMixin._region` appends the two sets of actuals in the order
+        the two sets of arguments are declared in.
+
+        Only a formal is resolved, and only where its declaration stated no
+        bound of any dimension. A local declared ``(:)`` has no call to be
+        measured at, and a formal declared ``(0:)`` -- which PSyIR records as
+        bounds whose upper is the assumed extent rather than as the extent
+        itself -- is left for :py:meth:`_bounds` to refuse; see
+        :py:attr:`_STATED_ORIGIN_WORDING`.
+
+        The schedule is mutated in place, and idempotently: a shape resolved
+        here is no longer assumed, so a second call over the same schedule
+        finds nothing to do. That is what lets :py:meth:`_substitute_bounds`
+        call it unconditionally.
+
+        :param schedule: the kernel schedule to be captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        """
+        table = schedule.symbol_table
+        integer = ScalarType.integer_type()
+        for symbol in list(table.argument_list):
+            datatype = symbol.datatype
+            if not isinstance(datatype, ArrayType):
+                continue
+            # Every dimension, not any: a declaration stating one bound of one
+            # of them -- 'dimension(0:,:)' -- is one whose origin does not
+            # come from where its extent would, and _bounds refuses it whole
+            # rather than this measuring the half of it that is plain.
+            if not all(dimension is ArrayType.Extent.ATTRIBUTE
+                       for dimension in datatype.shape):
+                continue
+            resolved = []
+            for index in range(1, len(datatype.shape) + 1):
+                extent = table.new_symbol(
+                    f"{symbol.name}_extent_{index}",
+                    tag=f"{cls._IMPLICIT_EXTENT_TAG}:{symbol.name}:{index}",
+                    symbol_type=DataSymbol,
+                    datatype=LFRicTypes("LFRicIntegerScalarDataType")(),
+                    interface=ArgumentInterface(
+                        ArgumentInterface.Access.READ))
+                # Appended immediately, because a symbol carrying an argument
+                # interface that the argument list does not hold is a table
+                # PSyclone reports as inconsistent.
+                table.append_argument(extent)
+                # The lower bound is the Fortran default rather than the
+                # actual's: an assumed-shape dummy is 1-based whatever the
+                # array passed to it was declared as, so this is exactly where
+                # the origin is not read from the call.
+                resolved.append((Literal("1", integer), Reference(extent)))
+            symbol.datatype = ArrayType(datatype.elemental_type, resolved)
+
+    @classmethod
+    def _implicit_extents(cls, table):
+        """Name the extent scalars :py:meth:`_resolve_assumed_shapes` added.
+
+        Read in the order the argument list holds them rather than the order
+        they were created in, because that is the order the generated
+        signature declares them and the actuals have to be supplied in the
+        same one.
+
+        :param table: the kernel's own symbol table, after the resolution.
+        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+
+        :returns: per added formal, the formal it measures and the dimension
+            of it, in call order.
+        :rtype: dict[str, tuple[str, int]]
+        """
+        prefix = f"{cls._IMPLICIT_EXTENT_TAG}:"
+        tags = {symbol.name: tag for tag, symbol in table.tags_dict.items()
+                if tag.startswith(prefix)}
+        measured = {}
+        for symbol in table.argument_list:
+            tag = tags.get(symbol.name)
+            if tag is None:
+                continue
+            _, name, dimension = tag.split(":")
+            measured[symbol.name] = (name, int(dimension))
+        return measured
+
+    @classmethod
+    def _implicit_extent_actuals(cls, formals, actuals, table):
+        """Measure each assumed shape on the array the PSy layer passes.
+
+        An assumed-shape formal takes its size from the actual, so the size is
+        not in the kernel to be read: the declaration says only that there is
+        one. It is in the PSy layer, and ``SIZE`` on the actual is the
+        question Fortran itself answers when it shapes the dummy. The measured
+        value crosses as a scalar formal of the region --
+        :py:meth:`_resolve_assumed_shapes` has already made the extent a
+        formal and written it into the declaration -- and this supplies its
+        actual. It sits beside the resolution rather than with the rest of the
+        argument list because the two are one mechanism: the formal is of no
+        use without the measurement, and the measurement is of none without
+        the formal.
+
+        The array is measured whole, after
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosArgumentMixin._per_cell` has unsliced it. That is the same array
+        the dummy is shaped from: LFRic slices a trailing cell dimension and
+        no other, so dimension *n* of the formal is dimension *n* of the
+        actual either way, and the whole array is what the call site can name
+        once the launch has replaced the cell loop.
+
+        The route is the one
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosArgumentMixin._storage_extents` opened for a stencil's storage: a
+        companion scalar formal appended after the kernel's own, carrying
+        ``SIZE`` of an actual. The two differ in what they answer rather than
+        in how they answer it -- there, an extent the kernel states and a View
+        cannot honour; here, an extent the kernel does not state at all -- so
+        they measure separate arrays and are kept apart, and both are supplied
+        in the order
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosArgumentMixin._region_arguments` declares them.
+
+        :param formals: the kernel's own formals, in call order.
+        :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
+        :param actuals: the actuals the PSy layer passes for them, in the same
+            order and already unsliced by
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosArgumentMixin._per_cell`.
+        :type actuals: list[:py:class:`psyclone.psyir.nodes.DataNode`]
+        :param table: the kernel's own table, after the resolution.
+        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+
+        :returns: the formals with each measured extent appended to them, and
+            the expressions the PSy layer passes for those, in call order.
+            The two are returned together because appending to one without
+            the other is what would misalign the call.
+        :rtype: tuple[list[:py:class:`psyclone.psyir.symbols.DataSymbol`],
+            list[:py:class:`psyclone.psyir.nodes.IntrinsicCall`]]
+        """
+        passed = dict(zip((formal.name for formal in formals), actuals))
+        extents = []
+        measurements = []
+        for name, (measured, dimension) in cls._implicit_extents(
+                table).items():
+            extents.append(table.lookup(name))
+            measurements.append(IntrinsicCall.create(
+                IntrinsicCall.Intrinsic.SIZE,
+                [Reference(passed[measured].symbol),
+                 ("dim", Literal(str(dimension),
+                                 ScalarType.integer_type()))]))
+        return formals + extents, measurements
 
     @staticmethod
     def _render(writer, symbol, expression):
@@ -244,7 +454,11 @@ class LFRicKokkosBoundsMixin:
         for dimension in datatype.shape:
             lower = getattr(dimension, "lower", None)
             upper = getattr(dimension, "upper", None)
-            if lower is None or upper is None:
+            # A dimension with no bounds at all is the Extent itself; one
+            # declared 'dimension(0:)' keeps its lower bound and carries the
+            # Extent in place of its upper. Both are shapeless, and the
+            # wording tells them apart.
+            if lower is None or isinstance(upper, ArrayType.Extent):
                 raise TransformationError(
                     f"LFRicKokkosTrans requires '{symbol.name}' to be "
                     f"declared with explicit bounds, but it is declared with "
@@ -349,6 +563,14 @@ class LFRicKokkosBoundsMixin:
         which is why an array based anywhere else answers all three
         differently.
 
+        Every assumed-shape formal is resolved first, by
+        :py:meth:`_resolve_assumed_shapes`, so that a kernel asking ``SIZE`` of
+        one is answered with the extent measured at the call rather than
+        refused for a declaration that states none. The two belong together:
+        this is the method that makes a body's shape enquiries agree with the
+        shape a View is given, and after the resolution the two are again one
+        declaration.
+
         The schedule is mutated in place, which is why :py:meth:`validate`
         predicts this over a copy rather than running it.
 
@@ -363,6 +585,7 @@ class LFRicKokkosBoundsMixin:
             so a reader gets the bounds grammar's own message rather than a
             paraphrase of it.
         """
+        cls._resolve_assumed_shapes(schedule)
         for call in schedule.walk(IntrinsicCall):
             if call.intrinsic not in cls._BOUND_INTRINSICS:
                 continue

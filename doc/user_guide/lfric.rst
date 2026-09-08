@@ -4188,9 +4188,21 @@ case written the other way round. An allocation the launch cannot evaluate
 before it enters the region -- one sized from the kernel's own data, one made
 inside a loop, one carrying ``stat``, ``errmsg``, ``source`` or ``mold``, or
 a second allocation of the same array -- is refused by name instead. An
-assumed-shape local, sized by its caller, states no shape anywhere the region
-can read and stays refused, as does a shape with
-no C form, such as ``dimension(MAX(nlayers-n,1))``. The declared *lower*
+assumed-shape *local*, which has no caller to be sized by, states no shape
+anywhere the region can read and stays refused, as does a shape with
+no C form, such as ``dimension(MAX(nlayers-n,1))``. An assumed-shape
+*formal* is measured instead of refused: a boundary-condition kernel writing
+``real(kind=r_def), intent(in) :: normals(:,:)`` lets Fortran take the
+extents from the actual, and the PSy layer holds that actual, so the region
+carries one integer formal per dimension the declaration left out and the
+call passes ``SIZE(actual, dim=n)`` for each. The View is sized by that
+formal and every shape enquiry the body makes about the array resolves to
+it, as it would to a declared extent. The lower bound of such a formal is 1
+whatever the actual was declared from -- Fortran's own rule for an
+assumed-shape dummy -- so only the size comes from the caller; one that
+states a bound and leaves the other, ``dimension(0:)``, would take its
+origin from the kernel and its extent from the caller and is refused by
+name. The declared *lower*
 bound is read the same way and need not be 1: ``dimension(0:nlayers-1)`` is generated
 as a View of ``nlayers`` elements with ``0`` subtracted from every subscript
 of that array, so an origin the Fortran chose is carried through rather than
