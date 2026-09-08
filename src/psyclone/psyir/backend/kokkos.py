@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Union
 
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.kokkos_array_expression import (
-    KokkosArrayExpressionMixin)
+    KokkosArrayExpressionMixin, KokkosScratch)
 from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
@@ -144,32 +144,6 @@ class KokkosView:
     read_only: bool = False
     random_access: bool = False
     managed: bool = False
-
-
-@dataclass(frozen=True)
-class KokkosScratch:
-    """A kernel-local array placed in Kokkos team scratch.
-
-    A Fortran automatic local such as ``real(r_def), dimension(nlayers) ::
-    x_new`` crosses no interface, so it is described here rather than among
-    the region's arguments: it must not appear in the generated C ABI, and it
-    is not a kernel formal the region has to account for. Its extents are
-    integer expressions over the region's scalar arguments, such as
-    ``nlayers``, ``4`` or ``(nlayers + 1)``, which is what lets the generated
-    C++ size it: a scratch size is computed on the host before the launch,
-    where only those scalars are in scope.
-
-    ``index_offsets`` and ``extra_indices`` are carried, and the latter is
-    always empty, so that one array-reference table can hold both Views and
-    scratch and be read without a type test.
-    """
-
-    name: str
-    c_type: str
-    extents: Tuple[str, ...]
-    #: As :py:attr:`KokkosView.index_offsets`.
-    index_offsets: Tuple[Union[int, str], ...] = ()
-    extra_indices: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

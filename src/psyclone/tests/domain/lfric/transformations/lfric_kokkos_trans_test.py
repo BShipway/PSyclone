@@ -1184,6 +1184,52 @@ _FULL_SECTION_KERNEL = _SECTION_KERNEL.replace(
     "    difference(:) = difference(:) + (b_idx + nl)")
 
 
+# The statements convert_hdiv_native_code is built out of, with the routine it
+# calls left out: a rank-2 local named whole and set to zero, accumulated into
+# by column inside a loop over its second dimension, and a written field
+# section taking one of its columns. Between them these are the three shapes
+# the lowering has to reach, and the kernel family writes no fourth that does
+# not need MATMUL.
+_HDIV_SECTION_KERNEL = _SECTION_KERNEL.replace(
+    "    integer(kind=i_def) :: nl, w3_idx, b_idx\n",
+    "    integer(kind=i_def) :: i, nl, w3_idx, b_idx\n"
+    "    real(kind=r_tran), dimension(nlayers, 3) :: vector\n").replace(
+    "    difference(w3_idx : w3_idx + nl) = &\n"
+    "        mass_flux(b_idx + 1 : b_idx + nl + 1) "
+    "- mass_flux(b_idx : b_idx + nl)",
+    "    vector = 0.0_r_tran\n"
+    "    do i = 1, 3\n"
+    "      vector(:,i) = vector(:,i) + mass_flux(b_idx : b_idx + nl)\n"
+    "    end do\n"
+    "    difference(w3_idx : w3_idx + nl) = vector(:,1)")
+
+
+# The same kernel passing a column of the local to a routine, which is how
+# convert_hdiv_native_code reaches native_jacobian. The section is outside an
+# assignment and so beyond the lowering, but the call is beyond the capture
+# altogether, and that is the reason worth reporting.
+_HDIV_CALL_KERNEL = _HDIV_SECTION_KERNEL.replace(
+    "    difference(w3_idx : w3_idx + nl) = vector(:,1)",
+    "    call native_jacobian(vector(:,1))\n"
+    "    difference(w3_idx : w3_idx + nl) = vector(:,1)")
+
+
+# A local set from an array constructor, the way poly1d_reconstruction writes
+# its face list. The values are positional, so the statement is a section that
+# must not be lowered: the C writer spreads a constructor over its destination
+# itself, and a loop would leave a subscripted constructor behind.
+_CONSTRUCTOR_SECTION_KERNEL = _SECTION_KERNEL.replace(
+    "    integer(kind=i_def) :: nl, w3_idx, b_idx\n",
+    "    integer(kind=i_def) :: nl, w3_idx, b_idx\n"
+    "    integer(kind=i_def), dimension(4) :: faces\n").replace(
+    "    difference(w3_idx : w3_idx + nl) = &\n"
+    "        mass_flux(b_idx + 1 : b_idx + nl + 1) "
+    "- mass_flux(b_idx : b_idx + nl)",
+    "    faces(:) = (/ 2_i_def, 3_i_def, 4_i_def, 5_i_def /)\n"
+    "    difference(w3_idx : w3_idx + nl) = "
+    "mass_flux(b_idx : b_idx + nl) * real(faces(1), r_tran)")
+
+
 # The same kernel declaring its own constants beside the routine, the way
 # poly1d_reconstruction and create_w2mask do. The module is `private`, so the
 # PSy layer could not import either name even if it wanted to; the value is
@@ -2561,6 +2607,107 @@ def test_lfric_kokkos_trans_captures_an_array_section(section_target):
 
     assert "call fv_difference_kokkos(" in fortran
     assert "call fv_difference_code(" not in fortran
+
+
+def test_lfric_kokkos_trans_accepts_a_section_actual(
+        tmp_path, clear_module_manager_instance):
+    """The convert_hdiv_native family's array statements are all lowered.
+
+    Three shapes stand between that family and a capture, and this kernel is
+    the three of them without the routine they surround. ``vector = 0.0`` is
+    a whole array named with no accessor at all, which
+    ArrayAssignment2LoopsTrans refuses for want of one and
+    Reference2ArrayRangeTrans supplies; ``vector(:,i) = vector(:,i) + ...``
+    is a written section of a local; and the field write takes a column of
+    that local by section. What is left of the family after this is its call,
+    which is a capability of its own.
+    """
+    # pylint: disable=unused-argument
+    psy, loop, _ = _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM, _HDIV_SECTION_KERNEL)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert 'extern "C" void fv_difference_kokkos(' in cpp
+    # The local is a rank-2 automatic, so it is team scratch rather than a
+    # temporary of the lowering's own: the nests write through the View the
+    # region already described.
+    assert "vector_scratch_t vector(team.team_scratch(0), nlayers, 3);" in cpp
+    # 'vector = 0.0' became a nest over both of its dimensions, the second
+    # spread over the team and the first -- the contiguous one under
+    # LayoutLeft -- swept inside it.
+    assert "vector((idx_1 - 1), (idx - 1)) = 0.0;" in cpp
+    # The written section keeps the kernel's own loop as the parallel one and
+    # counts the column inside it, each side from its own lower bound.
+    assert ("vector((idx_2 - 1), (i - 1)) = (vector((idx_2 - 1), (i - 1)) + "
+            "mass_flux(((idx_2 + (b_idx - 1)) - 1)));" in cpp)
+    # The field write is a column of the local read at the assigned range's
+    # offset, which is what says the two sections were matched up rather than
+    # subscripted independently.
+    assert ("difference((idx_3 - 1)) = "
+            "vector(((idx_3 + (1 - w3_idx)) - 1), (1 - 1));" in cpp)
+    assert "call fv_difference_kokkos(" in fortran
+    assert "call fv_difference_code(" not in fortran
+
+
+def test_lfric_kokkos_trans_defers_a_section_actual_to_the_call(
+        tmp_path, clear_module_manager_instance):
+    """A section given to a routine is refused for the routine, not the shape.
+
+    ``call native_jacobian(vector(:,1))`` carries two reasons a capture
+    cannot proceed: the section stands outside an assignment, and the call
+    has no Fortran to reach. Only the second is the loop's real blocker --
+    remove the call and the section goes with it -- so the section rule steps
+    aside and lets _validate_calls answer. The coverage survey asks each rule
+    on its own and keeps every message, so a rule that answered here would
+    report this loop as an array-section blocker that no array-section work
+    could ever clear.
+    """
+    # pylint: disable=unused-argument
+    _, loop, _ = _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM, _HDIV_CALL_KERNEL)
+
+    # Asked on its own, as the survey asks it, the section rule has nothing
+    # to say about this kernel: every assignment in it lowers, and the one
+    # section that does not is the call's argument.
+    LFRicKokkosTrans._validate_sections(
+        LFRicKokkosTrans._schedule(loop.kernels()[0]))
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert "cannot capture the call to 'native_jacobian'" in str(error.value)
+    assert "array section outside an assignment" not in str(error.value)
+
+
+def test_lfric_kokkos_trans_keeps_an_array_constructor_whole(
+        tmp_path, clear_module_manager_instance):
+    """A constructor assigned to a section is written, not lowered.
+
+    ``faces(:) = (/ 2, 3, 4, 5 /)`` is a section by its left-hand side and a
+    list of values by its right, and the two do not survive being separated:
+    a loop over the section would have to subscript the constructor, which
+    nothing can render. CWriter already spreads a constructor over its
+    destination element by element, so the lowering leaves this statement
+    alone and that path is reached.
+    """
+    # pylint: disable=unused-argument
+    _, loop, _ = _invoke(
+        tmp_path, "fv_difference", _SECTION_ALGORITHM,
+        _CONSTRUCTOR_SECTION_KERNEL)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "faces((1 - 1)) = 2;" in cpp
+    assert "faces((4 - 1)) = 5;" in cpp
+    # Written once for the whole team rather than by every member, and by no
+    # loop: a counted loop over the four values is exactly what must not
+    # appear.
+    assert "Kokkos::single(Kokkos::PerTeam(team)" in cpp
+    assert "faces((idx" not in cpp
+    # The section that is not a constructor is lowered as it always was, so
+    # the two live in one kernel without either changing the other.
+    assert "difference((idx - 1)) = (mass_flux(" in cpp
 
 
 def test_lfric_kokkos_trans_refuses_an_unlowerable_section(

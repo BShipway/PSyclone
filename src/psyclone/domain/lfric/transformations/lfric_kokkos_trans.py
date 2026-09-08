@@ -23,11 +23,13 @@ from psyclone.psyGen import InvokeSchedule, Transformation
 from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Call, IntrinsicCall, Literal, Loop, Range,
-    Reference, Routine)
+    ArrayReference, Assignment, Call, IntrinsicCall, Literal, Loop, Reference,
+    Routine)
+from psyclone.psyir.nodes.array_mixin import ArrayMixin
 from psyclone.psyir.tools import DependencyTools
 from psyclone.psyir.transformations import (
-    ArrayAssignment2LoopsTrans, TransformationError)
+    ArrayAssignment2LoopsTrans, Reference2ArrayRangeTrans,
+    TransformationError)
 
 
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
@@ -163,14 +165,30 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     stencil kernel written as a generic interface is still refused there
     whatever its shape.
 
-    A whole-column array section such as ``a(i:j)``, which the finite-volume
-    kernels use to assign a column as a unit, is accepted and lowered to an
-    explicit loop by
+    **An array-valued assignment is lowered to an explicit loop.** Two
+    shapes reach the lowering. A whole-column array section such as
+    ``a(i:j) = ...``, which the finite-volume kernels use to assign a column
+    as a unit, is one; a whole-array assignment naming no section at all --
+    ``vector = 0.0_r_def``, where ``vector`` is declared with a shape -- is
+    the other, and it is expanded into a section by
+    :py:class:`~psyclone.psyir.transformations.Reference2ArrayRangeTrans`
+    first, which makes explicit the section it already meant.
     :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
-    before the region is described. The generated region has no way to say
-    ``a(i:j)``, so a section that transformation refuses -- one carrying a
-    loop-carried dependency, for instance -- is refused here too, with its
-    reason quoted. A section outside an assignment altogether is beyond what
+    then rewrites both into loops, before the region is described.
+
+    The generated region has no way to say ``a(i:j)``, so a shape that
+    transformation refuses is refused here too, with its reason quoted. The
+    refusals that arise in GungHo are a loop-carried dependency, which no
+    order of generated loops could honour, and a right-hand side calling
+    something neither scalar-valued nor elemental -- ``MATMUL``,
+    ``DOT_PRODUCT`` and the other contractions among them, whose result is an
+    array a loop nest cannot subscript.
+
+    A section that is not in an assignment at all is judged by where it is
+    instead. One that is an actual argument of a call is left to the rule
+    about calls, which refuses or accepts the whole call on its own terms
+    rather than being pre-empted here by the shape of one argument. Anywhere
+    else -- the bounds of an ``ALLOCATE``, most often -- it is beyond what
     lowering can reach and is refused before the backend sees it.
 
     **An array constructor fills an array; it is not a value.** A kernel
@@ -262,8 +280,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     ``u_e((k - 0))``. The lower bound must satisfy the same grammar as the
     upper -- an integer expression over kernel arguments and literals using
     ``+``, ``-``, ``*`` and ``/`` -- and is refused on the same terms when it
-    does not. A bound of 1 renders exactly the source it rendered before this was
-    accepted, the span folding back to the upper bound alone.
+    does not. A bound of 1 renders exactly the source it rendered before this
+    was accepted, the span folding back to the upper bound alone.
 
     The subtraction is written out even where it is zero, because it is
     applied in one place -- the back-end's generation of an array accessor --
@@ -565,15 +583,29 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
             return False
         return True
 
-    @staticmethod
-    def _lower_sections(schedule):
-        """Replace every whole-column section with an explicit loop.
+    @classmethod
+    def _lower_sections(cls, schedule):
+        """Replace every array-valued assignment with an explicit loop.
 
         Applied to the schedule :py:meth:`_schedule` returns, which
         :py:meth:`~psyclone.domain.lfric.LFRicKern.get_callees` caches so that
         transformations applied to a kernel persist. That is the intended
         idiom, so the lowering is done once here rather than repeated for
         every consumer of the schedule.
+
+        Two shapes reach the lowering and one is kept from it. A written
+        section, ``a(2:n) = 0.0``, is what
+        :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
+        exists for. A whole array named with no accessor at all,
+        ``pv_at_quad = 0.0``, is the same statement written the shorter way,
+        and that transformation refuses it for want of an accessor; writing
+        one in with
+        :py:class:`~psyclone.psyir.transformations.Reference2ArrayRangeTrans`
+        first makes it the section it already meant. The exception is an
+        array constructor, ``cells(:) = [2, 3, 4, 5]``, whose values are
+        positional: :py:class:`~psyclone.psyir.backend.c.CWriter` renders one
+        element by element from the constructor itself, and a loop would
+        leave behind a subscripted constructor that no writer can render.
 
         :param schedule: the kernel schedule to be captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
@@ -583,10 +615,14 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
             running this method over a copy, so reaching it from
             :py:meth:`apply` would mean that prediction had been skipped.
         """
+        expansion = Reference2ArrayRangeTrans()
         lowering = ArrayAssignment2LoopsTrans()
         for assignment in schedule.walk(Assignment):
-            if assignment.walk(Range):
-                lowering.apply(assignment)
+            if not cls._is_array_valued(assignment):
+                continue
+            if not isinstance(assignment.lhs, ArrayMixin):
+                expansion.apply(assignment.lhs)
+            lowering.apply(assignment)
 
     @staticmethod
     def _parallel_loops(schedule):

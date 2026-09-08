@@ -80,7 +80,10 @@ on this mixin is therefore not supported.
 from psyclone.core import AccessType
 from psyclone.domain.lfric import LFRicConstants
 from psyclone.psyir.nodes import (
-    Assignment, Call, CodeBlock, IntrinsicCall, Range, Reference)
+    ArrayConstructor, Assignment, Call, CodeBlock, IntrinsicCall, Range,
+    Reference)
+from psyclone.psyir.nodes.array_mixin import ArrayMixin
+from psyclone.psyir.symbols import ArrayType, DataSymbol
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -392,9 +395,38 @@ class LFRicKokkosContractMixin:
                 f"LFRicKokkosTrans cannot capture the call to '{name}': the "
                 "generated region has no Fortran to call into.")
 
+    @staticmethod
+    def _is_array_valued(assignment):
+        """Answer whether ``assignment`` is one that lowering rewrites.
+
+        The two shapes it answers for are a written section, ``a(2:n) = 0.0``,
+        and a whole array named with no accessor at all, ``pv_at_quad = 0.0``,
+        which is the same statement written the shorter way. An array
+        constructor on the right, ``cells(:) = [2, 3, 4, 5]``, is excluded
+        even though it is a section: its values are positional and
+        :py:class:`~psyclone.psyir.backend.c.CWriter` renders it element by
+        element, so lowering would take a statement the backend can already
+        write and leave a subscripted constructor in its place.
+
+        :param assignment: the assignment to judge.
+        :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
+
+        :returns: whether :py:meth:`LFRicKokkosTrans._lower_sections` rewrites
+            this assignment.
+        :rtype: bool
+        """
+        if isinstance(assignment.rhs, ArrayConstructor):
+            return False
+        if assignment.walk(Range):
+            return True
+        target = assignment.lhs
+        return (not isinstance(target, ArrayMixin)
+                and isinstance(target.symbol, DataSymbol)
+                and isinstance(target.symbol.datatype, ArrayType))
+
     @classmethod
     def _validate_sections(cls, schedule):
-        """Check that every whole-column section can be lowered to a loop.
+        """Check that every array-valued assignment can be lowered to a loop.
 
         The generated region has no way to say ``a(i:j)``, so a section is
         rewritten as an explicit loop before the backend sees it. This
@@ -410,21 +442,34 @@ class LFRicKokkosContractMixin:
         so the lowering itself is the predicate and the copy is what keeps it
         side-effect free.
 
+        A section that is not part of an assignment is out of reach of
+        lowering, but it is only this rule's to refuse when it stands on its
+        own. Passed to a routine -- ``call convert(field(:,k))`` -- the call
+        is the blocker and :py:meth:`_validate_calls` is the rule that names
+        it, so this one steps aside rather than reporting the argument as a
+        second, weaker reason for the same refusal.
+
         :param schedule: the kernel schedule to be captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
-        :raises TransformationError: if a section is not part of an
-            assignment, and so is beyond what lowering can reach.
-        :raises TransformationError: if a section's own assignment cannot be
+        :raises TransformationError: if a section stands outside an assignment
+            other than as the argument of a call, and so is beyond what
+            lowering can reach.
+        :raises TransformationError: if an array-valued assignment cannot be
             lowered, in which case the reason is the one PSyclone gives.
         """
         for section in schedule.walk(Range):
-            if section.ancestor(Assignment) is None:
-                raise TransformationError(
-                    "LFRicKokkosTrans cannot capture an array section outside "
-                    "an assignment: only a whole-column assignment can be "
-                    "lowered to a loop the generated region can express.")
-        if not schedule.walk(Range):
+            if section.ancestor(Assignment) is not None:
+                continue
+            call = section.ancestor(Call)
+            if call is not None and not isinstance(call, IntrinsicCall):
+                continue
+            raise TransformationError(
+                "LFRicKokkosTrans cannot capture an array section outside "
+                "an assignment: only a whole-column assignment can be "
+                "lowered to a loop the generated region can express.")
+        if not any(cls._is_array_valued(assignment)
+                   for assignment in schedule.walk(Assignment)):
             return
         try:
             cls._lower_sections(schedule.copy())
