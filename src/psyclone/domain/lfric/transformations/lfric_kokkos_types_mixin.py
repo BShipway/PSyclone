@@ -47,7 +47,7 @@ the size a View is given and the origin its subscripts are shifted from. Which
 of the names a body reads is module state, and what the region does with each,
 is ``LFRicKokkosConstantsMixin``; this module answers only what a kind maps to.
 Which kinds one captured body names, and the compile-time width assertions
-they become, are ``LFRicKokkosArgumentMixin``, beside the interface that
+they become, are ``LFRicKokkosInterfaceMixin``, beside the interface that
 carries them.
 
 The one constraint that follows is that a method reaching a helper of the
@@ -69,8 +69,8 @@ class LFRicKokkosTypesMixin:
     to, and the widths the generated region has to assert. The shape its
     declaration gives it is ``LFRicKokkosBoundsMixin``; whether the body may
     read it at all, and as what, is ``LFRicKokkosConstantsMixin``. Nothing
-    here builds the region or the Fortran that calls it; that is
-    ``LFRicKokkosArgumentMixin``.
+    here builds the region, which is ``LFRicKokkosArgumentMixin``, or the
+    Fortran that calls it, which is ``LFRicKokkosInterfaceMixin``.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
@@ -106,7 +106,7 @@ class LFRicKokkosTypesMixin:
     #: for the same reason -- a row would have to name a width, and both
     #: :py:meth:`_supported_kinds` and
     #: :py:meth:`~psyclone.domain.lfric.transformations.\
-    #: lfric_kokkos_argument_mixin.LFRicKokkosArgumentMixin._kind_assertions`
+    #: lfric_kokkos_interface_mixin.LFRicKokkosInterfaceMixin._kind_assertions`
     #: read that table as widths.
     _C_LOGICAL_TYPE = "bool"
 
@@ -133,7 +133,7 @@ class LFRicKokkosTypesMixin:
     #: than assumed here. LFRic's ``constants_mod`` declares no such kind --
     #: being unnamed is the whole of what makes it the default -- so
     #: :py:meth:`~psyclone.domain.lfric.transformations.\
-    #: lfric_kokkos_argument_mixin.LFRicKokkosArgumentMixin._kind_assertions`
+    #: lfric_kokkos_interface_mixin.LFRicKokkosInterfaceMixin._kind_assertions`
     #: keeps the name out of the ``use`` line it writes and out of the
     #: literal's kind suffix.
     #:
