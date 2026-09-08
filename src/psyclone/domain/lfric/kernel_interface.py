@@ -204,17 +204,36 @@ class KernelInterface(ArgOrdering):
             "TODO #928: _mesh_ncell2d_no_halos not implemented")
 
     def cell_map(self, var_accesses=None):
-        '''Not implemented.
+        '''Create the LFRic objects an inter-grid kernel's cell map implies
+        and add them to the symbol table and argument list. These are the map
+        itself, the number of fine cells per coarse cell in each of the two
+        horizontal directions -- which are the map's extents -- and the
+        number of cells in the fine mesh, which dimensions the whole-mesh
+        dofmap :py:meth:`fs_intergrid` adds for the fine function space.
 
         :param var_accesses: an unused optional argument that stores \
             information about variable accesses.
         :type var_accesses: :\
             py:class:`psyclone.core.VariablesAccessMap`
 
-        :raises NotImplementedError: as this method is not implemented.
-
         '''
-        raise NotImplementedError("TODO #928: cell_map not implemented")
+        ncell_f_per_c_x = self._symtab.find_or_create_tag(
+            "ncell_f_per_c_x",
+            symbol_type=LFRicTypes("NumberOfCellsDataSymbol"),
+            interface=self._read_access)
+        ncell_f_per_c_y = self._symtab.find_or_create_tag(
+            "ncell_f_per_c_y",
+            symbol_type=LFRicTypes("NumberOfCellsDataSymbol"),
+            interface=self._read_access)
+        cell_map_symbol = self._symtab.find_or_create_tag(
+            "cell_map", symbol_type=LFRicTypes("CellMapDataSymbol"),
+            dims=[Reference(ncell_f_per_c_x), Reference(ncell_f_per_c_y)],
+            interface=self._read_access)
+        ncell_f = self._symtab.find_or_create_tag(
+            "ncell_f", symbol_type=LFRicTypes("NumberOfCellsDataSymbol"),
+            interface=self._read_access)
+        self._arglist.extend(
+            [cell_map_symbol, ncell_f_per_c_x, ncell_f_per_c_y, ncell_f])
 
     def field_vector(self, argvect, var_accesses=None):
         '''Create LFRic field vector arguments and add them to the symbol
@@ -461,19 +480,56 @@ class KernelInterface(ArgOrdering):
         self._arglist.append(ndf_symbol)
 
     def fs_intergrid(self, function_space, var_accesses=None):
-        '''Not implemented.
+        '''Create the arguments an inter-grid kernel needs for one of its two
+        function spaces, and add them to the symbol table and argument list.
 
-        :param arg: the CMA operator argument.
-        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        Which arguments those are depends on the mesh the space's field is
+        on. A field on the coarse mesh is read at the cell the PSy layer is
+        iterating over, so it takes what any field takes: the number of
+        unique dofs and a dofmap for that one cell. A field on the fine mesh
+        is read at cells the cell map chooses, so it takes the number of dofs
+        as well, and its dofmap covers the whole fine mesh rather than a
+        single cell.
+
+        :param function_space: the function space for these arguments.
+        :type function_space: :py:class:`psyclone.domain.lfric.FunctionSpace`
         :param var_accesses: an unused optional argument that stores \
             information about variable accesses.
         :type var_accesses: :\
             py:class:`psyclone.core.VariablesAccessMap`
 
-        :raises NotImplementedError: as this method is not implemented.
-
         '''
-        raise NotImplementedError("TODO #928: fs_intergrid not implemented")
+        arg = self._kern.arguments.get_arg_on_space(function_space)
+        if arg.mesh != "gh_fine":
+            self.fs_compulsory_field(
+                function_space, var_accesses=var_accesses)
+            return
+
+        self.fs_common(function_space, var_accesses=var_accesses)
+        fs_name = function_space.orig_name
+        undf_symbol = self._symtab.find_or_create_tag(
+            f"undf_{fs_name}", fs=fs_name,
+            symbol_type=LFRicTypes("NumberOfUniqueDofsDataSymbol"),
+            interface=self._read_access)
+        self._arglist.append(undf_symbol)
+
+        ndf_symbol = self._symtab.find_or_create_tag(
+            f"ndf_{fs_name}", fs=fs_name,
+            symbol_type=LFRicTypes("NumberOfDofsDataSymbol"),
+            interface=self._read_access)
+        # Declared here rather than looked up, so that this method answers
+        # for its own arguments whether or not cell_map() has run: both name
+        # the one fine-mesh cell count, and the tag makes them the one
+        # symbol.
+        ncell_f = self._symtab.find_or_create_tag(
+            "ncell_f", symbol_type=LFRicTypes("NumberOfCellsDataSymbol"),
+            interface=self._read_access)
+        dofmap_symbol = self._symtab.find_or_create_tag(
+            f"whole_dofmap_{fs_name}", fs=fs_name,
+            symbol_type=LFRicTypes("WholeDofMapDataSymbol"),
+            dims=[Reference(ndf_symbol), Reference(ncell_f)],
+            interface=self._read_access)
+        self._arglist.append(dofmap_symbol)
 
     def fs_compulsory_field(self, function_space, var_accesses=None):
         '''Create any arguments that are compulsory for a field on a
