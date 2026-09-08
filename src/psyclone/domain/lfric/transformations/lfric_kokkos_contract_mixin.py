@@ -94,7 +94,7 @@ class LFRicKokkosContractMixin:
     what the generated region can express. What a symbol is in C terms is
     ``LFRicKokkosTypesMixin``; what its declaration says its shape is, and
     the one predicate that asks, is ``LFRicKokkosBoundsMixin``; how the
-    region and its call are built is ``LFRicKokkosCallMixin``.
+    region's arguments are built is ``LFRicKokkosArgumentMixin``.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
