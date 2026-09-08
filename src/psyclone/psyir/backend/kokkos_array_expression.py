@@ -569,6 +569,16 @@ class KokkosArrayExpression:
         :py:meth:`KokkosArrayExpressionMixin.arrayreference_node` and has its
         array's declared origin removed there rather than here.
 
+        A name Fortran allows to stand for its whole array carries no
+        subscripts to replace, and is the same value as the section spelling
+        it: ``lhs_e = matmul(a, b)`` and ``lhs_e(:) = matmul(a, b)`` mean one
+        thing. So such a name is given the nest's index in every one of its
+        dimensions, rather than being generated as it stands. Leaving it
+        alone would name the View itself where an element was wanted, on
+        either side of the assignment -- ``lhs_e = _kae_r0`` assigns a
+        ``double`` to a View, and ``_kae_r0 + q`` adds one to the other --
+        and neither is an operation Kokkos defines.
+
         An intrinsic of the array-valued tier is taken out of the copy first,
         while its operands' own :py:class:`~psyclone.psyir.nodes.Range`
         subscripts are still there for it to read, and leaves behind both a
@@ -596,7 +606,46 @@ class KokkosArrayExpression:
                     index.replace_with(Reference(DataSymbol(
                         variables[position], _INDEX_TYPE)))
                     position += 1
+        clone = self._subscript_whole_arrays(clone, variables)
         return statements, self._writer._visit(clone)
+
+    @staticmethod
+    def _subscript_whole_arrays(clone, variables):
+        """Subscript every unsubscripted array name in a copy of an element.
+
+        The rank is required to be the nest's own, which a conforming Fortran
+        expression gives every whole-array name in it. A name of some other
+        rank is left as it stands rather than subscripted wrongly, because
+        this nest has no index to give it: only non-conforming source can
+        produce one, and the subscript that would be invented for it would be
+        a wrong element rather than a missing one.
+
+        :param clone: the copy being rewritten, which may itself be the name.
+        :type clone: :py:class:`psyclone.psyir.nodes.Node`
+        :param variables: the generated name of each dimension's index.
+        :type variables: List[str]
+
+        :returns: the copy, or the access replacing it where the whole of it
+            was one unsubscripted name.
+        :rtype: :py:class:`psyclone.psyir.nodes.Node`
+        """
+        for reference in clone.walk(Reference):
+            if isinstance(reference, ArrayMixin):
+                continue
+            datatype = getattr(reference.symbol, "datatype", None)
+            if not isinstance(datatype, ArrayType):
+                continue
+            if len(datatype.shape) != len(variables):
+                continue
+            access = ArrayReference.create(
+                reference.symbol,
+                [Reference(DataSymbol(variable, _INDEX_TYPE))
+                 for variable in variables])
+            if reference is clone:
+                clone = access
+            else:
+                reference.replace_with(access)
+        return clone
 
     def _check_dependence(self, node, into):
         """Refuse an assignment whose nest would not have independent steps.

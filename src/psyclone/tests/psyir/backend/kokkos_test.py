@@ -2158,3 +2158,131 @@ def test_kae_steps_over_the_sections_a_reduction_consumed():
     assert text.count("for (int _kae_i") == 1
     assert "_kae_i0 = 1; _kae_i0 <= (1 + nlayers - 1)" in text
     assert "a((_kae_i0 - 1)) = (b((_kae_i0 - 1)) * _kae_r0);" in text
+
+
+# ---------------------------------------------------------------------------
+# A whole-array destination, written without subscripts
+# ---------------------------------------------------------------------------
+def test_kae_arithmetic_over_contractions_indexes_the_destination():
+    """``lhs = matmul(..) - matmul(..) + matmul(..)`` writes one element.
+
+    This is the shape ``apply_elim_mixed_lp_operator_kernel_mod`` writes, and
+    it names its destination without subscripting it, which is what makes it
+    different from every section this tier had been given. The nest still runs
+    over the destination's own dimension, so the write inside it is to one
+    element of the destination and not to the whole of it: a View has no
+    ``operator=`` taking a scalar, so the alternative does not even compile.
+    """
+    lowering, statements = _lowering(
+        "  p = matmul(w, q) - matmul(transpose(w), q) + matmul(w, f(1:3))\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert text.count("for (int _kae_i") == 1
+    assert "p((_kae_i0 - 1)) = ((_kae_r0 - _kae_r1) + _kae_r2);" in text
+    # The defect this states was a write to the View itself rather than to an
+    # element of it, so the absence of the unsubscripted name is the assertion
+    # that matters and the presence of the subscripted one is not enough.
+    assert "p = " not in text
+
+
+def test_kae_a_section_destination_takes_the_same_arithmetic():
+    """The same statement written as a section lowers the same way.
+
+    A destination is a section or a whole array according to how the kernel
+    spelt it, and the two spellings mean the same thing in Fortran, so they
+    generate the same nest.
+    """
+    lowering, statements = _lowering(
+        "  p(:) = matmul(w, q) - matmul(transpose(w), q)"
+        " + matmul(w, f(1:3))\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "p((_kae_i0 - 1)) = ((_kae_r0 - _kae_r1) + _kae_r2);" in text
+    assert "p = " not in text
+
+
+def test_kae_a_whole_array_destination_of_one_contraction_is_indexed():
+    """One intrinsic on the right-hand side is subscripted no differently.
+
+    The destination's spelling is what decides this and the right-hand side's
+    shape is not, so the single-intrinsic form is stated rather than left to
+    be inferred from the arithmetic above it.
+    """
+    lowering, statements = _lowering("  p = matmul(w, q)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "p((_kae_i0 - 1)) = _kae_r0;" in text
+    assert "p = " not in text
+
+
+def test_kae_a_scalar_term_beside_a_contraction_is_still_indexed():
+    """A whole array read beside a contraction is read one element at a time.
+
+    ``matmul(w, q) * 2.0 + q`` mixes a contraction, a scalar and a whole array
+    in one expression. The contraction leaves a scalar behind, the literal is
+    a scalar already, and the whole array is the one operand that has to
+    follow the nest's index -- an unsubscripted View beside a ``double`` is
+    not an addition C++ has.
+    """
+    lowering, statements = _lowering("  p = matmul(w, q) * 2.0_r_def + q\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "p((_kae_i0 - 1)) = ((_kae_r0 * 2.0) + q((_kae_i0 - 1)));" in text
+    assert "p = " not in text
+    assert "+ q)" not in text
+
+
+def test_kae_a_destination_read_on_the_right_is_read_per_element():
+    """``lhs = lhs + matmul(..)`` reads and writes the same element.
+
+    Fortran evaluates the whole right-hand side before assigning any of it,
+    and a nest does not; the two agree exactly where each iteration reads the
+    element it writes, which is what a whole-array read of the destination
+    becomes. So this is lowered rather than refused, and the element read is
+    the element written.
+    """
+    lowering, statements = _lowering("  p = p + matmul(w, q)\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "p((_kae_i0 - 1)) = (p((_kae_i0 - 1)) + _kae_r0);" in text
+    assert "p = " not in text
+
+
+def test_kae_a_rank_two_whole_array_destination_takes_both_indices():
+    """A destination of rank two is subscripted in both its dimensions.
+
+    The number of subscripts a whole-array name stands for is its rank, so
+    the rule is stated at a rank other than one: a fix that supplied the
+    innermost index alone would pass every test above it and would write the
+    wrong element here.
+    """
+    lowering, statements = _lowering("  v = matmul(w, w) + matmul(w, w)\n")
+    lowering._writer._views["v"] = KokkosView(
+        "v", "v_data", "double", ("3", "3"), index_offsets=(1, 1))
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert text.count("for (int _kae_i") == 2
+    assert "v((_kae_i0 - 1), (_kae_i1 - 1)) = (_kae_r0 + _kae_r1);" in text
+    assert "v = " not in text
+
+
+def test_kae_leaves_a_whole_array_name_of_another_rank_alone():
+    """A name the nest has no index for is not given one anyway.
+
+    Only non-conforming source puts a rank-2 name in a rank-1 expression, and
+    the nest that expression produced has one index rather than the two such
+    a name would need. Inventing the second would write a wrong element where
+    generating the name unchanged writes none, so the rank is checked before
+    the subscripts are supplied rather than assumed from the shape.
+    """
+    lowering, statements = _lowering("  p(:) = b(1) * w\n")
+
+    text = lowering.lower(statements[0].rhs, statements[0].lhs)
+
+    assert "p((_kae_i0 - 1)) = (b((1 - 1)) * w);" in text
