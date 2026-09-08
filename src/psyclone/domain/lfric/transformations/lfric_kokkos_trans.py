@@ -47,14 +47,16 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     """Replace one supported LFRic loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
-    an uncoloured loop -- over cell columns or over dofs -- running a single
-    kernel whose arguments are
-    fields, scalars and LMA operators, whose written fields are on
-    discontinuous spaces, and whose formals and referenced module constants
-    all map onto the ``int``/``float``/``double`` ABI the Kokkos backend
-    emits. Every part of the generated region -- its name, its C signature,
-    its Views and the ``bind(C)`` interface the PSy layer calls through -- is
-    derived from that kernel, so a second kernel needs no change here.
+    a loop running a single kernel -- over cell columns, coloured or not, or
+    over dofs -- whose arguments are fields, scalars and LMA operators, whose
+    written fields are either free of a shared write or made safe by one of
+    the two answers to one below, and whose formals and referenced module
+    constants all map onto the ``int``/``float``/``double`` ABI the Kokkos
+    backend emits. Every part of the generated region -- its name, its C
+    signature, its Views and the ``bind(C)`` interface the PSy layer calls
+    through -- is derived from that kernel, so a second kernel needs no change
+    here. A field written from a dof loop, or from a cell-column loop on a
+    discontinuous space, is free of one to begin with.
 
     **Precision is carried, not chosen.** A kind is placed on the ABI by the
     width LFRic's precision map gives it, so an ``r_solver`` kernel reaches
@@ -687,6 +689,59 @@ KernelModuleInlineTrans`.
     halo-dirty calls are retained, and only the resulting generic loop is
     replaced.
 
+    **A write two cells share has two answers, and both are generated.**
+    LFRic's ``gh_inc`` and ``gh_readinc`` are read-modify-writes of a field
+    at a dof two neighbouring cells both hold, so a launch running those
+    cells at once would lose one of the two contributions. The default
+    answer is an atomic: each update of such an argument is written as
+    ``Kokkos::atomic_add`` -- or ``_sub``, ``_mul``, ``_div``, by the
+    operator the update carries -- on the View element. It is applied per
+    argument and not per region, so a ``gh_write`` to a discontinuous space
+    in the same kernel stays a plain assignment, and it is the update and
+    not the read that is atomic, so a ``gh_readinc`` reads its element
+    plainly and updates it atomically.
+
+    The other answer is colouring, which is what LFRic's own OpenMP path
+    takes. A loop
+    :py:class:`~psyclone.domain.lfric.transformations.LFRicColourTrans` has
+    already rewritten is accepted: the inner ``cells_in_colour`` loop is the
+    one captured, the outer loop over colours stays in the PSy layer and
+    enters the region once per colour, and no atomic is generated, because
+    the cells of one colour meet at no dof. Such a region carries three
+    arguments an uncoloured one does not -- LFRic's colour map, the colour
+    being launched, and the number of colours -- and declares its cell from
+    them, ``const int cell = cmap(colour - 1, cell_in_colour) - 1;``. The
+    number of colours is not redundant beside the map: the map crosses the
+    ABI as bare storage and is rebuilt as a rank-2 View inside the region,
+    where that number is the ``LayoutLeft`` stride and so the extent that
+    has to be exact.
+
+    Which answer is used follows the loop unless :py:attr:`_ATOMICS_OPTION`
+    says otherwise, and the two are alternatives rather than a ranking. Both
+    are correct; which is faster is a measurement on a GPU, and neither this
+    class nor the branch that added the second answer has taken it.
+
+    **They do differ in one property that is not a measurement.**
+    Floating-point addition is not associative, so the order in which the
+    contributions to a shared dof arrive is part of the answer. An atomic
+    launch adds them in the order its threads reach the dof, which is cell
+    order on one thread and an order that varies between runs on more; a
+    coloured launch adds them in colour order, which is fixed whatever the
+    concurrency. So an atomic region reproduces a serial Fortran run bit for
+    bit on one thread and not on several, and a coloured region reproduces
+    itself on any thread count and a serial Fortran run on none. Measured
+    over a ten-timestep LFRic model run, the differences are one part in
+    1e10 or smaller, and neither is a defect.
+
+    One thing a coloured region does is worth stating, because a debug build
+    will say so. Its per-cell Views are strided by the launch's cell count,
+    which for a coloured launch is the cells of *this* colour, while the
+    index they are read at is the mesh cell the colour map returns. Under
+    ``LayoutLeft`` the last extent takes no part in the address, so the
+    addresses are the ones the Fortran computes; a build with
+    ``KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK`` would nonetheless report the index
+    as out of range.
+
     **A loop this transformation leaves behind may still be transformed
     afterwards**, colouring included, even though capturing forces the
     Invoke's PSy-layer symbols to be set up early. The region's actual
@@ -713,9 +768,11 @@ KernelModuleInlineTrans`.
     is obtained from a kernel argument that capture has removed. That raises
     :py:class:`~psyclone.errors.GenerationError` at code generation, naming
     the Invoke, rather than emitting a look-up on an unassigned pointer.
-    Colouring such an Invoke before capturing it is refused by
-    :py:meth:`validate` and colouring it afterwards by this, so the case is
-    reported either way round.
+    Colouring such an Invoke *before* capturing it needs no repair and is
+    accepted: the symbols are set up from here, after the colouring, so the
+    mesh is read from an argument the capture has not yet removed. That is
+    the order the coloured arm above asks for, and the completion pass then
+    finds the look-ups already emitted and does not emit them again.
     """
 
     #: The option naming the team size the hierarchical launch asks for.
@@ -723,6 +780,78 @@ KernelModuleInlineTrans`.
     #: the team; on the OpenMP backend that is one member, so a host build
     #: reaches the team-level concurrency only by setting this.
     _TEAM_SIZE_OPTION = "team_size"
+
+    #: The option choosing between the two answers to a write two cells of
+    #: one launch share. ``True`` generates a ``Kokkos::atomic_*`` update for
+    #: every read-modify-write of a shared field; ``False`` generates none
+    #: and requires the loop to have been coloured first, so that the cells
+    #: meeting at a dof are in different launches. Absent, the choice follows
+    #: the loop: a coloured loop takes the coloured arm and every other loop
+    #: takes atomics, which is what makes atomics the default and makes every
+    #: capture predating this option generate the source it generated then.
+    #:
+    #: The two are alternatives rather than a ranking. Both are correct, and
+    #: which is faster is a measurement neither this class nor the branch
+    #: that added it has made.
+    _ATOMICS_OPTION = "atomics"
+
+    @classmethod
+    def _uses_atomics(cls, node, options):
+        """Say which of the two answers to a shared write is in force.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: the transformation options.
+        :type options: Optional[Dict[str, Any]]
+
+        :returns: whether a shared update is to be generated as an atomic.
+        :rtype: bool
+        """
+        requested = (options or {}).get(cls._ATOMICS_OPTION)
+        if requested is None:
+            return node.loop_type != cls._COLOURED_LOOP_TYPE
+        return bool(requested)
+
+    def _validate_atomics_option(self, node, options):
+        """Check the ``"atomics"`` option against the loop it is given with.
+
+        Each arm answers a shared write on its own, and the two together
+        answer it twice: an atomic on data colouring has already made private
+        to one launch costs an instruction and buys nothing. Asking for both
+        is therefore a contradiction in what the caller stated rather than a
+        preference to be resolved quietly, and so is asking for neither on a
+        loop that has a shared write and has not been coloured -- which would
+        generate a race.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: the transformation options.
+        :type options: Optional[Dict[str, Any]]
+
+        :raises TransformationError: if the option is neither absent nor a
+            bool; if it is ``True`` on a coloured loop; or if it is ``False``
+            on an uncoloured loop whose kernel has a shared write.
+        """
+        requested = (options or {}).get(self._ATOMICS_OPTION)
+        if requested is not None and not isinstance(requested, bool):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option must be "
+                f"absent or a bool, but found '{requested}'.")
+        coloured = node.loop_type == self._COLOURED_LOOP_TYPE
+        if requested and coloured:
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is True "
+                "on a coloured loop. Colouring has already made every write "
+                "the launch's own, so an atomic would guard data no other "
+                "cell of the launch reaches; ask for one answer to a shared "
+                "write or the other.")
+        if (requested is False and not coloured
+                and self._shared_arguments(node.kernels()[0])):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is False "
+                "on a loop that is not coloured, whose kernel writes a field "
+                "two cells share. Colour the loop first, or leave the option "
+                "out and take the atomic update.")
 
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
@@ -737,7 +866,8 @@ KernelModuleInlineTrans`.
         :param node: the loop that is to be captured as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations. The
-            one read here is ``"team_size"``; see :py:meth:`apply`.
+            two read here are ``"team_size"`` and ``"atomics"``; see
+            :py:meth:`apply`.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.validate`.
@@ -750,12 +880,16 @@ KernelModuleInlineTrans`.
             class's description.
         :raises TransformationError: if the ``"team_size"`` option is neither
             absent nor a positive integer.
+        :raises TransformationError: if the ``"atomics"`` option and the
+            loop's colouring contradict each other, as
+            :py:meth:`_validate_atomics_option` states.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
                 "LFRicKokkosTrans expects an LFRicLoop but found "
                 f"'{type(node).__name__}'.")
 
+        self._validate_atomics_option(node, options)
         team_size = (options or {}).get(self._TEAM_SIZE_OPTION)
         if team_size is not None and (
                 isinstance(team_size, bool) or not isinstance(team_size, int)
@@ -807,6 +941,11 @@ KernelModuleInlineTrans`.
         # rule speaks only of what a dof launch has nowhere to put.
         self._validate_dof_body(node, probe, parallel_loops)
         self._validate_intrinsics(probe)
+        # On the probe, and after the lowering, because the shape of an
+        # update is what decides whether an atomic can carry it out and the
+        # lowering is what settles that shape.
+        if self._uses_atomics(node, options):
+            self._validate_shared_updates(kernel, probe)
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
         # so that an array parameter the generated unit could not declare is

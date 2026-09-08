@@ -4415,6 +4415,47 @@ shifted into the halo -- ``halo_cell_column``, which runs the halo alone --
 is still refused, there being no lower-bound formal to fill. Nothing is
 exchanged inside a region: the exchange the PSy layer emits in front of the
 loop is lowered in front of the call to the region.
+A field two cells both increment -- a ``gh_inc`` or a ``gh_readinc``
+argument, which is what a write to a continuous function space is -- has two
+answers here, and both are generated. The default is an atomic: the update
+is emitted as ``Kokkos::atomic_add``, or ``_sub``, ``_mul`` or ``_div`` by
+the operator it carries, on the View element. It is decided per argument
+rather than per region, so a ``gh_write`` to a discontinuous space in the
+same kernel stays a plain assignment; and it is the update and not the read
+that is made atomic, so a ``gh_readinc`` reads its element plainly. Each
+component of a field vector is a field of its own and is made safe
+separately. The other answer is colouring, which is what LFRic's own OpenMP
+path takes: a loop
+:py:class:`~psyclone.domain.lfric.transformations.LFRicColourTrans` has
+already rewritten is accepted, the inner ``cells_in_colour`` loop being the
+one captured while the outer loop over colours stays in the PSy layer and
+enters the region once per colour. No atomic is generated there, the cells
+of one colour meeting at no dof. Such a region carries three arguments an
+uncoloured one does not -- LFRic's colour map, the colour being launched and
+the number of colours -- and declares its cell from them rather than from
+its launch index; the number of colours is not redundant beside the map,
+because the map crosses the ABI as bare storage and is rebuilt inside the
+region as a rank-2 View, where that number is the ``LayoutLeft`` stride.
+Which answer is taken follows the loop the transformation is given, unless
+the ``atomics`` option of ``apply`` says otherwise. Asking for both
+answers at once is refused -- ``True`` on a coloured loop guards data no
+other cell of the launch reaches -- and so is asking for neither, ``False``
+on an uncoloured loop whose kernel writes a shared field being the one
+combination that would generate a race. The two are alternatives
+and not a ranking. Both are correct, and which is faster is a measurement on
+a GPU that has not been taken here, so the default is the one that needs
+nothing of the algorithm layer. They do differ in one property that is not a
+measurement: floating-point addition is not associative, so the order the
+contributions to a shared dof arrive in is part of the answer. An atomic
+launch adds them in the order its threads reach the dof, which is cell order
+on one thread and an order that varies between runs on more; a coloured
+launch adds them in colour order, which is fixed whatever the concurrency.
+So an atomic region reproduces a serial Fortran run bit for bit on one
+thread and not on several, and a coloured region reproduces itself on any
+thread count and a serial Fortran run on none.
+An access that is neither of those and
+neither safe nor read-only -- a reduction, of which GungHo has none in a
+coded kernel today -- is refused by naming it.
 A kernel symbol whose name Fortran allows and C++ reserves is refused,
 whether it is a formal or a local. Fortran reserves no words, so ``const``,
 ``new`` and ``operator`` are ordinary variable names, and one written out as

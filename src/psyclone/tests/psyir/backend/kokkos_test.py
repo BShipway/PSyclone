@@ -13,10 +13,12 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosConstant, KokkosRegion, KokkosScalar, KokkosScratch, KokkosView,
-    KokkosWriter, extent_names, is_extent, is_offset)
+    KokkosColourMap, KokkosConstant, KokkosRegion, KokkosScalar,
+    KokkosScratch, KokkosView, KokkosWriter, extent_names, is_extent,
+    is_offset)
 from psyclone.psyir.backend.kokkos_launch import (
-    hierarchical_launch, range_launch, team_launch)
+    hierarchical_launch, launch_index, launch_offsets, range_launch,
+    team_launch)
 from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
@@ -2836,6 +2838,490 @@ def test_kokkos_writer_writes_a_power_at_its_operands_width():
             "Kokkos::pow(b, c)"]
 
 
+#: How the probe below writes ``acc`` when nothing asks for another shape.
+#: A read-modify-write by addition, which is what ``gh_inc`` most often is.
+_SHARED_UPDATE = ("acc(map_w2(df) + k) = acc(map_w2(df) + k) "
+                  "+ src(map_w3(1) + k)")
+
+
+def _shared_write_schedule(update=_SHARED_UPDATE):
+    """Create a body updating a shared dof and writing an unshared one.
+
+    Both statements are in one kernel because the question the two tests
+    below ask is not whether an atomic can be generated but whether it is
+    generated for the argument that needs it and for no other. A body with
+    only the shared update could not tell an atomic applied per argument from
+    one applied to every write the region makes.
+
+    :param str update: the statement writing ``acc``. It is a parameter
+        because which atomic the writer can generate -- or whether it can
+        generate one at all -- is read from the shape of that statement and
+        not from any flag, so the refusals below differ from the accepted
+        case in this one string and in nothing else.
+
+    :returns: the kernel body.
+    :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+    """
+    source = f"""
+subroutine inc_probe_code(nlayers, acc, out, src, ndf_w2, undf_w2, map_w2, &
+                          ndf_w3, undf_w3, map_w3)
+  use constants_mod, only : i_def, r_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+  integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+  real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+  real(kind=r_def), dimension(undf_w3), intent(inout) :: out
+  real(kind=r_def), dimension(undf_w3), intent(in) :: src
+  integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+  integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+  integer(kind=i_def) :: k, df
+  do k = 0, nlayers - 1
+    do df = 1, ndf_w3
+      out(map_w3(df) + k) = 2.0_r_def * src(map_w3(df) + k)
+    end do
+    do df = 1, ndf_w2
+      {update}
+    end do
+  end do
+end subroutine inc_probe_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inc_probe_code", symbol_table=symbol_table, children=children)
+
+
+def _shared_write_region(**overrides):
+    """Return a region whose first field is written at a shared dof.
+
+    ``acc`` carries ``atomic=True`` and ``out`` does not, which is the whole
+    of the difference between the two writes as far as the writer is
+    concerned: what an LFRic ``gh_inc`` means is decided by the driving
+    transformation and reaches here as that flag.
+    """
+    region = KokkosRegion(
+        name="inc_probe_kokkos",
+        schedule=_shared_write_schedule(),
+        cell_count="ncells",
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosView("acc", "acc_data", "double", ("undf_w2",),
+                       index_offsets=(1,), atomic=True),
+            KokkosView("out", "out_data", "double", ("undf_w3",),
+                       index_offsets=(1,)),
+            KokkosView("src", "src_data", "double", ("undf_w3",),
+                       index_offsets=(1,), read_only=True,
+                       random_access=True),
+            KokkosScalar("ndf_w2", "int"),
+            KokkosScalar("undf_w2", "int"),
+            KokkosView("map_w2", "map_w2_data", "int",
+                       ("ndf_w2", "ncells"), index_offsets=(1,),
+                       extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ndf_w3", "int"),
+            KokkosScalar("undf_w3", "int"),
+            KokkosView("map_w3", "map_w3_data", "int",
+                       ("ndf_w3", "ncells"), index_offsets=(1,),
+                       extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ncells", "int"),
+        ))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_atomic_add_for_a_shared_write():
+    """A View marked atomic is updated by ``Kokkos::atomic_add``, alone.
+
+    Two cells sharing a dof both read-modify-write it, so the update has to
+    be indivisible. The write beside it is to a dof no other cell touches and
+    is generated as the plain assignment it was before atomics existed: the
+    flag is a property of one argument, not of the region, and a region that
+    atomicised every write would pay for a lock on data nothing else reaches.
+    """
+    code = KokkosWriter()(_shared_write_region())
+
+    shared = "(((map_w2((df - 1), cell) + k) - 1))"
+    unshared = "(((map_w3((df - 1), cell) + k) - 1))"
+    assert f"Kokkos::atomic_add(&acc{shared}, " \
+        "src(((map_w3((1 - 1), cell) + k) - 1)));" in code
+    assert f"out{unshared} = (2.0 * src{unshared});" in code
+
+    # The self-read is consumed by the update rather than left beside it.
+    assert f"acc{shared} = " not in code
+    assert code.count("Kokkos::atomic") == 1
+
+
+def _read_inc_schedule():
+    """Create a body that reads a shared dof before incrementing it."""
+    source = """
+subroutine damped_inc_code(nlayers, acc, damping, ndf_w2, undf_w2, map_w2)
+  use constants_mod, only : i_def, r_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+  real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+  real(kind=r_def), intent(in) :: damping
+  integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+  integer(kind=i_def) :: k, df
+  real(kind=r_def) :: previous
+  do k = 0, nlayers - 1
+    do df = 1, ndf_w2
+      previous = acc(map_w2(df) + k)
+      acc(map_w2(df) + k) = acc(map_w2(df) + k) + damping * previous
+    end do
+  end do
+end subroutine damped_inc_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "damped_inc_code", symbol_table=symbol_table, children=children)
+
+
+def _read_inc_region():
+    """Return a region whose one field is both read and updated atomically."""
+    return KokkosRegion(
+        name="damped_inc_kokkos",
+        schedule=_read_inc_schedule(),
+        cell_count="ncells",
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosView("acc", "acc_data", "double", ("undf_w2",),
+                       index_offsets=(1,), atomic=True),
+            KokkosScalar("damping", "double"),
+            KokkosScalar("ndf_w2", "int"),
+            KokkosScalar("undf_w2", "int"),
+            KokkosView("map_w2", "map_w2_data", "int",
+                       ("ndf_w2", "ncells"), index_offsets=(1,),
+                       extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ncells", "int"),
+        ))
+
+
+def test_kokkos_atomic_add_for_read_inc():
+    """A ``gh_readinc`` reads the shared dof plainly and updates it atomically.
+
+    LFRic's ``gh_readinc`` differs from ``gh_inc`` in reading the field's
+    incoming value as well as accumulating into it. That read is an ordinary
+    load: making it atomic would cost an instruction and buy nothing, because
+    what has to be indivisible is the update's read-modify-write and not a
+    read standing on its own. The kernel is racy in the same way LFRic's own
+    coloured OpenMP path is racy for the same statement, and no atomic in any
+    memory model repairs that; what the atomic guarantees is that no
+    contribution is lost.
+    """
+    code = KokkosWriter()(_read_inc_region())
+
+    shared = "(((map_w2((df - 1), cell) + k) - 1))"
+    assert f"previous = acc{shared};" in code
+    assert f"Kokkos::atomic_add(&acc{shared}, (damping * previous));" in code
+    assert "Kokkos::atomic_load" not in code
+    assert code.count("Kokkos::atomic") == 1
+
+
+def _coloured_region(**overrides):
+    """Return the first region's contract, captured from a coloured loop.
+
+    The body is unchanged: colouring changes which cells one launch runs, not
+    what it does to a cell. What the region gains is the map from the
+    launch's own index to a mesh cell, and the three arguments that lookup
+    reads.
+
+    :param overrides: fields to replace on the region.
+    :type overrides: unwrapped dict
+
+    :returns: the coloured region.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    base = _region(cell_count="ncells_in_colour")
+    fields = {
+        "arguments": base.arguments + (
+            KokkosView("cmap", "cmap_data", "int",
+                       ("ncolours", "ncells_in_colour"), index_offsets=(1, 1),
+                       read_only=True, random_access=True),
+            KokkosScalar("colour", "int"),
+            KokkosScalar("ncolours", "int"),
+        ),
+        "colour_map": KokkosColourMap(
+            name="cmap", colour="colour", index="cell_in_colour"),
+    }
+    fields.update(overrides)
+    return replace(base, **fields)
+
+
+def test_kokkos_coloured_region_looks_its_cell_up_in_the_map():
+    """A coloured launch runs one colour and finds each cell in the map.
+
+    This is the second of the two answers to a write two cells share, and it
+    is the one that generates no atomic: the caller enters the region once
+    per colour, cells of one colour meet at no dof, and so the update inside
+    is a plain read-modify-write. Everything below the first declaration is
+    the source the uncoloured region generates, because the body is indexed
+    by the mesh cell either way and the map is what supplies it.
+    """
+    code = KokkosWriter()(_coloured_region())
+
+    assert "KOKKOS_LAMBDA(const int cell_in_colour) {" in code
+    assert "const int cell = cmap(colour - 1, cell_in_colour) - 1;" in code
+    # The launch counts this colour's cells, not the mesh's.
+    assert "Kokkos::RangePolicy<>(0, ncells_in_colour)" in code
+    # The map is one-based Fortran on both axes, so both subscripts are
+    # adjusted where they are written and nowhere else.
+    assert code.count("- 1;") == 1
+    assert "Kokkos::atomic" not in code
+    # The body still reads the mesh cell.
+    assert "map_wtheta((df - 1), cell)" in code
+
+
+def test_kokkos_coloured_region_declares_its_map_and_colour():
+    """The map crosses the ABI as a read-only View and the colour as an int."""
+    code = KokkosWriter()(_coloured_region())
+
+    assert "const int *cmap_data" in code
+    assert "const int colour" in code
+    assert "const int ncolours" in code
+    # The first extent is the one that has to be exact: under LayoutLeft
+    # it is the stride, and it is the number of colours.
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> cmap(cmap_data, ncolours, ncells_in_colour);") in code
+
+
+def test_kokkos_uncoloured_region_declares_no_cell():
+    """A region with no colour map generates what it did before there was one.
+
+    The lookup is the whole of the coloured arm's effect on generated source,
+    so its absence is what every capture already in the model depends on.
+    """
+    code = KokkosWriter()(_region())
+
+    assert "KOKKOS_LAMBDA(const int cell) {" in code
+    assert "cmap" not in code
+    assert "const int cell =" not in code
+
+
+def test_kokkos_team_launches_index_the_colour_too():
+    """Both team shapes count this colour's cells, not the mesh's.
+
+    The flat shape's past-the-end guard is the reason this is asserted rather
+    than assumed: a guard left comparing the mesh cell against a count of one
+    colour's cells would return early for most of the cells it was given.
+    """
+    colours = KokkosColourMap(
+        name="cmap", colour="colour", index="cell_in_colour")
+    flat = team_launch(replace(_scratch_region(), colour_map=colours), "", "")
+    assert ("const int cell_in_colour = team.league_rank() * "
+            "team.team_size() + rank;") in flat
+    assert "if (cell_in_colour >= ncells)" in flat
+
+    hierarchical = hierarchical_launch(
+        replace(_level_region(), colour_map=colours), "", "")
+    assert "const int cell_in_colour = team.league_rank();" in hierarchical
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("name", "cmap data", "Kokkos colour map 'cmap data' is not a C++"),
+    ("colour", "", "Kokkos colour colour '' is not a C++"),
+    ("index", "0th", "Kokkos colour index '0th' is not a C++"),
+    ("name", "ncolours", "Kokkos colour map 'ncolours' is not a View"),
+    ("colour", "cmap", "Kokkos colour 'cmap' is not a scalar"),
+    ("index", "cell", "is also the region's cell index"),
+    ("index", "nlayers", "Kokkos colour index 'nlayers' is also a region"),
+])
+def test_kokkos_writer_rejects_a_broken_colour_map(field, value, message):
+    """Each way the map could be wrong is refused where it is described.
+
+    None of the seven announces itself downstream. Three are not identifiers
+    and generate text that does not compile, which is the mild case. The
+    other four compile: a map that is not a View, or a colour that is not a
+    scalar, indexes something that is not the map; an index equal to the cell
+    index declares the cell from itself; and an index that is also an
+    argument is shadowed by the declaration, so the launch would read the
+    argument's value for every cell.
+    """
+    region = _coloured_region()
+    colours = replace(region.colour_map, **{field: value})
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(replace(region, colour_map=colours))
+    assert message in str(err.value)
+
+
+def test_kokkos_writer_rejects_an_atomic_read_only_view():
+    """A View cannot be both updated by several cells and never updated.
+
+    The two flags are set from different facts -- the access LFRic declares
+    and whether the region writes through the argument -- so a description
+    holding both is a mistake in the transformation rather than in the
+    kernel, and it would generate a ``Kokkos::atomic_add`` through a
+    ``const`` pointer.
+    """
+    region = _read_inc_region()
+    arguments = list(region.arguments)
+    arguments[1] = replace(arguments[1], read_only=True)
+
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(replace(region, arguments=tuple(arguments)))
+
+    assert "Kokkos View 'acc' is atomic but read only." in str(err.value)
+
+
+@pytest.mark.parametrize("update, why", [
+    ("acc(map_w2(df) + k) = src(map_w3(1) + k)",
+     "the target is not read at all, so nothing is being accumulated"),
+    ("acc(map_w2(df) + k) = acc(map_w2(df) + k) ** 2.0_r_def",
+     "the operator joining the two is not one an atomic implements"),
+    ("acc(map_w2(df) + k) = acc(map_w2(df) + k) + acc(map_w2(df) + k)",
+     "the target is read twice, which is two reads and one write"),
+])
+def test_kokkos_writer_refuses_a_shared_write_no_atomic_carries(update, why):
+    """A shared write that is not a read-modify-write is refused, not guessed.
+
+    What the writer can make indivisible is one read of the target, one
+    operator and one write. Anything else naming the target on the right is a
+    computation the hardware has no single instruction for, and the three
+    shapes here are the three ways that happens: no read, the wrong operator,
+    and two reads. Generating a plain assignment for any of them would be a
+    race the region's own contract promised it did not have, so the refusal
+    names the alternative that does work.
+
+    :param str update: the statement writing the shared field.
+    :param str why: what is wrong with it, for the failure message.
+    """
+    region = _shared_write_region(schedule=_shared_write_schedule(update))
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "Kokkos region writes shared array 'acc' with a statement that " \
+        "is not one of the read-modify-write shapes an atomic answers " \
+        "(Kokkos::atomic_add, Kokkos::atomic_div, Kokkos::atomic_mul, " \
+        "Kokkos::atomic_sub). Colour the loop instead." in str(err.value), why
+
+
+def test_kokkos_atomic_add_when_the_target_is_the_second_operand():
+    """``acc = src + acc`` is the same update as ``acc = acc + src``.
+
+    Fortran lets a kernel write a commutative update either way round and
+    means the same thing by both, so the writer matches both and contributes
+    whichever operand is not the target. It is not a formatting question: the
+    operand the atomic is given is the one that is added, and taking the
+    wrong one would silently store the target's old value.
+    """
+    code = KokkosWriter()(_shared_write_region(
+        schedule=_shared_write_schedule(
+            "acc(map_w2(df) + k) = src(map_w3(1) + k) + acc(map_w2(df) + k)")))
+
+    assert "Kokkos::atomic_add(&acc(((map_w2((df - 1), cell) + k) - 1)), " \
+        "src(((map_w3((1 - 1), cell) + k) - 1)));" in code
+    assert code.count("Kokkos::atomic") == 1
+
+
+def test_kokkos_writer_refuses_a_subtraction_the_wrong_way_round():
+    """``acc = src - acc`` is not an update of ``acc`` and is refused.
+
+    Subtraction is in the table and the target does appear on the right, so
+    this is the case a match on the operator alone would accept. It is not an
+    accumulation: it replaces the target with a value computed from it, which
+    no atomic performs and which two cells cannot do in either order.
+    """
+    region = _shared_write_region(schedule=_shared_write_schedule(
+        "acc(map_w2(df) + k) = src(map_w3(1) + k) - acc(map_w2(df) + k)"))
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "not one of the read-modify-write shapes" in str(err.value)
+
+
+def test_kokkos_writer_refuses_a_whole_array_update_of_a_shared_field():
+    """A shared field updated as a section is refused before it is lowered.
+
+    The array tier turns a section into a nest of element assignments, and
+    every one of them would need an atomic. The refusal is not that this
+    cannot be generated -- it could be, one atomic per element -- but that
+    the tier lowers a section without knowing which of its destinations are
+    shared, so an atomic applied afterwards would be applied to all of them
+    or to none. Refusing names the two spellings that do work.
+    """
+    region = _shared_write_region(schedule=_shared_write_schedule(
+        "acc(1:3) = acc(1:3) + src(1:3)"))
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "Kokkos region updates shared array 'acc' with a whole-array " \
+        "expression, which no single atomic carries out. Capture it as an " \
+        "element assignment or colour the loop." in str(err.value)
+
+
+def _shared_level_schedule():
+    """Create a hierarchical body whose boundary write is a shared update.
+
+    ``_level_schedule``'s shape with one difference: the write outside the
+    parallel loop accumulates rather than assigns. That is the only body in
+    which the two mechanisms meet -- one team member does the write, and the
+    write is still indivisible against the other teams -- and it exists to
+    show that the writer applies both rather than choosing between them.
+    """
+    source = """
+subroutine inject_inc_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  real(kind=r_double) :: scale
+  scale = 0.5_r_double
+  do k = 1, nlayers
+    y(map(1) + k - 1) = y(map(1) + k - 1) + scale * x(map(1) + k - 1)
+  end do
+  y(map(1) + nlayers) = y(map(1) + nlayers) + x(map(1) + nlayers)
+end subroutine inject_inc_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inject_inc_code", symbol_table=symbol_table, children=children)
+
+
+def test_kokkos_hierarchical_region_makes_a_single_write_atomic_too():
+    """One team member does the boundary write, and it is still an atomic.
+
+    ``Kokkos::single`` and ``Kokkos::atomic_add`` answer different races and
+    a shared boundary write has both. The single stops the members of this
+    team repeating the update, which would count one cell's contribution
+    several times; the atomic stops another team's cell losing its own
+    against this one. Dropping either leaves a wrong answer that appears only
+    under concurrency, so the test asserts they are nested and not chosen
+    between.
+    """
+    schedule = _shared_level_schedule()
+    arguments = list(_scratch_region().arguments)
+    arguments[1] = replace(arguments[1], atomic=True)
+    region = KokkosRegion(
+        name="inject_inc_kokkos",
+        schedule=schedule,
+        cell_count="ncells",
+        arguments=tuple(arguments),
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(),
+        parallel_loops=(schedule.walk(Loop)[0],))
+
+    code = KokkosWriter()(region)
+
+    boundary = "(((map((1 - 1), cell) + nlayers) - 1))"
+    assert "    Kokkos::single(Kokkos::PerTeam(team), [&]() {\n" \
+        f"      Kokkos::atomic_add(&y{boundary}, x{boundary});\n" \
+        "    });\n" in code
+    # The write inside the parallel loop is one member's own iteration, so it
+    # needs the atomic and not the single.
+    inner = "(((map((1 - 1), cell) + k) - 1) - 1)"
+    assert f"Kokkos::atomic_add(&y({inner}), (scale * x({inner})));" in code
+    assert code.count("Kokkos::single") == 1
+    assert code.count("Kokkos::atomic_add") == 2
+
+
 def _dof_kernel_schedule():
     """Create the PSyIR body of a kernel that operates on a single dof.
 
@@ -3013,3 +3499,185 @@ def test_kokkos_hierarchical_launch_takes_a_lower_bound():
 
     assert "TeamPolicy((ncells - first_cell), Kokkos::AUTO)," in code
     assert "const int cell = first_cell + team.league_rank();" in code
+
+
+# The two capabilities the tests above describe were written apart and answer
+# different questions about one launch: the colour map says what the lambda's
+# index is called, and the first cell says where the counting starts and how
+# far it runs. The tests below are the ones neither branch could write, and
+# they are here rather than beside either capability because what they assert
+# is that the two compose.
+
+
+def _coloured_scratch_region(**overrides):
+    """Return a scratch region captured from a coloured loop.
+
+    ``_scratch_region``'s kernel, so the launch is the flat team one, with
+    ``_coloured_region``'s map and the count of one colour's cells in place
+    of the mesh's. The mesh count stays in the argument list because the
+    dofmap is still sliced by it: colouring changes which cells one launch
+    runs and not how many the mesh has.
+
+    :param overrides: fields to replace on the region.
+    :type overrides: unwrapped dict
+
+    :returns: the coloured team region.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    region = replace(
+        _scratch_region(),
+        name="tri_solve_coloured_kokkos",
+        cell_count="ncells_in_colour",
+        arguments=_scratch_region().arguments + (
+            KokkosScalar("ncells_in_colour", "int"),
+            KokkosView("cmap", "cmap_data", "int",
+                       ("ncolours", "ncells_in_colour"), index_offsets=(1, 1),
+                       read_only=True, random_access=True),
+            KokkosScalar("colour", "int"),
+            KokkosScalar("ncolours", "int"),
+        ),
+        colour_map=KokkosColourMap(
+            name="cmap", colour="colour", index="cell_in_colour"))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_coloured_team_launch_indexes_the_colour_and_the_mesh():
+    """A coloured region reaching the team shape keeps both of its indices.
+
+    The flat team launch computes a launch index from the league and the
+    team, and a coloured region's launch index is a position in its colour
+    rather than a mesh cell. Both facts are generated at once here: the team
+    arithmetic produces ``cell_in_colour``, the map turns that into ``cell``,
+    and the body -- which is the uncoloured region's body unchanged -- reads
+    the mesh cell. The two capabilities meet in the one statement that
+    declares the index, so a shape that had kept the mesh name would look
+    right in the launch and read the wrong cells in the body.
+    """
+    code = KokkosWriter()(_coloured_scratch_region())
+
+    assert ("const int cell_in_colour = team.league_rank() * "
+            "team.team_size() + rank;") in code
+    assert "if (cell_in_colour >= ncells_in_colour) {" in code
+    assert "const int cell = cmap(colour - 1, cell_in_colour) - 1;" in code
+    # The scratch is still per team member, and the body still reads the
+    # mesh cell the map produced.
+    assert "x_new_scratch_t x_new(team.thread_scratch(0), nlayers);" in code
+    assert "map((1 - 1), cell)" in code
+    # Colouring is the answer to the shared write here, so there is no other.
+    assert "Kokkos::atomic" not in code
+
+
+def test_kokkos_launch_helpers_are_independent_of_each_other():
+    """The index a launch names and the range it covers are separate answers.
+
+    Asked of the two helpers directly and over all four combinations, because
+    the three cell shapes each call both and a shape that read one where it
+    meant the other would still generate plausible source. ``launch_index``
+    reads only the colour map and ``launch_offsets`` only the first cell, so
+    neither combination is a special case of the other.
+    """
+    colours = KokkosColourMap(
+        name="cmap", colour="colour", index="cell_in_colour")
+    plain = _region()
+    coloured = replace(plain, colour_map=colours)
+
+    assert launch_index(plain) == "cell"
+    assert launch_index(coloured) == "cell_in_colour"
+    assert launch_index(_with_first_cell(plain)) == "cell"
+
+    assert launch_offsets(plain) == ("0", "", "ncells")
+    assert launch_offsets(coloured) == ("0", "", "ncells")
+    assert launch_offsets(_with_first_cell(plain)) == (
+        "first_cell", "first_cell + ", "(ncells - first_cell)")
+
+
+def test_kokkos_uncoloured_halo_launch_starts_where_it_was_told_to():
+    """A first cell without a colour map offsets the region's own index.
+
+    This is the composition the LFRic front end actually produces -- a loop
+    over the halo alone is never coloured -- and it is asserted through the
+    writer rather than through the helper above so that the name the offset
+    is applied to is the one the body reads.
+    """
+    code = KokkosWriter()(_with_first_cell(_scratch_region()))
+
+    assert "const int cell = first_cell + team.league_rank() * " \
+        "team.team_size() + rank;" in code
+    assert "cmap" not in code
+    assert "cell_in_colour" not in code
+    # The body reads the same name the launch declared.
+    assert "map((1 - 1), cell)" in code
+
+
+def test_kokkos_writer_refuses_a_colour_map_beside_a_first_cell():
+    """The one pair of the two that has no meaning is refused, not generated.
+
+    A coloured launch counts the cells of one colour and a first cell counts
+    the mesh's, so a region naming both would begin its colour at a mesh
+    cell's position -- an offset into the wrong sequence. Nothing generates
+    the pair, because a coloured loop is given a lower bound of ``start``
+    whatever the loop it replaced had; the refusal is here so that the two
+    helpers can be read as independent without one silently shadowing the
+    other.
+    """
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(_with_first_cell(_coloured_region()))
+
+    assert ("A coloured region's launch counts the cells of one colour and a "
+            "first cell counts the mesh's, so a coloured region cannot begin "
+            "past the first cell of its colour." in str(error.value))
+
+
+def test_kokkos_writer_refuses_a_colour_map_on_a_dof_region():
+    """A dof region has no shared write for a colour map to separate.
+
+    One dof launch iteration writes one dof and no two write the same one, so
+    there is nothing for either answer to a shared write to make safe. The
+    map would still be honoured by the launch -- ``launch_index`` reads it
+    without asking what shape is being generated -- and would rename the dof
+    index after a cell lookup, so the combination is refused where it is
+    described.
+    """
+    colours = KokkosColourMap(
+        name="cmap", colour="colour", index="cell_in_colour")
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(_dof_region(colour_map=colours))
+
+    assert ("A dof region writes one dof per iteration and no two iterations "
+            "write the same one, so it has no shared write for a colour map "
+            "to separate." in str(error.value))
+
+
+def test_kokkos_dof_launch_never_generates_an_atomic():
+    """No dof region reaches an atomic, whatever its Views are marked.
+
+    The dof arm's freedom from write conflicts is a property of its
+    iteration space rather than of anything the launch does, so the atomic
+    arm has nothing to answer there. Asserted with the View marked as the
+    atomic arm marks one, because that flag is what the writer reads: a dof
+    region carries no read-modify-write of a shared dof for it to apply to,
+    and the generated source is the plain assignment.
+    """
+    atomic_out = replace(_dof_region().arguments[0], atomic=True)
+    region = _dof_region(
+        arguments=(atomic_out,) + _dof_region().arguments[1:])
+
+    code = KokkosWriter()(region)
+
+    assert "out_dof(df) = (scale * in_dof(df));" in code
+    assert "Kokkos::atomic" not in code
+
+
+def test_kokkos_writer_rejects_a_first_cell_that_is_not_an_argument():
+    """A first cell is a value the region takes, so it has to be taken.
+
+    The count beside it is checked the same way and for the same reason: the
+    launch writes both names into its policy, and a name the signature does
+    not declare is a C++ compile error in generated source rather than
+    anything the writer would otherwise notice.
+    """
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(replace(_region(), cell_start="first_cell"))
+
+    assert ("First cell 'first_cell' is not a scalar argument."
+            in str(error.value))

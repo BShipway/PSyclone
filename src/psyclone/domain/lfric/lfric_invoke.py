@@ -395,11 +395,41 @@ class LFRicInvoke(Invoke):
         # pylint: disable=protected-access
         cursor = min(getattr(self.schedule, "_psy_layer_symbols_cursor", 0),
                      len(self.schedule.children))
-        self._check_mesh_initialised(cursor)
-        cursor = self.meshes.initialise_colourmaps(cursor)
+        if not self._colourmaps_initialised(cursor):
+            self._check_mesh_initialised(cursor)
+            cursor = self.meshes.initialise_colourmaps(cursor)
         cursor = self.mesh_properties.initialise_colour_limits(cursor)
         cursor = self.loop_bounds.initialise(cursor, resume=True)
         self.schedule._psy_layer_symbols_cursor = cursor
+
+    def _colourmaps_initialised(self, cursor: int) -> bool:
+        '''
+        Checks whether the first pass already looked the colourmaps up.
+
+        An Invoke coloured *before* the transformation that sets its symbols
+        up has them from setup_psy_layer_symbols(), which ran against a
+        Schedule that was already coloured. That order is the one
+        LFRicKokkosTrans's coloured arm asks for -- LFRicColourTrans is
+        applied and the inner loop is then captured -- and re-emitting the
+        look-ups for it would assign the same pointer twice, which is what
+        this pass exists not to do.
+
+        :param cursor: the end of the preamble the first pass generated.
+
+        :returns: whether the preamble already assigns a colourmap.
+
+        '''
+        for tag in ("cmap", "tilecolourmap"):
+            try:
+                symbol = self.schedule.symbol_table.lookup_with_tag(tag)
+            except KeyError:
+                continue
+            for node in self.schedule.children[:cursor]:
+                if (isinstance(node, Assignment)
+                        and isinstance(node.lhs, Reference)
+                        and node.lhs.symbol is symbol):
+                    return True
+        return False
 
     def _check_mesh_initialised(self, cursor: int):
         '''

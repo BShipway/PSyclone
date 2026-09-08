@@ -43,6 +43,39 @@ writer is the only caller; nothing here visits PSyIR.
 """
 
 
+def launch_index(region):
+    """Return the name a launch gives the index it iterates over.
+
+    Each shape below counts from :py:func:`launch_offsets`' first index to
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_count`, and
+    for all but one region that count is the mesh cells and the index is
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`. A
+    region captured from a coloured loop counts the cells of one colour
+    instead, and the mesh cell is looked up from that through its
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.colour_map`; the
+    writer emits that lookup as the region's first local declaration, so
+    what each shape here has to change is only the name it declares.
+
+    This function answers *what the index is called*; :py:func:`launch_offsets`
+    answers *where the counting starts and how far it runs*. The two are
+    independent of each other at every site, and the one region that could
+    not compose them -- a colour map together with a first cell, whose index
+    counts one colour's cells while the bound counts the mesh's -- is refused
+    by
+    :py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter._validate` rather
+    than generated.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the launch's own index name.
+    :rtype: str
+    """
+    if region.colour_map is None:
+        return region.cell_index
+    return region.colour_map.index
+
+
 def launch_offsets(region):
     """Return the three pieces of text a region's lower bound contributes.
 
@@ -60,6 +93,11 @@ def launch_offsets(region):
     That is asserted rather than reasoned about: the captures already in the
     model are gated on whole-model checksums and on assertions over this
     exact text.
+
+    The name the offset is applied to is :py:func:`launch_index`'s, which is
+    the composition of the two: a halo launch of an uncoloured region offsets
+    the region's own cell index, and no region reaching here both names a
+    colour map and begins past the first cell.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -187,7 +225,7 @@ def range_launch(region, local_declarations, body):
     return (
         f'  Kokkos::parallel_for("{region.name}", '
         f"Kokkos::RangePolicy<>({first}, {region.cell_count}),\n"
-        f"      KOKKOS_LAMBDA(const int {region.cell_index}) {{\n"
+        f"      KOKKOS_LAMBDA(const int {launch_index(region)}) {{\n"
         f"{local_declarations}{body}"
         "      });\n")
 
@@ -245,12 +283,12 @@ def team_launch(region, local_declarations, body):
         "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
         "team.team_size()),\n"
         "        [&](const int rank) {\n"
-        f"      const int {region.cell_index} = {offset}team.league_rank()"
+        f"      const int {launch_index(region)} = {offset}team.league_rank()"
         " * team.team_size() + rank;\n"
         # The league is sized by rounding up, so the last team runs with
         # ranks that have no cell. Without this they would run the body
         # for a cell past the end of every View.
-        f"      if ({region.cell_index} >= {region.cell_count}) {{\n"
+        f"      if ({launch_index(region)} >= {region.cell_count}) {{\n"
         "        return;\n"
         "      }\n"
         f"{constructions}"
@@ -329,6 +367,7 @@ def hierarchical_launch(region, local_declarations, body):
         f'  Kokkos::parallel_for("{region.name}",\n'
         f"      {policy},\n"
         "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
-        f"    const int {region.cell_index} = {offset}team.league_rank();\n"
+        f"    const int {launch_index(region)} = "
+        f"{offset}team.league_rank();\n"
         f"{constructions}{local_declarations}{body}"
         "  });\n")

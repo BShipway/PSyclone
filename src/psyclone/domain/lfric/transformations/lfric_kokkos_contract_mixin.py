@@ -81,9 +81,13 @@ therefore not supported.
 from psyclone.core import AccessType
 from psyclone.domain.lfric import LFRicConstants
 from psyclone.psyGen import BuiltIn
+from psyclone.psyir.backend.kokkos_array_expression import (
+    KokkosArrayExpression)
+from psyclone.psyir.backend.kokkos_array_expression_mixin import (
+    ATOMIC_UPDATES, atomic_update_operands)
 from psyclone.psyir.nodes import (
-    ArrayConstructor, Assignment, Call, CodeBlock, IntrinsicCall, Range,
-    Reference)
+    ArrayConstructor, ArrayReference, Assignment, Call, CodeBlock,
+    IntrinsicCall, Range, Reference)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
 from psyclone.psyir.symbols import ArrayType, DataSymbol
 from psyclone.psyir.transformations import TransformationError
@@ -102,9 +106,19 @@ class LFRicKokkosContractMixin:
     # design; the class it is mixed into carries the public interface.
     # pylint: disable=too-few-public-methods
 
-    #: Accesses a plain ``parallel_for`` over cells can honour. ``INC``,
-    #: ``READINC`` and ``REDUCTION`` all need colouring or atomics.
-    _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE)
+    #: Accesses a cell-parallel launch can honour. The first three are each
+    #: cell's own and need nothing; ``INC`` and ``READINC`` are shared
+    #: between the cells that meet at a dof, and are answered either by an
+    #: atomic update or by colouring the loop, which is the choice
+    #: ``LFRicKokkosTrans._uses_atomics`` makes. Which of the two is in force
+    #: is not asked here: both make the same accesses safe.
+    #: ``REDUCTION`` is not here: it is shared between *all* cells
+    #: rather than between neighbours, so neither answer reaches it.
+    _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE,
+                      AccessType.INC, AccessType.READINC)
+    #: The accesses under which two cells contribute to one element, so that
+    #: the update has to be made indivisible or serialised by colour.
+    _SHARED_ACCESSES = (AccessType.INC, AccessType.READINC)
     #: The LFRic argument types the region can describe. ``gh_operator`` is an
     #: LMA operator, which reaches the kernel as a rank-3 array over
     #: ``(ncell_3d, ndf1, ndf2)`` with every extent a formal of its own, so
@@ -166,12 +180,24 @@ class LFRicKokkosContractMixin:
     #: name rather than accepted on the strength of the resemblance.
     _SUPPORTED_SHAPES = ("gh_quadrature_xyoz", "gh_evaluator")
 
-    #: Loop types the launch has a shape for. ``""`` is a loop over cell
-    #: columns and ``"dof"`` one over dofs. The colour and tile types are
-    #: absent because they index a colour map rather than counting, and
+    #: The one :py:attr:`~psyclone.psyGen.Loop.loop_type` a captured loop may
+    #: carry besides none at all and ``dof``. It is the inner loop of a
+    #: colouring, whose iterations are the cells of one colour; the enclosing
+    #: ``colour`` loop is left as Fortran and is what runs the colours in
+    #: sequence, which is where the safety of a shared write without atomics
+    #: comes from.
+    _COLOURED_LOOP_TYPE = "cells_in_colour"
+
+    #: Loop types the launch has a shape for. ``""`` and ``None`` are a loop
+    #: over cell columns, ``"dof"`` one over dofs, and
+    #: :py:attr:`_COLOURED_LOOP_TYPE` the inner loop of a colouring, whose
+    #: cells are read through a colour map rather than counted from the mesh.
+    #: The enclosing ``colours`` loop and the tiled types are absent -- the
+    #: first is what the PSy layer keeps and runs in sequence, and a tiled
+    #: colouring has a second level of indirection nothing here models -- and
     #: ``"null"`` because it is not a loop at all: the kernel under it is
     #: called once, for the whole domain.
-    _LOOP_TYPES = ("", "dof")
+    _LOOP_TYPES = ("", None, "dof", _COLOURED_LOOP_TYPE)
 
     #: Iteration spaces the launch has a shape for. The four cell-column
     #: spaces all launch over cells, differing only in how far the count
@@ -208,11 +234,17 @@ class LFRicKokkosContractMixin:
     #: :py:meth:`~psyclone.domain.lfric.LFRicLoop.upper_bound_psyir`'s
     #: business, and the region takes its value rather than its expression.
     #:
-    #: The coloured bounds -- ``ncolours``, ``ncolour``, ``ntilecolours`` and
-    #: the rest -- are absent. They index a colour map rather than counting
-    #: from the first cell, and a loop carrying one is refused by
+    #: The last two are the coloured pair, and they count the same way the
+    #: others do: ``ncolour`` is the number of cells of the colour the
+    #: enclosing loop is on, ``colour_halo`` that number to a halo depth.
+    #: What differs is what the count is of -- cells of one colour rather
+    #: than cells of the mesh -- and the region reads its cells through
+    #: :py:class:`~psyclone.psyir.backend.kokkos.KokkosColourMap` for that
+    #: reason. The tiled bounds, ``ntilecolours`` and the rest, remain
+    #: absent: a tiled loop is refused by
     #: :py:meth:`_validate_iteration_space` before this is asked.
-    _COUNTED_BOUNDS = ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo")
+    _COUNTED_BOUNDS = ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo",
+                       "ncolour", "colour_halo")
 
     #: Names a kernel symbol may not carry into the generated region. Fortran
     #: and C++ do not reserve the same words, so a perfectly ordinary Fortran
@@ -269,17 +301,27 @@ class LFRicKokkosContractMixin:
     def _validate_iteration_space(cls, node):
         """Check that the launch has a shape for what the loop iterates over.
 
-        Two questions, asked separately because they have separate answers. A
-        coloured loop is refused for its *type*: it runs the cells of one
-        colour through a colour map, so a launch from zero to a count would
-        run the wrong cells. The space is then refused by name, because the
-        survey reports one blocker per loop and the name is what tells two
-        unadmitted spaces apart.
+        Two questions, asked separately because they have separate answers.
+        The *type* says which of the loops a colouring leaves behind this is,
+        and only the inner one is captured: it runs the cells of one colour,
+        which the region reads through a
+        :py:class:`~psyclone.psyir.backend.kokkos.KokkosColourMap`, while the
+        enclosing ``colours`` loop stays in the PSy layer and is what runs the
+        colours one after another. That sequence is the alternative to an
+        atomic update, and it is why a coloured loop is admitted at all. Every
+        other type -- the enclosing loop, a tiled colouring's -- is refused.
+        The space is then refused by name, because the survey reports one
+        blocker per loop and the name is what tells two unadmitted spaces
+        apart.
 
         Both the cell-column spaces and the dof spaces are admitted. A dof
         loop hands its kernel one dof of each field rather than a dofmap, so
         it needs no cell index and no indirection at all; see
-        :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch`.
+        :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch`. A
+        colouring never reaches a dof loop --
+        :py:class:`~psyclone.transformations.LFRicColourTrans` refuses one --
+        so the two spaces and the coloured type are checked independently
+        here and can be relied on not to arrive together.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -291,8 +333,8 @@ class LFRicKokkosContractMixin:
         """
         if node.loop_type not in cls._LOOP_TYPES:
             raise TransformationError(
-                "LFRicKokkosTrans supports only an uncoloured loop over cell "
-                "columns or over dofs.")
+                "LFRicKokkosTrans supports only a loop over cell columns, "
+                "coloured or not, or a loop over dofs.")
         if node.iteration_space not in cls._ITERATION_SPACES:
             raise TransformationError(
                 f"LFRicKokkosTrans does not support the "
@@ -326,6 +368,16 @@ class LFRicKokkosContractMixin:
         upper bound alone still matters: a launch beginning at zero over a
         loop that did not would run the cells it was told to skip, which is a
         wrong answer rather than a compile error.
+
+        **A coloured loop always begins at ``start``**, so a coloured region
+        never takes a first cell, and the writer refuses one that does. That
+        is not this rule's doing but
+        :py:class:`~psyclone.transformations.LFRicColourTrans`'s: the loop it
+        makes over the cells of one colour is given a lower bound of
+        ``start`` whatever the loop it replaced had, the halo the original
+        reached into moving into the *upper* bound, ``colour_halo``. The two
+        counts a launch could otherwise be given -- an index into one colour's
+        cells and a cell of the mesh -- are therefore never asked to compose.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -524,13 +576,31 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
             as :py:class:`psyclone.domain.lfric.LFRicConstants` gives them.
         :type discontinuous: List[str]
 
+        A field accumulated into is passed over too. ``gh_inc`` is illegal
+        on a discontinuous space -- the metadata parser refuses it -- so
+        every shared write there is on a continuous one by construction, and
+        a rule refusing those would refuse the whole pattern. What makes such
+        a write safe is not the space but the update: an atomic combines the
+        two cells' contributions, and a coloured launch keeps them apart in
+        time. Which of the two is in force is decided by
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosTrans._uses_atomics`,
+        and the shape of the update itself is checked by
+        :py:meth:`_validate_shared_updates`. What remains refused here is a
+        plain ``gh_write`` or ``gh_readwrite`` to a continuous space, which
+        neither answer helps: two cells there do not contribute to a value,
+        they each decide it.
+
         :raises TransformationError: if the argument is a field written on a
-            continuous space, where one cell's contribution could overwrite
+            continuous space by an access that replaces the element rather
+            than contributing to it, where one cell's write could overwrite
             another's.
         """
         if argument.argument_type != "gh_field":
             return
         if argument.access == AccessType.READ:
+            return
+        if argument.access in LFRicKokkosContractMixin._SHARED_ACCESSES:
             return
         space = argument.function_space.orig_name.lower()
         if space not in discontinuous:
@@ -617,7 +687,9 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot capture the '{argument.access}' "
                     f"access of '{argument.name}': a cell-parallel launch "
-                    "would need colouring or atomics.")
+                    "answers a shared write with an atomic update or with "
+                    "colouring, and both of those model gh_inc and "
+                    "gh_readinc only.")
             if argument.argument_type != "gh_field":
                 continue
             cls._validate_field_type(argument)
@@ -629,6 +701,101 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
                         f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shapes "
                         f"only, but '{argument.name}' has '{shape}'.")
             cls._validate_written_space(argument, discontinuous)
+
+    @classmethod
+    def _shared_arguments(cls, kernel):
+        """Return the kernel arguments more than one cell of a launch updates.
+
+        Read from the kernel's metadata rather than from its body, and so
+        askable before any rewrite: what makes an argument shared is the
+        access LFRic declares for it, ``gh_inc`` or ``gh_readinc``, and not
+        the statement that carries out the update.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+        :returns: the shared arguments, in metadata order.
+        :rtype: list[:py:class:`psyclone.lfric.LFRicKernelArgument`]
+        """
+        return [argument for argument in kernel.arguments.args
+                if argument.access in cls._SHARED_ACCESSES]
+
+    @classmethod
+    def _validate_shared_updates(cls, kernel, schedule):
+        """Check that every write to a shared field is one an atomic answers.
+
+        Asked only when the atomic arm is in force: a coloured launch runs
+        the cells that meet at a dof in different launches, so any statement
+        at all is safe there and no shape is required of it.
+
+        The rules are the writer's own, asked here so that a loop the backend
+        could not express is refused rather than captured and then failed
+        part-way through. Two shapes are refused. One is an update that is
+        not a read-modify-write of the element by one of the operators in
+        :py:data:`~psyclone.psyir.backend.\
+kokkos_array_expression_mixin.ATOMIC_UPDATES`
+        -- there is no indivisible instruction for an arbitrary computation.
+        The other is a statement the backend lowers to a nest of its own,
+        such as one holding a section or an array-valued intrinsic: what the
+        atomic has to cover is then a whole loop rather than a statement.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param schedule: the kernel schedule, carrying every rewrite
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+LFRicKokkosTrans.apply`
+            makes, because those rewrites decide which statements survive as
+            statements.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if a shared field is written by a
+            statement no single atomic carries out.
+        """
+        shared = cls._shared_formals(kernel, schedule)
+        if not shared:
+            return
+        shapes = ", ".join(sorted(name for name, _ in ATOMIC_UPDATES.values()))
+        for assignment in schedule.walk(Assignment):
+            target = assignment.lhs
+            if (not isinstance(target, ArrayReference)
+                    or target.name not in shared):
+                continue
+            if cls._is_lowered(assignment):
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot capture '{kernel.name}': it "
+                    f"updates the shared field '{target.name}' with a "
+                    "whole-array expression, which no single atomic carries "
+                    "out. Colour the loop instead.")
+            if atomic_update_operands(assignment) is None:
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot capture '{kernel.name}': it "
+                    f"writes the shared field '{target.name}' with a "
+                    "statement that is not one of the read-modify-write "
+                    f"shapes an atomic answers ({shapes}). Colour the loop "
+                    "instead.")
+
+    @staticmethod
+    def _is_lowered(assignment):
+        """Answer whether the backend lowers this statement to a nest.
+
+        The same question
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
+KokkosArrayExpressionMixin.assignment_node`
+        asks, and spelt the same way so that the two cannot drift: a section
+        anywhere in the statement, or an array-valued intrinsic on the right,
+        and in neither case a constructor, which the C writer spreads over
+        its destination itself.
+
+        :param assignment: the statement to classify.
+        :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
+
+        :returns: whether the statement becomes a nest rather than a
+            statement.
+        :rtype: bool
+        """
+        return (bool(assignment.walk(Range))
+                or KokkosArrayExpression.holds(assignment.rhs)) and not \
+            isinstance(assignment.rhs, ArrayConstructor)
 
     @staticmethod
     def _validate_body(schedule):
@@ -878,8 +1045,8 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
                         "kernel argument, so that the generated scratch can "
                         "be sized.")
 
-    @staticmethod
-    def _cell_position(kernel, loop, formals, actuals):
+    @classmethod
+    def _cell_position(cls, kernel, loop, formals, actuals):
         """Return the formal carrying LFRic's cell index, or ``None``.
 
         ``ArgOrdering.generate`` emits that index as the kernel's first
@@ -896,6 +1063,11 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         dropped below is some other argument, and the result is a region that
         compiles, runs and reads the wrong data.
 
+        A colouring makes the actual ``cmap(colour, cell)`` rather than
+        ``cell``, and that is the same value by a longer route: the region
+        already declares its own cell from the same lookup, so the position
+        it derives from it is the cell of the mesh either way.
+
         :param kernel: the kernel being captured.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
         :param loop: the loop the kernel sits in.
@@ -910,18 +1082,52 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         :rtype: Optional[str]
 
         :raises TransformationError: if the kernel takes an operator but the
-            first actual is not a reference to the loop's own variable.
+            first actual is neither a reference to the loop's own variable
+            nor that variable's entry in the colour map.
         """
         if not kernel.arguments.has_operator():
             return None
         actual = actuals[0]
-        if not (isinstance(actual, Reference)
-                and actual.symbol is loop.variable):
+        if not cls._is_the_loops_cell(kernel, loop, actual):
             raise TransformationError(
                 f"LFRicKokkosTrans expected the PSy layer to supply the "
                 f"loop's own cell index as the first argument of "
                 f"'{kernel.name}', but found '{actual.debug_string()}'.")
         return formals[0].name
+
+    @classmethod
+    def _is_the_loops_cell(cls, kernel, loop, actual):
+        """Say whether an actual is the cell the loop is on.
+
+        Two spellings mean it, and no third one does. Uncoloured, LFRic
+        passes the loop's own variable. Coloured, it passes that variable's
+        entry in the kernel's colour map, with the colour the outer Fortran
+        loop is on: ``cmap(colour, cell)``. The map and the index are checked
+        against the symbols the schedule holds, so an unrelated array
+        reference in the first position is refused rather than mistaken for
+        a cell.
+
+        :param kernel: the kernel being captured.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param loop: the loop the kernel sits in.
+        :type loop: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param actual: the first actual argument the PSy layer supplies.
+        :type actual: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: whether that actual is this loop's cell index.
+        :rtype: bool
+        """
+        if not isinstance(actual, Reference):
+            return False
+        if not isinstance(actual, ArrayReference):
+            return actual.symbol is loop.variable
+        if loop.loop_type != cls._COLOURED_LOOP_TYPE:
+            return False
+        indices = actual.indices
+        return (actual.symbol is kernel.colourmap
+                and len(indices) == 2
+                and isinstance(indices[1], Reference)
+                and indices[1].symbol is loop.variable)
 
 
 __all__ = ["LFRicKokkosContractMixin"]

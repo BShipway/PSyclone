@@ -58,6 +58,24 @@ because it shares the policy type with them and nothing else -- none of the
 cell shapes' scratch, team or lower-bound machinery applies to it -- and
 because :py:mod:`psyclone.psyir.backend.kokkos` has the least room left of the
 three files that could have held it.
+
+**Neither of the two helpers the cell shapes compose is called here, and that
+is deliberate rather than an omission.**
+:py:func:`~psyclone.psyir.backend.kokkos_launch.launch_index` answers which
+name a launch gives its index, and the answer differs from the region's own
+only for a coloured region -- which a dof region is not, having no shared write
+for a colour map to separate.
+The first of those is refused by
+:py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter._validate` rather than
+left to be read out of the text below.
+
+:py:func:`~psyclone.psyir.backend.kokkos_launch.launch_offsets` answers where
+the counting starts, and a dof loop starts at the first dof: LFRic's ``dof``
+and ``owned_dof`` spaces both begin there, so no loop reaching this shape names
+a lower bound. A region that named one anyway would launch from zero, the field
+being read by none of the text below. That is the shape's stated omission and
+not an oversight: it is unused rather than wrong, and the arm that honoured it
+would be an untested path for something LFRic does not write.
 """
 
 

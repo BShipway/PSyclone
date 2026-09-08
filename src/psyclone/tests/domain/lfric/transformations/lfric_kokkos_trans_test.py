@@ -14,7 +14,7 @@ import pytest
 
 from psyclone.configuration import Config
 from psyclone.core import AccessType
-from psyclone.domain.lfric import KernCallArgList, LFRicLoop
+from psyclone.domain.lfric import KernCallArgList, LFRicKern, LFRicLoop
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.errors import GenerationError
 from psyclone.lfric import LFRicArgStencil
@@ -358,6 +358,230 @@ program kokkos_coloured_test
   call invoke(scaled_copy_kernel_type(out_field, in_field, scaling),  &
               assemble_w2_kernel_type(vel_field, out_field))
 end program kokkos_coloured_test
+"""
+
+
+# The shared-write shape, in the smallest form that carries both halves of
+# it. 'acc' is 'gh_inc' onto W2 and its statement is a read-modify-write, so
+# two cells sharing one of its dofs both accumulate into it; 'out' is
+# 'gh_write' onto W3, which no other cell touches. A kernel with only the
+# first could not tell an atomic applied per argument from one applied to
+# every write the region makes.
+_SHARED_WRITE_KERNEL = """
+module inc_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           gh_write, cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: inc_probe_kernel_type
+    type(arg_type) :: meta_args(3) = (/                        &
+         arg_type(gh_field, gh_real, gh_inc,   w2),            &
+         arg_type(gh_field, gh_real, gh_write, w3),            &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: inc_probe_code
+  end type inc_probe_kernel_type
+contains
+  subroutine inc_probe_code(nlayers, acc, out, src, &
+                            ndf_w2, undf_w2, map_w2, &
+                            ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: src
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        out(map_w3(df) + k) = 2.0_r_def*src(map_w3(df) + k)
+      end do
+      do df = 1, ndf_w2
+        acc(map_w2(df) + k) = acc(map_w2(df) + k) + src(map_w3(1) + k)
+      end do
+    end do
+  end subroutine inc_probe_code
+end module inc_probe_kernel_mod
+"""
+
+
+_VECTOR_INC_KERNEL = """
+module vector_inc_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: vector_inc_kernel_type
+    type(arg_type) :: meta_args(2) = (/                        &
+         arg_type(gh_field*3, gh_real, gh_inc,  w2),           &
+         arg_type(gh_field,   gh_real, gh_read, w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: vector_inc_code
+  end type vector_inc_kernel_type
+contains
+  subroutine vector_inc_code(nlayers, acc_1, acc_2, acc_3, src, &
+                             ndf_w2, undf_w2, map_w2, &
+                             ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc_1
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc_2
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc_3
+    real(kind=r_def), dimension(undf_w3), intent(in) :: src
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w2
+        acc_1(map_w2(df) + k) = acc_1(map_w2(df) + k) + src(map_w3(1) + k)
+        acc_2(map_w2(df) + k) = acc_2(map_w2(df) + k) + src(map_w3(1) + k)
+        acc_3(map_w2(df) + k) = acc_3(map_w2(df) + k) + src(map_w3(1) + k)
+      end do
+    end do
+  end subroutine vector_inc_code
+end module vector_inc_kernel_mod
+"""
+
+
+_VECTOR_INC_ALGORITHM = """
+program kokkos_vector_inc_test
+  use field_mod, only : field_type
+  use vector_inc_kernel_mod, only : vector_inc_kernel_type
+  implicit none
+  type(field_type) :: acc(3), src
+  call invoke(vector_inc_kernel_type(acc, src))
+end program kokkos_vector_inc_test
+"""
+
+
+_SHARED_WRITE_ALGORITHM = """
+program kokkos_shared_write_test
+  use field_mod, only : field_type
+  use inc_probe_kernel_mod, only : inc_probe_kernel_type
+  implicit none
+  type(field_type) :: acc, src, out
+  call invoke(inc_probe_kernel_type(acc, out, src))
+end program kokkos_shared_write_test
+"""
+
+
+# The shape of shared write an atomic cannot answer: the shared field takes
+# the value of an array-valued intrinsic, which the C writer accumulates in
+# a nest of its own. A section alone does not do it -- those are lowered to
+# PSyIR loops before the question is asked, and each statement the lowering
+# leaves is an ordinary read-modify-write an atomic does carry. Real GungHo
+# kernels write this way -- 'nodal_coordinates' and 'strong_curl' among
+# them -- and the coloured arm is what carries them.
+_WHOLE_ARRAY_INC_KERNEL = """
+module whole_inc_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: whole_inc_probe_kernel_type
+    type(arg_type) :: meta_args(2) = (/                        &
+         arg_type(gh_field, gh_real, gh_inc,  w2),             &
+         arg_type(gh_field, gh_real, gh_read, w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: whole_inc_probe_code
+  end type whole_inc_probe_kernel_type
+contains
+  subroutine whole_inc_probe_code(nlayers, acc, src, &
+                                  ndf_w2, undf_w2, map_w2, &
+                                  ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+    real(kind=r_def), dimension(undf_w3), intent(in) :: src
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    real(kind=r_def), dimension(ndf_w2, ndf_w3) :: weights
+    weights(:, :) = 1.0_r_def
+    acc(1:ndf_w2) = matmul(weights, src(1:ndf_w3))
+  end subroutine whole_inc_probe_code
+end module whole_inc_probe_kernel_mod
+"""
+
+
+_WHOLE_ARRAY_INC_ALGORITHM = """
+program kokkos_whole_array_inc_test
+  use field_mod, only : field_type
+  use whole_inc_probe_kernel_mod, only : whole_inc_probe_kernel_type
+  implicit none
+  type(field_type) :: acc, src
+  call invoke(whole_inc_probe_kernel_type(acc, src))
+end program kokkos_whole_array_inc_test
+"""
+
+
+# The shared write in the shape GungHo writes it most often: 'matrix_vector',
+# an operator applied to a field and accumulated onto a continuous space. The
+# operator is what makes this different from 'inc_probe_kernel_mod' -- LFRic
+# passes the cell index as the first actual for exactly the kernels that take
+# one, and a colouring rewrites that actual into a lookup in the colour map.
+_SHARED_WRITE_OPERATOR_KERNEL = """
+module inc_operator_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_operator, gh_real,      &
+                           gh_inc, gh_read, cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: inc_operator_probe_kernel_type
+    type(arg_type) :: meta_args(3) = (/                        &
+         arg_type(gh_field,    gh_real, gh_inc,  w2),          &
+         arg_type(gh_field,    gh_real, gh_read, w3),          &
+         arg_type(gh_operator, gh_real, gh_read, w2, w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: inc_operator_probe_code
+  end type inc_operator_probe_kernel_type
+contains
+  subroutine inc_operator_probe_code(cell, nlayers, lhs, x, ncell_3d, &
+                                     matrix, ndf_w2, undf_w2, map_w2, &
+                                     ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: cell, nlayers, ncell_3d
+    integer(kind=i_def), intent(in) :: ndf_w2, undf_w2, ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: lhs
+    real(kind=r_def), dimension(undf_w3), intent(in) :: x
+    real(kind=r_def), dimension(ncell_3d,ndf_w2,ndf_w3), intent(in) :: matrix
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: df1, df2, k, ik
+    do k = 0, nlayers - 1
+      ik = (cell - 1) * nlayers + k + 1
+      do df1 = 1, ndf_w2
+        do df2 = 1, ndf_w3
+          lhs(map_w2(df1) + k) = lhs(map_w2(df1) + k) + &
+                                 matrix(ik, df1, df2) * x(map_w3(df2) + k)
+        end do
+      end do
+    end do
+  end subroutine inc_operator_probe_code
+end module inc_operator_probe_kernel_mod
+"""
+
+
+_SHARED_WRITE_OPERATOR_ALGORITHM = """
+program kokkos_shared_write_operator_test
+  use field_mod, only : field_type
+  use operator_mod, only : operator_type
+  use inc_operator_probe_kernel_mod, only : inc_operator_probe_kernel_type
+  implicit none
+  type(field_type) :: lhs, x
+  type(operator_type) :: matrix
+  call invoke(inc_operator_probe_kernel_type(lhs, x, matrix))
+end program kokkos_shared_write_operator_test
 """
 
 
@@ -3180,6 +3404,32 @@ def coloured_target_fixture(tmp_path, clear_module_manager_instance):
         extra={"assemble_w2_kernel_mod": _COLOURED_KERNEL})
 
 
+@pytest.fixture(name="shared_write_target")
+# pylint: disable-next=unused-argument
+def shared_write_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel accumulates into a shared dof."""
+    return _invoke(
+        tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL)
+
+
+@pytest.fixture(name="shared_write_operator_target")
+# pylint: disable-next=unused-argument
+def shared_write_operator_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke accumulating into a shared dof through an operator."""
+    return _invoke(
+        tmp_path, "inc_operator_probe", _SHARED_WRITE_OPERATOR_ALGORITHM,
+        _SHARED_WRITE_OPERATOR_KERNEL)
+
+
+@pytest.fixture(name="vector_inc_target")
+# pylint: disable-next=unused-argument
+def vector_inc_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel accumulates into a shared field vector."""
+    return _invoke(
+        tmp_path, "vector_inc", _VECTOR_INC_ALGORITHM, _VECTOR_INC_KERNEL)
+
+
 @pytest.fixture(name="section_target")
 # pylint: disable-next=unused-argument
 def section_target_fixture(tmp_path, clear_module_manager_instance):
@@ -5130,12 +5380,60 @@ def test_lfric_kokkos_trans_operator_cell_actual_must_be_the_counter(
         LFRicKokkosTrans().apply(loop)
 
 
-def test_lfric_kokkos_trans_rejects_incremented_field(target):
-    """An incremented field needs colouring or atomics, not a bare launch."""
+def test_lfric_kokkos_trans_rejects_an_unmodelled_shared_update(target):
+    """A shared field written by something no atomic carries out is refused.
+
+    ``gh_inc`` says two cells contribute to one element; it does not say how,
+    and this kernel's body simply assigns to the element. Assignment is not a
+    contribution, so an atomic cannot express it and a coloured launch would
+    still leave the answer depending on which cell ran last. The refusal is
+    raised by validate rather than by the backend, so that a whole-model
+    capture leaves the loop as Fortran instead of failing part-way through
+    it.
+
+    Monkeypatching the access rather than writing a kernel for it is
+    deliberate: what is under test is the pairing of the metadata with the
+    body, and no LFRic kernel in the tree carries that pairing -- a real
+    ``gh_inc`` kernel accumulates.
+    """
     _, loop, kernel = target
     kernel.arguments.args[0]._access = AccessType.INC
-    with pytest.raises(TransformationError, match="colouring or atomics"):
+    with pytest.raises(TransformationError) as err:
         LFRicKokkosTrans().validate(loop)
+    assert "read-modify-write" in str(err.value)
+    assert "Kokkos::atomic_add" in str(err.value)
+
+
+def test_lfric_kokkos_trans_atomics_reach_a_continuous_gh_inc(
+        shared_write_target):
+    """The default arm captures a continuous ``gh_inc`` with an atomic.
+
+    The end-to-end claim the two backend tests cannot make: that an LFRic
+    loop whose kernel accumulates into a field on a continuous space is
+    accepted, that the accumulation is generated as an atomic, and that
+    nothing else about the capture changes. The field's own actual is passed
+    exactly as any other written field's is -- an atomic is a property of the
+    update, not of the interface -- and the write beside it, to a
+    discontinuous space no neighbour reaches, stays a plain assignment.
+    """
+    psy, loop, _ = shared_write_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::atomic_add(&acc(" in cpp
+    assert cpp.count("Kokkos::atomic") == 1
+    # The View is declared as any other written field's is. An 'Atomic'
+    # memory trait would have been the other way to spell this, and is not
+    # used: it would make every access to the field atomic, including the
+    # plain reads a 'gh_readinc' kernel makes, and it would change the type
+    # the region declares rather than the statement that needed changing.
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged> acc(acc_data, undf_w2);" in cpp)
+    assert "Kokkos::Atomic" not in cpp
+
+    fortran = str(psy.gen)
+    assert "real(c_double), dimension(*), intent(inout) :: acc" in fortran
+    assert "call inc_probe_kokkos(" in fortran
 
 
 def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
@@ -7805,8 +8103,8 @@ def test_lfric_kokkos_trans_iteration_space_predicate_refuses_a_colouring(
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans._validate_iteration_space(loop)
 
-    assert ("LFRicKokkosTrans supports only an uncoloured loop over cell "
-            "columns or over dofs." in str(error.value))
+    assert ("LFRicKokkosTrans supports only a loop over cell columns, "
+            "coloured or not, or a loop over dofs." in str(error.value))
 
 
 def test_lfric_kokkos_trans_iteration_space_predicate_accepts_a_dof_loop(
@@ -7840,7 +8138,8 @@ def test_lfric_kokkos_trans_halo_depth_predicate_accepts_counted_bounds(
         "1", ScalarType(ScalarType.Intrinsic.INTEGER,
                         ScalarType.Precision.UNDEFINED))
 
-    for bound in ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo"):
+    for bound in ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo",
+                  "ncolour", "colour_halo"):
         loop._upper_bound_name = bound
         LFRicKokkosTrans._validate_halo_depth(loop)
 
@@ -7849,18 +8148,21 @@ def test_lfric_kokkos_trans_halo_depth_predicate_refuses_an_unknown_bound(
         target):
     """A bound that is not a count from the first cell is refused by name.
 
-    The coloured bounds are the ones this excludes: they index a colour map
-    rather than counting, so a launch from zero to one of them would run the
-    wrong cells. A loop carrying one is refused for its iteration space too,
-    but the survey asks each rule on its own and this one has its own answer.
+    The tiled bounds are the ones this excludes. The plain coloured pair is
+    not: ``ncolour`` and ``colour_halo`` count the cells of one colour from
+    the first of them, which is the same shape of bound the uncoloured ones
+    are, and the region reads which mesh cell each of those is from the
+    colour map. A tiled colouring counts something else again and is refused
+    for its iteration space too, but the survey asks each rule on its own and
+    this one has its own answer.
     """
     _, loop, _ = target
-    loop._upper_bound_name = "ncolour"
+    loop._upper_bound_name = "ntilecolours"
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans._validate_halo_depth(loop)
 
-    assert ("LFRicKokkosTrans does not support the 'ncolour' loop bound."
+    assert ("LFRicKokkosTrans does not support the 'ntilecolours' loop bound."
             in str(error.value))
 
 
@@ -8605,6 +8907,445 @@ def test_lfric_kokkos_trans_validate_probe_is_not_the_schedule(section_target):
     assert schedule.walk(Range)
 
 
+def test_lfric_kokkos_trans_refuses_an_unmodelled_access(
+        shared_write_target):
+    """An access neither arm answers is refused by name.
+
+    'gh_inc' and 'gh_readinc' are read-modify-writes of a field at a shared
+    dof, which is what an atomic update and a colouring both answer. A
+    reduction is not: every cell accumulates into one value, and where that
+    value lives -- a PSy-layer scalar the invoke finishes with a global sum --
+    is somewhere the region has no View for.
+
+    There is no such kernel to write. PSyclone's own metadata parser refuses
+    'gh_reduction' on a user-supplied kernel outright, so a reduction reaches
+    a coded LFRic loop by no route at all, and the access has to be put on the
+    argument here to ask the question. That is the point of the test: the
+    refusal is a claim about what this transformation does with an access it
+    does not model, and it should not depend on which accesses LFRic happens
+    to admit this year.
+
+    """
+    _, loop, kernel = shared_write_target
+    kernel.arguments.args[0]._access = AccessType.REDUCTION
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "'REDUCTION'" in str(err.value)
+    assert "'acc'" in str(err.value)
+    # And it names what is modelled, so the reader is not left to infer it
+    # from the absence of their access.
+    assert "gh_readinc" in str(err.value)
+
+
+def _coloured_inner(schedule):
+    """Return the cells-in-colour loop of an already-coloured schedule.
+
+    :param schedule: the invoke schedule 'LFRicColourTrans' has rewritten.
+    :type schedule: :py:class:`psyclone.psyGen.InvokeSchedule`
+
+    :returns: the inner loop, the one that runs the cells of one colour.
+    :rtype: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+    """
+    return [loop for loop in schedule.walk(LFRicLoop)
+            if loop.loop_type == "cells_in_colour"][0]
+
+
+def test_lfric_kokkos_trans_accepts_a_coloured_loop(shared_write_target):
+    """A loop colouring has already made safe is captured without atomics.
+
+    This is the second of the two answers to a shared write, and the one
+    LFRic's own OpenMP path takes: the cells of one colour share no dof, so
+    the launch over them races with nothing and the update is a plain
+    read-modify-write. The colours are run one after another, which is where
+    the ordering that makes it safe comes from, so the capture takes the
+    inner loop and leaves the Fortran loop over colours to make one launch
+    per colour.
+
+    The colour map crosses the ABI because the region's cell is no longer its
+    launch index: the launch counts the cells of this colour and the map says
+    which cell of the mesh each of those is.
+
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(_coloured_inner(schedule))
+    fortran = str(psy.gen)
+
+    # One launch per colour: the call sits inside the surviving Fortran loop
+    # over colours, and the loop over cells is gone.
+    assert "do colour = loop0_start, loop0_stop, 1" in fortran
+    assert "call inc_probe_kokkos(" in fortran
+    assert fortran.index("do colour =") < fortran.index(
+        "call inc_probe_kokkos(")
+    assert "call inc_probe_code(" not in fortran
+
+    # The colour map and the colour itself are formals of the region, and
+    # the PSy layer passes both.
+    call_line = [line for line in fortran.splitlines()
+                 if "call inc_probe_kokkos(" in line][0]
+    assert "cmap" in call_line
+    assert "colour" in call_line
+    assert "const int *cmap_data" in cpp
+    assert "const int colour" in cpp
+    assert "cmap_data" in _formals(cpp)
+    assert "colour" in _formals(cpp)
+    # The region's cell is the map's answer rather than its launch index.
+    assert "cmap(colour - 1" in cpp
+
+    # And no atomic anywhere: that is the whole point of the arm.
+    assert "atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_colours_a_loop_that_takes_an_operator(
+        shared_write_operator_target):
+    """A coloured operator kernel reads its cell through the colour map.
+
+    LFRic supplies the cell index as an actual argument for exactly the
+    kernels that take an operator, because the kernel does arithmetic with it
+    -- ``ik = (cell - 1) * nlayers + 1`` -- to find its own slice of the local
+    stencil. Uncoloured, that actual is the loop's own variable. Coloured, it
+    is ``cmap(colour, cell)``, and it must be recognised as the same thing:
+    the region declares the cell position from its own cell rather than taking
+    it, so a refusal here would refuse 'matrix_vector', the commonest shared
+    write GungHo has.
+
+    The two declarations are ordered, and that is the whole of the fix: the
+    colour map answers first, and the one-based position is derived from its
+    answer rather than from the launch index, which counts the cells of one
+    colour and is not a cell of the mesh.
+
+    """
+    psy, loop, _ = shared_write_operator_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(_coloured_inner(schedule))
+
+    # 'cell' is the kernel's own formal, so the launch index generated clear
+    # of it is 'cell_1', and the position the kernel is given is the map's
+    # answer plus one rather than the launch index plus one.
+    assert "const int cell_1 = cmap(colour - 1, cell_in_colour) - 1;" in cpp
+    assert "const int cell = cell_1 + 1;" in cpp
+    assert cpp.index("const int cell_1 =") < cpp.index("const int cell =")
+    assert "cell" not in _formals(cpp)
+    assert "atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_cell_index_it_cannot_place(
+        shared_write_operator_target, monkeypatch):
+    """An actual that is neither the loop's cell nor the map's is refused.
+
+    ``ArgOrdering`` decides what the first actual of an operator kernel is,
+    and this transformation reads that decision rather than trusting it: an
+    entry dropped in the wrong place is a region that compiles, runs and
+    reads the wrong data. The refusal is kept reachable by naming the loop's
+    variable something the actual is not.
+
+    """
+    psy, loop, _ = shared_write_operator_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+    inner = _coloured_inner(schedule)
+    monkeypatch.setattr(inner, "_variable",
+                        schedule.symbol_table.lookup("colour"))
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().apply(inner)
+    assert "cell index as the first argument" in str(err.value)
+    assert "cmap(colour,cell)" in str(err.value)
+
+
+def test_lfric_kokkos_trans_refuses_colouring_and_atomics_together(
+        shared_write_target):
+    """Asking for both answers to one shared write is refused, not ranked.
+
+    Either arm is correct on its own and the two together are correct as
+    well, at the cost of an atomic on data that colouring has already made
+    private to one launch. A transformation that quietly dropped one of them
+    would decide by preference something the caller had stated, so the
+    contradiction is reported instead.
+
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(
+            _coloured_inner(schedule), options={"atomics": True})
+    assert "'atomics'" in str(err.value)
+    assert "coloured" in str(err.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_non_bool_atomics_option(
+        shared_write_target):
+    """The option chooses between two arms, so it takes no third value."""
+    _, loop, _ = shared_write_target
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop, options={"atomics": "yes"})
+
+    assert ("LFRicKokkosTrans' 'atomics' option must be absent or a bool, "
+            "but found 'yes'." in str(err.value))
+
+
+def test_lfric_kokkos_trans_refuses_neither_answer_to_a_shared_write(
+        shared_write_target):
+    """Turning the atomics off without colouring first is refused.
+
+    It is the one combination that is not merely redundant: the launch would
+    run every cell at once and two of them would read-modify-write the same
+    dof, losing a contribution silently and only sometimes.
+    """
+    _, loop, _ = shared_write_target
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop, options={"atomics": False})
+
+    assert ("'atomics' option is False on a loop that is not coloured, whose "
+            "kernel writes a field two cells share" in str(err.value))
+
+
+def test_lfric_kokkos_trans_atomics_may_be_asked_for_explicitly(
+        shared_write_target):
+    """Asking for the default arm by name gets the default arm."""
+    _, loop, _ = shared_write_target
+
+    cpp = LFRicKokkosTrans().apply(loop, options={"atomics": True})
+
+    assert cpp.count("Kokkos::atomic_add") == 1
+
+
+def test_lfric_kokkos_trans_atomics_off_is_redundant_when_coloured(
+        shared_write_target):
+    """Turning them off on a coloured loop asks for what it would do anyway.
+
+    Stated rather than refused, because it contradicts nothing: the coloured
+    arm generates no atomic whether or not the caller says so.
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(
+        _coloured_inner(schedule), options={"atomics": False})
+
+    assert "atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_colouring_with_no_colour_count(
+        shared_write_target, monkeypatch):
+    """A colour map with no extent to address it by is refused, not guessed.
+
+    LFRic creates the name for the number of colours where it first needs
+    one, so a schedule can be coloured and not yet hold it. The generated
+    View's first extent is the ``LayoutLeft`` stride, and a wrong stride
+    reads a different cell for every colour but the first.
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+    inner = _coloured_inner(schedule)
+    kernel = inner.kernels()[0]
+    # Asked of the rule rather than of a whole capture: LFRic reaches for the
+    # same name to write the enclosing loop's own bound, so a schedule
+    # missing it does not survive as far as apply().
+    monkeypatch.setattr(LFRicKern, "ncolours_var",
+                        property(lambda self: None))
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans._colouring(
+            kernel, inner, LFRicKokkosTrans._schedule(kernel), "cell")
+
+    assert ("cannot capture a coloured loop whose invoke has no number of "
+            "colours" in str(err.value))
+
+
+def test_lfric_kokkos_trans_colour_names_avoid_each_other(target):
+    """A generated name steps aside for one generated beside it.
+
+    ``next_available_name`` answers for the symbol table, which holds none of
+    the four names the coloured launch declares, so two of them could be
+    handed the same answer. They share one C++ scope.
+    """
+    psy, _, _ = target
+    table = psy.invokes.invoke_list[0].schedule.symbol_table
+    taken = {"cell"}
+
+    first = LFRicKokkosTrans._clear_name(table, "colour", taken)
+    second = LFRicKokkosTrans._clear_name(table, "colour", taken)
+
+    assert first == "colour"
+    assert second != first
+    assert LFRicKokkosTrans._clear_name(table, "cell", taken) != "cell"
+
+
+def test_lfric_kokkos_trans_atomics_reach_every_component_of_a_vector(
+        vector_inc_target):
+    """A ``gh_inc`` field vector shares every one of its components.
+
+    LFRic passes a vector field as one formal per component, and the access
+    is declared once for all of them. Reading the access off the first
+    component alone would leave the rest as plain assignments -- correct
+    Kokkos that loses contributions from every cell but one.
+    """
+    _, loop, _ = vector_inc_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert cpp.count("Kokkos::atomic_add") == 3
+    for component in ("acc_1", "acc_2", "acc_3"):
+        assert f"Kokkos::atomic_add(&{component}(" in cpp
+    # The field it reads is not shared, and stays a plain load.
+    assert "Kokkos::atomic_add(&src(" not in cpp
+
+
+def test_lfric_kokkos_trans_coloured_capture_looks_the_colourmap_up_once(
+        shared_write_target):
+    """The completion pass adds no look-up the set-up pass already made.
+
+    Colouring before capturing means the set-up pass runs against a coloured
+    Schedule and emits the colourmap look-ups itself. The completion pass
+    exists for the other order and must find nothing to do here: emitting
+    them again would assign the same pointer twice, in a preamble the
+    coloured arm generates for every one of its captures.
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    LFRicKokkosTrans().apply(_coloured_inner(schedule))
+    fortran = str(psy.gen)
+
+    assert fortran.count("cmap => mesh%get_colour_map()") == 1
+    assert fortran.count("ncolour = mesh%get_ncolours()") == 1
+
+
+def test_lfric_kokkos_trans_captures_a_coloured_meshless_invoke(
+        tmp_path, clear_module_manager_instance):
+    # pylint: disable=unused-argument
+    """An Invoke with no mesh of its own may be coloured and then captured.
+
+    The mesh symbol a colouring creates is assigned by the set-up pass, from
+    a kernel argument. Capturing first removes that kernel and leaves the
+    assignment impossible, which is refused elsewhere; colouring first does
+    not, because the set-up pass runs from the capture and the kernel is
+    still in the tree when it does.
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL,
+        dist_mem=False)
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    LFRicKokkosTrans().apply(_coloured_inner(schedule))
+    fortran = str(psy.gen)
+
+    assert "mesh => acc_proxy%vspace%get_mesh()" in fortran
+    assert "cmap => mesh%get_colour_map()" in fortran
+    assert "call inc_probe_kokkos(" in fortran
+
+
+def test_lfric_kokkos_trans_declares_each_ndf_once(shared_write_target):
+    """Asking which formals are shared declares nothing in the Invoke.
+
+    The walk that answers it is an ArgOrdering, and an ArgOrdering writes
+    the scalars it names into the Invoke's own symbol table whenever the
+    kernel it is given is in a Schedule. Doing that here created
+    ``ndf_<space>`` before LFRicFunctionSpaces did, whose declarations are
+    made with ``new_symbol``: the space was then declared a second time as
+    ``ndf_<space>_1`` and never assigned or read. LFRic builds the PSy layer
+    with ``-Werror=unused-variable``, so the whole model stopped compiling.
+    """
+    psy, loop, _ = shared_write_target
+
+    LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    for space in ("w2", "w3"):
+        assert f"integer(kind=i_def) :: ndf_{space}\n" in fortran
+        assert f"ndf_{space}_1" not in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_whole_array_shared_update(
+        tmp_path, clear_module_manager_instance):
+    # pylint: disable=unused-argument
+    """A shared field written whole is refused, and told what does carry it.
+
+    An atomic covers one statement. A shared field given the value of
+    ``MATMUL`` is not written by a statement the region holds: the writer
+    accumulates it in a nest, and what would have to be made atomic is that
+    nest. The refusal names the other arm rather than only saying no,
+    because colouring is what captures these kernels.
+    """
+    _, loop, _ = _invoke(
+        tmp_path, "whole_inc_probe", _WHOLE_ARRAY_INC_ALGORITHM,
+        _WHOLE_ARRAY_INC_KERNEL)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("updates the shared field 'acc' with a whole-array expression, "
+            "which no single atomic carries out. Colour the loop instead."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_knows_which_first_actual_is_a_cell(
+        shared_write_operator_target):
+    """Only the two spellings of the loop's cell are read as one.
+
+    An operator kernel takes the cell index as its first argument, and the
+    generated region has to name the launch index there instead. Two
+    spellings mean the cell -- the loop's own variable, or its entry in the
+    colour map -- and anything else has to be refused rather than renamed,
+    because renaming it would silently pass the launch index where the
+    kernel expected something else. Neither of the other shapes reaches
+    here from LFRic today, so they are asked of the classifier directly.
+    """
+    _, loop, kernel = shared_write_operator_target
+    integer = ScalarType.integer_type()
+    unrelated = DataSymbol("lookup", ArrayType(integer, [2, 2]))
+
+    assert LFRicKokkosTrans._is_the_loops_cell(
+        kernel, loop, Reference(loop.variable))
+    assert not LFRicKokkosTrans._is_the_loops_cell(
+        kernel, loop, Literal("1", integer))
+    assert not LFRicKokkosTrans._is_the_loops_cell(
+        kernel, loop, ArrayReference.create(
+            unrelated, [Literal("1", integer), Literal("1", integer)]))
+
+
+def test_lfric_kokkos_trans_refuses_a_formal_count_the_metadata_denies(
+        shared_write_target, monkeypatch):
+    """Which formals are shared is read by position, so counts must agree.
+
+    The metadata says which arguments are shared and the walk that reads it
+    gives their positions; the names are the kernel's own formals in the
+    same order. If the two lengths differ then no position can be trusted
+    and a wrong formal would be declared shared, so the mismatch is refused
+    rather than indexed into. LFRic checks the same agreement earlier, which
+    is why the disagreement is arranged here instead of written in Fortran.
+    """
+    _, loop, _ = shared_write_target
+    monkeypatch.setattr(
+        LFRicKokkosTrans, "_implicit_extents",
+        classmethod(lambda cls, table: {"acc": ("acc", 1)}))
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert ("cannot say which formals of 'inc_probe_code' are shared between "
+            "cells" in message)
+    counts = re.search(
+        r"declares (\d+) of them and its metadata describes (\d+)\.", message)
+    assert counts and int(counts.group(2)) - int(counts.group(1)) == 1
+
+
 # A kernel that operates on a dof rather than on a cell column. LFRic hands
 # such a kernel one dof of each of its fields -- 'call scale_field_code(
 # out_field_data(df), in_field_data(df), scale)' -- so there is no dofmap in
@@ -8933,3 +9674,163 @@ def test_lfric_kokkos_trans_describes_itself_without_naming_a_cell():
     """
     assert str(LFRicKokkosTrans()) == (
         "Capture a supported LFRic loop as a Kokkos launch")
+
+
+# The two capabilities above were written apart: one taught the launch to
+# begin somewhere other than the first cell and to run over dofs, the other
+# taught it to run one colour of a coloured loop. The kernel below is the one
+# neither needed on its own -- a continuous-space kernel, so its loop can be
+# coloured, holding a level loop, so its capture takes a team launch -- and
+# the tests that follow it are about how the two answers compose.
+_COLOURED_LEVEL_KERNEL = """
+module column_scale_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: column_scale_kernel_type
+    type(arg_type) :: meta_args(2) = (/                              &
+         arg_type(gh_field, gh_real, gh_inc,  w2),                   &
+         arg_type(gh_field, gh_real, gh_read, w2) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: column_scale_code
+  end type column_scale_kernel_type
+contains
+  subroutine column_scale_code(nlayers, field_out, field_in, &
+                               ndf_w2, undf_w2, map_w2)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w2), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def) :: k
+    real(kind=r_def) :: scaling
+    scaling = 0.5_r_def
+    do k = 1, nlayers - 1
+      field_out(map_w2(1) + k - 1) = scaling * field_in(map_w2(1) + k - 1)
+    end do
+    field_out(map_w2(1) + nlayers - 1) = field_in(map_w2(1) + nlayers - 1)
+  end subroutine column_scale_code
+end module column_scale_kernel_mod
+"""
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_colours_a_team_launch(
+        tmp_path, clear_module_manager_instance):
+    """A coloured loop and a team launch are selected independently.
+
+    Which launch shape a region takes is decided by what its kernel holds --
+    a level loop here, so one team per cell -- and colouring decides what the
+    launch's own index means. Nothing in either decision reads the other, so
+    the two arrive together in one region: the team arithmetic names the
+    index, the map turns it into a mesh cell, and the body indexes by the
+    mesh cell as an uncoloured capture's does.
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _COLOURED_LEVEL_KERNEL)
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(
+        _coloured_inner(schedule), options={"team_size": 4})
+
+    # The team shape, and the colour map inside it.
+    assert "TeamPolicy(ncells, 4)," in cpp
+    assert "const int cell_in_colour = team.league_rank();" in cpp
+    assert "const int cell = cmap(colour - 1, cell_in_colour) - 1;" in cpp
+    # The level loop is still spread over the team, and the statement after
+    # it is still one member's.
+    assert "Kokkos::TeamVectorRange(team, 1, (nlayers - 1) + 1)" in cpp
+    assert "Kokkos::single(Kokkos::PerTeam(team)" in cpp
+    # Colouring is the answer to this kernel's shared write, so there is no
+    # atomic beside it, and the launch begins at the first cell of its colour.
+    assert "Kokkos::atomic" not in cpp
+    assert "first_cell" not in cpp
+
+    # The PSy layer passes the map, the colour and this colour's cell count.
+    call_line = [line for line in str(psy.gen).splitlines()
+                 if "call column_scale_kokkos(" in line][0]
+    assert "cmap, colour, ncolour, last_halo_cell_all_colours(colour,1)" \
+        in call_line
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_a_coloured_loop_never_takes_a_first_cell(
+        tmp_path, clear_module_manager_instance):
+    """Colouring gives the loop it makes a lower bound of ``start``.
+
+    This is why the two capabilities never meet in the one place they could
+    contradict each other. A first cell counts the mesh's cells and a colour
+    map's index counts one colour's, so a region carrying both would offset
+    into the wrong sequence; the writer refuses the pair, and this is the
+    front end's half of that answer -- it does not produce it. The halo-ness
+    of the loop is not lost with the bound: it moves into the coloured
+    loop's *upper* bound, which is why the capture is still of a loop that
+    runs into the halo.
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM, _COLOURED_LEVEL_KERNEL)
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+    inner = _coloured_inner(schedule)
+
+    # pylint: disable-next=protected-access
+    assert inner._lower_bound_name == "start"
+    assert inner.upper_bound_name == "colour_halo"
+    assert LFRicKokkosTrans._start_name(inner) is None
+
+    cpp = LFRicKokkosTrans().apply(inner)
+
+    assert "first_cell" not in cpp
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_refuses_to_colour_a_halo_only_loop(
+        tmp_path, clear_module_manager_instance):
+    """The one loop that does take a first cell cannot be coloured at all.
+
+    A loop over the halo alone is a loop over a discontinuous space -- that
+    is what lets it skip the owned cells -- and ``LFRicColourTrans`` refuses
+    those, so the second half of the pair the writer refuses is unreachable
+    from LFRic as well as meaningless in the back end. Asserted rather than
+    assumed, because the writer's refusal would otherwise be a rule with no
+    stated reason for never firing.
+    """
+    _, loop, _ = _invoke(
+        tmp_path, "halo_write", _HALO_CELL_ALGORITHM, _HALO_CELL_KERNEL)
+    # pylint: disable-next=protected-access
+    assert loop._lower_bound_name == "cell_halo_start"
+    assert LFRicKokkosTrans._start_name(loop) == "first_cell"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicColourTrans().apply(loop)
+
+    assert ("Loops iterating over a discontinuous function space are not "
+            "currently supported." in str(error.value))
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_dof_capture_takes_no_atomic_even_when_asked(
+        tmp_path, clear_module_manager_instance):
+    """The dof arm generates no atomic, with the option on or off.
+
+    A dof launch's freedom from write conflicts is a property of its
+    iteration space: one iteration writes one dof, and no two iterations
+    write the same one. There is therefore nothing for the atomic arm to
+    make safe, and asking for it changes nothing -- which is asserted rather
+    than left to be inferred from a kernel that happens to have no shared
+    write, because the option is the caller's way of asking for the arm and
+    an arm that fired here would be generating a lock on unshared data.
+    """
+    _, loop, _ = _invoke(
+        tmp_path, "scale_field", _DOF_ALGORITHM, _DOF_KERNEL)
+
+    plain = LFRicKokkosTrans().apply(loop, options={"atomics": True})
+
+    assert "Kokkos::RangePolicy<>(0, ndofs)" in plain
+    assert "KOKKOS_LAMBDA(const int df) {" in plain
+    assert "Kokkos::atomic" not in plain
+    assert "cmap" not in plain
