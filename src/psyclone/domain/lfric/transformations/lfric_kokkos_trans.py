@@ -162,19 +162,34 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     unassigned variable -- code that compiles, links, runs and is wrong.
 
     **A stencil is accepted by shape**, and the accepted shapes are
-    :py:attr:`_SUPPORTED_STENCILS` -- ``cross2d`` alone. A 2-D stencil needs
-    no argument machinery of its own: LFRic hands the kernel a sliced dofmap
-    and a sliced size array, both of them array formals, so both become Views
-    with the cell index appended exactly as the dofmap ``map_w3(:,cell)``
-    already does. A 1-D or region stencil hands the size over as a *scalar*
-    formal fed from ``field_stencil_size(cell)``, which would need a per-cell
-    scalar argument kind that does not exist here, so those shapes are refused
-    by name. A stencil also makes the PSy layer emit a halo exchange in front
-    of the loop, which is lowered before the loop is replaced rather than
-    after; see :py:meth:`_lower_halo_exchanges`. The matcher refusal above is
-    unaffected: PSyclone's issue #928 leaves every stencil shape unbuilt, so a
-    stencil kernel written as a generic interface is still refused there
-    whatever its shape.
+    :py:attr:`_SUPPORTED_STENCILS` -- ``cross``, ``cross2d`` and ``region``.
+    A 2-D stencil needs no argument machinery of its own: LFRic hands the
+    kernel a sliced dofmap and a sliced size array, both of them array
+    formals, so both become Views with the cell index appended exactly as the
+    dofmap ``map_w3(:,cell)`` already does.
+
+    A 1-D or region stencil hands the size over as a *scalar* formal fed from
+    ``field_stencil_size(cell)``. That is one cell's value and a region runs
+    every cell at once, so the size crosses the ABI as the whole rank-1 array
+    and the body subscripts it by the launch's own cell -- a scalar formal
+    made per-cell, which is what the 2-D shape's size array already is. The
+    dofmap beside it is declared ``dimension(ndf, stencil_size)``, over that
+    per-cell value, while LFRic allocates it uniformly. A View's extents fix
+    its strides, so a per-cell value cannot size one: the region carries the
+    dofmap's storage extent beside it as a scalar of its own, measured by the
+    PSy layer as ``SIZE(field_stencil_dofmap, dim=2)``, and sizes the View and
+    any automatic array declared over the stencil from that instead.
+
+    ``xory1d`` is refused by name. It carries a direction argument on top of
+    the 1-D size, chosen per cell in the algorithm layer, and nothing here
+    describes it.
+
+    A stencil also makes the PSy layer emit a halo exchange in front of the
+    loop, which is lowered before the loop is replaced rather than after; see
+    :py:meth:`_lower_halo_exchanges`. The matcher refusal above is unaffected:
+    PSyclone's issue #928 leaves every stencil shape unbuilt, so a stencil
+    kernel written as a generic interface is still refused there whatever its
+    shape.
 
     **A basis is accepted by shape** too, and the accepted shapes are
     :py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ`` and

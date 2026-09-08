@@ -19,7 +19,7 @@ from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.nodes import (
-    CodeBlock, KernelSchedule, Literal, Loop)
+    CodeBlock, KernelSchedule, Literal, Loop, Reference)
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -378,6 +378,38 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             f"{launch}"
             "  Kokkos::fence();\n"
             "}\n")
+
+    def reference_node(self, node: Reference) -> str:
+        """Emit a name, subscripting it where the region made it per-cell.
+
+        Almost every reference is its own name and nothing else, which is
+        what :py:class:`~psyclone.psyir.backend.c.CWriter` writes. The
+        exception is a formal the kernel declares as a *scalar* and the
+        region describes as a View: LFRic gives a stencil's size that way,
+        one value per cell, and the region takes the whole array and
+        subscripts it by the cell the thread is on. The kernel's own text
+        names it bare, here and in every expression it reaches, so this is
+        the one place that difference can be applied -- and applying it in
+        only some of those places would read another cell's stencil rather
+        than fail to compile.
+
+        Such a View is recognised by carrying region indices and no kernel
+        indices at all, which is exactly what a scalar formal made per-cell
+        has: no dimension the kernel subscripts and one the region does.
+        Every other View has at least one kernel index and is reached through
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression.\
+KokkosArrayExpressionMixin.arrayreference_node` instead.
+
+        :param node: the reference in the captured body.
+
+        :returns: the name, subscripted by the region's own indices where the
+            region described the scalar as a per-cell View.
+        """
+        view = self._views.get(node.name)
+        if (isinstance(view, KokkosView) and view.extra_indices
+                and not view.index_offsets and not node.children):
+            return f"{node.name}({', '.join(view.extra_indices)})"
+        return super().reference_node(node)
 
     @staticmethod
     def _is_identifier(value):

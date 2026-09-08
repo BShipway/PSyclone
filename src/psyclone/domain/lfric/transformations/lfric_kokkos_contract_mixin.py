@@ -127,18 +127,24 @@ class LFRicKokkosContractMixin:
     _GENERATED_NAMES = ("body", "league_size", "probe", "rank",
                         "scratch_bytes", "team", "team_size")
 
-    #: Stencil shapes whose PSy-layer arguments :py:meth:`apply`'s generic
-    #: per-cell rule already passes correctly. A 2-D stencil hands the kernel
-    #: a sliced dofmap and a sliced size array, both of them array formals, so
-    #: both become Views with the cell index appended -- which is what
-    #: ``map_w3(:,cell)`` already does and needs nothing new.
+    #: Stencil shapes the region's per-cell arguments describe. A 2-D stencil
+    #: hands the kernel a sliced dofmap and a sliced size array, both of them
+    #: array formals, so both become Views with the cell index appended --
+    #: which is what ``map_w3(:,cell)`` already does and needs nothing new.
     #:
     #: A 1-D or region stencil hands the size to the kernel as a *scalar*
-    #: formal, fed from ``x_stencil_size(cell)``. That rule would pass the
-    #: whole sliced expression against a by-value dummy, so admitting those
-    #: shapes needs a per-cell scalar argument kind that does not exist here.
-    #: No executed GungHo loop asks for one, so they are refused by name.
-    _SUPPORTED_STENCILS = ("cross2d",)
+    #: formal, fed from ``x_stencil_size(cell)``. That is one cell's value,
+    #: and a region runs every cell at once, so it crosses the ABI as the
+    #: whole rank-1 array and is subscripted by the launch's own cell; see
+    #: :py:meth:`LFRicKokkosArgumentMixin._per_cell_scalars`. The dofmap
+    #: those two shapes hand over declares that per-cell size as its own
+    #: second extent, which no View can be strided by, so the region carries
+    #: the dofmap's storage extent beside it.
+    #:
+    #: ``xory1d`` is absent. It carries a direction argument on top of the
+    #: 1-D size, chosen per cell in the algorithm layer, and nothing here
+    #: describes it. It is refused by name.
+    _SUPPORTED_STENCILS = ("cross", "cross2d", "region")
 
     #: Evaluator shapes whose basis data the region already carries. XYoZ
     #: quadrature adds two point counts, two weight arrays and one basis
@@ -390,7 +396,7 @@ class LFRicKokkosContractMixin:
                 if shape not in cls._SUPPORTED_STENCILS:
                     raise TransformationError(
                         f"LFRicKokkosTrans supports the "
-                        f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shape "
+                        f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shapes "
                         f"only, but '{argument.name}' has '{shape}'.")
             cls._validate_written_space(argument, discontinuous)
 

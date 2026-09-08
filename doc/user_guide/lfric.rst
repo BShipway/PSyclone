@@ -4291,12 +4291,22 @@ chosen a default. A declaration stating a width in place of a kind name,
 ``integer*8`` or ``real(kind=8)``, is refused for every intrinsic: it did say
 which width it wanted, and reading it as the default would narrow it in
 silence. A kernel that reads a
-field through a stencil is accepted when the stencil is ``cross2d`` and
-refused by name otherwise: a 2-D stencil gives the kernel a sliced dofmap and
-a sliced size array, both of which become Views with the cell index appended
-exactly as the ordinary dofmap does, whereas a 1-D or region stencil gives the
-size as a per-cell scalar for which the ABI has no argument kind. A stencil
-also makes the PSy layer emit a halo exchange in front of the loop; that
+field through a stencil is accepted when the stencil is ``cross``, ``cross2d``
+or ``region``, and refused by name otherwise. A 2-D stencil gives the kernel a
+sliced dofmap and a sliced size array, both of which become Views with the cell
+index appended exactly as the ordinary dofmap does. A 1-D or region stencil
+gives the size as a per-cell scalar instead, fed from
+``field_stencil_size(cell)``; because a region runs every cell at once, that
+scalar crosses the ABI as the whole rank-1 array and the generated body
+subscripts it by the launch's own cell, which makes it the same per-cell View
+the 2-D shape's size array already is. The dofmap beside it is declared over
+that per-cell size, while LFRic allocates it uniformly, and a View's extents
+fix its strides; the region therefore also carries the dofmap's storage extent
+as a scalar, which the PSy layer supplies as
+``SIZE(field_stencil_dofmap, dim=2)``, and sizes both that View and any
+automatic array declared over the stencil from it. ``xory1d`` is refused: it
+carries a direction argument on top of the 1-D size, chosen per cell in the
+algorithm layer, which the ABI does not describe. A stencil also makes the PSy layer emit a halo exchange in front of the loop; that
 exchange is lowered before the loop is replaced, because it computes its own
 depth by walking forward to the accesses that read the field and the
 replacement would have removed them first. A kernel taking an LMA operator --

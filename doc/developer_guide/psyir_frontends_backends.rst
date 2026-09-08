@@ -814,6 +814,17 @@ where a missing subtraction is a silent wrong answer rather than a compile
 error. The optimiser folds it; a reader of the generated source can see which
 origin each subscript was written against.
 
+A View with `extra_indices` and no `index_offsets` is the one case where a
+*name* rather than a subscript has to be rewritten. `LFRicKokkosTrans` uses
+that shape for a formal the kernel declares as a scalar and the PSy layer
+fills per cell -- a 1-D or region stencil's `stencil_size`, which reaches
+the region as the whole rank-1 array rather than as one cell's value.
+`reference_node` recognises exactly that shape and generates
+`smap_size(cell)` where the kernel wrote `smap_size`, so the body reads the
+current cell's value without the kernel's source being rewritten. Every
+other reference goes to `CWriter`, and a View that carries offsets is
+subscripted by `arrayreference_node` as before.
+
 Array-valued expressions
 ~~~~~~~~~~~~~~~~~~~~~~~~
 

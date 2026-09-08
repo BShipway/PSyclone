@@ -8,6 +8,8 @@
 
 # pylint: disable=protected-access
 
+import re
+
 import pytest
 
 from psyclone.configuration import Config
@@ -643,14 +645,14 @@ _STENCIL_1D_ALGORITHM = _STENCIL_ALGORITHM.replace(
     "kokkos_stencil_test", "kokkos_stencil_line_test")
 
 
-# The same kernel through a 1-D CROSS stencil, which is the shape the
-# transformation refuses. The refusal is not a matter of taste: LFRic gives a
-# 1-D stencil's size to the kernel as a *scalar* formal, fed per cell from
+# The same kernel through a 1-D CROSS stencil. LFRic gives a 1-D stencil's
+# size to the kernel as a *scalar* formal, fed per cell from
 # 'field_in_stencil_size(cell)', where CROSS2D gives an array formal fed from
-# a whole array. 'apply''s per-cell rule appends the cell index to an array
-# actual, so the array form needs nothing new and the scalar form would need
-# a per-cell scalar argument kind that does not exist. The dofmap loses its
-# branch dimension for the same reason. Both differences are visible below.
+# a whole array. That scalar is what the per-cell View kind exists for: the
+# region takes 'field_in_stencil_size' whole and subscripts it by the cell the
+# thread is on. The dofmap loses its branch dimension and gains the per-cell
+# size as its declared second extent, which is the other half of the same
+# shape and is why the region also carries that dofmap's storage extent.
 _STENCIL_1D_KERNEL = """
 module stencil_line_kernel_mod
   use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
@@ -690,6 +692,22 @@ contains
   end subroutine stencil_line_code
 end module stencil_line_kernel_mod
 """
+
+
+_STENCIL_REGION_ALGORITHM = _STENCIL_ALGORITHM.replace(
+    "stencil_sum", "stencil_region").replace(
+    "kokkos_stencil_test", "kokkos_stencil_region_test")
+
+
+# The same kernel again through a REGION stencil, whose PSy-layer arguments
+# have exactly the 1-D shape -- 'field_in_stencil_size(cell)' beside
+# 'field_in_stencil_dofmap(:,:,cell)' -- and differ from CROSS only in which
+# cells the dofmap names. Written out through a substitution rather than
+# patched into the 1-D kernel's metadata, so that the shape reaching the
+# transformation is the parser's reading of 'stencil(region)' rather than the
+# test's assertion about it.
+_STENCIL_REGION_KERNEL = _STENCIL_1D_KERNEL.replace(
+    "stencil_line", "stencil_region").replace("cross", "region")
 
 
 # A column solve reduced to its shape: two automatic arrays over nlayers, a
@@ -2535,6 +2553,15 @@ def stencil_1d_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "stencil_line", _STENCIL_1D_ALGORITHM, _STENCIL_1D_KERNEL)
 
 
+@pytest.fixture(name="stencil_region_target")
+# pylint: disable-next=unused-argument
+def stencil_region_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads through a REGION stencil."""
+    return _invoke(
+        tmp_path, "stencil_region", _STENCIL_REGION_ALGORITHM,
+        _STENCIL_REGION_KERNEL)
+
+
 @pytest.fixture(name="local_target")
 # pylint: disable-next=unused-argument
 def local_target_fixture(tmp_path, clear_module_manager_instance):
@@ -3984,39 +4011,116 @@ def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
         "call stencil_sum_kokkos(")
 
 
-def test_lfric_kokkos_trans_refuses_a_one_dimensional_stencil(
-        stencil_1d_target):
-    """A 1-D stencil hands the kernel its size as a scalar, not an array.
+def test_lfric_kokkos_trans_stencil_size_is_indexed_by_cell(
+        stencil_region_target):
+    """A stencil's size is one number per cell, not one number.
 
-    That is the difference the shape list is drawn along, and the fixture is a
-    real CROSS kernel rather than a patched CROSS2D one so that the difference
-    is the parser's rather than the test's. 'apply''s per-cell rule appends
-    the cell index to an array actual; a 1-D stencil's size arrives instead as
-    'field_in_stencil_size(cell)' against a by-value dummy, which would need a
-    per-cell scalar argument kind that does not exist. No executed GungHo loop
-    asks for one, so the shape is refused by name rather than mishandled.
+    The PSy layer evaluates 'field_in_stencil_size(cell)' inside the cell
+    loop it is about to lose, so the value it would hand a region is whichever
+    cell the Fortran loop happened to be on. A region runs every cell at once,
+    and the sizes differ wherever the mesh is not uniform, so the size crosses
+    the ABI as the whole rank-1 array and the region subscripts it by the cell
+    the thread is on -- the same change of shape a dofmap already gets.
+
+    The assertion is over *every* appearance of the name rather than over one
+    of them, because a size read correctly in one place and wrongly in another
+    compiles, links, runs and reads another cell's stencil.
     """
-    _, loop, _ = stencil_1d_target
+    psy, loop, _ = stencil_region_target
 
-    with pytest.raises(TransformationError, match="cross2d") as error:
-        LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "'cross'" in str(error.value)
-    assert "'field_in'" in str(error.value)
+    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap_size(smap_size_data, ncells);" in cpp)
+    assert "const int *smap_size_data" in cpp
+    # '\b' stops either pattern reaching 'smap_size_data' or 'smap_size_max',
+    # so what is left is the size itself: never bare, and subscripted by the
+    # cell everywhere but the View construction.
+    assert not re.findall(r"\bsmap_size\b(?!\()", cpp)
+    assert set(re.findall(r"\bsmap_size\(([^)]*)\)", cpp)) == {
+        "smap_size_data, ncells", "cell"}
+
+    fortran = str(psy.gen)
+    assert "integer(c_int), dimension(*), intent(in) :: smap_size" in fortran
+    assert "field_in_stencil_size," in fortran
 
 
-def test_lfric_kokkos_trans_rejects_stencil(target):
+def test_lfric_kokkos_trans_accepts_a_region_stencil(stencil_region_target):
+    """A REGION stencil is named in the accepted set and is captured.
+
+    Its dofmap is the 1-D shape -- 'field_in_stencil_dofmap(:,:,cell)' -- so
+    the region takes it whole as a rank-3 View. Its second extent is the one
+    the kernel declares, which is the *per-cell* size, and a View cannot be
+    strided by a value that varies cell to cell: the region carries the
+    dofmap's storage extent as a scalar of its own and sizes the View from
+    that instead.
+    """
+    psy, loop, _ = stencil_region_target
+
+    assert "region" in LFRicKokkosTrans._SUPPORTED_STENCILS
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("Kokkos::View<const int***, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap(smap_data, ndf_w3, smap_size_max, ncells);"
+            in cpp)
+    assert "const int smap_size_max" in cpp
+    assert "smap((df - 1), (step - 1), cell)" in cpp
+
+    fortran = str(psy.gen)
+    assert "STENCIL_REGION" in fortran
+    assert "integer(c_int), value :: smap_size_max" in fortran
+    assert ("call stencil_region_kokkos(nlayers_field_out, field_out_data, "
+            "field_in_data, field_in_stencil_size, field_in_stencil_dofmap, "
+            "ndf_w3, undf_w3, map_w3, SIZE(field_in_stencil_dofmap, dim=2), "
+            "loop0_stop)" in fortran)
+
+
+def test_lfric_kokkos_trans_accepts_a_cross_stencil_with_a_variable_extent(
+        stencil_1d_target):
+    """A 1-D CROSS stencil is captured, and its depth need not be a literal.
+
+    The algorithm layer supplies 'extent' as a variable, so the PSy layer
+    builds the dofmap at a depth it does not know until it runs and the halo
+    exchange in front of the loop is written to that same variable. Nothing
+    the region carries may therefore assume a size: the stencil size is the
+    whole per-cell array and the dofmap's storage extent is measured from the
+    array the PSy layer actually built.
+    """
+    psy, loop, _ = stencil_1d_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap_size(smap_size_data, ncells);" in cpp)
+    assert ("Kokkos::View<const int***, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> smap(smap_data, ndf_w3, smap_size_max, ncells);"
+            in cpp)
+    assert "for(step=1; step<=smap_size(cell); step+=1)" in cpp
+
+    fortran = str(psy.gen)
+    assert "STENCIL_CROSS, extent" in fortran
+    assert fortran.index("halo_exchange(depth=extent)") < fortran.index(
+        "call stencil_line_kokkos(")
+
+
+def test_lfric_kokkos_trans_refuses_an_unsupported_stencil_type(target):
     """Stencil storage and halo requirements are not silently captured.
 
-    The refusal is shape-specific rather than blanket from stage 5 on:
-    'cross2d' is accepted, and every other shape -- 'xory1d' here, which has a
-    direction argument on top of a 1-D size -- is named in the message that
-    refuses it.
+    The refusal is shape-specific: 'cross', 'cross2d' and 'region' are
+    accepted, and every other shape -- 'xory1d' here, which has a direction
+    argument on top of a 1-D size -- is refused by a message naming both the
+    shape it found and the whole set it would have taken.
     """
     _, loop, kernel = target
     kernel.arguments.args[1].stencil = LFRicArgStencil(name="xory1d")
-    with pytest.raises(TransformationError, match="stencil"):
+
+    with pytest.raises(TransformationError, match="stencil") as error:
         LFRicKokkosTrans().validate(loop)
+
+    assert "'xory1d'" in str(error.value)
+    for shape in LFRicKokkosTrans._SUPPORTED_STENCILS:
+        assert shape in str(error.value)
 
 
 def test_lfric_kokkos_trans_rejects_multiple_kernels(target, monkeypatch):
