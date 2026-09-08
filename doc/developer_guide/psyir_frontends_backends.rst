@@ -942,6 +942,15 @@ the generated C++. A `DataSymbol` does not validate its name and
 already generated survives being visited again. Nothing else about the symbol
 is read.
 
+On the LFRic path an assignment holding one of these is kept from the section
+lowering rather than passed through it. `ArrayAssignment2LoopsTrans` takes only
+a right-hand side that is scalar-valued or elemental, and a contraction is
+neither, so `exner_e(:) = MATMUL(m, rhs_e)` -- the shape `set_exner_code` is
+written in -- reaches the writer as it stands and is generated here.
+`LFRicKokkosIntrinsicMixin._written_as_a_nest` is what
+`LFRicKokkosContractMixin._is_array_valued` asks, alongside the array
+constructor it excludes for the same reason.
+
 `space` and `consumed` are what `KokkosArrayExpression` asks before it sizes
 a nest. An operand is not a section of the statement it appears in --
 `matmul(m3(ik,:,:), p_e)` is rank 1 while its operand is rank 2 -- so a

@@ -5880,3 +5880,47 @@ def test_kokkos_allocate_refused_for_a_module_array(module_allocate_target):
 
     assert "'profile_heights'" in str(error.value)
     assert "not a kernel-local allocatable array" in str(error.value)
+
+
+# set_exner_code's shape: a whole array assigned the value of a MATMUL,
+# `exner_e(:) = MATMUL(inv_mass_matrix_w3, rhs_e)`. The section lowering
+# refuses this assignment -- ArrayAssignment2LoopsTrans takes only a
+# scalar-valued or elemental right-hand side -- so it has to be left to the
+# backend, which writes the contraction as a nest over the destination.
+_MATMUL_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    real(kind=r_def), dimension(3,3) :: mass\n"
+    "    real(kind=r_def), dimension(3) :: rhs_e\n"
+    "    real(kind=r_def), dimension(3) :: column_e\n").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    mass(:,:) = 1.0_r_def\n"
+    "    rhs_e(:) = partial(1)\n"
+    "    column_e(:) = matmul(mass, rhs_e)\n"
+    "    swept(nlayers) = partial(nlayers) + column_e(3)")
+
+
+@pytest.fixture(name="matmul_target")
+# pylint: disable-next=unused-argument
+def matmul_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel assigns a whole array from MATMUL."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MATMUL_KERNEL)
+
+
+def test_lfric_kokkos_trans_generates_a_matmul_assignment(matmul_target):
+    """A whole array assigned from MATMUL is left to the backend.
+
+    The section lowering is what rewrites `a(:) = ...` into a loop, and it
+    declines a right-hand side that is neither scalar-valued nor elemental.
+    Refusing on that would refuse the very shape this tier exists for, so an
+    assignment holding one of its intrinsics is kept from the lowering and
+    written as a nest instead.
+    """
+    _, loop, _ = matmul_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "MATMUL" not in cpp
+    assert "+= mass(" in cpp
+    assert "column_e((_kae_i0 - 1)) = _kae_r0;" in cpp

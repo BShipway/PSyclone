@@ -70,6 +70,8 @@ inside a loop is not one array with a size at all. Both are refused by name.
 """
 
 from psyclone.psyir.backend.kokkos import KokkosWriter
+from psyclone.psyir.backend.kokkos_array_intrinsics import (
+    KokkosArrayIntrinsics)
 from psyclone.psyir.nodes import (
     ArrayReference, IntrinsicCall, Loop, Range, Reference)
 from psyclone.psyir.symbols import ArrayType
@@ -96,6 +98,31 @@ class LFRicKokkosIntrinsicMixin:
     #: frontend upper-cases the keyword it read, so the comparison folds
     #: case rather than assuming either spelling.
     _ALLOCATE_OPTIONS = ("stat", "errmsg", "source", "mold")
+
+    @staticmethod
+    def _written_as_a_nest(assignment):
+        """Answer whether the backend writes this assignment as it stands.
+
+        The section lowering rewrites ``a(:) = ...`` into a PSyIR loop before
+        any writer sees it, and
+        :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
+        takes only a right-hand side that is scalar-valued or elemental. A
+        contraction is neither: ``exner_e(:) = MATMUL(m, rhs_e)`` -- the shape
+        ``set_exner_code`` and ``set_rho_code`` are written in -- is exactly
+        what that transformation declines. Refusing on the decline would refuse
+        the shape this tier exists to write, so such an assignment is kept from
+        the lowering and left to
+        :py:class:`~psyclone.psyir.backend.kokkos_array_intrinsics.\
+KokkosArrayIntrinsics`, which generates the nest over the destination
+        directly.
+
+        :param assignment: the assignment to judge.
+        :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
+
+        :returns: whether the backend writes it without the section lowering.
+        :rtype: bool
+        """
+        return KokkosArrayIntrinsics.holds(assignment.rhs)
 
     @classmethod
     def _validate_intrinsics(cls, schedule):

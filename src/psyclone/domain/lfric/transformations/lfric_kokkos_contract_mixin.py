@@ -395,8 +395,8 @@ class LFRicKokkosContractMixin:
                 f"LFRicKokkosTrans cannot capture the call to '{name}': the "
                 "generated region has no Fortran to call into.")
 
-    @staticmethod
-    def _is_array_valued(assignment):
+    @classmethod
+    def _is_array_valued(cls, assignment):
         """Answer whether ``assignment`` is one that lowering rewrites.
 
         The two shapes it answers for are a written section, ``a(2:n) = 0.0``,
@@ -406,7 +406,12 @@ class LFRicKokkosContractMixin:
         even though it is a section: its values are positional and
         :py:class:`~psyclone.psyir.backend.c.CWriter` renders it element by
         element, so lowering would take a statement the backend can already
-        write and leave a subscripted constructor in its place.
+        write and leave a subscripted constructor in its place. An
+        array-valued intrinsic on the right is excluded for the same reason
+        and is
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
+        to say so.
 
         :param assignment: the assignment to judge.
         :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
@@ -416,6 +421,8 @@ class LFRicKokkosContractMixin:
         :rtype: bool
         """
         if isinstance(assignment.rhs, ArrayConstructor):
+            return False
+        if cls._written_as_a_nest(assignment):
             return False
         if assignment.walk(Range):
             return True
