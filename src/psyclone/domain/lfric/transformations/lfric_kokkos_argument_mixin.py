@@ -56,8 +56,15 @@ data. The kinds of argument, and what each becomes:
   own. What it needs is the cell, which the region declares from its launch
   index rather than taking; the cell-position formal is dropped from both
   lists together.
-* A **stencil** of the accepted shape hands over a sliced dofmap and a sliced
-  size array, both of which are per-cell Views like any other dofmap.
+* A **stencil** of the accepted shapes hands over a sliced dofmap, and beside
+  it either a sliced size array or -- for the 1-D and region shapes -- a
+  *scalar* size fed from ``x_stencil_size(cell)``. Both become per-cell Views
+  like any other dofmap: see
+  :py:meth:`LFRicKokkosArgumentMixin._per_cell_scalars`. The dofmap those two
+  shapes hand over is declared over that per-cell size, which no View can be
+  strided by, so the region also carries the dofmap's storage extent as a
+  scalar of its own; see
+  :py:meth:`LFRicKokkosArgumentMixin._storage_extents`.
 * **Quadrature** hands over its point counts as scalars, its weights as rank-1
   Views and one basis array per function space that asks for one, shaped
   ``(dim, ndf, np_xy, np_z)``. None of them is per-cell: the actual names the
@@ -85,10 +92,13 @@ therefore not supported, and most of them do reach across:
 LFRicKokkosArgumentMixin._kind_assertions` reads ``cls._C_TYPES``,
 ``cls._KIND_PROBES`` and ``cls._DEFAULT_KINDS``, and :py:meth:`\
 LFRicKokkosArgumentMixin._region` calls ``cls._cell_position``,
-``cls._constants``, ``cls._constant_arrays`` and ``cls._local_arrays``.
+``cls._constants`` and ``cls._constant_arrays``, and :py:meth:`\
+LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
 """
 
+import re
 import textwrap
+from dataclasses import replace
 
 from psyclone.domain.lfric import KernCallArgList
 from psyclone.lfric import LFRicHaloExchange
@@ -98,7 +108,7 @@ from psyclone.psyir.backend.kokkos import (
 from psyclone.psyir.nodes import (
     ArrayReference, Call, IntrinsicCall, Literal, Reference, Routine)
 from psyclone.psyir.symbols import (
-    ArgumentInterface, RoutineSymbol, UnsupportedFortranType)
+    ArgumentInterface, RoutineSymbol, ScalarType, UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -159,9 +169,122 @@ class LFRicKokkosArgumentMixin:
             name = name.replace("_code_", "_", 1)
         return f"{name}_kokkos"
 
+    @staticmethod
+    def _per_cell_scalars(formals, per_cell):
+        """Return the per-cell formals the kernel declares as scalars.
+
+        A stencil of the 1-D or region shapes is the only thing that produces
+        one. LFRic hands its size to the kernel as an ``integer`` dummy, fed
+        from ``x_stencil_size(cell)``, because the Fortran PSy layer is inside
+        the cell loop when it evaluates that; a region is inside no such loop
+        and runs every cell at once, so one cell's value is the wrong size for
+        the others wherever the mesh is not uniform. The formal therefore
+        becomes a rank-1 View over the whole array, subscripted by the
+        launch's own cell -- the change of shape a sliced dofmap already has,
+        applied to a formal whose *declaration* is a scalar.
+
+        :param formals: the kernel formals the generated signature carries,
+            in call order.
+        :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
+        :param set[str] per_cell: formals the PSy layer slices by cell, as
+            :py:meth:`_per_cell` returns them.
+
+        :returns: the names of those of them the kernel declares as scalars,
+            in call order.
+        :rtype: tuple[str, ...]
+        """
+        return tuple(symbol.name for symbol in formals
+                     if symbol.name in per_cell and not symbol.is_array)
+
     @classmethod
-    def _region_arguments(cls, formals, per_cell, constants, cell_index):
-        """Describe the generated signature for the backend.
+    def _storage_extents(cls, formals, actuals, sizes, table):
+        """Measure the array each per-cell size is the used length of.
+
+        A per-cell size is the length of *this cell's* stencil, and the kernel
+        declares the dofmap beside it as ``dimension(ndf, stencil_size)``.
+        Fortran allows that: the dummy is shaped by the actual's value at the
+        cell, and the actual ``x_stencil_dofmap(:,:,cell)`` is at least that
+        long. A View cannot be declared the same way. Its extents fix its
+        strides, so a stride that varied cell to cell would read another
+        cell's dofmap, and the extent it needs is instead the one the PSy
+        layer allocated -- ``stencil_dofmap_type`` sizes its dofmap for the
+        stencil whole and reports the used length per cell separately.
+
+        That length is not a kernel argument, so the region carries it as a
+        scalar of its own, measured with ``SIZE`` on the very array the PSy
+        layer passes. The dimension measured is the one whose declared extent
+        *is* the size, matched exactly: an extent that is an expression over
+        the size states a length derived from it rather than the length
+        itself, and measuring the array would answer a different question.
+
+        :param formals: the kernel formals the generated signature carries,
+            in call order.
+        :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
+        :param actuals: the actuals the PSy layer passes for them, in the same
+            order and already unsliced by :py:meth:`_per_cell`.
+        :type actuals: list[:py:class:`psyclone.psyir.nodes.DataNode`]
+        :param sizes: the per-cell scalar formals, as
+            :py:meth:`_per_cell_scalars` returns them.
+        :type sizes: tuple[str, ...]
+        :param table: the kernel's own table, asked for a name no formal and
+            no local has taken.
+        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+
+        :returns: per per-cell size that some array formal is declared over,
+            the name of the scalar carrying that array's storage extent and
+            the expression the PSy layer passes for it, in call order.
+        :rtype: dict[str, tuple[str,
+            :py:class:`psyclone.psyir.nodes.IntrinsicCall`]]
+        """
+        measured = {}
+        for name in sizes:
+            for formal, actual in zip(formals, actuals):
+                if not formal.is_array or not isinstance(actual, Reference):
+                    continue
+                declared = cls._extents(formal)
+                if name not in declared:
+                    continue
+                measured[name] = (
+                    table.next_available_name(f"{name}_max"),
+                    IntrinsicCall.create(
+                        IntrinsicCall.Intrinsic.SIZE,
+                        [Reference(actual.symbol),
+                         ("dim", Literal(str(declared.index(name) + 1),
+                                         ScalarType.integer_type()))]))
+                break
+        return measured
+
+    @staticmethod
+    def _rename_extents(bounds, renames):
+        """Rewrite one array's declared bounds around the per-cell sizes.
+
+        Each bound is generated C, so the rewrite is over its text: a name
+        appearing in it is replaced whole, leaving ``ndf_w3`` and
+        ``stencil_size_w3`` alone where ``stencil_size`` is renamed. An origin
+        that is an integer rather than an expression is carried through
+        untouched.
+
+        :param bounds: the origins or the extents of one array, as
+            :py:meth:`LFRicKokkosBoundsMixin._origins` and
+            :py:meth:`LFRicKokkosBoundsMixin._extents` give them.
+        :type bounds: tuple[Union[int, str], ...]
+        :param dict[str, str] renames: the new name of each per-cell size.
+
+        :returns: the same bounds with every per-cell size renamed.
+        :rtype: tuple[Union[int, str], ...]
+        """
+        if not renames:
+            return tuple(bounds)
+        pattern = re.compile(
+            r"\b(?:" + "|".join(re.escape(name) for name in renames) + r")\b")
+        return tuple(
+            pattern.sub(lambda match: renames[match.group()], bound)
+            if isinstance(bound, str) else bound
+            for bound in bounds)
+
+    @classmethod
+    def _region_arguments(cls, formals, per_cell, cell_index, renames):
+        """Describe the generated signature down to the cell count.
 
         The formals are passed in rather than read from the schedule because
         one of them may already have been dropped: a kernel taking an LMA
@@ -169,24 +292,27 @@ class LFRicKokkosArgumentMixin:
         taking, and :py:meth:`apply` removes it from the formals and the
         actuals together, so that the two stay index-aligned.
 
+        The module state the region carries follows what this returns, and is
+        described by :py:meth:`_constant_arguments`.
+
         :param formals: the kernel formals the generated signature carries,
             in call order.
         :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
         :param set[str] per_cell: formals the PSy layer slices by cell.
-        :param constants: the module state the region carries, as
-            :py:meth:`_constants` returns it. A scalar becomes an argument
-            passed by value, and an array of literal extents a read-only
-            View: a module array is state the region reads and never writes,
-            so it crosses as a View exactly as a read-only formal does.
-        :type constants: list[tuple[str, str, Optional[str], str,
-            :py:class:`psyclone.psyir.symbols.DataSymbol`]]
         :param str cell_index: the name the launch gives its own cell index,
             which every sliced View is indexed by. It is the region's
             :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
             and is passed rather than assumed because the kernel may declare
             ``cell`` itself.
+        :param dict[str, str] renames: the name of the scalar carrying the
+            storage extent behind each per-cell size, as
+            :py:meth:`_storage_extents` names them. Each becomes a scalar
+            argument of its own, appended after the kernel's formals and
+            before the cell count so that the order here and the order
+            :py:meth:`_region` extends the actuals in are one order.
 
-        :returns: one description per generated C argument, in call order.
+        :returns: one description per generated C argument, in call order, up
+            to and including the cell count.
         :rtype: tuple[Union[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
@@ -194,20 +320,48 @@ class LFRicKokkosArgumentMixin:
         arguments = []
         for symbol in formals:
             c_type = cls._c_type(symbol)
-            extents = cls._extents(symbol)
-            if not extents:
-                arguments.append(KokkosScalar(symbol.name, c_type))
-                continue
             sliced = symbol.name in per_cell
             read_only = (
                 symbol.interface.access == ArgumentInterface.Access.READ)
+            # A per-cell formal the kernel declares as a scalar has no shape
+            # of its own, so the cell count is its whole shape.
+            extents = cls._rename_extents(cls._extents(symbol), renames)
+            if not extents and not sliced:
+                arguments.append(KokkosScalar(symbol.name, c_type))
+                continue
             arguments.append(KokkosView(
                 symbol.name, f"{symbol.name}_data", c_type,
                 extents + ((cls._CELL_COUNT,) if sliced else ()),
-                index_offsets=cls._origins(symbol),
+                index_offsets=cls._rename_extents(
+                    cls._origins(symbol), renames),
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only))
+        for renamed in renames.values():
+            arguments.append(KokkosScalar(renamed, "int"))
         arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
+        return tuple(arguments)
+
+    @classmethod
+    def _constant_arguments(cls, constants):
+        """Describe the module state the region carries.
+
+        A scalar becomes an argument passed by value, and an array of literal
+        extents a read-only View: a module array is state the region reads and
+        never writes, so it crosses as a View exactly as a read-only formal
+        does. These follow the arguments :py:meth:`_region_arguments`
+        describes, the cell count last among those.
+
+        :param constants: the module state the region carries, as
+            :py:meth:`_constants` returns it.
+        :type constants: list[tuple[str, str, Optional[str], str,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`]]
+
+        :returns: one description per generated C argument, in call order.
+        :rtype: tuple[Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
+        """
+        arguments = []
         for name, _, _, c_type, symbol in constants:
             extents = cls._extents(symbol)
             if not extents:
@@ -323,7 +477,10 @@ LFRicKokkosTrans.apply` makes.
         :type options: Optional[Dict[str, Any]]
 
         :returns: the region, the actuals the PSy layer passes for its
-            formals, and the module state it carries.
+            formals, and the module state it carries. The actuals returned
+            already carry the storage extent of every per-cell size, appended
+            after the kernel's own, because
+            :py:meth:`_region_arguments` puts those scalars in the same place.
         :rtype: tuple[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`,
             list[:py:class:`psyclone.psyir.nodes.DataNode`],
@@ -336,6 +493,10 @@ LFRicKokkosTrans.apply` makes.
         formals, actuals, cell_position = cls._argument_lists(
             kernel, node, schedule)
         per_cell = cls._per_cell(formals, actuals)
+        storage = cls._storage_extents(
+            formals, actuals, cls._per_cell_scalars(formals, per_cell),
+            schedule.symbol_table)
+        renames = {name: renamed for name, (renamed, _) in storage.items()}
         constants = cls._constants(schedule)
         # The launch index shares a C++ scope with the kernel's own
         # declarations, so a kernel declaring 'cell' would collide with it.
@@ -349,14 +510,43 @@ LFRicKokkosTrans.apply` makes.
             cell_count=cls._CELL_COUNT,
             cell_index=cell_index,
             cell_position=cell_position,
-            arguments=cls._region_arguments(
-                formals, per_cell, constants, cell_index),
+            arguments=(cls._region_arguments(
+                formals, per_cell, cell_index, renames)
+                + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
-            scratch=cls._local_arrays(schedule),
+            scratch=cls._scratch_arrays(schedule, renames),
             parallel_loops=cls._parallel_loops(schedule),
             team_size=(options or {}).get(cls._TEAM_SIZE_OPTION))
+        actuals.extend(actual.copy() for _, actual in storage.values())
         return region, actuals, constants
+
+    @classmethod
+    def _scratch_arrays(cls, schedule, renames):
+        """Describe the kernel's automatic arrays, per-cell sizes renamed.
+
+        A local sized from a stencil's size -- ``dimension(stencil_size)`` --
+        is reserved on the host before the launch enters the region, so its
+        extent has to be a value the launch holds. The per-cell size is not
+        one: it is a View by the time the region is entered. The scalar
+        carrying the array's storage extent is, and reserving that much is
+        never short, so the rename that sizes the dofmap's View sizes this
+        too.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param dict[str, str] renames: the new name of each per-cell size.
+
+        :returns: one description per automatic array, in declaration order.
+        :rtype: tuple[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`, ...]
+        """
+        return tuple(
+            replace(item,
+                    extents=cls._rename_extents(item.extents, renames),
+                    index_offsets=cls._rename_extents(
+                        item.index_offsets, renames))
+            for item in cls._local_arrays(schedule))
 
     @classmethod
     def _call_region(cls, node, region, actuals, constants):
@@ -390,9 +580,10 @@ LFRicKokkosTrans.apply` makes.
             Reference(cls._import_constant(
                 symbol_table, name, container, orig_name))
             for name, container, orig_name, _, _ in constants)
-        # region.arguments is the formals, then the cell count, then the
-        # constants -- which is exactly the order 'actuals' is in once both
-        # appends above have run. The two are therefore index-aligned, and one
+        # region.arguments is the formals, then the storage extent of each
+        # per-cell size, then the cell count, then the constants -- which is
+        # exactly the order 'actuals' is in once _region's own extension and
+        # both appends above have run. The two are index-aligned, and one
         # loop covers a logical formal and an imported logical constant alike.
         # That alignment is what makes this correct and it is not visible from
         # the loop itself.
