@@ -52,20 +52,21 @@ The survey reports every blocker a loop carries rather than the first, so the
 rules ``_validate_kernel_metadata`` bundles are each askable on their own:
 :py:meth:`LFRicKokkosContractMixin._validate_evaluator`,
 :py:meth:`LFRicKokkosContractMixin._validate_field_types` and
-:py:meth:`LFRicKokkosContractMixin._validate_continuous_write`. The bundling
-method calls them rather than repeating them, and the last two share the
-per-argument
+``LFRicKokkosWriteMixin._validate_continuous_write``. The bundling method
+calls them rather than repeating them, and the last two share the per-argument
 :py:meth:`LFRicKokkosContractMixin._validate_field_type` and
-:py:meth:`LFRicKokkosContractMixin._validate_written_space` with the argument
-walk in ``_validate_kernel_metadata``, so the order the bundled refusals come
-in is unchanged by their being nameable apart.
+``LFRicKokkosWriteMixin._validate_written_space`` with the argument walk in
+``_validate_kernel_metadata``, so the order the bundled refusals come in is
+unchanged by their being nameable apart.
 
-Two predicates of that set are not here. ``_validate_bounds`` lives beside the
-declaration reading it predicts, in ``LFRicKokkosBoundsMixin``, and the rules
+Some predicates of that set are not here. ``_validate_bounds`` lives beside
+the declaration reading it predicts, in ``LFRicKokkosBoundsMixin``; the rules
 about where the loop iterates -- ``_validate_iteration_space``,
 ``_validate_halo_depth`` and the ``_validate_loop`` that bundles them -- are
-``LFRicKokkosIterationMixin``'s. Both are asked of ``LFRicKokkosTrans``
-exactly as these are.
+``LFRicKokkosIterationMixin``'s; and the rules about what the loop may write
+-- ``_validate_written_space``, ``_validate_continuous_write`` and
+``_validate_shared_updates`` -- are ``LFRicKokkosWriteMixin``'s. Each is asked
+of ``LFRicKokkosTrans`` exactly as these are.
 
 The sibling mixins are reached through ``cls``, resolved on
 ``LFRicKokkosTrans``: :py:meth:`LFRicKokkosContractMixin._validate_sections`
@@ -80,10 +81,6 @@ therefore not supported.
 
 from psyclone.core import AccessType
 from psyclone.domain.lfric import LFRicConstants
-from psyclone.psyir.backend.kokkos_array_expression import (
-    KokkosArrayExpression)
-from psyclone.psyir.backend.kokkos_array_expression_mixin import (
-    ATOMIC_UPDATES, atomic_update_operands)
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, Call, CodeBlock,
     IntrinsicCall, Range, Reference)
@@ -115,9 +112,6 @@ class LFRicKokkosContractMixin:
     #: rather than between neighbours, so neither answer reaches it.
     _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE,
                       AccessType.INC, AccessType.READINC)
-    #: The accesses under which two cells contribute to one element, so that
-    #: the update has to be made indivisible or serialised by colour.
-    _SHARED_ACCESSES = (AccessType.INC, AccessType.READINC)
     #: The LFRic argument types the region can describe. ``gh_operator`` is an
     #: LMA operator, which reaches the kernel as a rank-3 array over
     #: ``(ncell_3d, ndf1, ndf2)`` with every extent a formal of its own, so
@@ -289,53 +283,6 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
                 f"LFRicKokkosTrans supports only {phrase} fields, but "
                 f"'{argument.name}' is {argument.intrinsic_type}.")
 
-    @staticmethod
-    def _validate_written_space(argument, discontinuous):
-        """Check one argument's function space, if it is a written field.
-
-        A read field is passed over, as is anything that is not a field:
-        only a written space decides whether cells may run in parallel.
-
-        :param argument: the kernel argument to check.
-        :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param discontinuous: the names of the discontinuous function spaces,
-            as :py:class:`psyclone.domain.lfric.LFRicConstants` gives them.
-        :type discontinuous: List[str]
-
-        A field accumulated into is passed over too. ``gh_inc`` is illegal
-        on a discontinuous space -- the metadata parser refuses it -- so
-        every shared write there is on a continuous one by construction, and
-        a rule refusing those would refuse the whole pattern. What makes such
-        a write safe is not the space but the update: an atomic combines the
-        two cells' contributions, and a coloured launch keeps them apart in
-        time. Which of the two is in force is decided by
-        :py:meth:`~psyclone.domain.lfric.transformations.\
-LFRicKokkosTrans._uses_atomics`,
-        and the shape of the update itself is checked by
-        :py:meth:`_validate_shared_updates`. What remains refused here is a
-        plain ``gh_write`` or ``gh_readwrite`` to a continuous space, which
-        neither answer helps: two cells there do not contribute to a value,
-        they each decide it.
-
-        :raises TransformationError: if the argument is a field written on a
-            continuous space by an access that replaces the element rather
-            than contributing to it, where one cell's write could overwrite
-            another's.
-        """
-        if argument.argument_type != "gh_field":
-            return
-        if argument.access == AccessType.READ:
-            return
-        if argument.access in LFRicKokkosContractMixin._SHARED_ACCESSES:
-            return
-        space = argument.function_space.orig_name.lower()
-        if space not in discontinuous:
-            raise TransformationError(
-                f"LFRicKokkosTrans requires a discontinuous space for "
-                f"the written field '{argument.name}', but found "
-                f"'{space}': one cell's contribution could overwrite "
-                "another's.")
-
     @classmethod
     def _validate_field_types(cls, kernel):
         """Check every field the kernel takes for an intrinsic a View holds.
@@ -351,21 +298,6 @@ LFRicKokkosTrans._uses_atomics`,
             cls._validate_field_type(argument)
 
     @classmethod
-    def _validate_continuous_write(cls, kernel):
-        """Check every field the kernel writes for a discontinuous space.
-
-        :param kernel: the kernel the loop holds.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-
-        :raises TransformationError: if any written field argument is on a
-            continuous space, for the reason
-            :py:meth:`_validate_written_space` gives.
-        """
-        discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
-        for argument in kernel.arguments.args:
-            cls._validate_written_space(argument, discontinuous)
-
-    @classmethod
     def _validate_kernel_metadata(cls, kernel):
         """Check the LFRic metadata of the kernel to be captured.
 
@@ -375,9 +307,10 @@ LFRicKokkosTrans._uses_atomics`,
         argument is looked at. A kernel with two blockers on two arguments
         therefore reports the first *argument's*, which is not what running
         :py:meth:`_validate_field_types` and
-        :py:meth:`_validate_continuous_write` in turn would report. Those two
-        share :py:meth:`_validate_field_type` and
-        :py:meth:`_validate_written_space` with the walk below rather than
+        ``LFRicKokkosWriteMixin._validate_continuous_write`` in turn would
+        report. Those two share :py:meth:`_validate_field_type` and
+        ``LFRicKokkosWriteMixin._validate_written_space`` with the walk below
+        rather than
         restating them, so there is one copy of each rule and two ways to ask
         it.
 
@@ -427,101 +360,6 @@ LFRicKokkosTrans._uses_atomics`,
                         f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shapes "
                         f"only, but '{argument.name}' has '{shape}'.")
             cls._validate_written_space(argument, discontinuous)
-
-    @classmethod
-    def _shared_arguments(cls, kernel):
-        """Return the kernel arguments more than one cell of a launch updates.
-
-        Read from the kernel's metadata rather than from its body, and so
-        askable before any rewrite: what makes an argument shared is the
-        access LFRic declares for it, ``gh_inc`` or ``gh_readinc``, and not
-        the statement that carries out the update.
-
-        :param kernel: the kernel the loop holds.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-
-        :returns: the shared arguments, in metadata order.
-        :rtype: list[:py:class:`psyclone.lfric.LFRicKernelArgument`]
-        """
-        return [argument for argument in kernel.arguments.args
-                if argument.access in cls._SHARED_ACCESSES]
-
-    @classmethod
-    def _validate_shared_updates(cls, kernel, schedule):
-        """Check that every write to a shared field is one an atomic answers.
-
-        Asked only when the atomic arm is in force: a coloured launch runs
-        the cells that meet at a dof in different launches, so any statement
-        at all is safe there and no shape is required of it.
-
-        The rules are the writer's own, asked here so that a loop the backend
-        could not express is refused rather than captured and then failed
-        part-way through. Two shapes are refused. One is an update that is
-        not a read-modify-write of the element by one of the operators in
-        :py:data:`~psyclone.psyir.backend.\
-kokkos_array_expression_mixin.ATOMIC_UPDATES`
-        -- there is no indivisible instruction for an arbitrary computation.
-        The other is a statement the backend lowers to a nest of its own,
-        such as one holding a section or an array-valued intrinsic: what the
-        atomic has to cover is then a whole loop rather than a statement.
-
-        :param kernel: the kernel the loop holds.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-        :param schedule: the kernel schedule, carrying every rewrite
-            :py:meth:`~psyclone.domain.lfric.transformations.\
-LFRicKokkosTrans.apply`
-            makes, because those rewrites decide which statements survive as
-            statements.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-
-        :raises TransformationError: if a shared field is written by a
-            statement no single atomic carries out.
-        """
-        shared = cls._shared_formals(kernel, schedule)
-        if not shared:
-            return
-        shapes = ", ".join(sorted(name for name, _ in ATOMIC_UPDATES.values()))
-        for assignment in schedule.walk(Assignment):
-            target = assignment.lhs
-            if (not isinstance(target, ArrayReference)
-                    or target.name not in shared):
-                continue
-            if cls._is_lowered(assignment):
-                raise TransformationError(
-                    f"LFRicKokkosTrans cannot capture '{kernel.name}': it "
-                    f"updates the shared field '{target.name}' with a "
-                    "whole-array expression, which no single atomic carries "
-                    "out. Colour the loop instead.")
-            if atomic_update_operands(assignment) is None:
-                raise TransformationError(
-                    f"LFRicKokkosTrans cannot capture '{kernel.name}': it "
-                    f"writes the shared field '{target.name}' with a "
-                    "statement that is not one of the read-modify-write "
-                    f"shapes an atomic answers ({shapes}). Colour the loop "
-                    "instead.")
-
-    @staticmethod
-    def _is_lowered(assignment):
-        """Answer whether the backend lowers this statement to a nest.
-
-        The same question
-        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
-KokkosArrayExpressionMixin.assignment_node`
-        asks, and spelt the same way so that the two cannot drift: a section
-        anywhere in the statement, or an array-valued intrinsic on the right,
-        and in neither case a constructor, which the C writer spreads over
-        its destination itself.
-
-        :param assignment: the statement to classify.
-        :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
-
-        :returns: whether the statement becomes a nest rather than a
-            statement.
-        :rtype: bool
-        """
-        return (bool(assignment.walk(Range))
-                or KokkosArrayExpression.holds(assignment.rhs)) and not \
-            isinstance(assignment.rhs, ArrayConstructor)
 
     @staticmethod
     def _validate_body(schedule):

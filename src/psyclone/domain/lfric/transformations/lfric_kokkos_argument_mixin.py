@@ -96,16 +96,17 @@ The one constraint that follows is that a method reaching a helper of the
 sibling mixins ``LFRicKokkosTypesMixin``, ``LFRicKokkosBoundsMixin``,
 ``LFRicKokkosCallMixin``, ``LFRicKokkosConstantsMixin``,
 ``LFRicKokkosContractMixin``, ``LFRicKokkosInterfaceMixin``,
-``LFRicKokkosIterationMixin`` and ``LFRicKokkosScheduleMixin`` does so through
-``cls``, resolved on
+``LFRicKokkosIterationMixin``, ``LFRicKokkosScheduleMixin`` and
+``LFRicKokkosWriteMixin`` does so through ``cls``, resolved on
 ``LFRicKokkosTrans``. Calling a method here directly on this mixin is
 therefore not supported, and most of them do reach across:
 :py:meth:`LFRicKokkosArgumentMixin._region_arguments` asks ``cls._c_type``,
 ``cls._extents`` and ``cls._origins``, :py:meth:`\
 LFRicKokkosArgumentMixin._region` calls ``cls._cell_position``,
-``cls._constants``, ``cls._constant_arrays``, ``cls._is_dof``,
-``cls._kind_types``, ``cls._parallel_loops``, ``cls._count_name``,
-``cls._start_name`` and ``cls._implicit_extent_actuals``, :py:meth:`\
+``cls._constants``, ``cls._constant_arrays``, ``cls._colouring``,
+``cls._is_dof``, ``cls._kind_types``, ``cls._parallel_loops``,
+``cls._count_name``, ``cls._start_name``, ``cls._shared_formals``,
+``cls._uses_atomics`` and ``cls._implicit_extent_actuals``, :py:meth:`\
 LFRicKokkosArgumentMixin._call_region` calls ``cls._launch_symbol`` and
 ``cls._as_c_bool``, and :py:meth:`\
 LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
@@ -114,109 +115,16 @@ LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
 import re
 from dataclasses import replace
 
-from psyclone.core import AccessType
-from psyclone.domain.lfric import KernCallArgList, KernStubArgList
+from psyclone.domain.lfric import KernCallArgList
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
-    KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView)
+    KokkosRegion, KokkosScalar, KokkosView)
 from psyclone.psyir.nodes import (
     ArrayReference, BinaryOperation, Call, IntrinsicCall, Literal, Reference,
     Routine)
-from psyclone.psyir.symbols import (
-    ArgumentInterface, ScalarType, SymbolTable)
+from psyclone.psyir.symbols import ArgumentInterface, ScalarType
 from psyclone.psyir.transformations import TransformationError
-
-
-class _SharedArgumentPositions(KernStubArgList):
-    """A stub argument list recording which formals cells share.
-
-    The question it answers is which *formal* of the kernel carries an
-    argument whose metadata says two cells may update one element of it --
-    ``gh_inc`` and ``gh_readinc``. Nothing already in PSyclone answers it
-    without side effects.
-    :py:meth:`~psyclone.domain.lfric.ArgOrdering.\
-metadata_index_from_actual_index`
-    would, but only
-    :py:class:`~psyclone.domain.lfric.KernCallArgList` records the positions
-    it reads, and that builder creates PSy-layer symbols as it walks: running
-    it inside :py:meth:`~psyclone.domain.lfric.transformations.\
-LFRicKokkosTrans.validate`
-    would leave those symbols behind in invokes whose loops validation then
-    refuses.
-
-    :py:class:`~psyclone.domain.lfric.KernStubArgList` walks the same order,
-    so recording the positions here gives the same answer. It is not free of
-    the same side effect, though: every
-    :py:class:`~psyclone.domain.lfric.ArgOrdering` writes its scalars into
-    :py:attr:`~psyclone.domain.lfric.ArgOrdering._symtab`, which is the
-    Invoke's own table whenever the kernel it is given is in a Schedule
-    rather than a stub. Walking a real kernel that way created ``ndf_<space>``
-    ahead of :py:class:`~psyclone.lfric.LFRicFunctionSpaces`, whose
-    declarations are made with ``new_symbol`` and so became ``ndf_<space>_1``,
-    declared and never used -- which the LFRic build rejects under
-    ``-Werror=unused-variable``. This class therefore forces a private table,
-    as :py:class:`~psyclone.domain.lfric.KernelInterface` does, and the walk
-    leaves the tree untouched.
-
-    The positions are recorded by bracketing each field with the public
-    :py:attr:`~psyclone.domain.lfric.ArgOrdering.num_args`, which covers a
-    field vector's several entries as it covers a field's one.
-
-    :param kernel: the kernel whose argument list is to be walked.
-    :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-    """
-    # Inherited verbatim from KernStubArgList, which carries the same
-    # disable for the same reason: ArgOrdering declares handlers a subclass
-    # is free to leave to the base, and this one adds no coverage of its own.
-    # pylint: disable=abstract-method
-
-    #: The accesses under which one cell's contribution to an element has to
-    #: be combined with another's rather than replacing it.
-    _SHARED = (AccessType.INC, AccessType.READINC)
-
-    def __init__(self, kernel):
-        super().__init__(kernel)
-        # Everything this walk declares goes here and is dropped with it.
-        self._forced_symtab = SymbolTable()
-        #: The positions in the argument list that carry shared data.
-        self.shared_positions = set()
-
-    def _record(self, argument, first):
-        """Record the entries one argument added, if cells share it.
-
-        :param argument: the argument just appended.
-        :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param int first: the argument count before it was appended.
-        """
-        if argument.access in self._SHARED:
-            self.shared_positions.update(range(first, self.num_args))
-
-    def field(self, arg, var_accesses=None):
-        """Append a field and record whether cells share it.
-
-        :param arg: the field to be added.
-        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param var_accesses: optional map in which to store the accesses.
-        :type var_accesses:
-            Optional[:py:class:`psyclone.core.VariablesAccessMap`]
-        """
-        first = self.num_args
-        super().field(arg, var_accesses)
-        self._record(arg, first)
-
-    def field_vector(self, argvect, var_accesses=None):
-        """Append a field vector and record whether cells share it.
-
-        :param argvect: the field vector to be added.
-        :type argvect: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param var_accesses: optional map in which to store the accesses.
-        :type var_accesses:
-            Optional[:py:class:`psyclone.core.VariablesAccessMap`]
-        """
-        first = self.num_args
-        super().field_vector(argvect, var_accesses)
-        self._record(argvect, first)
 
 
 class LFRicKokkosArgumentMixin:
@@ -374,183 +282,6 @@ class LFRicKokkosArgumentMixin:
             for bound in bounds)
 
     @classmethod
-    def _shared_formals(cls, kernel, schedule):
-        """Return the names of the formals two cells may both update.
-
-        The names, and not the positions, because the caller has by then
-        dropped the cell-position formal from the front of its list and
-        appended the extents it measured to the back. A name survives both.
-
-        :param kernel: the kernel being captured.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-        :param schedule: the kernel schedule, whose argument list is in the
-            order :py:meth:`~psyclone.domain.lfric.ArgOrdering.generate`
-            fixes -- which is what makes the positions comparable.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-
-        :returns: the names of the kernel's own formals that carry data an
-            element of which more than one cell contributes to.
-        :rtype: set[str]
-
-        :raises TransformationError: if the kernel declares a different
-            number of formals than its metadata describes, so that no
-            position can be trusted.
-        """
-        builder = _SharedArgumentPositions(kernel)
-        builder.generate()
-        if not builder.shared_positions:
-            return set()
-        implicit = cls._implicit_extents(schedule.symbol_table)
-        formals = [symbol.name
-                   for symbol in schedule.symbol_table.argument_list
-                   if symbol.name not in implicit]
-        if builder.num_args != len(formals):
-            raise TransformationError(
-                f"LFRicKokkosTrans cannot say which formals of "
-                f"'{kernel.name}' are shared between cells: the kernel "
-                f"declares {len(formals)} of them and its metadata describes "
-                f"{builder.num_args}.")
-        return {formals[position] for position in builder.shared_positions}
-
-    @staticmethod
-    def _colour_symbols(kernel):
-        """Return the PSy-layer symbols a coloured launch is described from.
-
-        LFRic creates each of the three where it first needs one, and the
-        number of colours is the one a coloured schedule can be missing:
-        nothing in the PSy layer names it until a bound or a declaration
-        asks. It is not optional here, because the generated colour map is a
-        View and that number is its ``LayoutLeft`` stride.
-
-        :param kernel: the kernel being captured.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-
-        :returns: the colour map, the colour being launched, and the number
-            of colours.
-        :rtype: tuple[:py:class:`psyclone.psyir.symbols.DataSymbol`,
-            :py:class:`psyclone.psyir.symbols.DataSymbol`,
-            :py:class:`psyclone.psyir.symbols.DataSymbol`]
-
-        :raises TransformationError: if the PSy layer has no name for the
-            number of colours.
-        """
-        table = kernel.ancestor(InvokeSchedule).symbol_table
-        ncolours_name = kernel.ncolours_var
-        if not ncolours_name:
-            raise TransformationError(
-                "LFRicKokkosTrans cannot capture a coloured loop whose "
-                "invoke has no number of colours: the generated colour map "
-                "is a View and that number is the extent it is addressed "
-                "by.")
-        return (kernel.colourmap, table.lookup_with_tag("colours_loop_idx"),
-                table.lookup(ncolours_name))
-
-    @classmethod
-    def _colouring(cls, kernel, node, schedule, cell_index):
-        """Describe how a coloured launch finds the mesh cell of each index.
-
-        A colouring leaves two loops, and the one captured is the inner: the
-        outer loop over colours stays as Fortran and enters the region once
-        per colour, which is what makes a write two cells share safe without
-        an atomic. The launch therefore counts the cells of one colour and
-        the region's own cell index is no longer what it iterates over, so
-        three things cross the ABI that an uncoloured region does not carry:
-        LFRic's colour map, the colour this launch is on, and the number of
-        colours.
-
-        The last of those looks redundant beside the map itself and is not.
-        The map is passed as bare storage and rebuilt as a View inside the
-        region, and its first extent is the ``LayoutLeft`` stride: get that
-        wrong and every lookup reads the wrong cell. The second extent has
-        no such duty -- under ``LayoutLeft`` it takes no part in the address
-        -- so the cell count is reused for it rather than a fourth argument
-        added.
-
-        Nothing is described for an uncoloured loop, so such a region
-        generates exactly the source it generated before this existed.
-
-        :param kernel: the kernel being captured, which owns LFRic's colour
-            map and colour count.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-        :param node: the loop being captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-        :param schedule: the kernel schedule, whose names the launch index is
-            generated clear of.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-        :param str cell_index: the name the region gives the mesh cell, which
-            the launch index must not also be.
-
-        :returns: the region's colour map or ``None``, the descriptions of
-            the three generated arguments, and the actuals the PSy layer
-            passes for them.
-        :rtype: tuple[
-            Optional[
-                :py:class:`psyclone.psyir.backend.kokkos.KokkosColourMap`],
-            tuple[Union[
-                :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
-                :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...],
-            list[:py:class:`psyclone.psyir.nodes.Reference`]]
-
-        :raises TransformationError: if the PSy layer has no name for the
-            number of colours, as :py:meth:`_colour_symbols` raises it.
-        """
-        if node.loop_type != cls._COLOURED_LOOP_TYPE:
-            return None, (), []
-        map_symbol, colour_symbol, ncolours_symbol = cls._colour_symbols(
-            kernel)
-        # Generated clear of the kernel's own names for the reason the cell
-        # index is: the launch index and the map are declared in the scope
-        # the kernel's locals are declared in.
-        taken = {cell_index}
-        map_name, colour_name, ncolours, index = (
-            cls._clear_name(schedule.symbol_table, candidate, taken)
-            for candidate in (map_symbol.name, colour_symbol.name,
-                              ncolours_symbol.name, "cell_in_colour"))
-        colours = KokkosColourMap(
-            name=map_name, colour=colour_name, index=index)
-        arguments = (
-            # Both origins are Fortran's: the colour is one-based, and the
-            # launch's zero-based index names the cell one past it. The
-            # writer subtracts them where it writes the lookup, because this
-            # is the one View no PSyIR reference reaches, but they are stated
-            # here rather than left at nothing so the description is true.
-            KokkosView(map_name, f"{map_name}_data", "int",
-                       (ncolours, cls._CELL_COUNT), index_offsets=(1, 1),
-                       read_only=True, random_access=True),
-            KokkosScalar(colour_name, "int"),
-            KokkosScalar(ncolours, "int"),
-        )
-        return colours, arguments, [
-            Reference(map_symbol), Reference(colour_symbol),
-            Reference(ncolours_symbol)]
-
-    @staticmethod
-    def _clear_name(table, candidate, taken):
-        """Return a name clear of the kernel's own and of the names beside it.
-
-        ``next_available_name`` answers for the symbol table alone, and the
-        generated region declares two names the table does not hold: its cell
-        index, and each name generated just before this one. A launch that
-        declared its index under the cell's name would initialise the cell
-        from itself, and one that gave two of the three colour arguments the
-        same name would not compile.
-
-        :param table: the kernel's symbol table.
-        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
-        :param str candidate: the name to start from, which is LFRic's own
-            where there is one.
-        :param set[str] taken: the names already generated, added to here.
-
-        :returns: a name no symbol and no earlier generated name carries.
-        :rtype: str
-        """
-        name = table.next_available_name(candidate)
-        while name in taken:
-            name = table.next_available_name(f"{name}_")
-        taken.add(name)
-        return name
-
-    @classmethod
     def _region_arguments(cls, formals, per_cell, cell_index, renames,
                           count, start, shared=frozenset(), colour=()):
         # Seven descriptions of one argument list, which is what describing
@@ -607,7 +338,8 @@ class LFRicKokkosArgumentMixin:
             begins at the first cell of its colour.
         :type start: Optional[str]
         :param shared: the names of the formals more than one cell of the
-            launch may update, as :py:meth:`_shared_formals` gives them. Each
+            launch may update, as ``LFRicKokkosWriteMixin._shared_formals``
+            gives them. Each
             becomes an atomic View, so that the contributions of two cells to
             one element are combined rather than one of them lost. Empty is
             the answer for every kernel whose writes are its own cell's, and
@@ -615,7 +347,8 @@ class LFRicKokkosArgumentMixin:
             before this argument existed.
         :type shared: Container[str]
         :param colour: the descriptions of the colour map, the colour and the
-            number of colours, as :py:meth:`_colouring` builds them, or the
+            number of colours, as ``LFRicKokkosWriteMixin._colouring``
+            builds them, or the
             empty tuple for a loop that is not coloured. They go after the
             renamed extents and before the count for the reason those go
             where they do: :py:meth:`_region` extends the actuals in this

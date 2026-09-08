@@ -29,14 +29,16 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_schedule_mixin \
     import LFRicKokkosScheduleMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_write_mixin import (
+    LFRicKokkosWriteMixin)
 from psyclone.psyGen import Transformation
 from psyclone.psyir.backend.kokkos import KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Eleven mixins and Transformation, which is one contract split by subject
-# rather than twelve layers of behaviour: every base but the last holds only
+# Twelve mixins and Transformation, which is one contract split by subject
+# rather than thirteen layers of behaviour: every base but the last holds only
 # private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
@@ -45,7 +47,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,
                        LFRicKokkosInterfaceMixin,
                        LFRicKokkosIntrinsicMixin, LFRicKokkosIterationMixin,
-                       LFRicKokkosScheduleMixin, Transformation):
+                       LFRicKokkosScheduleMixin, LFRicKokkosWriteMixin,
+                       Transformation):
     """Replace one supported LFRic loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
@@ -783,78 +786,6 @@ KernelModuleInlineTrans`.
     #: reaches the team-level concurrency only by setting this.
     _TEAM_SIZE_OPTION = "team_size"
 
-    #: The option choosing between the two answers to a write two cells of
-    #: one launch share. ``True`` generates a ``Kokkos::atomic_*`` update for
-    #: every read-modify-write of a shared field; ``False`` generates none
-    #: and requires the loop to have been coloured first, so that the cells
-    #: meeting at a dof are in different launches. Absent, the choice follows
-    #: the loop: a coloured loop takes the coloured arm and every other loop
-    #: takes atomics, which is what makes atomics the default and makes every
-    #: capture predating this option generate the source it generated then.
-    #:
-    #: The two are alternatives rather than a ranking. Both are correct, and
-    #: which is faster is a measurement neither this class nor the branch
-    #: that added it has made.
-    _ATOMICS_OPTION = "atomics"
-
-    @classmethod
-    def _uses_atomics(cls, node, options):
-        """Say which of the two answers to a shared write is in force.
-
-        :param node: the loop that is to be captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-        :param options: the transformation options.
-        :type options: Optional[Dict[str, Any]]
-
-        :returns: whether a shared update is to be generated as an atomic.
-        :rtype: bool
-        """
-        requested = (options or {}).get(cls._ATOMICS_OPTION)
-        if requested is None:
-            return node.loop_type != cls._COLOURED_LOOP_TYPE
-        return bool(requested)
-
-    def _validate_atomics_option(self, node, options):
-        """Check the ``"atomics"`` option against the loop it is given with.
-
-        Each arm answers a shared write on its own, and the two together
-        answer it twice: an atomic on data colouring has already made private
-        to one launch costs an instruction and buys nothing. Asking for both
-        is therefore a contradiction in what the caller stated rather than a
-        preference to be resolved quietly, and so is asking for neither on a
-        loop that has a shared write and has not been coloured -- which would
-        generate a race.
-
-        :param node: the loop that is to be captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-        :param options: the transformation options.
-        :type options: Optional[Dict[str, Any]]
-
-        :raises TransformationError: if the option is neither absent nor a
-            bool; if it is ``True`` on a coloured loop; or if it is ``False``
-            on an uncoloured loop whose kernel has a shared write.
-        """
-        requested = (options or {}).get(self._ATOMICS_OPTION)
-        if requested is not None and not isinstance(requested, bool):
-            raise TransformationError(
-                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option must be "
-                f"absent or a bool, but found '{requested}'.")
-        coloured = node.loop_type == self._COLOURED_LOOP_TYPE
-        if requested and coloured:
-            raise TransformationError(
-                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is True "
-                "on a coloured loop. Colouring has already made every write "
-                "the launch's own, so an atomic would guard data no other "
-                "cell of the launch reaches; ask for one answer to a shared "
-                "write or the other.")
-        if (requested is False and not coloured
-                and self._shared_arguments(node.kernels()[0])):
-            raise TransformationError(
-                f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is False "
-                "on a loop that is not coloured, whose kernel writes a field "
-                "two cells share. Colour the loop first, or leave the option "
-                "out and take the atomic update.")
-
     def __str__(self):
         return "Capture a supported LFRic loop as a Kokkos launch"
 
@@ -884,7 +815,7 @@ KernelModuleInlineTrans`.
             absent nor a positive integer.
         :raises TransformationError: if the ``"atomics"`` option and the
             loop's colouring contradict each other, as
-            :py:meth:`_validate_atomics_option` states.
+            ``LFRicKokkosWriteMixin._validate_atomics_option`` states.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
