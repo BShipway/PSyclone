@@ -1887,16 +1887,16 @@ contains
     integer(kind=i_def) :: k, df, qp1, qp2
     real(kind=r_def) :: total
     do k = 0, nlayers - 1
-      total = 0.0_r_def
       do df = 1, ndf_w3
+        total = 0.0_r_def
         do qp2 = 1, np_z
           do qp1 = 1, np_xy
             total = total + weights_xy(qp1) * weights_z(qp2)               &
-                  * basis_w3(1,df,qp1,qp2) * field_in(map_w3(df) + k)
+                  * basis_w3(1,df,qp1,qp2)
           end do
         end do
+        field_out(map_w3(df) + k) = total * field_in(map_w3(df) + k)
       end do
-      field_out(map_w3(1) + k) = total
     end do
   end subroutine qr_weight_code
 end module qr_weight_kernel_mod
@@ -1947,18 +1947,17 @@ contains
     integer(kind=i_def) :: k, df, qp1, qp2
     real(kind=r_def) :: total
     do k = 0, nlayers - 1
-      total = 0.0_r_def
       do df = 1, ndf_w3
+        total = 0.0_r_def
         do qp2 = 1, np_z
           do qp1 = 1, np_xy
             total = total + weights_xy(qp1) * weights_z(qp2)               &
                   * (basis_w3(1,df,qp1,qp2)                                &
-                  +  diff_basis_w3(3,df,qp1,qp2))                          &
-                  * field_in(map_w3(df) + k)
+                  +  diff_basis_w3(3,df,qp1,qp2))
           end do
         end do
+        field_out(map_w3(df) + k) = total * field_in(map_w3(df) + k)
       end do
-      field_out(map_w3(1) + k) = total
     end do
   end subroutine qr_weight_code
 end module qr_weight_kernel_mod
