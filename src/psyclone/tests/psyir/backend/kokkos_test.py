@@ -17,6 +17,7 @@ from psyclone.psyir.backend.kokkos import (
     KokkosWriter, extent_names, is_extent, is_offset)
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
+from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
@@ -1515,6 +1516,7 @@ def test_kokkos_writer_rejects_an_invalid_constant(constant, message):
     ("name", "Kokkos region name 'not a name' is not a C++ identifier."),
     ("cell_count", "Cell count 'not a name' is not a C++ identifier."),
     ("cell_index", "Cell index 'not a name' is not a C++ identifier."),
+    ("cell_start", "First cell 'not a name' is not a C++ identifier."),
 ])
 def test_kokkos_writer_rejects_a_name_that_is_not_an_identifier(
         field, message):
@@ -2832,3 +2834,182 @@ def test_kokkos_writer_writes_a_power_at_its_operands_width():
         "  a = b ** c\n") == [
             "Kokkos::pow(s, s)",
             "Kokkos::pow(b, c)"]
+
+
+def _dof_kernel_schedule():
+    """Create the PSyIR body of a kernel that operates on a single dof.
+
+    An LFRic kernel with ``operates_on = dof`` is handed one dof of each
+    field it takes and no dofmap, no ``ndf`` and no ``nlayers``: everything
+    the cell-column kernel above needs to find its dofs is what the dof
+    iteration space removes.
+
+    :returns: the kernel schedule a dof region carries.
+    :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+    """
+    source = """
+subroutine scale_field_code(out_dof, in_dof, scale)
+  use constants_mod, only : r_def
+  real(kind=r_def), intent(inout) :: out_dof
+  real(kind=r_def), intent(in) :: in_dof, scale
+  out_dof = scale * in_dof
+end subroutine scale_field_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "scale_field_code", symbol_table=symbol_table, children=children)
+
+
+def _dof_region(**overrides):
+    """Return the launch and argument contract for a dof kernel.
+
+    Each of the kernel's two field arguments is a scalar formal fed from one
+    element of a field's data array, so the region carries it as a rank-1
+    View sliced to the dof count and subscripted by the launch's own index --
+    which is what the region does with a per-cell scalar too. The difference
+    is the index, and that is what ``dof`` selects.
+
+    :param overrides: fields to replace on the region.
+    :type overrides: unwrapped dict
+
+    :returns: the region the writer is asked to generate.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    region = KokkosRegion(
+        name="scale_field_kokkos",
+        schedule=_dof_kernel_schedule(),
+        cell_count="ndofs",
+        cell_index="df",
+        dof=True,
+        arguments=(
+            KokkosView("out_dof", "out_dof_data", "double", ("ndofs",),
+                       extra_indices=("df",)),
+            KokkosView("in_dof", "in_dof_data", "double", ("ndofs",),
+                       extra_indices=("df",), read_only=True,
+                       random_access=True),
+            KokkosScalar("scale", "double"),
+            KokkosScalar("ndofs", "int"),
+        ))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_dof_launch_ranges_over_the_dof_count():
+    """A dof region launches one iteration per dof of its own bound.
+
+    The count is the loop's own -- the owned dofs, or the annexed ones where
+    annexed dofs are computed -- and not the size of the field's data array.
+    A launch ranging over ``undf`` would run the halo dofs the Fortran loop
+    was told to stop before, and write them.
+    """
+    code = KokkosWriter()(_dof_region())
+
+    assert "Kokkos::RangePolicy<>(0, ndofs)" in code
+    assert "KOKKOS_LAMBDA(const int df) {" in code
+    assert "const int ndofs" in code
+    assert "undf" not in code
+
+    # The comment is generated rather than left to be inferred: the C++ of a
+    # dof region and of a cell region differ in the name of an index and in
+    # nothing else a reviewer can see.
+    assert "// One iteration per dof." in code
+    assert "// writes one dof and no two iterations write the same one" in code
+
+    # The cell shapes' fingerprints are all absent.
+    for absent in ("TeamPolicy", "league_rank", "const int cell"):
+        assert absent not in code
+
+    # The writer calls the shape function rather than repeating its text, so
+    # the comment and the policy line have one home.
+    assert "\n".join(
+        dof_launch(_dof_region(), "", "").splitlines()[:9]) in code
+
+
+def test_kokkos_dof_launch_has_no_dofmap():
+    """Nothing in a dof region indirects through a map.
+
+    This is the property the shape exists for. A cell-column kernel reaches
+    its dofs as ``field(map_w3(df) + k)``, so two columns may reach one dof
+    and a write needs colouring or an atomic; a dof kernel is handed the dof
+    itself, so the launch index *is* the dof and one iteration writes one.
+    """
+    code = KokkosWriter()(_dof_region())
+
+    # No rank-2 View, which is the shape every sliced dofmap has.
+    assert "**" not in code
+    assert "map_" not in code
+    assert "Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, " \
+        "Unmanaged> out_dof(out_dof_data, ndofs);" in code
+    assert "out_dof(df) = (scale * in_dof(df));" in code
+
+
+def test_kokkos_writer_rejects_a_dof_region_asking_for_a_team():
+    """A dof launch has no team, so a region asking for one is refused.
+
+    Neither of the two fields that select a team shape for a cell region can
+    be honoured for a dof one: a dof launch has no team to hold per-thread
+    scratch and no members to spread a loop across. Silently selecting the
+    dof shape anyway would drop the scratch declarations the body then reads,
+    which is a compile error at best and a wrong answer at worst, so the
+    combination is refused where it is described rather than left to the
+    shape to ignore.
+    """
+    for overrides in ({"scratch": _scratch_region().scratch},
+                      {"parallel_loops": _level_region().parallel_loops}):
+        with pytest.raises(ValueError) as error:
+            KokkosWriter()(_dof_region(**overrides))
+        assert ("A dof region has no team, so it can neither place scratch "
+                "nor spread a loop over one." in str(error.value))
+
+
+def _with_first_cell(region):
+    """Return ``region`` bounded below by a ``first_cell`` formal it takes.
+
+    :param region: the region to give a lower bound.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the same region, starting at a formal of that name.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    return replace(
+        region, cell_start="first_cell",
+        arguments=region.arguments + (KokkosScalar("first_cell", "int"),))
+
+
+def test_kokkos_range_launch_takes_a_lower_bound():
+    """A region starting past the first cell says where it starts.
+
+    An LFRic loop over the halo alone begins where the owned cells end, so
+    the launch cannot begin at zero. The first cell crosses the ABI as a
+    formal of its own, beside the count, rather than as anything the
+    generated source computes: the PSy layer knows the value and the region
+    takes values.
+    """
+    code = KokkosWriter()(_region())
+    assert "Kokkos::RangePolicy<>(0, ncells)" in code
+
+    code = KokkosWriter()(_with_first_cell(_region()))
+    assert "Kokkos::RangePolicy<>(first_cell, ncells)" in code
+    assert "const int first_cell" in code
+
+
+def test_kokkos_team_launch_takes_a_lower_bound():
+    """The flat team shape offsets its cell and shortens its league."""
+    code = KokkosWriter()(_with_first_cell(_scratch_region()))
+
+    assert "const int cell = first_cell + team.league_rank() * " \
+        "team.team_size() + rank;" in code
+    assert "const int league_size = ((ncells - first_cell) + team_size - 1)" \
+        " / team_size;" in code
+    # The tail guard is unchanged: the cell it computes is an absolute one,
+    # so the end it is compared against is the absolute end too.
+    assert "if (cell >= ncells) {" in code
+
+
+def test_kokkos_hierarchical_launch_takes_a_lower_bound():
+    """The one-team-per-cell shape offsets its cell and shortens its league."""
+    code = KokkosWriter()(_with_first_cell(_level_region()))
+
+    assert "TeamPolicy((ncells - first_cell), Kokkos::AUTO)," in code
+    assert "const int cell = first_cell + team.league_rank();" in code

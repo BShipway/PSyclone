@@ -80,6 +80,7 @@ therefore not supported.
 
 from psyclone.core import AccessType
 from psyclone.domain.lfric import LFRicConstants
+from psyclone.psyGen import BuiltIn
 from psyclone.psyir.nodes import (
     ArrayConstructor, Assignment, Call, CodeBlock, IntrinsicCall, Range,
     Reference)
@@ -123,8 +124,9 @@ class LFRicKokkosContractMixin:
     #: kernel that selects one: an automatic array selects the flat team
     #: launch and a parallelisable level loop the hierarchical one, and the
     #: hierarchical launch declares ``team`` whether or not there is scratch.
-    #: :py:attr:`_CELL_COUNT` is declared by all three shapes and is always
-    #: checked.
+    #: The bound names in
+    #: :py:attr:`LFRicKokkosArgumentMixin._BOUND_NAMES` are declared by one
+    #: shape or another and are always checked.
     _GENERATED_NAMES = ("body", "league_size", "probe", "rank",
                         "scratch_bytes", "team", "team_size")
 
@@ -163,6 +165,38 @@ class LFRicKokkosContractMixin:
     #: here has been measured against the model for them. They are refused by
     #: name rather than accepted on the strength of the resemblance.
     _SUPPORTED_SHAPES = ("gh_quadrature_xyoz", "gh_evaluator")
+
+    #: Loop types the launch has a shape for. ``""`` is a loop over cell
+    #: columns and ``"dof"`` one over dofs. The colour and tile types are
+    #: absent because they index a colour map rather than counting, and
+    #: ``"null"`` because it is not a loop at all: the kernel under it is
+    #: called once, for the whole domain.
+    _LOOP_TYPES = ("", "dof")
+
+    #: Iteration spaces the launch has a shape for. The four cell-column
+    #: spaces all launch over cells, differing only in how far the count
+    #: they are given reaches and, for ``halo_cell_column``, in where the
+    #: launch begins; the two dof spaces launch over dofs. Listed rather
+    #: than derived from
+    #: :py:class:`~psyclone.domain.lfric.LFRicConstants`, so that a space
+    #: LFRic adds later is refused by name instead of being accepted on the
+    #: strength of resembling one of these.
+    #:
+    #: ``domain`` is the one LFRic space absent. A kernel operating on the
+    #: whole domain is called once, with no loop for a launch to become.
+    _ITERATION_SPACES = (
+        "cell_column", "owned_cell_column", "halo_cell_column",
+        "owned_and_halo_cell_column", "dof", "owned_dof")
+
+    #: Lower bounds the launch can begin at. ``start`` is the first cell or
+    #: dof, which the launch reaches by beginning at zero; ``cell_halo_start``
+    #: is the first halo cell, which it reaches by taking
+    #: :py:attr:`LFRicKokkosArgumentMixin._CELL_START` as a formal of its own.
+    #:
+    #: The rest -- ``inner``, ``ncells`` and ``cell_halo`` -- are the lower
+    #: bounds redundant computation produces, each of them relative to a
+    #: depth index the region has no formal for. They are refused by name.
+    _LOWER_BOUNDS = ("start", "cell_halo_start")
 
     #: Upper bounds a launch beginning at the first cell can cover. Each of
     #: these names a count of consecutive cells or dofs starting from the
@@ -231,20 +265,38 @@ class LFRicKokkosContractMixin:
                 f"'{symbol.name}' in the generated region, because it is a "
                 "C++ keyword.")
 
-    @staticmethod
-    def _validate_iteration_space(node):
-        """Check that the loop iterates over uncoloured cell columns.
+    @classmethod
+    def _validate_iteration_space(cls, node):
+        """Check that the launch has a shape for what the loop iterates over.
+
+        Two questions, asked separately because they have separate answers. A
+        coloured loop is refused for its *type*: it runs the cells of one
+        colour through a colour map, so a launch from zero to a count would
+        run the wrong cells. The space is then refused by name, because the
+        survey reports one blocker per loop and the name is what tells two
+        unadmitted spaces apart.
+
+        Both the cell-column spaces and the dof spaces are admitted. A dof
+        loop hands its kernel one dof of each field rather than a dofmap, so
+        it needs no cell index and no indirection at all; see
+        :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch`.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
 
-        :raises TransformationError: if the loop is coloured or is not over
-            cell columns.
+        :raises TransformationError: if the loop's type is not one of
+            :py:attr:`_LOOP_TYPES`.
+        :raises TransformationError: if the loop's iteration space is not one
+            of :py:attr:`_ITERATION_SPACES`.
         """
-        if node.loop_type or node.iteration_space != "cell_column":
+        if node.loop_type not in cls._LOOP_TYPES:
             raise TransformationError(
-                "LFRicKokkosTrans supports only an uncoloured cell-column "
-                "loop.")
+                "LFRicKokkosTrans supports only an uncoloured loop over cell "
+                "columns or over dofs.")
+        if node.iteration_space not in cls._ITERATION_SPACES:
+            raise TransformationError(
+                f"LFRicKokkosTrans does not support the "
+                f"'{node.iteration_space}' iteration space.")
 
     @classmethod
     def _validate_halo_depth(cls, node):
@@ -264,30 +316,116 @@ class LFRicKokkosContractMixin:
         it needs of the *bound* is that it be a count from the first cell or
         dof, which is what :py:attr:`_COUNTED_BOUNDS` lists.
 
-        The lower bound is still the question it was. The launch begins at
-        the first cell, so a loop beginning anywhere else would run the
-        cells it was told to skip -- a wrong answer rather than a compile
-        error, and the reason this refuses rather than trusting the upper
-        bound alone.
+        The lower bound is now a question of the same shape. A loop over the
+        halo cells alone begins where the owned cells end, and the region
+        carries that first cell as a formal beside the count, exactly as it
+        carries the count: the PSy layer holds the value and the launch takes
+        it. What is refused is a lower bound the PSy layer states relative to
+        a depth index the region has no formal for, which is what
+        :py:attr:`_LOWER_BOUNDS` excludes. Refusing rather than trusting the
+        upper bound alone still matters: a launch beginning at zero over a
+        loop that did not would run the cells it was told to skip, which is a
+        wrong answer rather than a compile error.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
 
-        :raises TransformationError: if the loop does not start at the first
-            cell or dof.
+        :raises TransformationError: if the loop's lower bound is not one of
+            :py:attr:`_LOWER_BOUNDS`.
         :raises TransformationError: if the loop's upper bound is not one of
             :py:attr:`_COUNTED_BOUNDS`.
         """
         # LFRicLoop does not currently expose its lower-bound name.
         # pylint: disable=protected-access
-        if node._lower_bound_name != "start":
+        if node._lower_bound_name not in cls._LOWER_BOUNDS:
             raise TransformationError(
-                "LFRicKokkosTrans supports only a loop starting at the "
-                "first cell or dof.")
+                f"LFRicKokkosTrans does not support the "
+                f"'{node._lower_bound_name}' loop lower bound.")
         if node.upper_bound_name not in cls._COUNTED_BOUNDS:
             raise TransformationError(
                 f"LFRicKokkosTrans does not support the "
                 f"'{node.upper_bound_name}' loop bound.")
+
+    @staticmethod
+    def _validate_builtin(node):
+        """Refuse a loop holding an LFRic builtin, by the builtin's name.
+
+        LFRic writes a builtin as a loop over dofs, so admitting the dof
+        iteration space reaches them and this rule is what stops it. A
+        builtin has no kernel file and no
+        :py:class:`~psyclone.psyir.nodes.KernelSchedule`: PSyclone lowers it
+        into the PSy layer itself. Every rule after this one asks a question
+        of that schedule, so without this the capture fails with an
+        ``AttributeError`` from inside the metadata checks rather than with a
+        refusal -- which the coverage survey would record as an error row and
+        a whole-model capture build would stop on.
+
+        Capturing a builtin is a capability of its own: what would be
+        generated is not a translation of a kernel file but of PSyclone's own
+        model of the operation.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :raises TransformationError: if any kernel in the loop is a builtin.
+        """
+        for kernel in node.kernels():
+            if isinstance(kernel, BuiltIn):
+                raise TransformationError(
+                    f"LFRicKokkosTrans does not support the LFRic builtin "
+                    f"'{kernel.name}'.")
+
+    @classmethod
+    def _validate_dof_body(cls, node, schedule, parallel_loops):
+        """Refuse a dof kernel asking for anything only a team can give.
+
+        The dof launch is a flat range and has no team: no per-thread scratch
+        to place a kernel-local array in, and no members to spread a loop
+        across. Both of those are things the two cell launches offer, and
+        both are chosen by looking at the kernel rather than at the loop, so
+        a dof kernel carrying one would otherwise reach
+        :py:class:`~psyclone.psyir.backend.kokkos.KokkosWriter` describing a
+        region it refuses -- a failure part-way through the capture rather
+        than a refusal, and a loop the coverage survey had called capturable.
+
+        Neither is a shape a GungHo dof kernel has: a kernel handed one dof
+        of each field has nothing to size a local array by. It is refused
+        rather than left unexamined because the survey is asked of every loop
+        in the model and reports what it is told.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param schedule: the kernel schedule being captured, carrying every
+            rewrite ``apply`` makes; the same probe
+            :py:meth:`_validate_locals` is asked of, because an allocated
+            local only has its shape once the allocation tier is lowered.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param parallel_loops: the loops the launch would spread over a team,
+            as ``_parallel_loops`` gives them.
+        :type parallel_loops: Tuple[:py:class:`psyclone.psyir.nodes.Loop`,
+            ...]
+
+        :raises TransformationError: if the loop is over dofs and its kernel
+            declares an automatic array.
+        :raises TransformationError: if the loop is over dofs and its kernel
+            has a loop that would be spread over a team.
+        """
+        if not cls._is_dof(node):
+            return
+        # Sorted so that a kernel with two of them names the same one on
+        # every run.
+        for symbol in sorted(schedule.symbol_table.automatic_datasymbols,
+                             key=lambda symbol: symbol.name):
+            if symbol.is_array:
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot place the kernel-local array "
+                    f"'{symbol.name}' of a loop over dofs: the dof launch is "
+                    "a flat range and has no team to hold scratch.")
+        if parallel_loops:
+            raise TransformationError(
+                "LFRicKokkosTrans cannot spread a loop of a kernel over dofs "
+                "across a team: the dof launch is a flat range and has no "
+                "team.")
 
     @classmethod
     def _validate_loop(cls, node):
@@ -298,6 +436,8 @@ class LFRicKokkosContractMixin:
         :py:meth:`_validate_halo_depth`, called here in the order they have
         always been checked so that a loop failing more than one of them
         reports the same refusal as before.
+        :py:meth:`_validate_builtin` precedes both, because a builtin has no
+        kernel schedule for the rules after it to be asked of.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -305,6 +445,7 @@ class LFRicKokkosContractMixin:
         :raises TransformationError: if the loop does not hold exactly one
             kernel.
         """
+        cls._validate_builtin(node)
         cls._validate_iteration_space(node)
         cls._validate_halo_depth(node)
         if len(node.kernels()) != 1:
@@ -617,8 +758,9 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
-        :raises TransformationError: if the kernel already declares the name
-            the generated signature adds for the cell count.
+        :raises TransformationError: if the kernel already declares one of
+            the names the generated signature adds for its own bounds; see
+            :py:attr:`LFRicKokkosArgumentMixin._BOUND_NAMES`.
         :raises TransformationError: if a formal's name is a C++ keyword; see
             :py:attr:`_CXX_KEYWORDS`.
         :raises TransformationError: if a formal's kind is not one
@@ -628,9 +770,11 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         table = schedule.symbol_table
         formals = table.argument_list
         names = {symbol.name for symbol in formals}
-        if cls._CELL_COUNT in names:
+        # Sorted so that a kernel colliding with two of them names the same
+        # one on every run.
+        for bound in sorted(names.intersection(cls._BOUND_NAMES)):
             raise TransformationError(
-                f"LFRicKokkosTrans adds '{cls._CELL_COUNT}' to the generated "
+                f"LFRicKokkosTrans adds '{bound}' to the generated "
                 "signature, but the kernel already declares it.")
         for symbol in formals:
             cls._validate_cxx_name(symbol, "formal")
@@ -685,8 +829,9 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
             automatic array to place.
         :type parallel_loops: Tuple[:py:class:`psyclone.psyir.nodes.Loop`, ...]
 
-        :raises TransformationError: if the kernel declares a local named
-            :py:attr:`_CELL_COUNT`, which all three launch shapes declare.
+        :raises TransformationError: if the kernel declares a local named in
+            :py:attr:`LFRicKokkosArgumentMixin._BOUND_NAMES`, which every
+            launch shape may declare.
         :raises TransformationError: if the kernel selects a team launch --
             by having an automatic array, or a loop to spread over the team --
             and declares a local named in :py:attr:`_GENERATED_NAMES`, which
@@ -701,7 +846,7 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         names = {symbol.name for symbol in table.argument_list}
 
         locals_ = list(table.automatic_datasymbols)
-        generated = {cls._CELL_COUNT}
+        generated = set(cls._BOUND_NAMES)
         if any(symbol.is_array for symbol in locals_) or bool(parallel_loops):
             generated.update(cls._GENERATED_NAMES)
         # Sorted so that a kernel colliding with two of them names the same
