@@ -960,6 +960,15 @@ a scalar; the caller enters the region once per colour. No atomic is
 generated for such a region, because the cells of one colour meet at no dof,
 and the two fields are alternatives rather than a sequence.
 
+A kernel that takes an operator is given the cell index as an argument, and
+under colouring the PSy layer supplies it as `cmap(colour, cell)` rather than
+as `cell`. `LFRicKokkosContractMixin._is_the_loops_cell` recognises both
+spellings, so the region drops that actual and declares the position from the
+map's answer: `const int cell = cell_1 + 1;` follows the lookup above, where
+`cell_1` is the mesh cell and `cell` the kernel's own one-based formal. Every
+`matrix_vector` call site in GungHo is of this shape, so refusing it would
+leave the coloured arm without the commonest shared write there is.
+
 One consequence is worth knowing before a debug build reports it. A coloured
 region's per-cell Views -- its dofmaps, and a sliced actual like a stencil's
 -- are strided by the launch's cell count, which is the cells of this colour,

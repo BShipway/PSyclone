@@ -472,6 +472,67 @@ end program kokkos_shared_write_test
 """
 
 
+# The shared write in the shape GungHo writes it most often: 'matrix_vector',
+# an operator applied to a field and accumulated onto a continuous space. The
+# operator is what makes this different from 'inc_probe_kernel_mod' -- LFRic
+# passes the cell index as the first actual for exactly the kernels that take
+# one, and a colouring rewrites that actual into a lookup in the colour map.
+_SHARED_WRITE_OPERATOR_KERNEL = """
+module inc_operator_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_operator, gh_real,      &
+                           gh_inc, gh_read, cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: inc_operator_probe_kernel_type
+    type(arg_type) :: meta_args(3) = (/                        &
+         arg_type(gh_field,    gh_real, gh_inc,  w2),          &
+         arg_type(gh_field,    gh_real, gh_read, w3),          &
+         arg_type(gh_operator, gh_real, gh_read, w2, w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: inc_operator_probe_code
+  end type inc_operator_probe_kernel_type
+contains
+  subroutine inc_operator_probe_code(cell, nlayers, lhs, x, ncell_3d, &
+                                     matrix, ndf_w2, undf_w2, map_w2, &
+                                     ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: cell, nlayers, ncell_3d
+    integer(kind=i_def), intent(in) :: ndf_w2, undf_w2, ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: lhs
+    real(kind=r_def), dimension(undf_w3), intent(in) :: x
+    real(kind=r_def), dimension(ncell_3d,ndf_w2,ndf_w3), intent(in) :: matrix
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: df1, df2, k, ik
+    do k = 0, nlayers - 1
+      ik = (cell - 1) * nlayers + k + 1
+      do df1 = 1, ndf_w2
+        do df2 = 1, ndf_w3
+          lhs(map_w2(df1) + k) = lhs(map_w2(df1) + k) + &
+                                 matrix(ik, df1, df2) * x(map_w3(df2) + k)
+        end do
+      end do
+    end do
+  end subroutine inc_operator_probe_code
+end module inc_operator_probe_kernel_mod
+"""
+
+
+_SHARED_WRITE_OPERATOR_ALGORITHM = """
+program kokkos_shared_write_operator_test
+  use field_mod, only : field_type
+  use operator_mod, only : operator_type
+  use inc_operator_probe_kernel_mod, only : inc_operator_probe_kernel_type
+  implicit none
+  type(field_type) :: lhs, x
+  type(operator_type) :: matrix
+  call invoke(inc_operator_probe_kernel_type(lhs, x, matrix))
+end program kokkos_shared_write_operator_test
+"""
+
+
 # A whole-column section in the shape the finite-volume family uses, reduced
 # to the part that matters: a slice assigned as a unit, with a different lower
 # bound on each side so that a lowering which ignored the offsets would give a
@@ -3297,6 +3358,16 @@ def shared_write_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel accumulates into a shared dof."""
     return _invoke(
         tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL)
+
+
+@pytest.fixture(name="shared_write_operator_target")
+# pylint: disable-next=unused-argument
+def shared_write_operator_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke accumulating into a shared dof through an operator."""
+    return _invoke(
+        tmp_path, "inc_operator_probe", _SHARED_WRITE_OPERATOR_ALGORITHM,
+        _SHARED_WRITE_OPERATOR_KERNEL)
 
 
 @pytest.fixture(name="vector_inc_target")
@@ -8830,6 +8901,65 @@ def test_lfric_kokkos_trans_accepts_a_coloured_loop(shared_write_target):
 
     # And no atomic anywhere: that is the whole point of the arm.
     assert "atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_colours_a_loop_that_takes_an_operator(
+        shared_write_operator_target):
+    """A coloured operator kernel reads its cell through the colour map.
+
+    LFRic supplies the cell index as an actual argument for exactly the
+    kernels that take an operator, because the kernel does arithmetic with it
+    -- ``ik = (cell - 1) * nlayers + 1`` -- to find its own slice of the local
+    stencil. Uncoloured, that actual is the loop's own variable. Coloured, it
+    is ``cmap(colour, cell)``, and it must be recognised as the same thing:
+    the region declares the cell position from its own cell rather than taking
+    it, so a refusal here would refuse 'matrix_vector', the commonest shared
+    write GungHo has.
+
+    The two declarations are ordered, and that is the whole of the fix: the
+    colour map answers first, and the one-based position is derived from its
+    answer rather than from the launch index, which counts the cells of one
+    colour and is not a cell of the mesh.
+
+    """
+    psy, loop, _ = shared_write_operator_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(_coloured_inner(schedule))
+
+    # 'cell' is the kernel's own formal, so the launch index generated clear
+    # of it is 'cell_1', and the position the kernel is given is the map's
+    # answer plus one rather than the launch index plus one.
+    assert "const int cell_1 = cmap(colour - 1, cell_in_colour) - 1;" in cpp
+    assert "const int cell = cell_1 + 1;" in cpp
+    assert cpp.index("const int cell_1 =") < cpp.index("const int cell =")
+    assert "cell" not in _formals(cpp)
+    assert "atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_cell_index_it_cannot_place(
+        shared_write_operator_target, monkeypatch):
+    """An actual that is neither the loop's cell nor the map's is refused.
+
+    ``ArgOrdering`` decides what the first actual of an operator kernel is,
+    and this transformation reads that decision rather than trusting it: an
+    entry dropped in the wrong place is a region that compiles, runs and
+    reads the wrong data. The refusal is kept reachable by naming the loop's
+    variable something the actual is not.
+
+    """
+    psy, loop, _ = shared_write_operator_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+    inner = _coloured_inner(schedule)
+    monkeypatch.setattr(inner, "_variable",
+                        schedule.symbol_table.lookup("colour"))
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().apply(inner)
+    assert "cell index as the first argument" in str(err.value)
+    assert "cmap(colour,cell)" in str(err.value)
 
 
 def test_lfric_kokkos_trans_refuses_colouring_and_atomics_together(

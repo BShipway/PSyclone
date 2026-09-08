@@ -883,8 +883,8 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
                         "kernel argument, so that the generated scratch can "
                         "be sized.")
 
-    @staticmethod
-    def _cell_position(kernel, loop, formals, actuals):
+    @classmethod
+    def _cell_position(cls, kernel, loop, formals, actuals):
         """Return the formal carrying LFRic's cell index, or ``None``.
 
         ``ArgOrdering.generate`` emits that index as the kernel's first
@@ -901,6 +901,11 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         dropped below is some other argument, and the result is a region that
         compiles, runs and reads the wrong data.
 
+        A colouring makes the actual ``cmap(colour, cell)`` rather than
+        ``cell``, and that is the same value by a longer route: the region
+        already declares its own cell from the same lookup, so the position
+        it derives from it is the cell of the mesh either way.
+
         :param kernel: the kernel being captured.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
         :param loop: the loop the kernel sits in.
@@ -915,18 +920,52 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         :rtype: Optional[str]
 
         :raises TransformationError: if the kernel takes an operator but the
-            first actual is not a reference to the loop's own variable.
+            first actual is neither a reference to the loop's own variable
+            nor that variable's entry in the colour map.
         """
         if not kernel.arguments.has_operator():
             return None
         actual = actuals[0]
-        if not (isinstance(actual, Reference)
-                and actual.symbol is loop.variable):
+        if not cls._is_the_loops_cell(kernel, loop, actual):
             raise TransformationError(
                 f"LFRicKokkosTrans expected the PSy layer to supply the "
                 f"loop's own cell index as the first argument of "
                 f"'{kernel.name}', but found '{actual.debug_string()}'.")
         return formals[0].name
+
+    @classmethod
+    def _is_the_loops_cell(cls, kernel, loop, actual):
+        """Say whether an actual is the cell the loop is on.
+
+        Two spellings mean it, and no third one does. Uncoloured, LFRic
+        passes the loop's own variable. Coloured, it passes that variable's
+        entry in the kernel's colour map, with the colour the outer Fortran
+        loop is on: ``cmap(colour, cell)``. The map and the index are checked
+        against the symbols the schedule holds, so an unrelated array
+        reference in the first position is refused rather than mistaken for
+        a cell.
+
+        :param kernel: the kernel being captured.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param loop: the loop the kernel sits in.
+        :type loop: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param actual: the first actual argument the PSy layer supplies.
+        :type actual: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: whether that actual is this loop's cell index.
+        :rtype: bool
+        """
+        if not isinstance(actual, Reference):
+            return False
+        if not isinstance(actual, ArrayReference):
+            return actual.symbol is loop.variable
+        if loop.loop_type != cls._COLOURED_LOOP_TYPE:
+            return False
+        indices = actual.indices
+        return (actual.symbol is kernel.colourmap
+                and len(indices) == 2
+                and isinstance(indices[1], Reference)
+                and indices[1].symbol is loop.variable)
 
 
 __all__ = ["LFRicKokkosContractMixin"]
