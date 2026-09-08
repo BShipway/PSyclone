@@ -47,7 +47,7 @@ intrinsics are the part of the back-end that grows one entry at a time as
 kernels are captured, while the writer's own job does not.
 """
 
-from psyclone.psyir.backend.c import _is_real_argument
+from psyclone.psyir.backend.c_intrinsics_mixin import _is_real_argument
 from psyclone.psyir.backend.kokkos_array_intrinsics import (
     KokkosArrayIntrinsics)
 from psyclone.psyir.backend.visitor import VisitorError

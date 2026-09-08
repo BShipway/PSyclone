@@ -11,8 +11,9 @@ import re
 from typing import Optional, Tuple, Union
 
 from psyclone.psyir.backend.c import CWriter
-from psyclone.psyir.backend.kokkos_array_expression import (
-    KokkosArrayExpressionMixin, KokkosScratch)
+from psyclone.psyir.backend.kokkos_array_expression import KokkosScratch
+from psyclone.psyir.backend.kokkos_array_expression_mixin import (
+    KokkosArrayExpressionMixin)
 from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
@@ -228,6 +229,8 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
     The intrinsics and the handling of array-valued expressions are inherited
     rather than written here, from
     :py:mod:`~psyclone.psyir.backend.kokkos_intrinsics_mixin` and
+    :py:mod:`~psyclone.psyir.backend.kokkos_array_expression_mixin`, the
+    lowering the second of them drives being
     :py:mod:`~psyclone.psyir.backend.kokkos_array_expression`. Both mixins
     precede :py:class:`~psyclone.psyir.backend.c.CWriter` in the bases so that
     their handlers are found first and fall through to the C writer's by
@@ -401,7 +404,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         indices at all, which is exactly what a scalar formal made per-cell
         has: no dimension the kernel subscripts and one the region does.
         Every other View has at least one kernel index and is reached through
-        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression.\
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
 KokkosArrayExpressionMixin.arrayreference_node` instead.
 
         :param node: the reference in the captured body.
