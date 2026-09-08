@@ -4203,7 +4203,14 @@ judgement is PSyclone's rather than this transformation's: a callee reading
 data private to its own module, one whose declarations depend on an
 argument the call site writes to before calling, and one whose actual and
 formal types do not agree are each refused in ``InlineTrans``'s own words
-with the call named. A body may also fill an array from a
+with the call named. Not every call is a call, either: an indexed name whose
+meaning the kernel's own file does not settle -- ``blending_weights(index)``,
+where the array comes from a ``use`` -- is read by the frontend as a call,
+and resolving it reaches a datum rather than a routine. PSyclone reports
+that by failing to specialise the symbol rather than by refusing the
+transformation, and it is refused here with the rest, so that a kernel which
+cannot be captured is declined rather than raising out of ``validate``.
+A body may also fill an array from a
 constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
 dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
 generated as one assignment per element, into the array the kernel has

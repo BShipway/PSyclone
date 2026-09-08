@@ -92,6 +92,18 @@ class LFRicKokkosInlineMixin:
     to first, one whose actual and formal types do not match: each is refused
     by ``InlineTrans`` in its own words, and this mixin adds only which call
     it was.
+
+    **Not every Call is a call.** ``weights(index)`` is a function reference
+    or an element of an array, and where the kernel's own file does not say
+    which -- the name comes from a ``use`` whose module the frontend did not
+    read -- the frontend leaves a
+    :py:class:`~psyclone.psyir.nodes.Call` behind. Asking PSyclone to resolve
+    such a callee can reach a datum instead of a routine and raise
+    :py:exc:`TypeError` rather than a
+    :py:class:`~psyclone.psyir.transformations.TransformationError`. That is
+    caught and refused with the rest: a kernel this transformation cannot
+    capture must be declined, not turned into a traceback out of a
+    transformation the caller merely asked to validate.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
@@ -150,7 +162,11 @@ class LFRicKokkosInlineMixin:
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
         :raises TransformationError: if a call cannot be inlined, in which
-            case the reason is the one PSyclone gives for it.
+            case the reason is the one PSyclone gives for it. A
+            :py:exc:`TypeError` from resolving the callee is one of those
+            reasons: a name the frontend read as a call may resolve to a
+            datum, which PSyclone reports by failing to specialise the symbol
+            rather than by refusing the transformation.
         :raises TransformationError: if calls are still left after
             :py:attr:`_INLINE_LIMIT` of them have been inlined, which is what
             a self-recursive callee looks like from here.
@@ -164,7 +180,7 @@ class LFRicKokkosInlineMixin:
             cls._module_inline(call)
             try:
                 InlineTrans().apply(call)
-            except TransformationError as err:
+            except (TransformationError, TypeError) as err:
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot inline the call to '{name}' in "
                     f"'{schedule.name}': {err}") from err
@@ -194,14 +210,16 @@ class LFRicKokkosInlineMixin:
         any other refusal the message worth having is the one
         :py:meth:`_inline_calls` then gets from ``InlineTrans`` about the
         call itself. Reporting this one instead would name a rewrite the
-        reader never asked for.
+        reader never asked for. A :py:exc:`TypeError` from resolving the
+        callee is dropped for the same reason and on the same terms: it is
+        raised again where the call is inlined, and refused there.
 
         :param call: the call whose callee is to be brought in.
         :type call: :py:class:`psyclone.psyir.nodes.Call`
         """
         try:
             KernelModuleInlineTrans().apply(call)
-        except TransformationError:
+        except (TransformationError, TypeError):
             pass
 
     @classmethod

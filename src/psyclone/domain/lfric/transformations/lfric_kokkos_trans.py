@@ -201,7 +201,12 @@ KernelModuleInlineTrans`.
     the call site writes to before calling, one whose actual and formal types
     do not agree, one holding a CodeBlock. Each is refused in ``InlineTrans``'
     own words with the call named, because those words say what to fix and a
-    paraphrase would say less.
+    paraphrase would say less. So is a name that turns out not to be a call
+    at all: an indexed reference the kernel's own file does not settle the
+    meaning of is read as one by the frontend, and resolving it can reach a
+    datum and raise :py:exc:`TypeError` rather than refuse. That too is a
+    refusal here, so that :py:meth:`validate` declines a kernel it cannot
+    capture instead of raising out of PSyclone.
 
     **An array-valued assignment is lowered to an explicit loop.** Two
     shapes reach the lowering. A whole-column array section such as

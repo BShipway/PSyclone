@@ -1463,6 +1463,32 @@ _EXTERNAL_CALLEE_KERNEL = _LOCAL_KERNEL.replace(
     "    call sweep_column(nlayers, partial, swept)\n")
 
 
+# A configuration module holding an array, and the kernel that reads it. The
+# kernel's own file says nothing about what ``blend_weights`` is, so the
+# frontend leaves ``blend_weights(1)`` as a Call: an indexed name in an
+# expression is a function reference or an array element, and only the other
+# module's source settles which. This is the shape the limited-area kernels
+# have, and it is the shape that reaches a TypeError rather than a refusal
+# when PSyclone is asked for the callee.
+_ARRAY_LIKE_MODULE = """
+module weights_config_mod
+  use constants_mod, only : r_def
+  implicit none
+  private
+  real(kind=r_def), public :: blend_weights(3) = &
+      (/ 1.0_r_def, 2.0_r_def, 3.0_r_def /)
+end module weights_config_mod
+"""
+
+
+_ARRAY_LIKE_CALL_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use weights_config_mod, only : blend_weights").replace(
+    "      field_out(map_w3(1) + k - 1) = swept(k)",
+    "      field_out(map_w3(1) + k - 1) = swept(k) * blend_weights(1)")
+
+
 # The sweep of _LOCAL_KERNEL taken out into a module procedure of the kernel's
 # own module. This is the shape inlining can reach: the callee is a procedure
 # of the very Container the call site is in, so no import has to be followed
@@ -2480,10 +2506,12 @@ def chained_procedure_target_fixture(tmp_path, clear_module_manager_instance):
 
 
 @pytest.fixture(name="recursive_procedure_target")
-# pylint: disable-next=unused-argument
 def recursive_procedure_target_fixture(tmp_path,
                                        clear_module_manager_instance):
     """Create an invoke whose kernel calls a self-recursive procedure."""
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
     return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
                    _RECURSIVE_PROCEDURE_KERNEL)
 
@@ -2503,6 +2531,15 @@ def external_callee_target_fixture(tmp_path, clear_module_manager_instance):
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _EXTERNAL_CALLEE_KERNEL,
         extra={"helper_state_mod": _EXTERNAL_STATE_MODULE})
+
+
+@pytest.fixture(name="array_like_call_target")
+# pylint: disable-next=unused-argument
+def array_like_call_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke reading an array the frontend takes for a call."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ARRAY_LIKE_CALL_KERNEL,
+        extra={"weights_config_mod": _ARRAY_LIKE_MODULE})
 
 
 @pytest.fixture(name="off_abi_constant_target")
@@ -5335,6 +5372,29 @@ def test_lfric_kokkos_trans_refuses_an_external_callee(
     message = str(error.value)
     assert "cannot inline the call to 'sweep_column'" in message
     assert "column_solve_kernel_mod" in message
+
+
+def test_lfric_kokkos_trans_refuses_an_array_like_call(
+        array_like_call_target):
+    """A name PSyclone reads as a call and cannot type is refused, not raised.
+
+    ``blend_weights(1)`` is an element of an array ``weights_config_mod``
+    keeps, but the kernel's own file does not say so and the frontend leaves
+    it as a Call. Asking PSyclone for that callee reaches the datum and
+    raises :py:exc:`TypeError` rather than a
+    :py:class:`~psyclone.psyir.transformations.TransformationError`, since a
+    DataSymbol cannot be specialised into a RoutineSymbol. The mixin turns
+    that into a refusal, so the caller is told the kernel is not captured
+    instead of seeing PSyclone's traceback.
+    """
+    _, loop, _ = array_like_call_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'blend_weights'" in message
+    assert "specialise" in message
 
 
 # pylint: disable-next=unused-argument
