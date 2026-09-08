@@ -2835,7 +2835,13 @@ def test_kokkos_writer_writes_a_power_at_its_operands_width():
             "Kokkos::pow(b, c)"]
 
 
-def _shared_write_schedule():
+#: How the probe below writes ``acc`` when nothing asks for another shape.
+#: A read-modify-write by addition, which is what ``gh_inc`` most often is.
+_SHARED_UPDATE = ("acc(map_w2(df) + k) = acc(map_w2(df) + k) "
+                  "+ src(map_w3(1) + k)")
+
+
+def _shared_write_schedule(update=_SHARED_UPDATE):
     """Create a body updating a shared dof and writing an unshared one.
 
     Both statements are in one kernel because the question the two tests
@@ -2843,8 +2849,17 @@ def _shared_write_schedule():
     generated for the argument that needs it and for no other. A body with
     only the shared update could not tell an atomic applied per argument from
     one applied to every write the region makes.
+
+    :param str update: the statement writing ``acc``. It is a parameter
+        because which atomic the writer can generate -- or whether it can
+        generate one at all -- is read from the shape of that statement and
+        not from any flag, so the refusals below differ from the accepted
+        case in this one string and in nothing else.
+
+    :returns: the kernel body.
+    :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
     """
-    source = """
+    source = f"""
 subroutine inc_probe_code(nlayers, acc, out, src, ndf_w2, undf_w2, map_w2, &
                           ndf_w3, undf_w3, map_w3)
   use constants_mod, only : i_def, r_def
@@ -2861,7 +2876,7 @@ subroutine inc_probe_code(nlayers, acc, out, src, ndf_w2, undf_w2, map_w2, &
       out(map_w3(df) + k) = 2.0_r_def * src(map_w3(df) + k)
     end do
     do df = 1, ndf_w2
-      acc(map_w2(df) + k) = acc(map_w2(df) + k) + src(map_w3(1) + k)
+      {update}
     end do
   end do
 end subroutine inc_probe_code
@@ -3144,3 +3159,161 @@ def test_kokkos_writer_rejects_an_atomic_read_only_view():
         KokkosWriter()(replace(region, arguments=tuple(arguments)))
 
     assert "Kokkos View 'acc' is atomic but read only." in str(err.value)
+
+
+@pytest.mark.parametrize("update, why", [
+    ("acc(map_w2(df) + k) = src(map_w3(1) + k)",
+     "the target is not read at all, so nothing is being accumulated"),
+    ("acc(map_w2(df) + k) = acc(map_w2(df) + k) ** 2.0_r_def",
+     "the operator joining the two is not one an atomic implements"),
+    ("acc(map_w2(df) + k) = acc(map_w2(df) + k) + acc(map_w2(df) + k)",
+     "the target is read twice, which is two reads and one write"),
+])
+def test_kokkos_writer_refuses_a_shared_write_no_atomic_carries(update, why):
+    """A shared write that is not a read-modify-write is refused, not guessed.
+
+    What the writer can make indivisible is one read of the target, one
+    operator and one write. Anything else naming the target on the right is a
+    computation the hardware has no single instruction for, and the three
+    shapes here are the three ways that happens: no read, the wrong operator,
+    and two reads. Generating a plain assignment for any of them would be a
+    race the region's own contract promised it did not have, so the refusal
+    names the alternative that does work.
+
+    :param str update: the statement writing the shared field.
+    :param str why: what is wrong with it, for the failure message.
+    """
+    region = _shared_write_region(schedule=_shared_write_schedule(update))
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "Kokkos region writes shared array 'acc' with a statement that " \
+        "is not one of the read-modify-write shapes an atomic answers " \
+        "(Kokkos::atomic_add, Kokkos::atomic_div, Kokkos::atomic_mul, " \
+        "Kokkos::atomic_sub). Colour the loop instead." in str(err.value), why
+
+
+def test_kokkos_atomic_add_when_the_target_is_the_second_operand():
+    """``acc = src + acc`` is the same update as ``acc = acc + src``.
+
+    Fortran lets a kernel write a commutative update either way round and
+    means the same thing by both, so the writer matches both and contributes
+    whichever operand is not the target. It is not a formatting question: the
+    operand the atomic is given is the one that is added, and taking the
+    wrong one would silently store the target's old value.
+    """
+    code = KokkosWriter()(_shared_write_region(
+        schedule=_shared_write_schedule(
+            "acc(map_w2(df) + k) = src(map_w3(1) + k) + acc(map_w2(df) + k)")))
+
+    assert "Kokkos::atomic_add(&acc(((map_w2((df - 1), cell) + k) - 1)), " \
+        "src(((map_w3((1 - 1), cell) + k) - 1)));" in code
+    assert code.count("Kokkos::atomic") == 1
+
+
+def test_kokkos_writer_refuses_a_subtraction_the_wrong_way_round():
+    """``acc = src - acc`` is not an update of ``acc`` and is refused.
+
+    Subtraction is in the table and the target does appear on the right, so
+    this is the case a match on the operator alone would accept. It is not an
+    accumulation: it replaces the target with a value computed from it, which
+    no atomic performs and which two cells cannot do in either order.
+    """
+    region = _shared_write_region(schedule=_shared_write_schedule(
+        "acc(map_w2(df) + k) = src(map_w3(1) + k) - acc(map_w2(df) + k)"))
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "not one of the read-modify-write shapes" in str(err.value)
+
+
+def test_kokkos_writer_refuses_a_whole_array_update_of_a_shared_field():
+    """A shared field updated as a section is refused before it is lowered.
+
+    The array tier turns a section into a nest of element assignments, and
+    every one of them would need an atomic. The refusal is not that this
+    cannot be generated -- it could be, one atomic per element -- but that
+    the tier lowers a section without knowing which of its destinations are
+    shared, so an atomic applied afterwards would be applied to all of them
+    or to none. Refusing names the two spellings that do work.
+    """
+    region = _shared_write_region(schedule=_shared_write_schedule(
+        "acc(1:3) = acc(1:3) + src(1:3)"))
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "Kokkos region updates shared array 'acc' with a whole-array " \
+        "expression, which no single atomic carries out. Capture it as an " \
+        "element assignment or colour the loop." in str(err.value)
+
+
+def _shared_level_schedule():
+    """Create a hierarchical body whose boundary write is a shared update.
+
+    ``_level_schedule``'s shape with one difference: the write outside the
+    parallel loop accumulates rather than assigns. That is the only body in
+    which the two mechanisms meet -- one team member does the write, and the
+    write is still indivisible against the other teams -- and it exists to
+    show that the writer applies both rather than choosing between them.
+    """
+    source = """
+subroutine inject_inc_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  real(kind=r_double) :: scale
+  scale = 0.5_r_double
+  do k = 1, nlayers
+    y(map(1) + k - 1) = y(map(1) + k - 1) + scale * x(map(1) + k - 1)
+  end do
+  y(map(1) + nlayers) = y(map(1) + nlayers) + x(map(1) + nlayers)
+end subroutine inject_inc_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inject_inc_code", symbol_table=symbol_table, children=children)
+
+
+def test_kokkos_hierarchical_region_makes_a_single_write_atomic_too():
+    """One team member does the boundary write, and it is still an atomic.
+
+    ``Kokkos::single`` and ``Kokkos::atomic_add`` answer different races and
+    a shared boundary write has both. The single stops the members of this
+    team repeating the update, which would count one cell's contribution
+    several times; the atomic stops another team's cell losing its own
+    against this one. Dropping either leaves a wrong answer that appears only
+    under concurrency, so the test asserts they are nested and not chosen
+    between.
+    """
+    schedule = _shared_level_schedule()
+    arguments = list(_scratch_region().arguments)
+    arguments[1] = replace(arguments[1], atomic=True)
+    region = KokkosRegion(
+        name="inject_inc_kokkos",
+        schedule=schedule,
+        cell_count="ncells",
+        arguments=tuple(arguments),
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(),
+        parallel_loops=(schedule.walk(Loop)[0],))
+
+    code = KokkosWriter()(region)
+
+    boundary = "(((map((1 - 1), cell) + nlayers) - 1))"
+    assert "    Kokkos::single(Kokkos::PerTeam(team), [&]() {\n" \
+        f"      Kokkos::atomic_add(&y{boundary}, x{boundary});\n" \
+        "    });\n" in code
+    # The write inside the parallel loop is one member's own iteration, so it
+    # needs the atomic and not the single.
+    inner = "(((map((1 - 1), cell) + k) - 1) - 1)"
+    assert f"Kokkos::atomic_add(&y({inner}), (scale * x({inner})));" in code
+    assert code.count("Kokkos::single") == 1
+    assert code.count("Kokkos::atomic_add") == 2

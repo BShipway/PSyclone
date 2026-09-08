@@ -123,11 +123,38 @@ def atomic_update_operands(assignment):
         return None
     function, commutative = entry
     left, other = right.children[0], right.children[1]
-    if left == assignment.lhs:
+    if left == assignment.lhs and not _names(other, assignment.lhs):
         return (function, other)
-    if commutative and other == assignment.lhs:
+    if (commutative and other == assignment.lhs
+            and not _names(left, assignment.lhs)):
         return (function, left)
     return None
+
+
+def _names(expression, target):
+    """Whether an expression reads the array the update is writing.
+
+    The value an atomic is given is read before the update begins and is not
+    part of it, so an expression naming the target reads a location another
+    cell may be updating at the same moment. That is a race whatever the
+    writer generates, and it is the target's own dof for ``acc + acc`` and a
+    neighbouring one for ``acc(i) + acc(j)``; neither is answered by making
+    the write indivisible.
+
+    Matching is on the symbol rather than on the subscript, because two
+    subscripts that differ textually may still be the same dof: which they
+    are is decided by a dofmap the writer cannot read.
+
+    :param expression: the operand contributed to the target.
+    :type expression: :py:class:`psyclone.psyir.nodes.Node`
+    :param target: the assignment's left-hand side.
+    :type target: :py:class:`psyclone.psyir.nodes.Reference`
+
+    :returns: whether the expression refers to the target's array.
+    :rtype: bool
+    """
+    return any(reference.symbol is target.symbol
+               for reference in expression.walk(Reference))
 
 
 class KokkosArrayExpressionMixin:
