@@ -46,16 +46,19 @@ lower bounds and the shape enquiries answered from them -- is not here but in
 the size a View is given and the origin its subscripts are shifted from. Which
 of the names a body reads is module state, and what the region does with each,
 is ``LFRicKokkosConstantsMixin``; this module answers only what a kind maps to.
+Which kinds one captured body names, and the compile-time width assertions
+they become, are ``LFRicKokkosArgumentMixin``, beside the interface that
+carries them.
 
 The one constraint that follows is that a method reaching a helper of the
-sibling mixins ``LFRicKokkosBoundsMixin``, ``LFRicKokkosCallMixin`` or
+sibling mixins ``LFRicKokkosBoundsMixin``, ``LFRicKokkosArgumentMixin`` or
 ``LFRicKokkosConstantsMixin`` does so through ``cls``, resolved on
 ``LFRicKokkosTrans``. Calling such a method directly on either mixin is
 therefore not supported.
 """
 
 from psyclone.configuration import Config
-from psyclone.psyir.nodes import Call, IntrinsicCall, Literal, Reference
+from psyclone.psyir.nodes import Call, IntrinsicCall, Reference
 from psyclone.psyir.symbols import ArrayType, ScalarType
 
 
@@ -67,7 +70,7 @@ class LFRicKokkosTypesMixin:
     declaration gives it is ``LFRicKokkosBoundsMixin``; whether the body may
     read it at all, and as what, is ``LFRicKokkosConstantsMixin``. Nothing
     here builds the region or the Fortran that calls it; that is
-    ``LFRicKokkosCallMixin``.
+    ``LFRicKokkosArgumentMixin``.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
@@ -103,8 +106,8 @@ class LFRicKokkosTypesMixin:
     #: for the same reason -- a row would have to name a width, and both
     #: :py:meth:`_supported_kinds` and
     #: :py:meth:`~psyclone.domain.lfric.transformations.\
-    #: lfric_kokkos_call_mixin.LFRicKokkosCallMixin._kind_assertions` read
-    #: that table as widths.
+    #: lfric_kokkos_argument_mixin.LFRicKokkosArgumentMixin._kind_assertions`
+    #: read that table as widths.
     _C_LOGICAL_TYPE = "bool"
 
     #: A literal of each intrinsic, usable as the argument of
@@ -130,9 +133,9 @@ class LFRicKokkosTypesMixin:
     #: than assumed here. LFRic's ``constants_mod`` declares no such kind --
     #: being unnamed is the whole of what makes it the default -- so
     #: :py:meth:`~psyclone.domain.lfric.transformations.\
-    #: lfric_kokkos_call_mixin.LFRicKokkosCallMixin._kind_assertions` keeps
-    #: the name out of the ``use`` line it writes and out of the literal's
-    #: kind suffix.
+    #: lfric_kokkos_argument_mixin.LFRicKokkosArgumentMixin._kind_assertions`
+    #: keeps the name out of the ``use`` line it writes and out of the
+    #: literal's kind suffix.
     #:
     #: ``REAL`` has no entry and is refused: LFRic names a kind on every real
     #: it means -- ``r_def``, ``r_solver``, ``r_single`` and ``r_tran`` are all
@@ -369,84 +372,6 @@ class LFRicKokkosTypesMixin:
             return default[0] if default else None
         precision = Config.get().api_conf("lfric").precision_map
         return cls._C_TYPES.get((intrinsic, precision.get(kind)))
-
-    @classmethod
-    def _kind_types(cls, schedule):
-        """Return the C type of every kind the captured body names.
-
-        The region's arguments carry their own C types, but its locals and
-        its literals cross no interface: nothing outside the generated file
-        constrains them, so a kind the backend cannot resolve is silently
-        generated at the C writer's default width. This is what stops that.
-
-        A kind :py:meth:`_map_kind` cannot resolve is left out rather than
-        refused, because the argument checks have already refused every kind
-        that reaches the ABI; what is left is a local or a literal whose width
-        the C writer's own default is free to choose.
-
-        A kind named only as a cast target -- the ``r_def`` of
-        ``real(x, r_def)``, which no declaration in the body repeats -- is
-        collected too. The backend resolves a cast's width through this table,
-        so leaving it out would silently write ``(float)`` for a cast the
-        Fortran asked to be ``double``: the one case where an unresolved kind
-        changes a value rather than only a local's width. A cast naming a kind
-        the precision map does not carry is still left out, and still written
-        at that default, because there is no width to write instead.
-
-        A declaration naming no kind is collected under the name
-        :py:attr:`_DEFAULT_KINDS` gives it, for the same reason and with more
-        force: the width it fixes is not written down anywhere at all, so
-        leaving it out would be the one case where nothing -- neither this
-        table nor the compiler's own argument check -- had looked at it.
-
-        :param schedule: the kernel schedule being captured.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-
-        :returns: one ``(kind name, C type)`` pair per resolvable kind,
-            name-ordered.
-        :rtype: tuple[tuple[str, str], ...]
-        """
-        table = schedule.symbol_table
-        kinds = {}
-        for symbol in list(table.argument_list) + list(
-                table.automatic_datasymbols):
-            c_type = cls._c_type(symbol)
-            kind = cls._kind_name(symbol)
-            if kind is None and c_type is not None:
-                # On the ABI with no kind named at all, since _c_type refuses
-                # a width stated in place of a name. The region carries it
-                # under the name _DEFAULT_KINDS gives it so that the width it
-                # fixes can be asserted like any other.
-                kind = cls._default_kind_name(symbol)
-            if kind is not None:
-                kinds[kind] = c_type
-        for literal in schedule.walk(Literal):
-            datatype = literal.datatype
-            precision = getattr(datatype, "precision", None)
-            if not isinstance(precision, Reference):
-                continue
-            kind = precision.symbol.name
-            kinds[kind] = cls._map_kind(datatype.intrinsic, kind)
-        for reference in schedule.walk(Reference):
-            if not cls._kind_argument(reference):
-                continue
-            # The call's own datatype says which intrinsic the kind qualifies,
-            # which the kind name alone does not: i_def and r_def are both
-            # just names until the cast around them says integer or real.
-            intrinsic = getattr(reference.parent.datatype, "intrinsic", None)
-            kind = reference.symbol.name
-            c_type = (cls._map_kind(intrinsic, kind)
-                      if intrinsic is not None else None)
-            if c_type is None:
-                # Left out rather than written in as None. A declaration above
-                # may already have resolved this kind, and the filter below
-                # drops whatever is left None, so writing it in would lose the
-                # width that declaration found.
-                continue
-            kinds[kind] = c_type
-        return tuple(
-            (kind, kinds[kind]) for kind in sorted(kinds)
-            if kinds[kind] is not None)
 
 
 __all__ = ["LFRicKokkosTypesMixin"]

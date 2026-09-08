@@ -395,7 +395,8 @@ lfric_kokkos_bounds_mixin.LFRicKokkosBoundsMixin._substitute_bounds`, and
             name it has *in* that container if the import renamed it, the C
             type it crosses the ABI as, and the symbol itself, which is what
             :py:meth:`~psyclone.domain.lfric.transformations.\
-lfric_kokkos_call_mixin.LFRicKokkosCallMixin._region_arguments` reads a shape
+lfric_kokkos_argument_mixin.LFRicKokkosArgumentMixin._region_arguments` reads
+            a shape
             from.
         :rtype: tuple[str, str, Optional[str], str,
             :py:class:`psyclone.psyir.symbols.DataSymbol`]

@@ -6,7 +6,9 @@
 # -----------------------------------------------------------------------------
 """Capture a supported LFRic loop as a Kokkos launch."""
 
-from psyclone.domain.lfric import KernCallArgList, LFRicLoop
+from psyclone.domain.lfric import LFRicLoop
+from psyclone.domain.lfric.transformations.lfric_kokkos_argument_mixin \
+    import LFRicKokkosArgumentMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_bounds_mixin import (
     LFRicKokkosBoundsMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
@@ -22,13 +24,11 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_inline_mixin import (
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.errors import GenerationError
-from psyclone.lfric import LFRicHaloExchange
-from psyclone.psyGen import InvokeSchedule, Transformation
-from psyclone.psyir.backend.kokkos import KokkosRegion, KokkosWriter
+from psyclone.psyGen import Transformation
+from psyclone.psyir.backend.kokkos import KokkosWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Call, Exit, IntrinsicCall, Literal, Loop,
-    Reference, Routine, WhileLoop)
+    Assignment, Exit, Literal, Loop, WhileLoop)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
 from psyclone.psyir.tools import DependencyTools
 from psyclone.psyir.transformations import (
@@ -36,8 +36,13 @@ from psyclone.psyir.transformations import (
     TransformationError)
 
 
+# Eight mixins and Transformation, which is one contract split by subject
+# rather than nine layers of behaviour: every base but the last holds only
+# private helpers, and none of them overrides anything.
+# pylint: disable-next=too-many-ancestors
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
-                       LFRicKokkosBoundsMixin, LFRicKokkosCallMixin,
+                       LFRicKokkosArgumentMixin, LFRicKokkosBoundsMixin,
+                       LFRicKokkosCallMixin,
                        LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,
                        LFRicKokkosIntrinsicMixin,
                        Transformation):
@@ -170,6 +175,27 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     unaffected: PSyclone's issue #928 leaves every stencil shape unbuilt, so a
     stencil kernel written as a generic interface is still refused there
     whatever its shape.
+
+    **A basis is accepted by shape** too, and the accepted shapes are
+    :py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ`` and
+    ``gh_evaluator``. Neither needs argument machinery of its own. XYoZ
+    quadrature adds two point counts, two weight arrays and one basis array
+    per function space that asked for one, shaped
+    ``(dim, ndf, np_xy, np_z)``; an evaluator adds no rule at all, tabulating
+    the basis at the nodal points of a target function space to give
+    ``(dim, ndf, ndf of the target)`` and no weights. Every one of those is an
+    argument the PSy layer has computed before the loop and every extent of it
+    is a formal of the same kernel, so the existing scalar and View
+    descriptions cover them whole. A kernel may name both shapes, in which
+    case each space it declares carries a basis array per shape; each shape is
+    checked on its own so that a refusal names the one that is not modelled
+    rather than the whole set.
+
+    Face and edge quadrature are refused by name. They carry a face or edge
+    count and a single point count in place of the XYoZ pair, and while the
+    same descriptions look as though they would cover those too, nothing here
+    has been measured against the model for them. Refusing by name says that;
+    accepting on the strength of the resemblance would not.
 
     **A called subroutine is inlined, not called.** The generated region is
     a C++ function and there is no Fortran for it to call into, so a kernel
@@ -787,66 +813,6 @@ can_loop_be_parallelised`
                 chosen.append(loop)
         return tuple(chosen)
 
-    @classmethod
-    def _as_c_bool(cls, actual, symbol_table):
-        """Wrap one actual argument in a conversion to ``logical(c_bool)``.
-
-        This is what puts a Fortran ``logical`` on the C ABI without either
-        side knowing the other's width. The dummy is ``logical(c_bool),
-        value``; the actual is whatever kind LFRic declared, typically
-        ``l_def``; and ``LOGICAL(x, c_bool)`` is a standard conversion the
-        compiler performs, not a reinterpretation of storage. Neither side
-        consults the precision map, which is why PSyclone issue #1941 --
-        recording ``l_def`` as 1 byte where it is 4 -- cannot affect the
-        result.
-
-        :param actual: the argument expression to convert, already detached
-            from the tree or freshly built.
-        :type actual: :py:class:`psyclone.psyir.nodes.DataNode`
-        :param symbol_table: the PSy-layer routine's table, which gains the
-            ``c_bool`` import if it does not already carry one.
-        :type symbol_table: :py:class:`psyclone.psyir.symbols.SymbolTable`
-
-        :returns: the conversion, ready to stand in the actual's place.
-        :rtype: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
-        """
-        c_bool = cls._import_constant(symbol_table, "c_bool", "iso_c_binding")
-        return IntrinsicCall.create(
-            IntrinsicCall.Intrinsic.LOGICAL,
-            [actual, ("kind", Reference(c_bool))])
-
-    @staticmethod
-    def _lower_halo_exchanges(node):
-        """Lower every halo exchange in ``node``'s invoke, before ``node`` is.
-
-        A halo exchange does not know its own depth: it computes one by
-        walking forward for the accesses that read the field it exchanges, and
-        those accesses are LFRic kernel arguments carrying LFRic metadata.
-        :py:meth:`apply` is about to replace the loop holding them with a
-        plain :py:class:`~psyclone.psyir.nodes.Call`, which carries none, so
-        an exchange lowered afterwards finds no reader at all and PSyclone
-        raises :py:class:`~psyclone.errors.InternalError` rather than
-        generating a wrong depth.
-
-        Lowering the exchanges first is the order whole-container lowering
-        would have used anyway -- an exchange precedes the loop it feeds, and
-        lowering runs in schedule order -- so this restores that order rather
-        than choosing a new one. It does nothing for a schedule that has no
-        exchange, which is every region captured before stencils.
-
-        :param node: the loop about to be captured, used only to reach the
-            invoke schedule containing it. A node with no
-            :py:class:`~psyclone.psyGen.InvokeSchedule` ancestor, as a unit
-            test's bare schedule has, is left alone.
-        :type node: :py:class:`~psyclone.domain.lfric.LFRicLoop`
-
-        """
-        schedule = node.ancestor(InvokeSchedule)
-        if schedule is None:
-            return
-        for exchange in schedule.walk(LFRicHaloExchange):
-            exchange.lower_to_language_level()
-
     def apply(self, node, options=None, **kwargs):
         """Generate C++ and replace ``node`` with the typed launch call.
 
@@ -883,93 +849,15 @@ can_loop_be_parallelised`
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)
         self._substitute_constants(schedule)
-        parallel_loops = self._parallel_loops(schedule)
-
-        # KernCallArgList creates references to PSy-layer symbols. Ensure the
-        # LFRic invoke has first specialised those symbols as DataSymbols.
-        node.ancestor(InvokeSchedule).invoke.setup_psy_layer_symbols()
-        argument_builder = KernCallArgList(kernel)
-        argument_builder.generate()
-        formals = schedule.symbol_table.argument_list
-        actuals = [argument.copy()
-                   for argument in argument_builder.psyir_arglist]
-        if len(actuals) != len(formals):
-            raise TransformationError(
-                f"LFRicKokkosTrans expected {len(formals)} actual arguments "
-                f"for '{kernel.name}' but the PSy layer supplies "
-                f"{len(actuals)}.")
-
-        cell_position = self._cell_position(kernel, node, formals, actuals)
-        if cell_position is not None:
-            # Both lists, together. They are walked in step below -- and
-            # 'formals' is what describes the generated signature -- so
-            # dropping the actual alone would attribute every later actual to
-            # the formal before it, and the dofmaps, being the ones detected
-            # by the shape of their actual, would silently lose the cell
-            # dimension that makes them per-cell.
-            formals = formals[1:]
-            del actuals[0]
-
-        # An actual that indexes into PSy-layer storage -- a dofmap sliced as
-        # map(:,cell) -- is passed whole instead, and the region takes the
-        # cell index itself. Everything else is already a plain reference.
-        per_cell = set()
-        for index, (formal, actual) in enumerate(zip(formals, actuals)):
-            if not isinstance(actual, ArrayReference):
-                continue
-            per_cell.add(formal.name)
-            actuals[index] = Reference(actual.symbol)
-
-        constants = self._constants(schedule)
-        # The launch index shares a C++ scope with the kernel's own
-        # declarations, so a kernel declaring 'cell' would collide with it.
-        # Spelt from the dataclass default so the two cannot drift: a kernel
-        # that has not taken the name still generates 'cell'.
-        cell_index = schedule.symbol_table.next_available_name(
-            KokkosRegion.cell_index)
-        region = KokkosRegion(
-            name=self._region_name(schedule),
-            schedule=schedule,
-            cell_count=self._CELL_COUNT,
-            cell_index=cell_index,
-            cell_position=cell_position,
-            arguments=self._region_arguments(
-                formals, per_cell, constants, cell_index),
-            constants=self._constant_arrays(schedule),
-            kind_types=self._kind_types(schedule),
-            scratch=self._local_arrays(schedule),
-            parallel_loops=parallel_loops,
-            team_size=(options or {}).get(self._TEAM_SIZE_OPTION))
+        region, actuals, constants = self._region(
+            kernel, node, schedule, options)
         try:
             cpp = KokkosWriter()(region)
         except (VisitorError, ValueError, TypeError) as err:
             raise TransformationError(
                 f"LFRicKokkosTrans cannot express '{kernel.name}' in the "
                 f"Kokkos backend: {err}") from err
-
-        self._lower_halo_exchanges(node)
-        lowered_loop = node.lower_to_language_level()
-        cell_count = lowered_loop.stop_expr.copy()
-        routine = lowered_loop.ancestor(Routine)
-        symbol_table = routine.symbol_table
-        launch = self._launch_symbol(symbol_table, region)
-        actuals.append(cell_count)
-        actuals.extend(
-            Reference(self._import_constant(
-                symbol_table, name, container, orig_name))
-            for name, container, orig_name, _, _ in constants)
-        # region.arguments is the formals, then the cell count, then the
-        # constants -- which is exactly the order 'actuals' is in once both
-        # appends above have run. The two are therefore index-aligned, and one
-        # loop covers a logical formal and an imported logical constant alike.
-        # That alignment is what makes this correct and it is not visible from
-        # the loop itself.
-        for index, argument in enumerate(region.arguments):
-            if argument.c_type == self._C_LOGICAL_TYPE:
-                actuals[index] = self._as_c_bool(actuals[index], symbol_table)
-        counter = lowered_loop.variable
-        lowered_loop.replace_with(Call.create(launch, actuals))
-        self._drop_unused_counter(routine, counter)
+        self._call_region(node, region, actuals, constants)
         return cpp
 
 
