@@ -4157,10 +4157,16 @@ extent that has come out negative, which is an allocation neither language
 defines. A name a ``parameter`` beside the array gives a value to is resolved
 to that value rather than asked of the launch, so
 ``integer(kind=i_def), parameter :: nfaces = 4`` sizing
-``dimension(nfaces)`` needs nothing passed. A declaration that states no
-shape at all is refused by name -- an ``allocatable`` local is sized by an
-``ALLOCATE`` in the body and an assumed-shape one by its caller, and scratch
-bytes are asked for before the launch enters the region -- as is a shape with
+``dimension(nfaces)`` needs nothing passed. An ``allocatable`` local is
+sized by an ``ALLOCATE`` in the body, and where that statement's bounds obey the same grammar the region
+reads the shape from it, rewrites the declaration and removes both the
+``ALLOCATE`` and its ``DEALLOCATE``, after which the array is the scratch
+case written the other way round. An allocation the launch cannot evaluate
+before it enters the region -- one sized from the kernel's own data, one made
+inside a loop, one carrying ``stat``, ``errmsg``, ``source`` or ``mold``, or
+a second allocation of the same array -- is refused by name instead. An
+assumed-shape local, sized by its caller, states no shape anywhere the region
+can read and stays refused, as does a shape with
 no C form, such as ``dimension(MAX(nlayers-n,1))``. The declared *lower*
 bound is read the same way and need not be 1: ``dimension(0:nlayers-1)`` is generated
 as a View of ``nlayers`` elements with ``0`` subtracted from every subscript
@@ -4177,12 +4183,22 @@ the finite-volume kernels use to write a column as a unit, and
 no whole-array assignment and the region has to say the loop instead. What
 the lowering declines is refused here with its reason quoted: an assignment
 reading the array it writes, for which no order of loops means what the
-Fortran meant, and one whose right-hand side calls something neither
-scalar-valued nor elemental, ``MATMUL`` and the other contractions among
-them. A section that is not in an assignment is judged by where it is
-instead: as an actual argument it is left to the rule about calls, and
-anywhere else -- in the bounds of an ``ALLOCATE``, most often -- it is
-refused. A body may also fill an array from a
+Fortran meant. An array-valued intrinsic on the right-hand side is generated
+rather than refused -- ``MATMUL``, ``DOT_PRODUCT``, ``SUM``, ``MINVAL``,
+``MAXVAL`` and ``TRANSPOSE`` become loop nests over the destination, with no
+array temporary between them, because one element of a contraction is a
+scalar reduction and one element of a transpose is an index swap. What is
+refused of these is a fold the shape cannot express: a ``dim`` that is not a
+literal or names no dimension the operand has, a ``mask``, a reduction
+directly inside another, or an operand that is neither a whole array nor a
+section of one. ``RESHAPE`` is generated only from a rank-1 source with a
+literal shape. An intrinsic no writer in the chain can spell is refused when
+the transformation is asked rather than when it generates, because
+``validate`` puts each of the body's intrinsics to the writer itself.
+A section that is not in an assignment is judged by where it is
+instead: as an actual argument it is left to the rule about calls, in the
+bounds of an ``ALLOCATE`` it is read as the shape that statement states, and
+anywhere else it is refused. A body may also fill an array from a
 constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
 dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
 generated as one assignment per element, into the array the kernel has
