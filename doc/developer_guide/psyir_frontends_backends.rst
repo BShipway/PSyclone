@@ -530,7 +530,11 @@ The node validates that it has a loop to leave, so a `break` cannot escape
 into a body that has none. A back-end that puts a loop body somewhere a
 `break` does not mean the same thing -- a lambda, in the Kokkos back-end's
 hierarchical launch -- has to keep such a loop out of that shape itself;
-`LFRicKokkosTrans._parallel_loops` is where that is done.
+`LFRicKokkosTrans._parallel_loops` is where that is done. It is inherited from
+`LFRicKokkosScheduleMixin`, in
+`domain/lfric/transformations/lfric_kokkos_schedule_mixin.py`, which holds the
+steps that choose the kernel implementation to capture and put its body into
+the shape the region is described from.
 
 Kokkos back-end
 +++++++++++++++
