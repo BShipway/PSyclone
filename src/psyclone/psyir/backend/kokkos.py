@@ -84,9 +84,13 @@ def is_extent(value):
     :py:func:`~psyclone.psyir.backend.kokkos_launch.scratch_guard`.
 
     What is still refused is anything that is not arithmetic over names and
-    integers -- a call such as ``pow(nlayers, 2)`` or ``max(nlayers, 1)``,
-    which is where a comma reaches an extent -- because the generated
-    ``shmem_size`` argument is this text and nothing rewrites it.
+    integers -- a call such as ``pow(nlayers, nlayers)`` or
+    ``max(nlayers, 1)``, which is where a comma reaches an extent -- because
+    the generated ``shmem_size`` argument is this text and nothing rewrites
+    it. A power reaches an extent as a call only when its exponent is not an
+    integer literal: ``nlayers ** 2`` is written as ``(nlayers * nlayers)``
+    and is arithmetic this accepts. See
+    :py:mod:`psyclone.psyir.backend.c_integer_power`.
 
     :param value: the candidate extent, which need not be a string.
 

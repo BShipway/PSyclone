@@ -42,6 +42,7 @@ Currently limited to just a few PSyIR nodes to support the OpenCL generation,
 it needs to be extended for generating pure C code.
 
 '''
+from psyclone.psyir.backend.c_integer_power import integer_power
 from psyclone.psyir.backend.language_writer import LanguageWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
@@ -486,6 +487,12 @@ class CWriter(LanguageWriter):
         :param node: A BinaryOperation PSyIR node.
         :type node: :py:class:`psyclone.psyir.nodes.BinaryOperation`
 
+        A power whose exponent is a small integer literal is written as the
+        product tree gfortran builds for it rather than as 'pow', so that the
+        generated region rounds as the Fortran it replaced;
+        :py:mod:`psyclone.psyir.backend.c_integer_power` says which exponents
+        and why.
+
         :returns: The C code as a string.
         :rtype: str
 
@@ -528,6 +535,8 @@ class CWriter(LanguageWriter):
             BinaryOperation.Operator.SUB: ("-", operator_format),
             BinaryOperation.Operator.MUL: ("*", operator_format),
             BinaryOperation.Operator.DIV: ("/", operator_format),
+            # Reached only by a power the tree above did not write: a
+            # non-literal or real exponent, or one out of range.
             BinaryOperation.Operator.POW: ("pow", function_format),
             BinaryOperation.Operator.EQ: ("==", operator_format),
             BinaryOperation.Operator.NE: ("!=", operator_format),
@@ -538,6 +547,16 @@ class CWriter(LanguageWriter):
             BinaryOperation.Operator.AND: ("&&", operator_format),
             BinaryOperation.Operator.OR: ("||", operator_format),
             }
+
+        # A constant integer power is the multiplications gfortran makes
+        # rather than a call to 'pow', which rounds differently; see
+        # :py:mod:`psyclone.psyir.backend.c_integer_power`.
+        if node.operator == BinaryOperation.Operator.POW:
+            product = integer_power(self._visit(node.children[0]),
+                                    node.children[1],
+                                    _is_real_argument(node.children[0]))
+            if product is not None:
+                return product
 
         # If the instance operator exists in the map, use its associated
         # operator and formatter to generate the code, otherwise raise

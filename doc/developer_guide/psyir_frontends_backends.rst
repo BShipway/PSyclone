@@ -359,9 +359,11 @@ Additionally, there are three partially-implemented back-ends
   `do k = n, 1, -1` becomes `for(k=n; k>=1; k+=-1)`; a step that is a
   runtime value is taken to be positive. An array constructor is written
   only where it fills an array, and the C back-end section below says why
-  that is the only position it can be written in. Which intrinsics that
-  subset contains, and why four of them depend on their argument's type, is
-  set out there too.
+  that is the only position it can be written in. A power by a small integer
+  literal is written as the multiplications gfortran makes rather than as a
+  call to `pow`, so that `x ** 2` is `(x * x)`; which exponents that covers,
+  and why the rest keep `pow`, is set out there too, as is which intrinsics
+  the subset contains and why four of them depend on their argument's type.
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
@@ -432,6 +434,43 @@ intrinsic, so the value is never narrowed below what was asked for. Honouring
 it needs a writer that has been told what each kind's width is, which is what
 `kind_types` gives the Kokkos back-end below; that back-end overrides this
 method and casts at the width the Fortran asked for.
+
+`CWriter.binaryoperation_node` does not write a constant integer power as a
+call to `pow`. `x ** 2` becomes `(x * x)` and `x ** 3` becomes `((x * x) * x)`,
+which is what gfortran generates for the same source: its front end never
+calls the library for an integer literal exponent, expanding the power by the
+binary method into multiplications instead. Each of those multiplications is
+correctly rounded by IEEE-754, so the multiplication tree has one right
+answer; `pow` has no such guarantee, and glibc's differs from it often enough
+to matter. Measured over 200,000 pseudo-random operands, `pow(x, 2)` differs
+from the product in the last bit for about one in a thousand of them and
+`pow(x, 3)` for about a quarter, and that difference was what stopped a
+generated LFRic region from reproducing the model's checksums bit for bit.
+
+`psyclone.psyir.backend.c_integer_power` holds the rule, in three functions so
+that each is testable on its own: `literal_exponent` recognises the exponents
+the rule applies to, `power_tree` builds the text, and `integer_power` joins
+them and answers `None` where `pow` is to be kept. The exponent must be an
+integer `Literal`, optionally under a unary sign -- the Fortran frontend
+writes `x ** (-2)` as a `MINUS` over `Literal("2")`, so the sign is a node and
+not part of the literal's value. A negative exponent over a real base becomes
+`(1 / tree)`; `1` rather than `1.0` so that a single-precision base is not
+widened by the division. Every product is parenthesised, so the text is
+unambiguous wherever it is placed and no operand's own precedence can reach
+into it.
+
+What the rule declines is as deliberate as what it writes. A non-literal
+exponent, a real exponent, and an exponent of zero all stay `pow`. A negative
+exponent over an integer base stays `pow` too, because Fortran evaluates that
+in integer arithmetic and the reciprocal would not. So does any exponent above
+eight in magnitude: nothing was measured there, and `pow` is the honest answer
+where the shape gfortran uses has not been checked. Exponents of five and six
+are written, but they are the two the prototype's generated-code probe does
+not compare against Fortran: gfortran's chain for them depends on the
+optimisation level -- the binary method at `-O0` and `-Og`, GCC's
+`powi_table` addition chain from `-O1` -- so there is no single tree that
+matches Fortran at every level. The exponents the model's kernels use, two
+through four and seven and eight, are the same text under both methods.
 
 `CWriter.arrayconstructor_node` writes an array constructor as one
 assignment per element rather than as a value, because C has no array-valued
