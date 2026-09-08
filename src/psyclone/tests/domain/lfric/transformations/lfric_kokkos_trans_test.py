@@ -96,6 +96,20 @@ _CELL_LOCAL_KERNEL = _KERNEL.replace(
     "      do df = 1, ndf_wtheta", "      do df = 1, cell")
 
 
+# An invoke of a builtin, which LFRic writes as a loop over dofs rather than
+# over cell columns. With annexed dofs computed it runs to the last annexed
+# one, which is the bound twenty-three of the loops the coverage survey
+# records under 'halo-depth' carry.
+_BUILTIN_ALGORITHM = """
+program kokkos_builtin_test
+  use field_mod, only : field_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(setval_X(out_field, in_field))
+end program kokkos_builtin_test
+"""
+
+
 _HALO_ALGORITHM = """
 program kokkos_halo_test
   use field_mod, only : field_type
@@ -144,6 +158,74 @@ contains
     end do
   end subroutine halo_read_code
 end module halo_read_kernel_mod
+"""
+
+
+# An invoke whose loop runs into the halo without being asked to. LFRic
+# assembles an operator redundantly to the first halo depth, so a kernel
+# writing one is bounded by 'mesh%get_last_halo_cell(1)' rather than by the
+# owned cells -- which is what two hundred and twenty-one of the loops the
+# coverage survey records under 'halo-depth' look like, and what makes this
+# fixture the released population rather than a construction.
+_HALO_OPERATOR_ALGORITHM = """
+program kokkos_halo_operator_test
+  use constants_mod,  only : r_def
+  use field_mod,      only : field_type
+  use operator_mod,   only : operator_type
+  use operator_setval_x_kernel_mod, only : operator_setval_x_kernel_type
+  implicit none
+  type(operator_type) :: op
+  type(field_type) :: weight
+  call invoke(operator_setval_x_kernel_type(op, weight, 1.0_r_def))
+end program kokkos_halo_operator_test
+"""
+
+
+# operator_setval_x's shape with a weight field added. The field is what puts
+# a dofmap in the region, and the dofmap is the argument whose View is sized
+# by the cell count: a launch reaching into the halo reads columns of it that
+# a View sliced by the owned count would not hold.
+_HALO_OPERATOR_KERNEL = """
+module operator_setval_x_kernel_mod
+  use argument_mod, only : arg_type, gh_operator, gh_field, gh_scalar,     &
+                           gh_real, gh_write, gh_read, cell_column,        &
+                           any_discontinuous_space_1,                      &
+                           any_discontinuous_space_2
+  use constants_mod, only : i_def, r_def
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: operator_setval_x_kernel_type
+    type(arg_type) :: meta_args(3) = (/                                    &
+         arg_type(gh_operator, gh_real, gh_write,                          &
+                  any_discontinuous_space_1,                               &
+                  any_discontinuous_space_2),                              &
+         arg_type(gh_field,    gh_real, gh_read,                           &
+                  any_discontinuous_space_1),                              &
+         arg_type(gh_scalar,   gh_real, gh_read) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: operator_setval_x_code
+  end type operator_setval_x_kernel_type
+contains
+  subroutine operator_setval_x_code(cell, nlayers, ncell_3d, op, weight, &
+                                    scalar, ndf1, undf1, map1, ndf2)
+    integer(kind=i_def), intent(in) :: cell, nlayers, ncell_3d
+    integer(kind=i_def), intent(in) :: ndf1, undf1, ndf2
+    integer(kind=i_def), dimension(ndf1), intent(in) :: map1
+    real(kind=r_def), dimension(ncell_3d,ndf1,ndf2), intent(inout) :: op
+    real(kind=r_def), dimension(undf1), intent(in) :: weight
+    real(kind=r_def), intent(in) :: scalar
+    integer(kind=i_def) :: df1, df2, k, ik
+    do k = 0, nlayers - 1
+      ik = (cell - 1) * nlayers + k + 1
+      do df2 = 1, ndf2
+        do df1 = 1, ndf1
+          op(ik, df1, df2) = scalar * weight(map1(df1) + k)
+        end do
+      end do
+    end do
+  end subroutine operator_setval_x_code
+end module operator_setval_x_kernel_mod
 """
 
 
@@ -1183,6 +1265,21 @@ _DIVIDED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "      u_local(k) = partial(k)\n"
     "    end do\n"
     "    swept(nlayers) = partial(nlayers) + u_local(1)")
+
+
+# The same kernel with a formal named after a C++ keyword. Fortran reserves no
+# words at all, so `const` is an ordinary dummy argument -- and it is the one
+# project_eliminated_theta_q32_kernel_mod declares, whose region the compiler
+# met as `const float const,`. The kernel's own dummy names are its own
+# business, the PSy layer calling it positionally, so only the generated C++
+# ever has to write them.
+_KEYWORD_FORMAL_KERNEL = _LOCAL_KERNEL.replace("field_in", "const")
+
+
+# The same again for a local, which the launch declares in the scope it
+# generates the kernel body into. `new` is a C++ keyword and an ordinary
+# Fortran name.
+_KEYWORD_LOCAL_KERNEL = _LOCAL_KERNEL.replace("swept", "new")
 
 
 # A local whose shape its declaration does not carry. Every one of the fifteen
@@ -3057,6 +3154,15 @@ def halo_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "halo_read", _HALO_ALGORITHM, _HALO_KERNEL)
 
 
+@pytest.fixture(name="halo_operator_target")
+# pylint: disable-next=unused-argument
+def halo_operator_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose loop runs to the first halo depth."""
+    return _invoke(
+        tmp_path, "operator_setval_x", _HALO_OPERATOR_ALGORITHM,
+        _HALO_OPERATOR_KERNEL)
+
+
 @pytest.fixture(name="paired_target")
 # pylint: disable-next=unused-argument
 def paired_target_fixture(tmp_path, clear_module_manager_instance):
@@ -3482,6 +3588,22 @@ def divided_local_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel sizes a local by a division."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _DIVIDED_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="keyword_formal_target")
+# pylint: disable-next=unused-argument
+def keyword_formal_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel names a formal after a C++ keyword."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _KEYWORD_FORMAL_KERNEL)
+
+
+@pytest.fixture(name="keyword_local_target")
+# pylint: disable-next=unused-argument
+def keyword_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel names a local after a C++ keyword."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _KEYWORD_LOCAL_KERNEL)
 
 
 @pytest.fixture(name="shapeless_local_target")
@@ -4012,6 +4134,119 @@ def test_lfric_kokkos_trans_keeps_a_preceding_halo_exchange(halo_target):
         fortran.index("call halo_read_kokkos(")
 
 
+def test_lfric_kokkos_trans_accepts_a_literal_halo_depth(halo_operator_target):
+    """A loop assembling an operator runs to the first halo depth.
+
+    Nothing asks for that bound: LFRic gives it to every loop writing an
+    operator, because an operator's columns are needed one cell beyond the
+    ones this rank owns. The launch is bounded by the count the loop carried
+    rather than by the owned cells, and the count reaches it as the region's
+    existing formal filled from the loop's own stop expression -- so the halo
+    arithmetic stays where the PSy layer already does it and no part of it
+    crosses into the generated C++.
+    """
+    psy, loop, _ = halo_operator_target
+    assert loop.upper_bound_name == "cell_halo"
+    assert loop.upper_bound_halo_depth.value == "1"
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    # The bound is a formal of the region, and the per-cell dofmap View is
+    # sized by that same formal rather than by any owned-cell count.
+    assert "const int ncells" in cpp
+    assert "map1(map1_data, ndf1, ncells)" in cpp
+    assert "get_last_halo_cell" not in cpp
+    assert "loop0_stop = mesh%get_last_halo_cell(1)" in fortran
+    assert "loop0_stop)" in fortran.split(
+        "call operator_setval_x_kokkos(")[1].split("\n")[0]
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_accepts_an_annexed_bound(
+        tmp_path, monkeypatch, clear_module_manager_instance):
+    """The last annexed dof is a bound the launch can be given.
+
+    Twenty-three of the loops the coverage survey records under this blocker
+    are dof loops running from the first dof to the last annexed one. That is
+    a count from the first dof exactly as a halo bound is a count from the
+    first cell, so the bound rule accepts it, and the PSy layer fills the
+    launch's formal from a different member than a halo bound uses -- the
+    field's function space rather than the mesh.
+
+    Those loops remain refused for the space they iterate over, which is a
+    rule of its own and a capability of its own. This test is about the
+    bound, and asserts that separation rather than assuming it.
+
+    Whether annexed dofs are computed is a configuration option, and the test
+    configuration has it off; the model this prototype targets has it on, so
+    the bound is asked for here rather than waited for.
+    """
+    monkeypatch.setattr(
+        Config.get().api_conf("lfric"), "_compute_annexed_dofs", True)
+    psy, loop, _ = _invoke(
+        tmp_path, "moist_dyn_gas", _BUILTIN_ALGORITHM, _KERNEL)
+    assert loop.upper_bound_name == "nannexed"
+
+    LFRicKokkosTrans._validate_halo_depth(loop)
+
+    fortran = str(psy.gen)
+    assert ("loop0_stop = out_field_proxy%vspace%get_last_dof_annexed()"
+            in fortran)
+    assert "get_last_halo_cell" not in fortran
+
+    with pytest.raises(TransformationError, match="cell-column loop"):
+        LFRicKokkosTrans().validate(loop)
+
+
+def test_lfric_kokkos_trans_accepts_a_runtime_halo_depth(
+        halo_operator_target):
+    """A depth computed at run time is evaluated where it already is.
+
+    Six of the loops carrying this blocker take their depth from a variable
+    rather than from a literal. The depth is an expression of the PSy layer's
+    own symbols, and it stays there: the PSy layer evaluates it into the loop
+    bound it already computes, and only that value crosses the ABI. Nothing
+    in the generated C++ names the depth, so a region generated for a depth
+    of one and a region generated for a depth read at run time differ in
+    nothing but what the caller passes.
+    """
+    psy, loop, _ = halo_operator_target
+    depth = psy.invokes.invoke_list[0].schedule.symbol_table.new_symbol(
+        "halo_depth", symbol_type=DataSymbol,
+        datatype=ScalarType(ScalarType.Intrinsic.INTEGER,
+                            ScalarType.Precision.UNDEFINED))
+    loop.set_upper_bound("cell_halo", halo_depth=Reference(depth))
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert "loop0_stop = mesh%get_last_halo_cell(halo_depth)" in fortran
+    assert "halo_depth" not in cpp
+    assert "const int ncells" in cpp
+
+
+def test_lfric_kokkos_trans_halo_exchanges_precede_the_region(
+        halo_operator_target):
+    """A region iterating into the halo does not exchange the halo itself.
+
+    The exchange is the PSy layer's, before the launch, whether or not the
+    launch reaches past the owned cells. Widening the bound moves where the
+    region reads, not who fills what it reads: an exchange inside a region
+    would be a communication call in device code.
+    """
+    psy, loop, _ = halo_operator_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert fortran.index("call weight_proxy%halo_exchange(depth=1)") < \
+        fortran.index("call operator_setval_x_kokkos(")
+    assert "halo_exchange" not in cpp
+    assert "is_dirty" not in cpp
+    assert "set_dirty" not in cpp
+
+
 def test_lfric_kokkos_trans_lowers_no_exchange_outside_an_invoke(target):
     """A loop with no invoke schedule above it is left alone.
 
@@ -4442,13 +4677,18 @@ def test_lfric_kokkos_trans_rejects_wrong_node():
             [], structure=CodeBlock.Structure.STATEMENT))
 
 
-def test_lfric_kokkos_trans_rejects_halo_depth(target):
-    """The prototype may not launch over a halo or redundant region."""
+def test_lfric_kokkos_trans_rejects_a_shifted_lower_bound(target):
+    """A launch begins at the first cell, so the loop has to as well.
+
+    A loop over the halo alone starts where the owned cells end. The launch
+    has no lower bound to give that to, so it would run the owned cells the
+    loop was told to skip -- a wrong answer rather than a compile error,
+    which is why the upper bound being one this understands is not on its
+    own enough.
+    """
     _, loop, _ = target
-    loop._upper_bound_halo_depth = Literal(
-        "1", ScalarType(ScalarType.Intrinsic.INTEGER,
-                        ScalarType.Precision.UNDEFINED))
-    with pytest.raises(TransformationError, match="halo depth"):
+    loop._lower_bound_name = "cell_halo_start"
+    with pytest.raises(TransformationError, match="first cell or dof"):
         LFRicKokkosTrans().validate(loop)
 
 
@@ -6179,6 +6419,61 @@ def test_lfric_kokkos_trans_rejects_a_shapeless_local(shapeless_local_target):
     LFRicKokkosTrans().validate(loop)
 
 
+def test_lfric_kokkos_trans_rejects_a_cxx_keyword_formal(
+        keyword_formal_target):
+    """A formal Fortran allows and C++ reserves is refused by name.
+
+    ``project_eliminated_theta_q32_kernel_mod`` declares a dummy argument
+    called ``const``, which is an ordinary Fortran name and a C++ keyword: the
+    region generated for it said ``const float const,`` and the model build
+    stopped there. That loop reaches the transformation at all because this
+    branch released the halo bound, so the collision is this branch's to
+    refuse. A rename is not attempted: it would have to reach every place the
+    backend writes a name.
+    """
+    _, loop, kernel = keyword_formal_target
+    # The transformation reaches the kernel schedule the same way.
+    # pylint: disable-next=protected-access
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    with pytest.raises(TransformationError) as error:
+        # pylint: disable-next=protected-access
+        LFRicKokkosTrans._validate_formals(schedule)
+
+    assert ("cannot name the kernel formal 'const' in the generated region, "
+            "because it is a C++ keyword" in str(error.value))
+
+    # And the loop as a whole is refused, rather than a region being written
+    # that no compiler would take.
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'const'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_rejects_a_cxx_keyword_local(keyword_local_target):
+    """A kernel-local of a C++ keyword's name is refused as a formal is.
+
+    The launch declares a local in the scope it generates the kernel body
+    into, where the name is no more writable than it is in the signature.
+    """
+    _, loop, kernel = keyword_local_target
+    # pylint: disable-next=protected-access
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    with pytest.raises(TransformationError) as error:
+        # pylint: disable-next=protected-access
+        LFRicKokkosTrans._validate_locals(schedule)
+
+    assert ("cannot name the kernel local 'new' in the generated region, "
+            "because it is a C++ keyword" in str(error.value))
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'new'" in str(error.value)
+
+
 def test_lfric_kokkos_trans_reports_an_unwritable_shape(
         unwritable_shape_target):
     """A declared shape the C writer cannot render is refused, not raised.
@@ -7508,36 +7803,56 @@ def test_lfric_kokkos_trans_iteration_space_predicate_refuses_a_dof_loop(
             in str(error.value))
 
 
-def test_lfric_kokkos_trans_halo_depth_predicate_refuses_a_depth(target):
-    """A halo depth is one of the two rules about where the loop runs."""
+def test_lfric_kokkos_trans_halo_depth_predicate_accepts_counted_bounds(
+        target):
+    """Every bound counting from the first cell or dof passes the rule.
+
+    A depth and a depthless halo bound are one question rather than two:
+    'cell_halo' with no depth carries no halo depth to find, and a survey
+    reporting them apart would count one fact twice. Both are now accepted,
+    and so are the three dof bounds, because a launch covers whatever count
+    its loop carried.
+    """
     _, loop, _ = target
     loop._upper_bound_halo_depth = Literal(
         "1", ScalarType(ScalarType.Intrinsic.INTEGER,
                         ScalarType.Precision.UNDEFINED))
 
-    with pytest.raises(TransformationError) as error:
+    for bound in ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo"):
+        loop._upper_bound_name = bound
         LFRicKokkosTrans._validate_halo_depth(loop)
 
-    assert ("LFRicKokkosTrans does not support a halo depth."
-            in str(error.value))
 
+def test_lfric_kokkos_trans_halo_depth_predicate_refuses_an_unknown_bound(
+        target):
+    """A bound that is not a count from the first cell is refused by name.
 
-def test_lfric_kokkos_trans_halo_depth_predicate_refuses_halo_bounds(target):
-    """A depthless halo bound is refused by the same predicate.
-
-    'cell_halo' with no depth carries no halo depth to find, so the bounds
-    rule is what catches it. The two belong together: both are about which
-    cells the loop visits, and a survey reporting them apart would count one
-    fact twice.
+    The coloured bounds are the ones this excludes: they index a colour map
+    rather than counting, so a launch from zero to one of them would run the
+    wrong cells. A loop carrying one is refused for its iteration space too,
+    but the survey asks each rule on its own and this one has its own answer.
     """
     _, loop, _ = target
-    loop._upper_bound_name = "cell_halo"
+    loop._upper_bound_name = "ncolour"
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans._validate_halo_depth(loop)
 
-    assert ("LFRicKokkosTrans supports only owned-cell bounds."
+    assert ("LFRicKokkosTrans does not support the 'ncolour' loop bound."
             in str(error.value))
+
+
+def test_lfric_kokkos_trans_halo_depth_predicate_refuses_a_shifted_start(
+        target):
+    """The lower-bound half of the same rule is askable on its own."""
+    _, loop, _ = target
+    loop._lower_bound_name = "cell_halo_start"
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_halo_depth(loop)
+
+    assert ("LFRicKokkosTrans supports only a loop starting at the first "
+            "cell or dof." in str(error.value))
 
 
 def test_lfric_kokkos_trans_evaluator_predicate_refuses_an_unmodelled_shape(

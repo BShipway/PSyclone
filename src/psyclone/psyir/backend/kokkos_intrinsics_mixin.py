@@ -51,7 +51,7 @@ from psyclone.psyir.backend.c_intrinsics_mixin import _is_real_argument
 from psyclone.psyir.backend.kokkos_array_intrinsics import (
     KokkosArrayIntrinsics)
 from psyclone.psyir.backend.visitor import VisitorError
-from psyclone.psyir.nodes import IntrinsicCall, Reference
+from psyclone.psyir.nodes import Assignment, IntrinsicCall, Reference
 from psyclone.psyir.symbols import DataSymbol
 
 
@@ -64,6 +64,28 @@ class KokkosIntrinsicsMixin:
     host functions. Everything here is one of those two corrections, or an
     intrinsic the C writer has no handler for at all.
     """
+
+    #: How a power the integer-power tree did not write is spelt. The C
+    #: writer's ``pow`` is C's, and binds ``double`` whatever it is given, so
+    #: a kernel writing ``exner_cell ** onemk_over_k`` at ``r_solver``
+    #: computed it in double and rounded the answer back to ``float``, where
+    #: gfortran called ``powf`` and rounded once. That is not a tolerance
+    #: question: ``sample_eos_operators_code`` is the first captured region
+    #: whose power is single precision, and it moved the C16_MG whole-model
+    #: checksums by about one part in ``1e12`` for this alone.
+    #:
+    #: ``Kokkos::pow`` is overloaded, so the width follows the operands as it
+    #: does in Fortran, and a double power stays the library call it already
+    #: was. The qualification is also the one every function in
+    #: :py:attr:`_KOKKOS_FUNCTIONS` carries, and for the same reason: an
+    #: unqualified name is a host function.
+    #:
+    #: A real base with a non-literal *integer* exponent is neither fixed nor
+    #: worsened by this. gfortran expands that one into ``__builtin_powi``,
+    #: which is a product tree of its own and neither ``pow`` nor
+    #: ``Kokkos::pow``; both compute it in double, as they did before. No
+    #: captured region writes one.
+    _POW_FUNCTION = "Kokkos::pow"
 
     #: Intrinsics that become a plain ``Kokkos::`` function call, by the name
     #: Kokkos gives them. Qualification is required for device code -- an
@@ -295,6 +317,34 @@ class KokkosIntrinsicsMixin:
         argument = self._visit(node.arguments[0])
         return f"({allowed[0]})Kokkos::{name}({argument})"
 
+    @staticmethod
+    def _written_by_the_array_tier(call):
+        """Answer whether the array-valued tier writes this call for us.
+
+        Being one of that tier's intrinsics is not enough: the tier generates
+        a loop nest over an assignment's *destination*, so it writes such a
+        call on a right-hand side and in no other position. A reduction read
+        in a condition, in a subscript or as an actual argument is left to the
+        ordinary handler, which is why this asks where the call is as well as
+        what it is.
+
+        :param call: the intrinsic call to judge.
+        :type call: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+
+        :returns: whether the array-valued tier writes it where it stands.
+        :rtype: bool
+        """
+        if not KokkosArrayIntrinsics.handles(call):
+            return False
+        assignment = call.ancestor(Assignment)
+        if assignment is None:
+            return False
+        # Identity rather than equality: two calls of the same intrinsic on
+        # the same operands compare equal, and which side of the assignment
+        # this one is on is exactly the question.
+        return any(node is call
+                   for node in assignment.rhs.walk(IntrinsicCall))
+
     def unsupported_intrinsics(self, schedule, kind_types=()):
         """Return the intrinsics in a body that this writer cannot spell.
 
@@ -310,8 +360,15 @@ class KokkosIntrinsicsMixin:
         from its argument's kind -- ``EPSILON`` -- is still answered, while an
         array the region never described is not looked up and an argument that
         is itself unwritable does not stand in for the call. The intrinsics of
-        the array-valued tier are not asked at all: they are not written by a
-        handler, and lowering replaces them before the writer meets one.
+        the array-valued tier are not asked *where that tier writes them*: they
+        are not written by a handler, and the tier replaces them before the
+        writer meets one. Where it writes them is the right-hand side of an
+        assignment, that tier generating a nest over the destination, and
+        nowhere else. ``if (MINVAL(smap_sizes) == 1)`` --
+        ``edge_lump_w2_mass_matrix_code``'s test for a domain edge -- is a
+        reduction in a condition, which no tier writes and which reaches the
+        handler that has no spelling for it. Skipping it for its name alone
+        let ``validate`` accept a kernel ``apply`` then refused.
 
         :param schedule: the body to search.
         :type schedule: :py:class:`psyclone.psyir.nodes.Node`
@@ -328,7 +385,7 @@ class KokkosIntrinsicsMixin:
         refused = []
         for call in schedule.walk(IntrinsicCall):
             if call.intrinsic in self._QUERIES \
-                    or KokkosArrayIntrinsics.handles(call):
+                    or self._written_by_the_array_tier(call):
                 continue
             probe = call.copy()
             for argument in probe.arguments:

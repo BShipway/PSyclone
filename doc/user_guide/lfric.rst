@@ -4387,7 +4387,27 @@ beside it are scalars; and a field on the fine mesh brings its dofmap whole,
 ``map_f(:,:)``, which is what the PSy layer passes and what the region
 therefore declares. The second mesh reaches the region as data and never as
 an iteration space: ``ncell_f`` is the extent the fine dofmap is strided by,
-not a bound anything is launched over. The
+not a bound anything is launched over. A loop that iterates into the
+halo is accepted, and the halo exchange stays where the PSy layer put it.
+The launch's upper bound crosses the interface as a scalar formal filled with
+the loop's own stop expression, so what that bound means is settled in the PSy
+layer and only its value reaches the region: a literal depth, whose bound the
+PSy layer writes as ``mesh%get_last_halo_cell(1)``; a dof loop over the
+annexed dofs, written
+``field_proxy%vspace%get_last_dof_annexed()``; and a depth computed at run
+time, ``mesh%get_last_halo_cell(depth)``, whose depth expression is evaluated
+where it already was and never crosses. Every per-cell View is sliced to that
+same formal, so a region running into the halo describes the cells it runs
+over rather than the owned ones. What such bounds have in common is that each
+counts consecutively from the first cell or dof; a loop whose *lower* bound is
+shifted into the halo -- ``halo_cell_column``, which runs the halo alone --
+is still refused, there being no lower-bound formal to fill. Nothing is
+exchanged inside a region: the exchange the PSy layer emits in front of the
+loop is lowered in front of the call to the region.
+A kernel symbol whose name Fortran allows and C++ reserves is refused,
+whether it is a formal or a local. Fortran reserves no words, so ``const``,
+``new`` and ``operator`` are ordinary variable names, and one written out as
+a C++ identifier gives a region no compiler will take. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 

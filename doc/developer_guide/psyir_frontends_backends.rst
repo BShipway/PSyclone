@@ -492,6 +492,19 @@ optimisation level -- the binary method at `-O0` and `-Og`, GCC's
 matches Fortran at every level. The exponents the model's kernels use, two
 through four and seven and eight, are the same text under both methods.
 
+What the rule declines becomes a call, and the *name* of that call belongs to
+the back-end. `CIntrinsicsMixin._POW_FUNCTION` is `pow` for the C writer,
+which is right there: C's `pow` takes and returns `double`, and C has no
+Fortran kind for it to disagree with. It is wrong for a back-end whose
+operands carry one. A single-precision `x ** y` written as `pow` is computed
+in double and rounded back to `float`, where gfortran calls `powf` and rounds
+once; the two differ in the last bit for the same reason the product tree
+exists at all. The Kokkos back-end overrides the attribute with `Kokkos::pow`,
+which is overloaded, so the width follows the operands as it does in Fortran,
+and a double power stays the library call it already was. That difference,
+like the integer one, was found by a generated LFRic region failing to
+reproduce the model's checksums bit for bit, and by nothing else.
+
 `CWriter.arrayconstructor_node` writes an array constructor as one
 assignment per element rather than as a value, because C has no array-valued
 expression. `assignment_node` therefore hands an assignment whose right-hand
@@ -643,6 +656,17 @@ width, and is the one intrinsic here that refuses instead of falling through.
 There is no kind-blind spelling to fall back to: the trait is a template over
 the type, so a region that does not describe the argument's kind raises a
 `VisitorError` naming `kind_types` rather than guessing at `double`.
+
+`**` is not an intrinsic call but an operator, and the only part of it this
+writer touches is the name of the function `CWriter` falls back to when the
+integer-power tree declines. `_POW_FUNCTION` overrides that name with
+`Kokkos::pow`. The qualification is the one every function above carries, and
+the overloading is the reason it matters here beyond device code: C's `pow`
+binds `double` whatever it is given, so a power over `real(kind=r_solver)`
+operands was computed in double and rounded back, where gfortran called
+`powf` and rounded once. `Kokkos::pow` lets the width follow the operands, and
+a double power resolves to the library call it always was. The tree itself is
+`CWriter`'s and is not touched: this writer has no `binaryoperation_node`.
 
 `unsupported_intrinsics(schedule, kind_types)` answers the opposite question
 -- which of a body's intrinsics this writer could not spell -- so that a
