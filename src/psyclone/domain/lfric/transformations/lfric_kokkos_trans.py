@@ -176,6 +176,27 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     stencil kernel written as a generic interface is still refused there
     whatever its shape.
 
+    **A basis is accepted by shape** too, and the accepted shapes are
+    :py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ`` and
+    ``gh_evaluator``. Neither needs argument machinery of its own. XYoZ
+    quadrature adds two point counts, two weight arrays and one basis array
+    per function space that asked for one, shaped
+    ``(dim, ndf, np_xy, np_z)``; an evaluator adds no rule at all, tabulating
+    the basis at the nodal points of a target function space to give
+    ``(dim, ndf, ndf of the target)`` and no weights. Every one of those is an
+    argument the PSy layer has computed before the loop and every extent of it
+    is a formal of the same kernel, so the existing scalar and View
+    descriptions cover them whole. A kernel may name both shapes, in which
+    case each space it declares carries a basis array per shape; each shape is
+    checked on its own so that a refusal names the one that is not modelled
+    rather than the whole set.
+
+    Face and edge quadrature are refused by name. They carry a face or edge
+    count and a single point count in place of the XYoZ pair, and while the
+    same descriptions look as though they would cover those too, nothing here
+    has been measured against the model for them. Refusing by name says that;
+    accepting on the strength of the resemblance would not.
+
     **A called subroutine is inlined, not called.** The generated region is
     a C++ function and there is no Fortran for it to call into, so a kernel
     that calls a helper has that helper's statements made its own before

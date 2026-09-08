@@ -4316,7 +4316,20 @@ own signature, while the arithmetic the kernel writes over it --
 ``ik = (cell - 1) * nlayers + 1``, by which a kernel finds its column's slice
 of the operator -- is generated unchanged. If the PSy layer ever supplied
 something other than the loop variable there, the transformation refuses
-rather than binding the wrong index. The
+rather than binding the wrong index. A kernel that asks for a basis is
+accepted when every shape it names is ``gh_quadrature_XYoZ`` or
+``gh_evaluator``, and refused by name otherwise. Neither adds anything to the
+ABI: XYoZ quadrature gives the kernel two point counts, two weight arrays and
+one basis array per function space that asked for one, over
+``(dim, ndf, np_xy, np_z)``, while an evaluator gives it no rule at all,
+tabulating the basis at the nodal points of a target space to give
+``(dim, ndf, ndf of the target)`` and no weights. Every one of those is an
+argument the PSy layer has computed before the loop and every extent of it is
+a formal of the same kernel, so the ordinary scalar and View descriptions
+cover them whole; a kernel may name both shapes, and then carries a basis
+array per shape on each of its spaces. Face and edge quadrature are refused by
+name, because they replace the XYoZ pair with a face or edge count and a
+single point count and nothing here has been measured against them. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 
