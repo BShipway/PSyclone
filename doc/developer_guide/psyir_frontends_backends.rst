@@ -380,10 +380,13 @@ Additionally, there are three partially-implemented back-ends
   through to `CWriter`'s. `KokkosConstant` in
   `psyclone.psyir.backend.kokkos_constant` is a third,
   `KokkosArrayExpressionMixin` in
-  `psyclone.psyir.backend.kokkos_array_expression` a fourth, and
+  `psyclone.psyir.backend.kokkos_array_expression_mixin` a fourth,
+  `KokkosArrayExpression` in
+  `psyclone.psyir.backend.kokkos_array_expression` -- the lowering that
+  fourth hands an array expression to -- a fifth, and
   `KokkosArrayIntrinsics` in
-  `psyclone.psyir.backend.kokkos_array_intrinsics` -- which that fourth owns
-  one of per region -- a fifth; all are described below. The
+  `psyclone.psyir.backend.kokkos_array_intrinsics` -- which that fifth owns
+  one of per region -- a sixth; all are described below. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -874,9 +877,13 @@ and `KokkosArrayExpression` in
 public surface is two methods: `ranks(node)` reports the shape an expression
 produces, one extent per dimension in the same string form a View's `extents`
 take, and `lower(node, into=None)` generates the source that evaluates it.
-`KokkosArrayExpressionMixin` supplies the writer's `assignment_node` and the
-handlers the nest needs, and is inherited ahead of `CWriter` for the same
-reason `KokkosIntrinsicsMixin` is.
+`KokkosArrayExpressionMixin`, in
+`psyclone.psyir.backend.kokkos_array_expression_mixin`, supplies the writer's
+`assignment_node` and the handlers the nest needs, and is inherited ahead of
+`CWriter` for the same reason `KokkosIntrinsicsMixin` is. The two are separate
+modules because they grow for different reasons: the lowering gains code when
+a new shape of array expression has to be generated, and the mixin when the
+writer claims a new node kind or changes what it hands on to `CWriter`.
 
 The destination decides which of two shapes is generated. Given an `into`,
 the value is written straight into it and nothing is allocated:

@@ -541,7 +541,7 @@ KokkosArrayExpression._space` gives one, or the empty tuple.
         :type node: :py:class:`psyclone.psyir.nodes.Node`
         :param indices: the generated index of each of its dimensions, as
             Fortran subscripts: the origin of the array is removed by
-            :py:meth:`~psyclone.psyir.backend.kokkos_array_expression.\
+            :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
 KokkosArrayExpressionMixin.arrayreference_node`, which every access reaches.
         :type indices: list[str]
 
@@ -588,7 +588,7 @@ KokkosArrayExpressionMixin.arrayreference_node`, which every access reaches.
         The result's subscripts are packed into a zero-based position in the
         leading-dimension-fastest order both Fortran and ``LayoutLeft`` use,
         and the source's own origin is added back, so that the access reaches
-        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression.\
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
 KokkosArrayExpressionMixin.arrayreference_node` as a Fortran subscript like
         every other.
 
