@@ -364,6 +364,11 @@ Additionally, there are three partially-implemented back-ends
   call to `pow`, so that `x ** 2` is `(x * x)`; which exponents that covers,
   and why the rest keep `pow`, is set out there too, as is which intrinsics
   the subset contains and why four of them depend on their argument's type.
+  The three handlers that answer from those tables -- unary operations,
+  binary operations and intrinsic calls -- are `CIntrinsicsMixin` in
+  `psyclone.psyir.backend.c_intrinsics_mixin`, inherited by `CWriter` ahead
+  of `LanguageWriter`, so that the part of the backend that grows one table
+  entry at a time is separate from the statements and control flow around it.
 - `KokkosWriter()` in `psyclone.psyir.backend.kokkos` which extends
   `CWriter` to generate a complete C++/Kokkos translation unit. It is not
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
@@ -402,6 +407,14 @@ Additionally, there are three partially-implemented back-ends
 C back-end
 ++++++++++
 
+The three handlers below are inherited from `CIntrinsicsMixin` in
+`psyclone.psyir.backend.c_intrinsics_mixin` rather than written in
+`psyclone.psyir.backend.c`, and are named `CWriter.<handler>` here because
+that is where a caller reaches them. Operators and intrinsics share the one
+module because they share decisions: `MOD` is an intrinsic spelt as C's `%`
+operator, `**` is an operator spelt as the `pow` function, and four
+intrinsics are chosen by their argument's type.
+
 `CWriter.intrinsiccall_node` translates an `IntrinsicCall` through a table
 that gives each supported intrinsic a C spelling and one of five formatters:
 an infix operator, a function call, a cast, a cast wrapped round a function
@@ -413,7 +426,8 @@ Four intrinsics have no single right spelling, because Fortran overloads them
 on their argument's type and C does not. `REAL_INTRINSIC_ALTERNATIVES` gives
 the real spelling of each -- `ABS` becomes `fabs`, `MOD` becomes `fmod`,
 `MAX` and `MIN` become `fmax` and `fmin` -- and the module-level helper
-`_is_real_argument` chooses between that and the table entry. Choosing wrongly
+`_is_real_argument`, in the same module, chooses between that and the table
+entry. Choosing wrongly
 is silent in one direction and loud in the other: `abs` binds `::abs(int)` and
 truncates a real, while `%` does not compile for one.
 
@@ -575,7 +589,8 @@ implementation on a GPU and forwards to `<cmath>` on a host build.
 nothing: `ACOS`, `ASIN`, `ATAN`, `ATAN2`, `COS`, `EXP`, `LOG`, `SIN`, `SQRT`
 and `TAN` keep their names, and `SIGN` becomes `copysign`. `ABS` and `MOD`
 are not in it, because they are the two that `CWriter` already spells by
-their argument's type: this writer reuses `_is_real_argument` and generates
+their argument's type: this writer reuses `_is_real_argument` from
+`psyclone.psyir.backend.c_intrinsics_mixin` and generates
 `Kokkos::fabs` or `Kokkos::abs`, and `Kokkos::fmod` for a real `MOD` while
 leaving an integer one to `CWriter`'s `%`.
 

@@ -40,7 +40,8 @@
 import pytest
 
 from psyclone.errors import GenerationError, InternalError
-from psyclone.psyir.backend.c import CWriter, _is_real_argument
+from psyclone.psyir.backend.c import CWriter
+from psyclone.psyir.backend.c_intrinsics_mixin import _is_real_argument
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Call,
