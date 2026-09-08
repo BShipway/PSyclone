@@ -472,6 +472,58 @@ end program kokkos_shared_write_test
 """
 
 
+# The shape of shared write an atomic cannot answer: the shared field takes
+# the value of an array-valued intrinsic, which the C writer accumulates in
+# a nest of its own. A section alone does not do it -- those are lowered to
+# PSyIR loops before the question is asked, and each statement the lowering
+# leaves is an ordinary read-modify-write an atomic does carry. Real GungHo
+# kernels write this way -- 'nodal_coordinates' and 'strong_curl' among
+# them -- and the coloured arm is what carries them.
+_WHOLE_ARRAY_INC_KERNEL = """
+module whole_inc_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_inc, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: whole_inc_probe_kernel_type
+    type(arg_type) :: meta_args(2) = (/                        &
+         arg_type(gh_field, gh_real, gh_inc,  w2),             &
+         arg_type(gh_field, gh_real, gh_read, w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: whole_inc_probe_code
+  end type whole_inc_probe_kernel_type
+contains
+  subroutine whole_inc_probe_code(nlayers, acc, src, &
+                                  ndf_w2, undf_w2, map_w2, &
+                                  ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: acc
+    real(kind=r_def), dimension(undf_w3), intent(in) :: src
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    real(kind=r_def), dimension(ndf_w2, ndf_w3) :: weights
+    weights(:, :) = 1.0_r_def
+    acc(1:ndf_w2) = matmul(weights, src(1:ndf_w3))
+  end subroutine whole_inc_probe_code
+end module whole_inc_probe_kernel_mod
+"""
+
+
+_WHOLE_ARRAY_INC_ALGORITHM = """
+program kokkos_whole_array_inc_test
+  use field_mod, only : field_type
+  use whole_inc_probe_kernel_mod, only : whole_inc_probe_kernel_type
+  implicit none
+  type(field_type) :: acc, src
+  call invoke(whole_inc_probe_kernel_type(acc, src))
+end program kokkos_whole_array_inc_test
+"""
+
+
 # The shared write in the shape GungHo writes it most often: 'matrix_vector',
 # an operator applied to a field and accumulated onto a continuous space. The
 # operator is what makes this different from 'inc_probe_kernel_mod' -- LFRic
@@ -9172,3 +9224,78 @@ def test_lfric_kokkos_trans_declares_each_ndf_once(shared_write_target):
     for space in ("w2", "w3"):
         assert f"integer(kind=i_def) :: ndf_{space}\n" in fortran
         assert f"ndf_{space}_1" not in fortran
+
+
+def test_lfric_kokkos_trans_refuses_a_whole_array_shared_update(
+        tmp_path, clear_module_manager_instance):
+    # pylint: disable=unused-argument
+    """A shared field written whole is refused, and told what does carry it.
+
+    An atomic covers one statement. A shared field given the value of
+    ``MATMUL`` is not written by a statement the region holds: the writer
+    accumulates it in a nest, and what would have to be made atomic is that
+    nest. The refusal names the other arm rather than only saying no,
+    because colouring is what captures these kernels.
+    """
+    _, loop, _ = _invoke(
+        tmp_path, "whole_inc_probe", _WHOLE_ARRAY_INC_ALGORITHM,
+        _WHOLE_ARRAY_INC_KERNEL)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("updates the shared field 'acc' with a whole-array expression, "
+            "which no single atomic carries out. Colour the loop instead."
+            in str(error.value))
+
+
+def test_lfric_kokkos_trans_knows_which_first_actual_is_a_cell(
+        shared_write_operator_target):
+    """Only the two spellings of the loop's cell are read as one.
+
+    An operator kernel takes the cell index as its first argument, and the
+    generated region has to name the launch index there instead. Two
+    spellings mean the cell -- the loop's own variable, or its entry in the
+    colour map -- and anything else has to be refused rather than renamed,
+    because renaming it would silently pass the launch index where the
+    kernel expected something else. Neither of the other shapes reaches
+    here from LFRic today, so they are asked of the classifier directly.
+    """
+    _, loop, kernel = shared_write_operator_target
+    integer = ScalarType.integer_type()
+    unrelated = DataSymbol("lookup", ArrayType(integer, [2, 2]))
+
+    assert LFRicKokkosTrans._is_the_loops_cell(
+        kernel, loop, Reference(loop.variable))
+    assert not LFRicKokkosTrans._is_the_loops_cell(
+        kernel, loop, Literal("1", integer))
+    assert not LFRicKokkosTrans._is_the_loops_cell(
+        kernel, loop, ArrayReference.create(
+            unrelated, [Literal("1", integer), Literal("1", integer)]))
+
+
+def test_lfric_kokkos_trans_refuses_a_formal_count_the_metadata_denies(
+        shared_write_target, monkeypatch):
+    """Which formals are shared is read by position, so counts must agree.
+
+    The metadata says which arguments are shared and the walk that reads it
+    gives their positions; the names are the kernel's own formals in the
+    same order. If the two lengths differ then no position can be trusted
+    and a wrong formal would be declared shared, so the mismatch is refused
+    rather than indexed into. LFRic checks the same agreement earlier, which
+    is why the disagreement is arranged here instead of written in Fortran.
+    """
+    _, loop, _ = shared_write_target
+    monkeypatch.setattr(
+        LFRicKokkosTrans, "_implicit_extents",
+        classmethod(lambda cls, table: {"acc": ("acc", 1)}))
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert ("cannot say which formals of 'inc_probe_code' are shared between "
+            "cells" in message)
+    counts = re.search(
+        r"declares (\d+) of them and its metadata describes (\d+)\.", message)
+    assert counts and int(counts.group(2)) - int(counts.group(1)) == 1
