@@ -682,6 +682,425 @@ def test_kokkos_flat_shapes_ignore_team_size():
             KokkosWriter()(region)
 
 
+def _private_schedule():
+    """Create a body whose spread loop keeps its working values in scalars.
+
+    Both kinds of loop-private scalar are here, because both are declared by
+    the same rule and a body with only one of them would leave the other to
+    an assertion rather than to the generator: ``weight`` is written and read
+    back within one level, and ``df`` is the counter of a loop nested inside
+    that level. Neither is read before the level writes it and neither is
+    read once the level loop has finished, so each level owns its own.
+    """
+    source = """
+subroutine private_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k, df
+  real(kind=r_double) :: weight
+  do k = 1, nlayers
+    weight = 0.5_r_double * x(map(1) + k - 1)
+    do df = 1, ndf
+      y(map(df) + k - 1) = weight + y(map(df) + k - 1)
+    end do
+  end do
+end subroutine private_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "private_code", symbol_table=symbol_table, children=children)
+
+
+def _private_region(**overrides):
+    """Return a region whose spread loop owns every scalar it writes.
+
+    Its ABI is ``_scratch_region``'s, as ``_level_region``'s is.
+
+    :param overrides: fields to replace on the region.
+    :type overrides: dict
+
+    :returns: the region to hand the writer.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    schedule = _private_schedule()
+    region = KokkosRegion(
+        name="private_kokkos",
+        schedule=schedule,
+        cell_count="ncells",
+        arguments=_scratch_region().arguments,
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(),
+        parallel_loops=(schedule.walk(Loop)[0],))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_spread_loop_declares_its_scalars_inside_the_lambda():
+    """A scalar the spread loop writes is declared by each iteration.
+
+    Declared at the top of the team body it is one object per member, and
+    the levels are handed out between the members: when the loop ends it
+    holds the last level *that member* ran, which is a value no statement
+    should be able to read. Moving the declaration inside the lambda gives
+    every iteration its own and takes the name out of scope afterwards.
+    """
+    code = KokkosWriter()(_private_region())
+
+    opened = code.index("        [&](const int k) {\n")
+    closed = code.index("    });\n", opened)
+    assert "      double weight;\n" in code[opened:closed]
+    # Not both: the region-scope declaration is removed rather than
+    # shadowed, so that a member reading the outer one is a compile error
+    # here and not a wrong answer on the machine this is generated for.
+    assert "\n    double weight;\n" not in code
+
+
+def test_kokkos_spread_loop_declares_its_inner_counters_inside_the_lambda():
+    """The counter of a loop inside the spread loop is private too.
+
+    It is written by the inner loop's own initialisation before anything
+    reads it and nothing reads it afterwards, which is the same rule the
+    working scalars meet; the counter is worth its own test because it is
+    the one the kernel author never declared and so never thinks about.
+    """
+    code = KokkosWriter()(_private_region())
+
+    opened = code.index("        [&](const int k) {\n")
+    closed = code.index("    });\n", opened)
+    assert "      int df;\n" in code[opened:closed]
+    assert "\n    int df;\n" not in code
+    # The loop itself is still the serial one each member runs: only where
+    # its counter is declared has changed.
+    assert "for(df=1; df<=ndf; df+=1)" in code[opened:closed]
+
+
+def _live_out_schedule():
+    """Create a body reading a scalar after the loop that wrote it.
+
+    The level loop leaves ``running`` holding the last level's value and the
+    statement after it reads that value, which is a loop-carried use: the
+    loop cannot be spread over the team at all, whatever the writer does
+    with the declaration. A second loop follows so that the same body can
+    also be generated with a different loop chosen.
+    """
+    source = """
+subroutine live_out_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k, df
+  real(kind=r_double) :: running
+  do k = 1, nlayers
+    running = x(map(1) + k - 1) * 2.0_r_double
+    y(map(1) + k - 1) = running
+  end do
+  do df = 1, ndf
+    y(map(df) + nlayers) = x(map(df) + nlayers)
+  end do
+  y(map(1) + nlayers) = running
+end subroutine live_out_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "live_out_code", symbol_table=symbol_table, children=children)
+
+
+def _live_out_region(loop=0):
+    """Return a region spreading one of the two loops of that body.
+
+    :param loop: which of the body's loops to spread, in source order.
+    :type loop: int
+
+    :returns: the region to hand the writer.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    schedule = _live_out_schedule()
+    return KokkosRegion(
+        name="live_out_kokkos",
+        schedule=schedule,
+        cell_count="ncells",
+        arguments=_scratch_region().arguments,
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(),
+        parallel_loops=(schedule.walk(Loop)[loop],))
+
+
+def test_kokkos_scalar_read_after_the_spread_loop_stays_outside():
+    """A scalar the body reads after the loop is not hidden in the lambda.
+
+    Moving it inside would silence the C++ compiler, which is the whole
+    danger: the statement after the loop would then read a differently named
+    object and the wrong answer would arrive with no diagnostic anywhere.
+    The value it wants belongs to the last level, and after a spread no
+    member holds it, so the region is refused instead.
+
+    With the other loop chosen the same scalar is generated exactly as it
+    was: nothing is moved out of a loop that was not spread.
+    """
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(_live_out_region())
+    message = str(err.value)
+    assert "running" in message
+    assert "live_out_kokkos" in message
+
+    code = KokkosWriter()(_live_out_region(loop=1))
+    assert "        [&](const int df) {\n" in code
+    assert "\n    double running;\n" in code
+    assert "\n      double running;\n" not in code
+
+
+def _spread_region(body, loop=0):
+    """Return a region spreading one loop of a body given as Fortran.
+
+    The declarations are fixed and the statements are not, so that a rule
+    about scalars can be exercised by writing the statements that break it
+    rather than by building a schedule by hand.
+
+    :param body: the executable part of the kernel, indented as Fortran.
+    :type body: str
+    :param loop: which of the body's loops to spread, in source order; a
+        tuple to spread more than one.
+    :type loop: int | Tuple[int]
+
+    :returns: the region to hand the writer.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    source = f"""
+subroutine spread_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k, df
+  real(kind=r_double) :: weight, total
+{body}
+end subroutine spread_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    schedule = KernelSchedule.create(
+        "spread_code", symbol_table=symbol_table, children=children)
+    indices = (loop,) if isinstance(loop, int) else loop
+    return KokkosRegion(
+        name="spread_kokkos",
+        schedule=schedule,
+        cell_count="ncells",
+        arguments=_scratch_region().arguments,
+        kind_types=(("r_double", "double"), ("i_def", "int")),
+        scratch=(),
+        parallel_loops=tuple(
+            schedule.walk(Loop)[index] for index in indices))
+
+
+def test_kokkos_spread_loop_takes_a_scalar_every_branch_writes():
+    """A scalar written by both arms of an ``if`` is written by the level.
+
+    Whichever arm runs leaves the iteration's own value in it, so it is
+    private on the same terms as one written unconditionally. This is the
+    case
+    :py:meth:`~psyclone.psyir.tools.dependency_tools.DependencyTools._is_scalar_parallelisable`
+    is not asked about: it takes the first access to a scalar anywhere in the
+    loop and does not ask which branches reach it.
+    """
+    code = KokkosWriter()(_spread_region("""
+  do k = 1, nlayers
+    if (x(map(1) + k - 1) > 0.0_r_double) then
+      weight = 1.0_r_double
+    else
+      weight = 2.0_r_double
+    end if
+    y(map(1) + k - 1) = weight
+  end do
+"""))
+
+    opened = code.index("        [&](const int k) {\n")
+    closed = code.index("    });\n", opened)
+    assert "      double weight;\n" in code[opened:closed]
+    assert "\n    double weight;\n" not in code
+
+
+@pytest.mark.parametrize("case, body", [
+    ("one branch", """
+  do k = 1, nlayers
+    if (x(map(1) + k - 1) > 0.0_r_double) then
+      weight = 1.0_r_double
+    end if
+    y(map(1) + k - 1) = weight
+  end do
+"""),
+    ("accumulated", """
+  do k = 1, nlayers
+    weight = weight + x(map(1) + k - 1)
+    y(map(1) + k - 1) = weight
+  end do
+"""),
+    ("written in a while", """
+  do k = 1, nlayers
+    do while (weight < x(map(1) + k - 1))
+      weight = weight + 1.0_r_double
+    end do
+    y(map(1) + k - 1) = weight
+  end do
+"""),
+])
+def test_kokkos_spread_loop_refuses_a_scalar_an_iteration_reads_first(
+        case, body):
+    """A level reading a scalar it has not yet written cannot be spread.
+
+    Each of these carries a value from one iteration into the next, which is
+    what a spread destroys: an ``if`` with no ``else`` leaves the previous
+    level's value in place, an accumulation reads it on purpose, and a
+    ``while`` is not analysed at all, so what it writes is not known to have
+    been written. The third is refused for being unknown rather than for
+    being wrong, which is the safe direction: the answer costs a loop its
+    spread and never a wrong number.
+    """
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(_spread_region(body))
+    assert "reads before it writes" in str(err.value), case
+    assert "weight" in str(err.value)
+
+
+def test_kokkos_spread_loop_refuses_a_scalar_on_the_interface():
+    """A formal the loop writes is refused: it cannot be moved anywhere.
+
+    A kernel argument is a parameter of the generated function and part of
+    the region's ABI, so there is no declaration to move inside the lambda
+    and no way for a member to have its own. LFRic's kernels do not write
+    their scalar arguments today, and the check is here because the writer
+    must not depend on that.
+    """
+    region = _spread_region("""
+  do k = 1, nlayers
+    weight = x(map(1) + k - 1)
+    y(map(1) + k - 1) = weight
+  end do
+""")
+    table = region.schedule.symbol_table
+    formals = list(table.argument_list)
+    symbol = table.lookup("weight")
+    symbol.interface = ArgumentInterface(ArgumentInterface.Access.READWRITE)
+    table.specify_argument_list(formals + [symbol])
+    # Described as well as declared, or the region is refused a step earlier
+    # for an argument it does not account for.
+    region = replace(
+        region,
+        arguments=region.arguments + (KokkosScalar("weight", "double"),))
+
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(region)
+    assert "not a local of the kernel but part of its interface" in \
+        str(err.value)
+
+
+def test_kokkos_spread_loop_shadows_a_scalar_the_body_also_uses():
+    """A scalar used at team level as well keeps both declarations.
+
+    ``weight`` is a working value in the spread loop and a working value
+    again in the statements after it, and every use writes it before reading
+    it. The loop's members each need their own; the statements after it need
+    something to name. So the private declaration shadows the region-scope
+    one rather than replacing it, which is what an LFRic kernel reusing one
+    temporary through a long body needs -- the alternative refuses the region
+    over a name.
+    """
+    code = KokkosWriter()(_spread_region("""
+  do k = 1, nlayers
+    weight = x(map(1) + k - 1)
+    y(map(1) + k - 1) = weight
+  end do
+  weight = x(map(1)) * 2.0_r_double
+  y(map(1)) = weight
+"""))
+
+    opened = code.index("        [&](const int k) {\n")
+    closed = code.index("    });\n", opened)
+    assert "      double weight;\n" in code[opened:closed]
+    assert "\n    double weight;\n" in code
+
+
+def test_kokkos_spread_loop_refuses_a_scalar_the_enclosing_loop_carries():
+    """A serial loop around the spread loop runs its earlier statements again.
+
+    The read before the spread loop is a read after it as well, on every
+    iteration of the enclosing loop but the last, so the value the spread
+    destroyed is wanted after all. Liveness that only looked forwards from
+    the loop would miss this and generate a wrong answer silently.
+    """
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(_spread_region("""
+  do df = 1, ndf
+    y(map(df)) = weight
+    do k = 1, nlayers
+      weight = x(map(df) + k - 1)
+    end do
+  end do
+""", loop=1))
+    assert "reads after the loop without writing it first" in str(err.value)
+    assert "weight" in str(err.value)
+
+
+def test_kokkos_spread_loop_refuses_a_scalar_a_while_condition_reads():
+    """The condition of an enclosing ``while`` is a read after the loop.
+
+    It is evaluated once the body has run, on the value the last iteration
+    left behind, which after a spread no member holds. The condition is not
+    a statement of the body and is counted separately for that reason.
+    """
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(_spread_region("""
+  weight = 0.0_r_double
+  do while (weight < 10.0_r_double)
+    do k = 1, nlayers
+      weight = x(map(1) + k - 1)
+    end do
+  end do
+"""))
+    assert "reads after the loop without writing it first" in str(err.value)
+    assert "weight" in str(err.value)
+
+
+def test_kokkos_spread_loop_declares_only_what_it_writes_itself():
+    """A name a second spread loop only reads is not declared in its lambda.
+
+    ``df`` counts a serial loop inside the first spread loop, which makes it
+    that loop's own, and is read by the second, which does not write it at
+    all. A declaration in the second loop's lambda would shadow the value
+    the body left there with an uninitialised object of the same name --
+    which compiles, and which no compiler will say a word about. Privacy is
+    therefore per loop and follows what each loop writes, not what it names.
+    """
+    code = KokkosWriter()(_spread_region("""
+  do k = 1, nlayers
+    do df = 1, ndf
+      y(map(df) + k - 1) = x(map(df) + k - 1)
+    end do
+  end do
+  df = 2
+  do k = 1, nlayers
+    y(map(df) + k - 1) = x(map(1) + k - 1) * 2.0_r_double
+  end do
+""", loop=(0, 2)))
+
+    first = code.index("        [&](const int k) {\n")
+    second = code.index("        [&](const int k) {\n", first + 1)
+    assert "      int df;\n" in code[first:second]
+    assert "      int df;\n" not in code[second:]
+    # The team-level declaration stays: the statements between the two loops
+    # write it and the second loop reads what they wrote.
+    assert "\n    int df;\n" in code
+
+
 def _with_cell_position(region, name="cell"):
     """Return ``region`` with ``name`` prepended to its schedule's formals.
 

@@ -391,7 +391,10 @@ Additionally, there are three partially-implemented back-ends
   fourth hands an array expression to -- a fifth, and
   `KokkosArrayIntrinsics` in
   `psyclone.psyir.backend.kokkos_array_intrinsics` -- which that fifth owns
-  one of per region -- a sixth; all are described below. The
+  one of per region -- a sixth, and `team_private_scalars` in
+  `psyclone.psyir.backend.kokkos_team_scalars` -- which decides, before any
+  code is generated, which of the body's scalars belong to one member of a
+  team -- a seventh; all are described below. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -733,9 +736,66 @@ each iteration's write is wrapped on its own. Scratch moves with the same
 change of meaning: `team.team_scratch(0)` with `PerTeam`, since a per-cell
 temporary is team-shared once a team is a cell.
 
-Which loops may be spread is a dependence judgement, and it is made by
-`LFRicKokkosTrans` rather than here: the back-end renders the loops it is
-given and does not judge them. It does check what it is given, since none of
+A scalar is a third case, and the one whose correctness rests on where its
+declaration is written. Every member has its own copy of a local declared at
+the top of the functor, so a scalar a spread loop writes and reads back
+within an iteration is already the member's own and races with nothing. What
+that placement does not survive is a read *after* the loop: with a team of
+more than one member the value left in a member's copy is the one the last
+iteration that member ran left there, and the member which reads it after the
+barrier need not be the member which ran the loop's last iteration. Under
+`Kokkos::AUTO` on the OpenMP backend a team has one member, the two are the
+same value, and nothing on a host says otherwise.
+
+`kokkos_team_scalars.team_private_scalars` settles this before generation
+rather than leaving it to that coincidence. For each loop the region names,
+it classifies every scalar the loop writes:
+
+- written before anything in the loop reads it, and not live at the loop's
+  exit -- nothing that runs afterwards reads it without writing it first:
+  **loop-private**. Its declaration is generated inside that loop's
+  `TeamVectorRange` lambda, which gives each iteration its own and takes the
+  name out of scope after the loop. The counter of
+  a serial loop nested inside a spread loop is private on the same terms,
+  its initialisation being the write;
+- anything else: **shared**, and the region is refused -- `ValueError` from
+  the writer, which `LFRicKokkosTrans` reports as a `TransformationError` and
+  the LFRic capture script records as an unmodelled region. Refusing the
+  region rather than leaving the declaration where it was is the point: the
+  value such a statement wants belongs to the loop's last iteration, and
+  after a spread no member holds it.
+
+The second half of that test is liveness rather than "used nowhere else",
+because an LFRic kernel reuses its counters and its one or two temporaries
+all through a body -- `df` driving a serial loop at team level and then a
+nested loop inside a spread one, `t1` holding a difference at team level and
+a sum inside a level -- and each of those uses writes before it reads. So a
+private declaration *shadows* the region-scope one wherever the body needs
+both, and the region-scope declaration is dropped only where nothing outside
+the spread loops mentions the name. This is the shadowing the lambda's own
+parameter already does to the loop variable's declaration, for the same
+reason and with the same consequence: the generated code is not compiled
+with `-Wshadow`.
+
+A scalar the loop only reads is neither, and stays where it is: every member
+computed it redundantly at team level, so every member's copy holds the same
+value.
+
+The classification is a flow analysis over the loop body rather than a pair
+of walks, because the property is order-sensitive in a way a walk cannot see.
+A loop whose only write to a scalar is inside an `if` with no `else` reads
+the previous iteration's value whenever the branch is not taken; an `if` with
+an `else` that writes in both arms does not. A construct the analysis does
+not model -- a `while`, a call -- contributes reads and no writes, so a
+scalar it writes is refused for being unknown rather than made private for
+being unexamined. `DependencyTools._is_scalar_parallelisable`, which
+`LFRicKokkosTrans` uses when choosing the loops, takes the first access to a
+scalar anywhere in the loop and does not ask which branches reach it, so the
+back-end's answer is the narrower of the two.
+
+Which loops may be spread is otherwise a dependence judgement, and it is made
+by `LFRicKokkosTrans` rather than here: the back-end renders the loops it is
+given, and judges only what they do to the body's scalars. It does check what it is given, since none of
 the four mistakes announces itself downstream -- an entry must be a `Loop` of
 the region's own schedule, not nested inside another chosen loop, and of unit
 step, `TeamVectorRange` having no stride. `team_size` renders as a literal in
