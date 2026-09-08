@@ -4128,7 +4128,17 @@ precision map decides which implementation of a kind-polymorphic kernel is
 captured: a kernel written as a generic interface over specific procedures
 that differ only in precision is resolved to the one the algorithm layer's
 arguments select, and the generated region is named after that procedure
-rather than after the interface. A field's data may be real or integer:
+rather than after the interface. Choosing between the members asks
+PSyclone's own argument matcher to build the interface each member's
+metadata implies, and that matcher could not build one for a kernel asking
+for an evaluator, which is part of issue #928; rather than compare the
+arguments here and cite the issue, the matcher was taught the shape -- one
+rank-3 basis per target space, no point count and no weights -- so the
+question is asked in the one place that asks it. The same change stops a
+basis on an ``ANY_SPACE_<n>``, whose first extent metadata cannot fix
+(issue #461), being read as the members matching no precision at all: that
+extent is named with a variable, as the PSy layer names it, and is not one
+of the things the matcher compares. A field's data may be real or integer:
 LFRic's ``integer_field_type`` has ``field_type``'s proxy shape with
 ``integer(i_def)`` data, and the element type of the View a field crosses
 on follows that argument's own declaration, so a ``gh_integer`` field is a

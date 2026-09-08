@@ -483,6 +483,18 @@ class LFRicTypes:
             Array("DiffBasisFunctionQrEdge", "LFRicRealScalarDataType",
                   [LFRicTypes("LFRicDimension"), "number of dofs",
                    "number of qr points in edges", "number of edges"], ["fs"]),
+            # An evaluator carries no quadrature rule: the basis is tabulated
+            # at the nodal points of a target function space, so its last
+            # extent is that space's number of dofs rather than a point count.
+            # The target space is a property of the symbol beside its own,
+            # because one function space may be evaluated on several targets
+            # and the arrays are then distinguished only by that.
+            Array("BasisFunctionEvaluator", "LFRicRealScalarDataType",
+                  [LFRicTypes("LFRicDimension"), "number of dofs",
+                   "number of dofs"], ["fs", "fs_target"]),
+            Array("DiffBasisFunctionEvaluator", "LFRicRealScalarDataType",
+                  [LFRicTypes("LFRicDimension"), "number of dofs",
+                   "number of dofs"], ["fs", "fs_target"]),
             Array("QrWeightsInXy", "LFRicRealScalarDataType",
                   ["number of qr points in xy"], []),
             Array("QrWeightsInZ", "LFRicRealScalarDataType",

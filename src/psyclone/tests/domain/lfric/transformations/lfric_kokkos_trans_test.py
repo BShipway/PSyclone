@@ -2416,6 +2416,118 @@ contains
 """
 
 
+# A kind-polymorphic kernel that also asks for an evaluator. It is the shape
+# GungHo's sample_field_kernel_mod has: the basis is tabulated at the nodal
+# points of the written field's space and stays r_def whatever the fields do,
+# because the PSy layer computes it once at the model's own working precision.
+_POLYMORPHIC_EVALUATOR_MEMBER = """
+  subroutine {name}_code_{kind}(nlayers, field_out, field_in,           &
+                                ndf_{target}, undf_{target}, map_{target},  &
+                                ndf_{space}, undf_{space}, map_{space},     &
+                                basis_{space}_on_{target})
+    integer(kind=i_def), intent(in) :: nlayers
+    integer(kind=i_def), intent(in) :: ndf_{target}, undf_{target}
+    integer(kind=i_def), intent(in) :: ndf_{space}, undf_{space}
+    integer(kind=i_def), dimension(ndf_{target}), intent(in) :: map_{target}
+    integer(kind=i_def), dimension(ndf_{space}), intent(in) :: map_{space}
+    real(kind={kind}), dimension(undf_{target}), intent(inout) :: field_out
+    real(kind={kind}), dimension(undf_{space}), intent(in) :: field_in
+    real(kind=r_def), dimension({dim},ndf_{space},ndf_{target}),           &
+                                     intent(in) :: basis_{space}_on_{target}
+    integer(kind=i_def) :: k, df, dg
+    real(kind={kind}) :: total
+    do k = 0, nlayers - 1
+      do df = 1, ndf_{target}
+        total = 0.0_{kind}
+        do dg = 1, ndf_{space}
+          total = total + basis_{space}_on_{target}({dim},dg,df)          &
+                * field_in(map_{space}(dg) + k)
+        end do
+        field_out(map_{target}(df) + k) = total
+      end do
+    end do
+  end subroutine {name}_code_{kind}
+"""
+
+
+def _polymorphic_evaluator_kernel(name, first, second, space="w1",
+                                  target="w3", dim=3):
+    """Build a kernel module whose evaluator code is an interface over kinds.
+
+    :param str name: the kernel's base name, without ``_kernel_mod``.
+    :param str first: the kind of the first specific procedure.
+    :param str second: the kind of the second.
+    :param str space: the function space the basis is asked for on.
+    :param str target: the function space of the written field, which is what
+        an evaluator tabulates at.
+    :param int dim: the basis's first extent, which metadata fixes for a
+        named space and leaves unknown for an ``any_space``.
+
+    :returns: Fortran source for the module.
+    :rtype: str
+    """
+    members = "".join(
+        _POLYMORPHIC_EVALUATOR_MEMBER.format(
+            name=name, kind=kind, space=space, target=target, dim=dim)
+        for kind in (first, second))
+    # An any_space is named by argument_mod; a named function space by
+    # fs_continuity_mod.
+    generic = [fs for fs in (space, target) if fs.startswith("any_")]
+    named = [fs for fs in (space, target) if not fs.startswith("any_")]
+    generic_import = ", " + ", ".join(generic) if generic else ""
+    named_import = (f"  use fs_continuity_mod, only : {', '.join(named)}\n"
+                    if named else "")
+    return f"""
+module {name}_kernel_mod
+  use argument_mod, only : arg_type, func_type, gh_field, gh_real,        &
+                           gh_write, gh_read, gh_basis, cell_column,      &
+                           gh_evaluator{generic_import}
+  use constants_mod, only : i_def, r_def, r_single, r_double, r_solver
+{named_import}  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: {name}_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                  &
+         arg_type(gh_field, gh_real, gh_write, {target}),                 &
+         arg_type(gh_field, gh_real, gh_read,  {space}) /)
+    type(func_type) :: meta_funcs(1) = (/                                &
+         func_type({space}, gh_basis) /)
+    integer :: gh_shape = gh_evaluator
+    integer :: operates_on = cell_column
+  end type {name}_kernel_type
+  public :: {name}_code
+  interface {name}_code
+    module procedure {name}_code_{first}, {name}_code_{second}
+  end interface
+contains
+{members}end module {name}_kernel_mod
+"""
+
+
+def _polymorphic_evaluator_algorithm(name, field_module, field_type):
+    """Build an algorithm invoking one polymorphic evaluator kernel.
+
+    An evaluator carries no quadrature object, so the invoke passes nothing
+    but the two fields; their precision is the whole of what selects a member.
+
+    :param str name: the kernel's base name, without ``_kernel_mod``.
+    :param str field_module: the module the field type comes from.
+    :param str field_type: the LFRic field type, whose precision selects the
+        specific procedure.
+
+    :returns: Fortran source for the program.
+    :rtype: str
+    """
+    return f"""
+program kokkos_{name}_test
+  use {field_module}, only : {field_type}
+  use {name}_kernel_mod, only : {name}_kernel_type
+  implicit none
+  type({field_type}) :: out_field, in_field
+  call invoke({name}_kernel_type(out_field, in_field))
+end program kokkos_{name}_test
+"""
+
+
 def _polymorphic_algorithm(name, field_module, field_type, kind,
                            stencil=False):
     """Build an algorithm invoking one polymorphic kernel.
@@ -3339,6 +3451,63 @@ def ambiguous_target_fixture(tmp_path, clear_module_manager_instance):
             "dual_scale", "r_solver_field_mod", "r_solver_field_type",
             "r_solver"),
         _polymorphic_kernel("dual_scale", "r_single", "r_solver"))
+
+
+@pytest.fixture(name="polymorphic_evaluator_target")
+# pylint: disable-next=unused-argument
+def polymorphic_evaluator_target_fixture(tmp_path,
+                                         clear_module_manager_instance):
+    """Create an invoke of a polymorphic interface asking for an evaluator.
+
+    The precisions are ``polymorphic_target``'s, so the selection question is
+    the one that already has an answer; what is new is the ``gh_evaluator``
+    metadata standing between the matcher and it. The r_double member is
+    declared first, so a selection returning ``schedules[0]`` returns the
+    wrong one.
+    """
+    return _invoke(
+        tmp_path, "eval_scale",
+        _polymorphic_evaluator_algorithm(
+            "eval_scale", "r_solver_field_mod", "r_solver_field_type"),
+        _polymorphic_evaluator_kernel("eval_scale", "r_double", "r_single"))
+
+
+@pytest.fixture(name="any_space_evaluator_target")
+# pylint: disable-next=unused-argument
+def any_space_evaluator_target_fixture(tmp_path,
+                                       clear_module_manager_instance):
+    """Create a polymorphic evaluator interface on an ``any_space``.
+
+    Metadata cannot say how many components a basis on an ``any_space`` has,
+    which is PSyclone's issue #461, so the interface the matcher builds cannot
+    state the basis's first extent. That extent is never compared, so it must
+    not be what stops the question being asked.
+    """
+    return _invoke(
+        tmp_path, "any_scale",
+        _polymorphic_evaluator_algorithm(
+            "any_scale", "r_solver_field_mod", "r_solver_field_type"),
+        _polymorphic_evaluator_kernel("any_scale", "r_double", "r_single",
+                                      space="any_space_2",
+                                      target="any_space_1", dim=1))
+
+
+@pytest.fixture(name="ambiguous_evaluator_target")
+# pylint: disable-next=unused-argument
+def ambiguous_evaluator_target_fixture(tmp_path,
+                                       clear_module_manager_instance):
+    """Create an evaluator interface every member of which matches.
+
+    ``precision_map`` gives r_single and r_solver the same 4 bytes. The point
+    of asking it again over evaluator metadata is that the ambiguity must
+    survive the interface becoming buildable: a matcher that now answers must
+    answer "both" here rather than "the first one".
+    """
+    return _invoke(
+        tmp_path, "dual_eval",
+        _polymorphic_evaluator_algorithm(
+            "dual_eval", "r_solver_field_mod", "r_solver_field_type"),
+        _polymorphic_evaluator_kernel("dual_eval", "r_single", "r_solver"))
 
 
 @pytest.fixture(name="unmodelled_target")
@@ -4668,6 +4837,83 @@ def test_lfric_kokkos_trans_refuses_an_ambiguous_interface(ambiguous_target):
         LFRicKokkosTrans().validate(loop)
     assert "found 2 implementations of 'dual_scale_code'" in str(error.value)
     assert "dual_scale_code_r_single, dual_scale_code_r_solver" in str(
+        error.value)
+    assert "will not choose between them" in str(error.value)
+
+
+def test_lfric_kokkos_trans_accepts_a_polymorphic_kernel(
+        polymorphic_evaluator_target):
+    """An interface asking for an evaluator is selected between, not refused.
+
+    Until this task the matcher could not build the interface an evaluator
+    implies -- PSyclone's issue #928 -- so every member of such an interface
+    was refused together, whatever its precisions were. The two members here
+    differ in exactly the way ``polymorphic_target``'s do, so the answer is
+    the same answer; the only new thing is that it can now be reached.
+
+    The assertions are about the width rather than about a region existing,
+    because the r_double member is declared first: returning ``schedules[0]``
+    would generate a region that compiles and is wrong. The basis stays
+    ``double`` in both members, which is what LFRic writes -- the PSy layer
+    tabulates it once at r_def -- so the region carries a float field beside
+    a double basis and that mixture is itself the evidence that the formals
+    were read rather than assumed.
+    """
+    _, loop, kernel = polymorphic_evaluator_target
+    assert kernel.eval_shapes == ["gh_evaluator"]
+    assert len(kernel.get_callees()) == 2
+
+    # pylint: disable-next=protected-access
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert schedule.name == "eval_scale_code_r_single"
+    assert schedule is not kernel.get_callees()[0]
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    assert "eval_scale_r_single_kokkos" in cpp
+    assert "eval_scale_kokkos" not in cpp
+    assert "Kokkos::View<float*" in cpp
+    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
+        "ReadOnly> basis_w1_on_w3(basis_w1_on_w3_data, 3, ndf_w1, ndf_w3);" \
+        in cpp
+    assert "weights" not in cpp
+
+
+def test_lfric_kokkos_trans_selects_a_member_on_an_any_space(
+        any_space_evaluator_target):
+    """A basis on an ``any_space`` does not stop the question being asked.
+
+    Metadata fixes a basis's first extent for a named function space and
+    cannot for an ``any_space``, which is PSyclone's issue #461. That extent
+    is not one of the things the matcher compares -- it is a literal on both
+    sides -- so failing to produce it must not be read as the members failing
+    to match. Before this task it was: the interface builder raised, the
+    refusal said "found no implementation matching the precisions", and eight
+    GungHo loops were reported as having no matching member when their
+    precisions had never been looked at.
+    """
+    _, _, kernel = any_space_evaluator_target
+    assert len(kernel.get_callees()) == 2
+
+    # pylint: disable-next=protected-access
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert schedule.name == "any_scale_code_r_single"
+
+
+def test_lfric_kokkos_trans_refuses_an_ambiguous_evaluator_interface(
+        ambiguous_evaluator_target):
+    """Two members of an evaluator interface matching equally is a refusal.
+
+    The companion of
+    :py:func:`test_lfric_kokkos_trans_refuses_an_ambiguous_interface`, asked
+    through the metadata this task makes askable. Widening what the matcher
+    can be asked about must not turn a refusal into a first-match, so the
+    refusal is asserted to name both members rather than to merely happen.
+    """
+    _, loop, _ = ambiguous_evaluator_target
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+    assert "found 2 implementations of 'dual_eval_code'" in str(error.value)
+    assert "dual_eval_code_r_single, dual_eval_code_r_solver" in str(
         error.value)
     assert "will not choose between them" in str(error.value)
 

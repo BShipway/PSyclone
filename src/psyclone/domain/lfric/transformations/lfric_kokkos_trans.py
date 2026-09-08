@@ -85,10 +85,28 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     impossible. ``r_single`` and ``r_solver`` are both 4 bytes, so an
     interface offering both is refused rather than resolved by coincidence,
     as is one no algorithm precision selects at all. Metadata the matcher
-    cannot model -- a stencil, an evaluator shape, a CMA or inter-grid kernel,
-    which PSyclone's issue #928 leaves unbuilt -- is a third refusal, kept
-    distinct from finding no match because a question that cannot be asked has
-    not been answered "no".
+    cannot model -- a stencil, a CMA or inter-grid kernel, which PSyclone's
+    issue #928 leaves unbuilt -- is a third refusal, kept distinct from
+    finding no match because a question that cannot be asked has not been
+    answered "no".
+
+    An evaluator shape was one of those and is no longer. Rather than reach
+    past the matcher and compare the actual arguments here, citing #928 as the
+    reason, the matcher itself was taught what an evaluator implies: one
+    rank-3 basis per target space, extents of ``(dim, ndf, ndf of the
+    target)``, with no point count and no weights because an evaluator carries
+    no quadrature rule. That is a smaller answer than it sounds -- an
+    evaluator asks for no callback the class does not already have -- and it
+    keeps the question in the one place that asks it, so a kernel is selected
+    between on its precisions whatever shape its basis has.
+
+    It also removes a refusal that was a misreading rather than a mismatch.
+    Metadata cannot fix a basis's first extent for an ``any_space`` or an
+    ``any_discontinuous_space``, which is PSyclone's issue #461, and a matcher
+    that could not produce that extent reported the members as matching no
+    algorithm precision at all -- an answer about precisions it had never
+    compared. The extent is instead named with a variable, exactly as the PSy
+    layer names it, and it is not one of the things the matcher compares.
 
     **A field's data may be real or integer.** LFRic's ``integer_field_type``
     has ``field_type``'s proxy shape with ``integer(i_def)`` data, and the

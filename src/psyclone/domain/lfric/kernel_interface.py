@@ -45,7 +45,7 @@ from psyclone.core import AccessType
 from psyclone.domain.lfric.arg_ordering import ArgOrdering
 from psyclone.domain.lfric.lfric_constants import LFRicConstants
 from psyclone.domain.lfric.lfric_types import LFRicTypes
-from psyclone.errors import InternalError
+from psyclone.errors import GenerationError, InternalError
 from psyclone.psyir.frontend.fparser2 import INTENT_MAPPING
 from psyclone.psyir.nodes import Reference
 from psyclone.psyir.symbols import ArgumentInterface, SymbolTable
@@ -88,18 +88,20 @@ class KernelInterface(ArgOrdering):
         "integer": "IntegerVectorFieldDataSymbol",
         "real": "RealVectorFieldDataSymbol",
         "logical": "LogicalVectorFieldDataSymbol"}
-    #: Mapping from the LFRic metadata description of quadrature to the
-    #: associated LFRic-specific basis function datasymbol.
+    #: Mapping from the LFRic metadata description of an evaluator shape to
+    #: the associated LFRic-specific basis function datasymbol.
     basis_mapping = {
         "gh_quadrature_xyoz": "BasisFunctionQrXyozDataSymbol",
         "gh_quadrature_face": "BasisFunctionQrFaceDataSymbol",
-        "gh_quadrature_edge": "BasisFunctionQrEdgeDataSymbol"}
-    #: Mapping from the LFRic metadata description of quadrature to the
-    #: associated LFRic-specific differential basis function datasymbol.
+        "gh_quadrature_edge": "BasisFunctionQrEdgeDataSymbol",
+        "gh_evaluator": "BasisFunctionEvaluatorDataSymbol"}
+    #: Mapping from the LFRic metadata description of an evaluator shape to
+    #: the associated LFRic-specific differential basis function datasymbol.
     diff_basis_mapping = {
         "gh_quadrature_xyoz": "DiffBasisFunctionQrXyozDataSymbol",
         "gh_quadrature_face": "DiffBasisFunctionQrFaceDataSymbol",
-        "gh_quadrature_edge": "DiffBasisFunctionQrEdgeDataSymbol"}
+        "gh_quadrature_edge": "DiffBasisFunctionQrEdgeDataSymbol",
+        "gh_evaluator": "DiffBasisFunctionEvaluatorDataSymbol"}
     _read_access = ArgumentInterface(ArgumentInterface.Access.READ)
 
     def __init__(self, kern: "LFRicKern"):
@@ -768,9 +770,6 @@ class KernelInterface(ArgOrdering):
             differential basis function for the current function \
             space.
 
-        :raises NotImplementedError: if an evaluator shape is found \
-            that is not a quadrature shape (currently just \
-            'gh_evaluator').
         :raises InternalError: if the supplied evaluator shape is not \
             recognised.
 
@@ -783,11 +782,16 @@ class KernelInterface(ArgOrdering):
                 f"ndf_{fs_name}",
                 symbol_type=LFRicTypes("NumberOfDofsDataSymbol"),
                 fs=fs_name, interface=self._read_access)
+            first_dim = self._first_dim(function_space, first_dim_value_func)
 
             # Create the qr tag by appending the last part of the shape
-            # name to "qr_".
-            quad_name = shape.split("_")[-1]
-            basis_tag = basis_name_func(qr_var="qr_"+quad_name)
+            # name to "qr_". An evaluator has no rule to name, and takes
+            # its name from the space it is tabulated on instead.
+            if shape in const.VALID_QUADRATURE_SHAPES:
+                quad_name = shape.split("_")[-1]
+                basis_tag = basis_name_func(qr_var="qr_"+quad_name)
+            else:
+                basis_tag = None
             if shape == "gh_quadrature_xyoz":
                 nqp_xy = self._symtab.find_or_create_tag(
                     "nqp_xy",
@@ -798,11 +802,11 @@ class KernelInterface(ArgOrdering):
                     symbol_type=LFRicTypes("NumberOfQrPointsInZDataSymbol"),
                     interface=self._read_access)
                 type_name = mapping["gh_quadrature_xyoz"]
-                arg = LFRicTypes(type_name)(
-                    basis_tag, [int(first_dim_value_func(function_space)),
+                args = [LFRicTypes(type_name)(
+                    basis_tag, [first_dim,
                                 Reference(ndf_symbol), Reference(nqp_xy),
                                 Reference(nqp_z)],
-                    fs_name, interface=self._read_access)
+                    fs_name, interface=self._read_access)]
             elif shape == "gh_quadrature_face":
                 nfaces = self._symtab.find_or_create_tag(
                     "nfaces",
@@ -814,11 +818,11 @@ class KernelInterface(ArgOrdering):
                         "NumberOfQrPointsInFacesDataSymbol"),
                     interface=self._read_access)
                 type_name = mapping["gh_quadrature_face"]
-                arg = LFRicTypes(type_name)(
-                    basis_tag, [int(first_dim_value_func(function_space)),
+                args = [LFRicTypes(type_name)(
+                    basis_tag, [first_dim,
                                 Reference(ndf_symbol), Reference(nqp),
                                 Reference(nfaces)],
-                    fs_name, interface=self._read_access)
+                    fs_name, interface=self._read_access)]
             elif shape == "gh_quadrature_edge":
                 nedges = self._symtab.find_or_create_tag(
                     "nedges",
@@ -830,23 +834,69 @@ class KernelInterface(ArgOrdering):
                         "NumberOfQrPointsInEdgesDataSymbol"),
                     interface=self._read_access)
                 type_name = mapping["gh_quadrature_edge"]
-                arg = LFRicTypes(type_name)(
-                    basis_tag, [int(first_dim_value_func(function_space)),
+                args = [LFRicTypes(type_name)(
+                    basis_tag, [first_dim,
                                 Reference(ndf_symbol), Reference(nqp),
                                 Reference(nedges)],
-                    fs_name, interface=self._read_access)
-            elif shape in const.VALID_EVALUATOR_SHAPES:
+                    fs_name, interface=self._read_access)]
+            elif shape == "gh_evaluator":
                 # Need a (diff) basis array for each target space upon
                 # which the basis functions have been
                 # evaluated. _kern.eval_targets is a dict where the
-                # values are 2-tuples of (FunctionSpace, argument).
-                for _, _ in self._kern.eval_targets.items():
-                    raise NotImplementedError(
-                        "TODO #928: Evaluator shapes not implemented in "
-                        "kernel_interface class.")
+                # values are 2-tuples of (FunctionSpace, argument). There
+                # is no quadrature rule and therefore no point count: the
+                # last extent is the target space's own number of dofs.
+                type_name = mapping[shape]
+                args = []
+                for target_space, _ in self._kern.eval_targets.values():
+                    target_name = target_space.orig_name
+                    target_ndf = self._symtab.find_or_create_tag(
+                        f"ndf_{target_name}",
+                        symbol_type=LFRicTypes("NumberOfDofsDataSymbol"),
+                        fs=target_name, interface=self._read_access)
+                    args.append(LFRicTypes(type_name)(
+                        basis_name_func(on_space=target_space),
+                        [first_dim, Reference(ndf_symbol),
+                         Reference(target_ndf)],
+                        fs_name, target_name, interface=self._read_access))
             else:
                 raise InternalError(
                     f"Unrecognised quadrature or evaluator shape '{shape}'. "
                     f"Expected one of: {const.VALID_EVALUATOR_SHAPES}.")
-            self._symtab.add(arg)
-            self._arglist.append(arg)
+            for arg in args:
+                self._symtab.add(arg)
+                self._arglist.append(arg)
+
+    def _first_dim(self, function_space, first_dim_value_func):
+        '''Return the first extent of a basis or differential basis array.
+
+        Metadata fixes that extent for a named function space -- one for a
+        scalar basis, three for a vector one -- and cannot fix it for an
+        ``any_space`` or ``any_discontinuous_space``, which is TODO #461. The
+        PSy layer meets the same limit and answers it the same way: it names
+        the extent with a variable, ``dim_<function space>``, whose value it
+        supplies at run time. This does that here, so that a function space
+        whose components metadata cannot count still produces an argument of
+        the right rank, intrinsic and intent rather than no argument at all.
+
+        :param function_space: the function space that this basis or
+            differential basis function is on.
+        :type function_space: :py:class:`psyclone.domain.lfric.FunctionSpace`
+        :param function first_dim_value_func: a function that returns the
+            size of the first dimension of the basis or differential basis
+            function for the current function space, or raises if metadata
+            does not fix it.
+
+        :returns: the extent, as a literal value where metadata fixes it and
+            as a reference to the dimensioning variable where it does not.
+        :rtype: Union[int, :py:class:`psyclone.psyir.nodes.Reference`]
+
+        '''
+        try:
+            return int(first_dim_value_func(function_space))
+        except GenerationError:
+            symbol = self._symtab.find_or_create_tag(
+                f"dim_{function_space.mangled_name}",
+                symbol_type=LFRicTypes("LFRicIntegerScalarDataSymbol"),
+                interface=self._read_access)
+            return Reference(symbol)
