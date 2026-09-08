@@ -95,15 +95,17 @@ described.
 The one constraint that follows is that a method reaching a helper of the
 sibling mixins ``LFRicKokkosTypesMixin``, ``LFRicKokkosBoundsMixin``,
 ``LFRicKokkosCallMixin``, ``LFRicKokkosConstantsMixin``,
-``LFRicKokkosContractMixin``, ``LFRicKokkosInterfaceMixin`` and
-``LFRicKokkosScheduleMixin`` does so through ``cls``, resolved on
+``LFRicKokkosContractMixin``, ``LFRicKokkosInterfaceMixin``,
+``LFRicKokkosIterationMixin`` and ``LFRicKokkosScheduleMixin`` does so through
+``cls``, resolved on
 ``LFRicKokkosTrans``. Calling a method here directly on this mixin is
 therefore not supported, and most of them do reach across:
 :py:meth:`LFRicKokkosArgumentMixin._region_arguments` asks ``cls._c_type``,
 ``cls._extents`` and ``cls._origins``, :py:meth:`\
 LFRicKokkosArgumentMixin._region` calls ``cls._cell_position``,
-``cls._constants``, ``cls._constant_arrays``, ``cls._kind_types``,
-``cls._parallel_loops`` and ``cls._implicit_extent_actuals``, :py:meth:`\
+``cls._constants``, ``cls._constant_arrays``, ``cls._is_dof``,
+``cls._kind_types``, ``cls._parallel_loops``, ``cls._count_name``,
+``cls._start_name`` and ``cls._implicit_extent_actuals``, :py:meth:`\
 LFRicKokkosArgumentMixin._call_region` calls ``cls._launch_symbol`` and
 ``cls._as_c_bool``, and :py:meth:`\
 LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
@@ -113,8 +115,7 @@ import re
 from dataclasses import replace
 
 from psyclone.core import AccessType
-from psyclone.domain.lfric import (
-    KernCallArgList, KernStubArgList, LFRicConstants)
+from psyclone.domain.lfric import KernCallArgList, KernStubArgList
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
@@ -232,77 +233,6 @@ class LFRicKokkosArgumentMixin:
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
     # pylint: disable=too-few-public-methods
-
-    #: The region's iteration count, and the second extent of every per-cell
-    #: array, where the loop it came from iterated over cell columns. Named
-    #: by the PSy layer, not by the kernel.
-    _CELL_COUNT = "ncells"
-
-    #: The same count where the loop iterated over dofs. A separate name
-    #: rather than ``ncells`` reused, because the generated source is read:
-    #: a region whose ``RangePolicy`` runs to ``ncells`` while its index is a
-    #: dof would be telling a reviewer something untrue about what it does.
-    _DOF_COUNT = "ndofs"
-
-    #: The first cell of a launch that does not begin at the first cell of
-    #: the mesh. Only a loop over the halo cells alone has one; see
-    #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_start`.
-    _CELL_START = "first_cell"
-
-    #: The name a dof launch gives its own index, as
-    #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
-    #: names a cell launch's. ``df`` is what every LFRic kernel calls the
-    #: same thing.
-    _DOF_INDEX = "df"
-
-    #: Every name the generated signature may add for its own bounds. All
-    #: three are reserved for every region, whichever of them that region
-    #: goes on to use, so that whether a kernel is refused for a name
-    #: collision does not depend on which iteration space its loop had.
-    _BOUND_NAMES = (_CELL_COUNT, _DOF_COUNT, _CELL_START)
-
-    @classmethod
-    def _is_dof(cls, node):
-        """Say whether ``node`` iterates over dofs rather than cell columns.
-
-        :param node: the loop being captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-
-        :returns: whether the loop's iteration space is a dof one.
-        :rtype: bool
-        """
-        return node.iteration_space in LFRicConstants().DOF_ITERATION_SPACES
-
-    @classmethod
-    def _count_name(cls, node):
-        """Name the formal the launch for ``node`` is bounded above by.
-
-        :param node: the loop being captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-
-        :returns: :py:attr:`_DOF_COUNT` for a loop over dofs and
-            :py:attr:`_CELL_COUNT` for one over cell columns.
-        :rtype: str
-        """
-        return cls._DOF_COUNT if cls._is_dof(node) else cls._CELL_COUNT
-
-    @classmethod
-    def _start_name(cls, node):
-        """Name the formal the launch for ``node`` begins at, or ``None``.
-
-        A loop starting anywhere but at the first cell or dof needs one; that
-        is the halo-only iteration space and nothing else, because every
-        other bound this transformation accepts counts from the first.
-
-        :param node: the loop being captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-
-        :returns: :py:attr:`_CELL_START` where the loop begins past the first
-            cell, and ``None`` where it does not.
-        :rtype: Optional[str]
-        """
-        # pylint: disable-next=protected-access
-        return None if node._lower_bound_name == "start" else cls._CELL_START
 
     @staticmethod
     def _region_name(schedule):
@@ -662,12 +592,14 @@ class LFRicKokkosArgumentMixin:
             :py:meth:`_region` extends the actuals in are one order.
         :param str count: the formal the launch is bounded above by, which is
             also the last extent of every sliced View. It is
-            :py:meth:`_count_name`'s answer for the loop being captured, and
-            is passed rather than read from :py:attr:`_CELL_COUNT` because a
+            ``LFRicKokkosIterationMixin._count_name``'s answer for the loop
+            being captured, and is passed rather than read from
+            ``LFRicKokkosIterationMixin._CELL_COUNT`` because a
             loop over dofs counts dofs, and a coloured loop counts the cells
             of one colour.
         :param start: the formal the launch begins at, or ``None`` for a
-            launch beginning at zero. It is :py:meth:`_start_name`'s answer,
+            launch beginning at zero. It is
+            ``LFRicKokkosIterationMixin._start_name``'s answer,
             and is appended after the count so that the order here and the
             order :py:meth:`_call_region` completes the actuals in are one
             order. It is ``None`` for every coloured loop, which
