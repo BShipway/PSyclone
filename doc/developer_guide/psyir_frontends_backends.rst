@@ -374,9 +374,15 @@ Additionally, there are three partially-implemented back-ends
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
   region's name, its scalar arguments, its unmanaged Views, its
   `kind_types`, its `scratch`, the `parallel_loops` and `team_size`
-  that select and size the hierarchical launch, and the `cell_position`
-  naming the one formal it declares rather than takes, and it visits the
-  loop body through `CWriter`. Two parts of the back-end live beside it because they
+  that select and size the hierarchical launch, the `cell_position`
+  naming the one formal it declares rather than takes, and the
+  `colour_map` a region captured from a coloured loop declares its cell
+  from, and it visits the loop body through `CWriter`. That description --
+  `KokkosRegion` itself and the `KokkosScalar`, `KokkosView`,
+  `KokkosScratch`, `KokkosConstant` and `KokkosColourMap` it is made of --
+  is defined in `psyclone.psyir.backend.kokkos_region` and re-exported from
+  `psyclone.psyir.backend.kokkos`, so either module may be imported from.
+  Two parts of the back-end live beside it because they
   grow as regions are captured while the writer's own job does not:
   `psyclone.psyir.backend.kokkos_launch` renders the launch shapes, one
   function per shape, and `KokkosIntrinsicsMixin` in
@@ -873,9 +879,11 @@ alike; the one difference is punctuation, since a constant is a C array and
 is subscripted `face_order[(face - 1)]` rather than as a View. It is one
 dimensional, because a C array is written in row-major order and only in one
 dimension does that agree with the subscripts the Fortran body writes.
-`KokkosConstant` lives in its own module rather than beside the other
-descriptions because `kokkos.py` is at the size limit this project sets, and
-the descriptions there are to move out of it wholesale.
+`KokkosConstant` lives in `psyclone.psyir.backend.kokkos_constant` rather
+than beside the other descriptions because it was moved out first, when
+`kokkos.py` was at the size limit this project sets; the rest followed it
+into `psyclone.psyir.backend.kokkos_region`, and both are re-exported from
+`kokkos` so that neither move is visible to an importer.
 
 The cell position
 ~~~~~~~~~~~~~~~~~
@@ -911,6 +919,55 @@ of which a build would catch -- the name must be a C++ identifier, must be
 one of the schedule's formals, must not also be described as a region
 argument, and must not be the launch's own cell index, since `const int cell
 = cell + 1;` initialises an object from itself.
+
+A write two cells share
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Two things in the description answer a write that two cells of one launch
+would make to the same element, and a region carries one of them or neither.
+
+The first is `KokkosView.atomic`. A View marked with it has every
+read-modify-write of its elements generated as a `Kokkos::atomic_*` call
+rather than as an assignment, by `_atomic_update` in
+`KokkosArrayExpressionMixin`; `ATOMIC_UPDATES` there maps the four PSyIR
+operators Kokkos has an atomic for onto `Kokkos::atomic_add`, `_sub`, `_mul`
+and `_div`, and says for each whether the operand may be either side of the
+operator, since `a = b - a` is not an `atomic_sub`. The flag is per View, so
+a region writing an incremented field and a private one generates an atomic
+for the first and an assignment for the second, and it is the update alone
+that is atomic: a statement that reads the element elsewhere in its own
+right-hand side reads it plainly. An assignment the flag applies to that is
+not one of those four shapes, or that is a whole-array expression, raises a
+`VisitorError` naming the assignment rather than generating an update that
+is not atomic. A View that is both `atomic` and `read_only` is rejected by
+`_validate_view`, an atomic on data nothing writes being a contradiction in
+the description.
+
+The second is `KokkosColourMap`, which is how a region generated from an
+already-coloured loop finds its cell. Such a region is launched over the
+cells of one colour rather than over the mesh, so the launch index is no
+longer the cell: `launch_index` in `kokkos_launch` returns the colour map's
+own `index` name for it, and `KokkosWriter` prepends
+
+.. code-block:: c++
+
+    const int cell = cmap(colour - 1, cell_in_colour) - 1;
+
+to the launch body, in front of the `cell_position` declaration if there is
+one. The map is described as a rank-2 read-only View like any other
+argument, strided by the number of colours, and the colour being launched is
+a scalar; the caller enters the region once per colour. No atomic is
+generated for such a region, because the cells of one colour meet at no dof,
+and the two fields are alternatives rather than a sequence.
+
+One consequence is worth knowing before a debug build reports it. A coloured
+region's per-cell Views -- its dofmaps, and a sliced actual like a stencil's
+-- are strided by the launch's cell count, which is the cells of this colour,
+while the index they are read at is the mesh cell the map returned. Under
+`LayoutLeft` the trailing extent takes no part in an address, so only the
+leading one has to be exact and the addresses are the ones the Fortran
+computes; a build with `KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK` would nonetheless
+report the index as out of range.
 
 Extents
 ~~~~~~~
