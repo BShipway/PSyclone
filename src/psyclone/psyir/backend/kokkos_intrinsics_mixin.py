@@ -48,8 +48,11 @@ kernels are captured, while the writer's own job does not.
 """
 
 from psyclone.psyir.backend.c import _is_real_argument
+from psyclone.psyir.backend.kokkos_array_intrinsics import (
+    KokkosArrayIntrinsics)
 from psyclone.psyir.backend.visitor import VisitorError
-from psyclone.psyir.nodes import IntrinsicCall
+from psyclone.psyir.nodes import IntrinsicCall, Reference
+from psyclone.psyir.symbols import DataSymbol
 
 
 class KokkosIntrinsicsMixin:
@@ -112,6 +115,20 @@ class KokkosIntrinsicsMixin:
         IntrinsicCall.Intrinsic.MAX: "max",
         IntrinsicCall.Intrinsic.MIN: "min",
         }
+
+    #: Intrinsics that ask about an array's declared shape rather than about
+    #: its values. Lowering answers all three from the region's own View
+    #: descriptions and none of them survives to be written, so they are not
+    #: probed: asking the writer would report a refusal no generated region
+    #: can reach.
+    _QUERIES = (IntrinsicCall.Intrinsic.LBOUND,
+                IntrinsicCall.Intrinsic.UBOUND,
+                IntrinsicCall.Intrinsic.SIZE)
+
+    #: The name every argument of a probed intrinsic is given. It is never
+    #: generated into a region: the probe's answer is discarded and only
+    #: whether it raised is kept.
+    _PROBE = "_kae_probe"
 
     def literal_node(self, node) -> str:
         """Write a literal at the width its own Fortran kind has.
@@ -230,15 +247,99 @@ class KokkosIntrinsicsMixin:
                     f"{len(node.arguments)}.")
             return self._fold(self._KOKKOS_FOLDS[intrinsic], node)
         if intrinsic in self._KOKKOS_CAST_FUNCTIONS and \
-                len(node.arguments) == 1:
-            name = self._KOKKOS_CAST_FUNCTIONS[intrinsic]
-            return f"(int)Kokkos::{name}({self._visit(node.arguments[0])})"
+                len(node.arguments) in (1, 2):
+            return self._kokkos_cast_function(node)
         name = self._function_name(node)
         if name is None:
             return None
         arguments = ", ".join(self._visit(argument)
                               for argument in node.arguments)
         return f"Kokkos::{name}({arguments})"
+
+    def _kokkos_cast_function(self, node):
+        """Write a rounding intrinsic as a cast round a Kokkos function.
+
+        Fortran's ``NINT`` and ``FLOOR`` take an optional second argument
+        naming the integer kind of their result. It is not generated -- the
+        cast is written as ``(int)`` and nothing else -- so it is checked
+        instead: a kind the region maps to some other width would be
+        discarded silently, and a kernel asking for a 64-bit result would get
+        a 32-bit one that compiles and truncates.
+
+        The kind is read from the argument rather than from the call's type.
+        PSyIR gives ``NINT(x, i_def)`` an undefined precision, the result kind
+        of these intrinsics not being carried into the type they report, so
+        the second argument's own symbol is what names the width asked for.
+
+        :param node: the intrinsic call to write.
+        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+
+        :returns: the cast call.
+        :rtype: str
+
+        :raises VisitorError: if the call names a result kind the region maps
+            to a C type other than the one the cast is written with.
+        """
+        name = self._KOKKOS_CAST_FUNCTIONS[node.intrinsic]
+        allowed = self._KOKKOS_CAST_TYPES[IntrinsicCall.Intrinsic.INT]
+        c_type = None
+        if len(node.arguments) == 2 and isinstance(node.arguments[1],
+                                                   Reference):
+            c_type = self._kind_types.get(node.arguments[1].symbol.name)
+        if c_type is not None and c_type not in allowed:
+            raise VisitorError(
+                f"'{node.intrinsic.name}' is written as a cast to "
+                f"'{allowed[0]}', but this region maps the result kind it was "
+                f"given to '{c_type}'. Generating the cast would truncate the "
+                "value the kernel asked for.")
+        argument = self._visit(node.arguments[0])
+        return f"({allowed[0]})Kokkos::{name}({argument})"
+
+    def unsupported_intrinsics(self, schedule, kind_types=()):
+        """Return the intrinsics in a body that this writer cannot spell.
+
+        A transformation has to refuse a body the writer will refuse, and the
+        only thing that knows what the writer can spell is the writer: the
+        tables above are searched by several handlers, one of which builds its
+        map as a local, so a caller cannot read them and a second list kept
+        beside them would be a second list to keep in step. Each call is asked
+        of the writer instead, and what it refuses is reported by name.
+
+        The call is asked as a *probe*: every argument is replaced by a
+        reference of that argument's own type, so that an intrinsic answered
+        from its argument's kind -- ``EPSILON`` -- is still answered, while an
+        array the region never described is not looked up and an argument that
+        is itself unwritable does not stand in for the call. The intrinsics of
+        the array-valued tier are not asked at all: they are not written by a
+        handler, and lowering replaces them before the writer meets one.
+
+        :param schedule: the body to search.
+        :type schedule: :py:class:`psyclone.psyir.nodes.Node`
+        :param kind_types: the ``(kind name, C type)`` pairs the region will
+            be generated with.
+        :type kind_types: Iterable[Tuple[str, str]]
+
+        :returns: one ``NAME/arity`` entry per intrinsic refused, in the order
+            first met and without repetition.
+        :rtype: Tuple[str, ...]
+        """
+        self._kind_types = dict(kind_types)
+        self._views = {}
+        refused = []
+        for call in schedule.walk(IntrinsicCall):
+            if call.intrinsic in self._QUERIES \
+                    or KokkosArrayIntrinsics.handles(call):
+                continue
+            probe = call.copy()
+            for argument in probe.arguments:
+                argument.replace_with(Reference(
+                    DataSymbol(self._PROBE, argument.datatype)))
+            try:
+                self.intrinsiccall_node(probe)
+            except (VisitorError, ValueError, KeyError, NotImplementedError):
+                refused.append(
+                    f"{call.intrinsic.name}/{len(call.arguments)}")
+        return tuple(dict.fromkeys(refused))
 
     @classmethod
     def _function_name(cls, node):

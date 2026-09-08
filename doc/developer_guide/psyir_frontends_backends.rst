@@ -376,10 +376,12 @@ Additionally, there are three partially-implemented back-ends
   `psyclone.psyir.backend.kokkos_intrinsics_mixin` holds the intrinsics,
   inherited ahead of `CWriter` so its handlers are found first and fall
   through to `CWriter`'s. `KokkosConstant` in
-  `psyclone.psyir.backend.kokkos_constant` is a third, and
+  `psyclone.psyir.backend.kokkos_constant` is a third,
   `KokkosArrayExpressionMixin` in
-  `psyclone.psyir.backend.kokkos_array_expression` a fourth; both are
-  described below. The
+  `psyclone.psyir.backend.kokkos_array_expression` a fourth, and
+  `KokkosArrayIntrinsics` in
+  `psyclone.psyir.backend.kokkos_array_intrinsics` -- which that fourth owns
+  one of per region -- a fifth; all are described below. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -545,7 +547,15 @@ overload for.
 
 `FLOOR` and `NINT` keep the cast that `CWriter` wraps round them, since
 `Kokkos::floor` and `Kokkos::round` return a real just as their C
-counterparts do.
+counterparts do. Both take an optional second argument naming the integer
+kind of their result, and `_kokkos_cast_function` checks it rather than
+generating it: the cast is written `(int)` and nothing else, so a region
+mapping that kind to any other C type would silently discard the width the
+kernel asked for and a request for a 64-bit result would compile as a 32-bit
+one that truncates. The kind is read from the second argument's own symbol
+and not from the call's datatype, because PSyIR gives `NINT(x, i_def)` an
+undefined precision -- the result kind of these two is not carried into the
+type they report.
 
 A cast is generated at the width `kind_types` gives, so `real(x, r_solver)`
 becomes `(float)x` in a region that describes `r_solver` as `float` where
@@ -569,6 +579,25 @@ width, and is the one intrinsic here that refuses instead of falling through.
 There is no kind-blind spelling to fall back to: the trait is a template over
 the type, so a region that does not describe the argument's kind raises a
 `VisitorError` naming `kind_types` rather than guessing at `double`.
+
+`unsupported_intrinsics(schedule, kind_types)` answers the opposite question
+-- which of a body's intrinsics this writer could not spell -- so that a
+transformation can refuse a kernel when it is asked rather than discover the
+refusal part-way through generating. The tables above are not readable from
+outside: several handlers search them, one builds its map as a local, and a
+second list kept beside them would be a second list to keep in step. Each
+call is therefore put to the writer itself, and what raises is reported as
+`NAME/arity` in the order first met, without repetition.
+
+It is put as a *probe*: the call is copied and every argument replaced by a
+`Reference` to a `DataSymbol` of that argument's own datatype, named
+`_PROBE`. The type has to survive because `EPSILON` and the casts are
+answered from their argument's kind; the argument itself must not, because an
+array the region never described would fail the View lookup and an
+unwritable argument would stand in for the call it sits under. `LBOUND`,
+`UBOUND` and `SIZE` are not asked -- they are resolved by the array lowering
+before the writer sees them -- and neither are the array-valued intrinsics of
+the next section, which no handler writes and which lowering replaces first.
 
 Three launch shapes
 ~~~~~~~~~~~~~~~~~~~
@@ -871,6 +900,74 @@ On the LFRic path most array assignments never reach this class:
 them into PSyIR loops the back-end then generates as any other loop. What is
 left for the lowering here is the shapes that transformation declines, and
 the sections that are arguments rather than assignments.
+
+Array-valued intrinsics
+~~~~~~~~~~~~~~~~~~~~~~~
+
+`MATMUL`, `DOT_PRODUCT`, `SUM`, `MINVAL`, `MAXVAL`, `TRANSPOSE` and `RESHAPE`
+produce arrays, and Kokkos has no operator for any of them.
+`KokkosArrayIntrinsics` in `psyclone.psyir.backend.kokkos_array_intrinsics`
+generates them as loops. `KokkosArrayExpression` owns one instance per
+region, because the names both classes generate are numbered from a counter
+that a second region must start again from zero.
+
+The class turns on one observation: *one element* of any of these is not an
+array. An element of `MATMUL` or `DOT_PRODUCT` is a sum of products over the
+index the operands share; an element of `SUM`, `MINVAL` or `MAXVAL` is that
+same fold over the dimensions the `dim` argument does not keep; an element of
+`TRANSPOSE` or `RESHAPE` is an element of the operand, at subscripts computed
+from the ones asked for. So no array temporary is ever built. This is not
+only economy. Scratch is asked of the launch by `shmem_size` *before* the
+body is generated, so a temporary discovered while generating would arrive
+too late to be counted; a nest that needs none sidesteps the ordering
+problem entirely. It also composes for free: `MATMUL(TRANSPOSE(m), x)`
+resolves the transpose into the subscripts the contraction reads with, and
+`p(:) = MATMUL(a, b) + s * MATMUL(c, d)` is two accumulators in one nest.
+
+Three methods carry the work. `shape` says what shape a call produces, in the
+`(start, stop, step)` form `KokkosArrayExpression` uses for its own sections,
+so a statement's nest is sized from the intrinsic where no section states
+it. `hoist` rewrites a copy of the statement in place, replacing each
+outermost handled call by the accumulator its loops leave the value in and
+returning those loops for the caller to place ahead of the statement -- a
+loop is not an expression in C++ and cannot appear where the operand did.
+`element` resolves an index map and reads the array underneath it. A fold
+starts from `Kokkos::reduction_identity<T>::sum()`, `::min()` or `::max()`
+rather than from a literal, since a written `-DBL_MAX` would be right for one
+C type and would have to be spelt again for each of the others.
+
+A hoisted value re-enters the tree as a `Reference` whose symbol's *name* is
+the generated C++. A `DataSymbol` does not validate its name and
+`reference_node` writes the name it is given, so this is how text that is
+already generated survives being visited again. Nothing else about the symbol
+is read.
+
+On the LFRic path an assignment holding one of these is kept from the section
+lowering rather than passed through it. `ArrayAssignment2LoopsTrans` takes only
+a right-hand side that is scalar-valued or elemental, and a contraction is
+neither, so `exner_e(:) = MATMUL(m, rhs_e)` -- the shape `set_exner_code` is
+written in -- reaches the writer as it stands and is generated here.
+`LFRicKokkosIntrinsicMixin._written_as_a_nest` is what
+`LFRicKokkosContractMixin._is_array_valued` asks, alongside the array
+constructor it excludes for the same reason.
+
+`space` and `consumed` are what `KokkosArrayExpression` asks before it sizes
+a nest. An operand is not a section of the statement it appears in --
+`matmul(m3(ik,:,:), p_e)` is rank 1 while its operand is rank 2 -- so a
+caller taking the statement's shape from the first section it meets would
+take the wrong one. `space` gives the shape of the first array-valued call
+instead, and answers the empty tuple where every call in the statement is
+scalar-valued, as in `a(:) = b(:) * dot_product(p, q)`, whose shape comes
+from the sections beside it. `consumed` gives the `id()` of every access
+under one of these calls, which is what the section walk steps over.
+
+What is refused is the fold the generated shape cannot express: a `dim` that
+is not a literal or that names no dimension the operand has, any argument
+beside `dim` -- a `mask`, most often -- a reduction directly inside another,
+and an operand that is neither a whole array nor a section of one.
+`TRANSPOSE` is refused over anything that is not a matrix, and `RESHAPE` is
+generated only from a rank-1 source with a literal shape, its element being
+index arithmetic on the source's linear position.
 
 Lowering order
 ~~~~~~~~~~~~~~

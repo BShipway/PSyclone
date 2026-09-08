@@ -15,6 +15,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
     import LFRicKokkosConstantsMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin import (
     LFRicKokkosContractMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_intrinsic_mixin \
+    import LFRicKokkosIntrinsicMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.errors import GenerationError
@@ -34,7 +36,8 @@ from psyclone.psyir.transformations import (
 
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosBoundsMixin, LFRicKokkosCallMixin,
-                       LFRicKokkosConstantsMixin, Transformation):
+                       LFRicKokkosConstantsMixin, LFRicKokkosIntrinsicMixin,
+                       Transformation):
     """Replace one supported LFRic cell-column loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
@@ -178,18 +181,30 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
 
     The generated region has no way to say ``a(i:j)``, so a shape that
     transformation refuses is refused here too, with its reason quoted. The
-    refusals that arise in GungHo are a loop-carried dependency, which no
-    order of generated loops could honour, and a right-hand side calling
-    something neither scalar-valued nor elemental -- ``MATMUL``,
-    ``DOT_PRODUCT`` and the other contractions among them, whose result is an
-    array a loop nest cannot subscript.
+    refusal that arises in GungHo is a loop-carried dependency, which no
+    order of generated loops could honour.
+
+    **An array-valued intrinsic is generated, not refused.** ``MATMUL``,
+    ``DOT_PRODUCT``, ``SUM``, ``MINVAL``, ``MAXVAL`` and ``TRANSPOSE`` are
+    written by the backend as loop nests over the destination, and no array
+    temporary is created for any of them: one element of a contraction is a
+    scalar reduction, one element of a transpose is an index swap, so there
+    is nothing to hold between the two. ``MATMUL(TRANSPOSE(m), x)`` follows
+    from that rather than needing a case of its own. What is refused is a
+    fold this shape cannot express -- a ``dim`` that is not a literal or
+    names no dimension the operand has, a ``mask``, a reduction nested
+    directly inside another -- and an operand that is neither a whole array
+    nor a section of one. ``RESHAPE`` is generated only where the source is
+    rank 1 and the shape is a literal constructor, which makes it an index
+    map over storage the two languages already agree about.
 
     A section that is not in an assignment at all is judged by where it is
     instead. One that is an actual argument of a call is left to the rule
     about calls, which refuses or accepts the whole call on its own terms
-    rather than being pre-empted here by the shape of one argument. Anywhere
-    else -- the bounds of an ``ALLOCATE``, most often -- it is beyond what
-    lowering can reach and is refused before the backend sees it.
+    rather than being pre-empted here by the shape of one argument. One in
+    the bounds of an ``ALLOCATE`` is read as the shape it states, below.
+    Anywhere else it is beyond what lowering can reach and is refused before
+    the backend sees it.
 
     **An array constructor fills an array; it is not a value.** A kernel
     writing ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or filling one
@@ -271,11 +286,25 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     ``pow(nlayers, 2)`` carry a comma, which a ``shmem_size`` argument may
     not.
 
-    A declaration that states no shape is refused by name. An allocatable or
-    an assumed-shape local -- ``real(kind=r_def), allocatable, dimension(:)``
-    -- is sized by an ALLOCATE in the kernel body or by its caller, and
-    scratch bytes are requested before the launch enters the region, so there
-    is no point at which such a size could be known. A shape the C writer
+    **An allocated local is a declared one written the other way round.**
+    ``real(kind=r_def), allocatable, dimension(:) :: partial`` followed by
+    ``allocate(partial(nlayers))`` states the same shape as
+    ``dimension(nlayers)`` would, one statement later, so the ``ALLOCATE``'s
+    bounds are read into the declaration and both it and the matching
+    ``DEALLOCATE`` are removed. Every rule about a local array then applies
+    unchanged, the bounds being subject to the same grammar as a declared
+    shape. Four allocations are refused instead, each by name: one whose
+    extent the launch cannot evaluate, since the scratch size is computed on
+    the host from the region's own scalars and ``allocate(t(minval(map)))``
+    is not one of them; one inside a loop, which is a different array on each
+    trip rather than one array with a size; one carrying ``stat``, ``errmsg``,
+    ``source`` or ``mold``, each of which says something the reserved scratch
+    does not carry; and a second allocation of an array already allocated,
+    scratch being reserved once with one shape for the whole region.
+
+    An assumed-shape local -- one sized by its caller rather than by a
+    statement in the body -- states no shape anywhere the region can read,
+    and is refused by name. A shape the C writer
     cannot render at all, such as ``dimension(MAX(nlayers-n,1))``, is refused
     with the writer's own reason attached. Every one of these is refused by
     :py:meth:`validate` rather than discovered by :py:meth:`apply`.
@@ -395,6 +424,14 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     ``r_def`` of ``real(x, r_def)`` -- is none of these: it names a type, the
     cast consumes it, and the region carries the width rather than the name.
 
+    **An intrinsic the backend cannot spell is refused by** :py:meth:`validate`
+    **rather than discovered by** :py:meth:`apply`. The only thing that knows
+    what the backend can write is the backend, so ``validate`` asks it: every
+    intrinsic the body holds is put to the writer with its arguments replaced
+    by references of their own types, and the ones that raise are reported as
+    ``NAME/arity``. A second list kept beside the writer would be a list to
+    keep in step.
+
     It captures all information needed by the Kokkos backend before lowering
     the LFRic loop. The LFRic loop is then lowered so that its bound setup and
     halo-dirty calls are retained, and only the resulting generic loop is
@@ -493,9 +530,15 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         # all until the copy is lowered. The two predicates above have already
         # shown that both rewrites succeed on this schedule.
         probe = schedule.copy()
+        self._lower_allocations(probe)
         self._lower_sections(probe)
         self._substitute_bounds(probe)
-        self._validate_locals(schedule, self._parallel_loops(probe))
+        # The locals are judged on the probe rather than on the schedule,
+        # because the allocation tier is what gives an allocated local its
+        # shape: on the schedule it still has the deferred one the
+        # declaration carried.
+        self._validate_locals(probe, self._parallel_loops(probe))
+        self._validate_intrinsics(probe)
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
         # so that an array parameter the generated unit could not declare is
@@ -785,6 +828,7 @@ can_loop_be_parallelised`
         self.validate(node, options=options, **kwargs)
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
+        self._lower_allocations(schedule)
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)
         self._substitute_constants(schedule)

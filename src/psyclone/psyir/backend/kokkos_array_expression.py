@@ -57,20 +57,14 @@ which was within thirty lines of the size a module of this project may reach.
 from dataclasses import dataclass
 from typing import Tuple, Union
 
+from psyclone.psyir.backend.kokkos_array_intrinsics import (
+    INDEX_TYPE as _INDEX_TYPE, KokkosArrayIntrinsics)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Range, Reference)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
-from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
-
-
-# The type of the loop index a nest generates. Its precision is
-# deliberately undefined: the index is the writer's own and crosses no
-# interface, and ``gen_declaration`` renders a symbol whose kind the
-# region did not describe as a plain ``int``, which is what it must be.
-_INDEX_TYPE = ScalarType(ScalarType.Intrinsic.INTEGER,
-                         ScalarType.Precision.UNDEFINED)
+from psyclone.psyir.symbols import ArrayType, DataSymbol
 
 
 @dataclass(frozen=True)
@@ -141,6 +135,7 @@ class KokkosArrayExpression:
         self._temporaries = []
         self._counter = 0
         self._result = None
+        self._intrinsics = KokkosArrayIntrinsics(self, writer)
 
     @property
     def temporaries(self):
@@ -172,6 +167,22 @@ class KokkosArrayExpression:
         :rtype: Optional[str]
         """
         return self._result
+
+    @staticmethod
+    def holds(node) -> bool:
+        """Return whether an expression reads an array-valued intrinsic.
+
+        A statement that does has to be lowered whether or not it carries a
+        section, because the value of ``MATMUL`` or ``DOT_PRODUCT`` is
+        accumulated by loops rather than written as an expression.
+
+        :param node: the expression to search.
+        :type node: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: whether any of it is an intrinsic of that tier.
+        :rtype: bool
+        """
+        return KokkosArrayIntrinsics.holds(node)
 
     def ranks(self, node) -> Tuple[str, ...]:
         """Return the shape ``node`` produces, one extent per dimension.
@@ -208,12 +219,13 @@ class KokkosArrayExpression:
             writer's current depth and ending in a newline.
         :rtype: str
 
-        :raises VisitorError: if ``node`` is not array-valued, if it writes
-            an array it also reads at a different subscript, so that the nest
-            would carry a dependence between its iterations, or if a
-            temporary is needed and the expression names no type the region
-            described.
+        :raises VisitorError: if ``node`` is neither array-valued nor a
+            scalar-valued intrinsic of the array tier, if it writes an array
+            it also reads at a different subscript, so that the nest would
+            carry a dependence between its iterations, or if a temporary is
+            needed and the expression names no type the region described.
         """
+        # pylint: disable=protected-access
         # A scalar right-hand side is array-valued only by the destination it
         # is spread over -- ``m(:,:) = 0.0`` -- so where the expression names
         # no space of its own the destination's is the one to generate.
@@ -221,6 +233,11 @@ class KokkosArrayExpression:
         if not space and into is not None:
             space = self._space(into)
         if not space:
+            # ``x = dot_product(p, q)`` has no shape at all, and yet is not
+            # an expression either: its value is accumulated by loops, which
+            # go ahead of the assignment rather than inside it.
+            if into is not None and self._intrinsics.holds(node):
+                return self._scalar(node, into)
             raise VisitorError(
                 f"Cannot lower '{node.debug_string().strip()}' to a nest: it "
                 "is not an array-valued expression.")
@@ -233,10 +250,36 @@ class KokkosArrayExpression:
         comment = "" if into is not None else self._copy_comment(node)
         target, offsets = self._target(node, into, space)
         variables = [f"{self.PREFIX}_i{index}" for index in range(len(space))]
+        indent = "  " * (self._writer._depth + len(space))
+        statements, element = self._element(node, variables, indent)
         assignment = (
-            f"{self._access(target, variables, offsets)} = "
-            f"{self._element(node, variables)};\n")
-        return comment + self._nest(space, variables, assignment)
+            f"{self._access(target, variables, offsets, indent)} = "
+            f"{element};\n")
+        body = f"{statements}{indent}{assignment}"
+        return comment + self._nest(
+            space, variables, body, "  " * self._writer._depth)
+
+    def _scalar(self, node, into) -> str:
+        """Lower a scalar-valued intrinsic of the array tier to statements.
+
+        :param node: the expression to lower, which reads a reduction.
+        :type node: :py:class:`psyclone.psyir.nodes.Node`
+        :param into: the scalar the value is assigned to.
+        :type into: :py:class:`psyclone.psyir.nodes.Reference`
+
+        :returns: the accumulating loops and the assignment that reads them,
+            indented for the writer's current depth.
+        :rtype: str
+        """
+        # pylint: disable=protected-access
+        indent = "  " * self._writer._depth
+        self._result = None
+        clone = node.copy()
+        statements, value = self._intrinsics.hoist(clone, (), indent)
+        if value is None:
+            value = self._writer._visit(clone)
+        return (f"{statements}{indent}{self._writer._visit(into)} = "
+                f"{value};\n")
 
     # ------------------------------------------------------------------
     # Shape
@@ -257,7 +300,16 @@ class KokkosArrayExpression:
             an expression that is not array-valued.
         :rtype: Tuple[Tuple[str, str, str], ...]
         """
+        space = self._intrinsics.space(node)
+        if space:
+            return space
+        # An operand of one of those intrinsics is not a section of this
+        # expression -- ``matmul(m3(ik,:,:), p_e)`` is rank 1 where its
+        # operand is rank 2 -- so the accesses inside one are stepped over.
+        consumed = self._intrinsics.consumed(node)
         for access in node.walk(ArrayMixin):
+            if id(access) in consumed:
+                continue
             positions = [position
                          for position, index in enumerate(access.indices)
                          if isinstance(index, Range)]
@@ -382,8 +434,8 @@ class KokkosArrayExpression:
             f"{self._writer._nindent}// contiguous in this View's "
             "LayoutLeft, whose leading dimension is the fast one.\n")
 
-    def _nest(self, space, variables, assignment):
-        """Wrap one element assignment in a loop per dimension.
+    def _nest(self, space, variables, body, base):
+        """Wrap the statements producing one element in a loop per dimension.
 
         The innermost loop runs over the dimension the layout makes fastest,
         which for the ``LayoutLeft`` Views this back-end declares is the
@@ -391,24 +443,28 @@ class KokkosArrayExpression:
         way round computes the same answer and reads the memory in the worst
         possible order, so it is asserted by a test and stated here.
 
+        The body arrives indented rather than being indented here, because a
+        nest of the array-valued intrinsic tier holds several statements at
+        several depths of its own and only its writer knows where they sit.
+
         :param space: the iteration space, as :py:meth:`_space` gives it.
         :type space: Tuple[Tuple[str, str, str], ...]
         :param variables: the generated name of each dimension's index.
         :type variables: List[str]
-        :param str assignment: the element assignment, ending in a newline.
+        :param str body: the statements the innermost loop runs, each
+            indented and ending in a newline.
+        :param str base: the indentation of the outermost loop.
 
         :returns: the nest, indented and ending in a newline.
         :rtype: str
         """
-        # pylint: disable=protected-access
-        depth = self._writer._depth
-        text = f"{'  ' * (depth + len(space))}{assignment}"
+        text = body
         for position, (start, stop, _) in enumerate(space):
             variable = variables[position]
             # The loop that varies fastest is written last and so indented
             # deepest: position zero is the innermost of the nest, not the
             # outermost, because it is the dimension the layout makes fast.
-            indent = "  " * (depth + len(space) - 1 - position)
+            indent = base + "  " * (len(space) - 1 - position)
             text = (
                 f"{indent}for (int {variable} = {start}; "
                 f"{variable} <= {stop}; {variable}++) {{\n"
@@ -480,7 +536,7 @@ class KokkosArrayExpression:
         return (self._reserve(node, space),
                 tuple(start for start, _, _ in space))
 
-    def _access(self, target, variables, offsets):
+    def _access(self, target, variables, offsets, indent):
         """Return the C++ subscripting one element of the destination.
 
         :param target: the destination, as :py:meth:`_target` gives it.
@@ -491,17 +547,18 @@ class KokkosArrayExpression:
         :param offsets: the origin of each dimension, empty where the
             destination is a reference whose own description carries them.
         :type offsets: Tuple[str, ...]
+        :param str indent: the indentation statements are written at.
 
         :returns: the element access.
         :rtype: str
         """
         if not isinstance(target, str):
-            return self._element(target, variables)
+            return self._element(target, variables, indent)[1]
         indices = ", ".join(f"({variable} - {offset})"
                             for variable, offset in zip(variables, offsets))
         return f"{target}({indices})"
 
-    def _element(self, node, variables):
+    def _element(self, node, variables, indent):
         """Return the C++ for one element of an array-valued expression.
 
         Every :py:class:`~psyclone.psyir.nodes.Range` in a copy of the
@@ -512,16 +569,26 @@ class KokkosArrayExpression:
         :py:meth:`KokkosArrayExpressionMixin.arrayreference_node` and has its
         array's declared origin removed there rather than here.
 
+        An intrinsic of the array-valued tier is taken out of the copy first,
+        while its operands' own :py:class:`~psyclone.psyir.nodes.Range`
+        subscripts are still there for it to read, and leaves behind both a
+        value and the statements that value is accumulated by.
+
         :param node: the array-valued expression.
         :type node: :py:class:`psyclone.psyir.nodes.Node`
         :param variables: the generated name of each dimension's index.
         :type variables: List[str]
+        :param str indent: the indentation statements are written at.
 
-        :returns: the element expression.
-        :rtype: str
+        :returns: the statements the element needs, and the element
+            expression itself.
+        :rtype: Tuple[str, str]
         """
         # pylint: disable=protected-access
         clone = node.copy()
+        statements, value = self._intrinsics.hoist(clone, variables, indent)
+        if value is not None:
+            return statements, value
         for access in clone.walk(ArrayMixin):
             position = 0
             for index in list(access.indices):
@@ -529,7 +596,7 @@ class KokkosArrayExpression:
                     index.replace_with(Reference(DataSymbol(
                         variables[position], _INDEX_TYPE)))
                     position += 1
-        return self._writer._visit(clone)
+        return statements, self._writer._visit(clone)
 
     def _check_dependence(self, node, into):
         """Refuse an assignment whose nest would not have independent steps.
@@ -728,8 +795,12 @@ class KokkosArrayExpressionMixin:
         # An array constructor's values are positional, and the C writer
         # spreads them over the destination itself; a nest would have to
         # subscript the constructor, which nothing can render.
-        lowered = bool(node.walk(Range)) and not isinstance(
-            node.rhs, ArrayConstructor)
+        # A reduction is lowered even where the statement has no section in
+        # it at all: ``x = dot_product(p, q)`` writes a scalar, and still
+        # needs the loops that accumulate it written ahead of the assignment.
+        lowered = (bool(node.walk(Range))
+                   or self.array_expressions.holds(node.rhs)) and not \
+            isinstance(node.rhs, ArrayConstructor)
         if (not self._parallel_loops or self._parallel_depth
                 or not writes_an_array):
             if lowered:

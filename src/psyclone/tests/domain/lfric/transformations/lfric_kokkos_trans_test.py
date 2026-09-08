@@ -4177,21 +4177,16 @@ def test_lfric_kokkos_trans_places_a_local_sized_by_a_division(
 
 
 def test_lfric_kokkos_trans_rejects_a_shapeless_local(shapeless_local_target):
-    """An allocatable local is refused, saying whose statement its size is.
+    """A declaration with no shape is refused, saying whose statement its is.
 
-    Every row the catalogue counts under this refusal is an allocatable whose
-    ALLOCATE stands in the kernel body over values the kernel computes for
-    itself. Scratch bytes are requested before the launch enters the region,
-    so there is no point at which such a size could be known -- this is a
-    limit of the model rather than a gap in the reading, and the message says
-    which of the two it is.
-
-    The check is asked of the schedule directly, which is how the coverage
-    survey asks it and therefore what the catalogue's ``local-array`` row
-    counts. Asking ``validate`` instead would answer about a different
-    refusal: an ALLOCATE carries a ``Range`` for the shape it is requesting,
-    so the array-section check fires first and hides this one. Such a kernel
-    is blocked twice over, and the second blocker is the one measured here.
+    The rule reads declarations, and a deferred shape is not one: the message
+    says which of the two it is, and points at the statement that carries the
+    size instead. What has changed since it was written is that the statement
+    is now read. The declaration is rewritten from the ALLOCATE before this
+    rule is asked, so a kernel whose extents are values the region holds at
+    entry reaches it as an ordinary automatic array and is captured; the rule
+    still refuses the declaration it is asked about here, which is the one the
+    kernel wrote rather than the one the conversion leaves behind.
     """
     _, loop, kernel = shapeless_local_target
     schedule = LFRicKokkosTrans._schedule(kernel)
@@ -4204,9 +4199,9 @@ def test_lfric_kokkos_trans_rejects_a_shapeless_local(shapeless_local_target):
     assert "a deferred shape" in str(error.value)
     assert "ALLOCATE in the kernel body" in str(error.value)
 
-    # The loop is refused as a whole as well, so no caller sees it accepted.
-    with pytest.raises(TransformationError):
-        LFRicKokkosTrans().validate(loop)
+    # And the loop as a whole is now accepted, the ALLOCATE stating a size
+    # the launch can compute where it reserves its scratch.
+    LFRicKokkosTrans().validate(loop)
 
 
 def test_lfric_kokkos_trans_reports_an_unwritable_shape(
@@ -4232,7 +4227,8 @@ def test_lfric_kokkos_trans_reports_an_unwritable_shape(
     "literal_local_target", "arithmetic_local_target",
     "explicit_one_local_target", "lower_bound_local_target",
     "zero_based_local_target", "negative_origin_local_target",
-    "named_constant_local_target", "divided_local_target"])
+    "named_constant_local_target", "divided_local_target",
+    "allocate_local_target", "minval_target"])
 def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
         fixture_name, request):
     """Every widened shape passes ``validate`` as well as ``apply``.
@@ -4252,7 +4248,10 @@ def test_lfric_kokkos_trans_validate_accepts_what_apply_generates(
 @pytest.mark.parametrize("fixture_name", [
     "unsized_local_target", "unmapped_local_target",
     "unrenderable_origin_target", "unsized_expression_target",
-    "unwritable_shape_target"])
+    "unwritable_shape_target", "unknown_allocate_target",
+    "looped_allocate_target", "option_allocate_target",
+    "twice_allocate_target", "shapeless_allocate_target",
+    "module_allocate_target", "tiny_target"])
 def test_lfric_kokkos_trans_validate_and_apply_agree_on_locals(
         fixture_name, request):
     """Both refusals are made by ``validate``, not discovered by ``apply``.
@@ -5553,3 +5552,375 @@ def test_lfric_kokkos_trans_field_predicates_pass_over_a_non_field(
 
     LFRicKokkosTrans._validate_field_types(kernel)
     LFRicKokkosTrans._validate_continuous_write(kernel)
+
+
+# ---------------------------------------------------------------------------
+# Intrinsics: the allocation tier and the validate/apply gap
+# ---------------------------------------------------------------------------
+# The column solver with its two locals given a deferred shape and an
+# ALLOCATE, which is how vertical_cubic_sl_kernel_mod and the poly2d family
+# state a size the declaration could have carried. Both extents are kernel
+# arguments, so this is the scratch case wearing an ALLOCATE.
+_ALLOCATE_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
+    "    real(kind=r_def), dimension(nlayers) :: partial\n"
+    "    real(kind=r_def), dimension(nlayers) :: swept\n",
+    "    real(kind=r_def), allocatable, dimension(:) :: partial\n"
+    "    real(kind=r_def), allocatable, dimension(:) :: swept\n").replace(
+    "    partial(1) = field_in(map_w3(1))",
+    "    allocate( partial(nlayers), swept(nlayers) )\n"
+    "    partial(1) = field_in(map_w3(1))").replace(
+    "  end subroutine column_solve_code",
+    "    deallocate( partial, swept )\n"
+    "  end subroutine column_solve_code")
+
+
+# The same kernel sizing an allocation from the data rather than from a
+# region-entry value, as apply_variable_hx_kernel_mod does with
+# `allocate(t(minval(map_wt) : maxval(map_wt) + nlayers - 1))`. The launch
+# computes its scratch size on the host, where map_w3 is not a value it can
+# reduce over.
+_UNKNOWN_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial(minval(map_w3)), swept(nlayers) )")
+
+
+# An allocation inside a loop, which is not one array with a size but a
+# different array each trip.
+_LOOPED_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( swept(nlayers) )\n"
+    "    do k = 1, nlayers\n"
+    "      allocate( partial(nlayers) )\n"
+    "    end do")
+
+
+# conservative_neg_fix_code's shape: a whole-array MINVAL over a
+# kernel-local. This is the loop wave A found accepted by validate and
+# refused by the writer, and it is the witness that the gap is closed in the
+# accepting direction as well as the refusing one.
+_MINVAL_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    real(kind=r_def) :: floor_value\n").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    floor_value = minval(partial)\n"
+    "    swept(nlayers) = partial(nlayers) + floor_value")
+
+
+# The same kernel reading an intrinsic no writer in the chain has an entry
+# for. TINY is chosen because nothing else about the kernel changes: the
+# refusal has to come from the intrinsic and from nothing else.
+_TINY_KERNEL = _MINVAL_KERNEL.replace(
+    "    floor_value = minval(partial)",
+    "    floor_value = tiny(partial(1))")
+
+
+@pytest.fixture(name="allocate_local_target")
+# pylint: disable-next=unused-argument
+def allocate_local_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel ALLOCATEs its locals at entry."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ALLOCATE_LOCAL_KERNEL)
+
+
+@pytest.fixture(name="unknown_allocate_target")
+# pylint: disable-next=unused-argument
+def unknown_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes an allocation from its data."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNKNOWN_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="looped_allocate_target")
+# pylint: disable-next=unused-argument
+def looped_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates inside a loop."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _LOOPED_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="minval_target")
+# pylint: disable-next=unused-argument
+def minval_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reduces a local with MINVAL."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MINVAL_KERNEL)
+
+
+@pytest.fixture(name="tiny_target")
+# pylint: disable-next=unused-argument
+def tiny_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads an intrinsic no writer has."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _TINY_KERNEL)
+
+
+def test_kokkos_allocate_becomes_scratch(allocate_local_target):
+    """An ALLOCATE whose extents are region-entry values becomes scratch.
+
+    A kernel-local ``allocatable`` sized from the kernel's own arguments and
+    freed before the routine returns is the automatic array the local-array
+    branch already places in team scratch, written the other way round. The
+    conversion rewrites the declaration from the ALLOCATE and removes both
+    statements, after which every rule about a local array applies unchanged.
+    """
+    _, loop, _ = allocate_local_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "team.team_scratch" in cpp
+    assert "partial" in cpp and "swept" in cpp
+    for name in ("allocate", "ALLOCATE", "deallocate", "DEALLOCATE"):
+        assert name not in cpp
+
+
+def test_kokkos_allocate_rewrites_the_declaration(allocate_local_target):
+    """The converted local is described exactly as a declared one is."""
+    _, loop, kernel = allocate_local_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    LFRicKokkosTrans._lower_allocations(schedule)
+
+    assert [(scratch.name, scratch.extents, scratch.index_offsets)
+            for scratch in LFRicKokkosTrans._local_arrays(schedule)] \
+        == [("partial", ("nlayers",), ("1",)),
+            ("swept", ("nlayers",), ("1",))]
+    assert not [call for call in schedule.walk(IntrinsicCall)
+                if call.intrinsic in (IntrinsicCall.Intrinsic.ALLOCATE,
+                                      IntrinsicCall.Intrinsic.DEALLOCATE)]
+    assert loop is not None
+
+
+def test_kokkos_allocate_refused_when_the_extent_is_not_known(
+        unknown_allocate_target):
+    """An extent the launch cannot evaluate is refused, with the array named.
+
+    The scratch size is computed on the host before the launch, where the
+    only values in scope are the region's own scalars. A reduction over a
+    kernel argument is not one of them, so this is a refusal rather than a
+    conversion.
+    """
+    _, loop, _ = unknown_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'partial'" in str(error.value)
+
+
+def test_kokkos_allocate_refused_inside_a_loop(looped_allocate_target):
+    """An allocation inside a loop is a different array each trip."""
+    _, loop, _ = looped_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'partial'" in str(error.value)
+    assert "outside every loop" in str(error.value)
+
+
+def test_lfric_kokkos_trans_generates_minval(minval_target):
+    """MINVAL over a kernel-local generates, closing wave A's skip.
+
+    ``conservative_neg_fix_code`` was accepted by ``validate`` and refused by
+    the writer, and was skipped in the optimisation script for that reason.
+    The reduction is now written, so the skip has nothing left to protect.
+    """
+    _, loop, _ = minval_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::reduction_identity<double>::min()" in cpp
+    assert "Kokkos::min(" in cpp
+    assert "MINVAL" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_an_intrinsic_the_writer_lacks(
+        tiny_target):
+    """An intrinsic no writer can spell is refused by validate, by name.
+
+    ``validate`` used to accept any body whose *shape* was capturable and
+    leave the writer to discover that it could not spell one of its
+    intrinsics, which surfaced as a back-end error out of ``apply``. The
+    check asks the writer's own tables, so the two cannot part company.
+    """
+    _, loop, _ = tiny_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "TINY/1" in str(error.value)
+
+
+# An allocation carrying an option beside the arrays it names. `mold=` states
+# where the shape and type come from, and a literal is used for it so that the
+# refusal has to name an argument that is not a reference to anything.
+_OPTION_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial(nlayers), swept(nlayers), mold=0.0_r_def )")
+
+
+# The same local allocated twice, which two shapes over one name. Scratch is
+# reserved once with one size, so this is a refusal rather than a choice
+# between the two.
+_TWICE_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial(nlayers), swept(nlayers) )\n"
+    "    allocate( partial(nlayers) )")
+
+
+# An allocation naming its array and stating no bounds for it. Fortran would
+# not accept this of a deferred-shape array, and the frontend does not judge
+# it, so the conversion says why it has no size to reserve rather than
+# reserving nothing.
+_SHAPELESS_ALLOCATE_KERNEL = _ALLOCATE_LOCAL_KERNEL.replace(
+    "    allocate( partial(nlayers), swept(nlayers) )",
+    "    allocate( partial, swept(nlayers) )")
+
+
+# A kernel allocating the module's own workspace rather than its own, which
+# is how a module-scope allocatable acquires a shape. The storage outlives the
+# region and is shared with whatever else the module lets at it, so it is not
+# the automatic array the scratch reservation stands in for.
+_MODULE_ALLOCATE_KERNEL = _ALLOCATABLE_MODULE_VARIABLE_KERNEL.replace(
+    "    partial(1) = field_in(map_w3(1))",
+    "    allocate( profile_heights(nlayers) )\n"
+    "    partial(1) = field_in(map_w3(1))").replace(
+    "  end subroutine column_solve_code",
+    "    deallocate( profile_heights )\n"
+    "  end subroutine column_solve_code")
+
+
+@pytest.fixture(name="option_allocate_target")
+# pylint: disable-next=unused-argument
+def option_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates with an option argument."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _OPTION_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="twice_allocate_target")
+# pylint: disable-next=unused-argument
+def twice_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates one local twice."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _TWICE_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="shapeless_allocate_target")
+# pylint: disable-next=unused-argument
+def shapeless_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates without stating a shape."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _SHAPELESS_ALLOCATE_KERNEL)
+
+
+@pytest.fixture(name="module_allocate_target")
+# pylint: disable-next=unused-argument
+def module_allocate_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel allocates a module-scope array."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MODULE_ALLOCATE_KERNEL)
+
+
+def test_kokkos_allocate_refused_when_it_carries_an_option(
+        option_allocate_target):
+    """An option beside the arrays says something scratch cannot say.
+
+    ``stat=``, ``errmsg=``, ``source=`` and ``mold=`` each state part of what
+    the allocation is to do, and the reserved scratch carries none of it.
+    Dropping the statement would drop the option with it, so the refusal
+    names it, and names the arguments as they were written.
+    """
+    _, loop, _ = option_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'mold'" in str(error.value)
+    assert "'0.0_r_def'" in str(error.value)
+
+
+def test_kokkos_allocate_refused_when_allocated_twice(twice_allocate_target):
+    """Two allocations of one local are two shapes over one reservation."""
+    _, loop, _ = twice_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'partial'" in str(error.value)
+    assert "allocated more than once" in str(error.value)
+
+
+def test_kokkos_allocate_refused_when_it_states_no_shape(
+        shapeless_allocate_target):
+    """An allocation stating no bounds leaves nothing to reserve."""
+    _, loop, _ = shapeless_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'partial'" in str(error.value)
+    assert "states no explicit shape" in str(error.value)
+
+
+def test_kokkos_allocate_refused_for_a_module_array(module_allocate_target):
+    """Allocating module storage is not the kernel-local case.
+
+    A module-scope allocatable outlives the region and is shared with
+    whatever else the module lets at it, so giving it the shape the statement
+    states and reserving scratch for it would move storage the model reads
+    after the invoke.
+    """
+    _, loop, _ = module_allocate_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'profile_heights'" in str(error.value)
+    assert "not a kernel-local allocatable array" in str(error.value)
+
+
+# set_exner_code's shape: a whole array assigned the value of a MATMUL,
+# `exner_e(:) = MATMUL(inv_mass_matrix_w3, rhs_e)`. The section lowering
+# refuses this assignment -- ArrayAssignment2LoopsTrans takes only a
+# scalar-valued or elemental right-hand side -- so it has to be left to the
+# backend, which writes the contraction as a nest over the destination.
+_MATMUL_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    real(kind=r_def), dimension(3,3) :: mass\n"
+    "    real(kind=r_def), dimension(3) :: rhs_e\n"
+    "    real(kind=r_def), dimension(3) :: column_e\n").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    mass(:,:) = 1.0_r_def\n"
+    "    rhs_e(:) = partial(1)\n"
+    "    column_e(:) = matmul(mass, rhs_e)\n"
+    "    swept(nlayers) = partial(nlayers) + column_e(3)")
+
+
+@pytest.fixture(name="matmul_target")
+# pylint: disable-next=unused-argument
+def matmul_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel assigns a whole array from MATMUL."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MATMUL_KERNEL)
+
+
+def test_lfric_kokkos_trans_generates_a_matmul_assignment(matmul_target):
+    """A whole array assigned from MATMUL is left to the backend.
+
+    The section lowering is what rewrites `a(:) = ...` into a loop, and it
+    declines a right-hand side that is neither scalar-valued nor elemental.
+    Refusing on that would refuse the very shape this tier exists for, so an
+    assignment holding one of its intrinsics is kept from the lowering and
+    written as a nest instead.
+    """
+    _, loop, _ = matmul_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "MATMUL" not in cpp
+    assert "+= mass(" in cpp
+    assert "column_e((_kae_i0 - 1)) = _kae_r0;" in cpp
