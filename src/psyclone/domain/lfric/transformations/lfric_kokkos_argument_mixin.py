@@ -76,9 +76,14 @@ data. The kinds of argument, and what each becomes:
 * An **evaluator** hands over a basis array shaped ``(dim, ndf, ndf_target)``
   and neither weights nor point counts, the points being the nodal points of
   the target space rather than a rule's.
-* An **inter-grid** kernel's cell map is refused rather than built, by
-  :py:meth:`LFRicKokkosContractMixin._validate_intergrid`, because it is an
-  argument about two meshes where the region knows one.
+* An **inter-grid** kernel needs nothing built here at all. Its cell map is an
+  actual the PSy layer slices by cell, ``cell_map_c(:,:,cell)``, so the
+  per-cell rule below turns it into a rank-3 View like any sliced dofmap; the
+  three counts beside it are scalars; and the fine mesh's dofmap arrives whole,
+  ``map_f(:,:)``, which the same rule leaves whole because it is not sliced.
+  The launch is over the coarse mesh because that is the mesh LFRic's own loop
+  bound names, so the second mesh reaches the region as data and never as an
+  iteration space.
 
 Beside the kernel's own formals the region carries the cell count and the
 module state the body reads, and after them the ``bind(C)`` interface the PSy

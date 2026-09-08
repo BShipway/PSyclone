@@ -460,6 +460,19 @@ class LFRicTypes:
                   ["fs_from", "fs_to"]),
             Array("DofMap", "LFRicIntegerScalarDataType",
                   ["number of dofs"], ["fs"]),
+            # An inter-grid kernel is given one column of the coarse mesh and
+            # the fine cells lying under it. The cell map holds those cells,
+            # laid out as the horizontal grid they form, so its two extents
+            # are the fine cells per coarse cell in each direction rather
+            # than a count of anything the kernel iterates over.
+            Array("CellMap", "LFRicIntegerScalarDataType",
+                  ["number of cells", "number of cells"], []),
+            # The same kernel's fine function space is dofmapped over the
+            # whole fine mesh rather than over the cell the PSy layer is on:
+            # which fine cell to read is what the cell map says, and that is
+            # known only once the kernel is running.
+            Array("WholeDofMap", "LFRicIntegerScalarDataType",
+                  ["number of dofs", "number of cells"], ["fs"]),
             Array("BasisFunctionQrXyoz", "LFRicRealScalarDataType",
                   [LFRicTypes("LFRicDimension"), "number of dofs",
                    "number of qr points in xy",

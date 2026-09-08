@@ -62,6 +62,22 @@ BASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          os.pardir, os.pardir, "test_files", "lfric")
 
 
+def _intergrid_kernel_interface():
+    '''Create a KernelInterface for an inter-grid kernel. The inter-grid
+    callbacks are the only ones that ask which mesh an argument is on, so
+    they need a kernel rather than the None the single-mesh ones take.
+
+    :returns: an interface over a prolongation kernel.
+    :rtype: :py:class:`psyclone.domain.lfric.KernelInterface`
+
+    '''
+    _, invoke_info = parse(
+        os.path.join(BASE_PATH, "22.0_intergrid_prolong.f90"), api="lfric")
+    psy = PSyFactory("lfric", distributed_memory=False).create(invoke_info)
+    schedule = psy.invokes.invoke_list[0].schedule
+    return KernelInterface(schedule[0].loop_body[0])
+
+
 def test_init():
     '''Test that we can create an instance of the KernelInterface class
     and that any defaults are set as expected
@@ -201,7 +217,6 @@ def test_mesh_ncell2d_no_halos():
     kernel_interface._mesh_ncell2d_no_halos()
 
 
-@pytest.mark.xfail(reason="Issue #928: this callback is not yet implemented")
 def test_cell_map():
     '''Test that the KernelInterface class cell_map method adds the
     expected symbols to the symbol table and the _arglist list.
@@ -209,6 +224,29 @@ def test_cell_map():
     '''
     kernel_interface = KernelInterface(None)
     kernel_interface.cell_map()
+
+    cell_map, ncell_f_per_c_x, ncell_f_per_c_y, ncell_f = \
+        kernel_interface._arglist[-4:]
+
+    for symbol, tag in ((ncell_f_per_c_x, "ncell_f_per_c_x"),
+                        (ncell_f_per_c_y, "ncell_f_per_c_y"),
+                        (ncell_f, "ncell_f")):
+        assert kernel_interface._symtab.lookup(tag) is symbol
+        assert isinstance(symbol, LFRicTypes("NumberOfCellsDataSymbol"))
+        assert isinstance(symbol.interface, ArgumentInterface)
+        assert (symbol.interface.access ==
+                kernel_interface._read_access.access)
+
+    assert kernel_interface._symtab.lookup("cell_map") is cell_map
+    assert isinstance(cell_map, LFRicTypes("CellMapDataSymbol"))
+    assert isinstance(cell_map.interface, ArgumentInterface)
+    assert cell_map.interface.access == kernel_interface._read_access.access
+    # The map is dimensioned by the two fine-cells-per-coarse-cell counts,
+    # in that order.
+    assert len(cell_map.shape) == 2
+    assert isinstance(cell_map.shape[0].upper, Reference)
+    assert cell_map.shape[0].upper.symbol is ncell_f_per_c_x
+    assert cell_map.shape[1].upper.symbol is ncell_f_per_c_y
 
 
 def test_field_vector(monkeypatch):
@@ -463,14 +501,74 @@ def test_fs_common():
     assert kernel_interface._arglist[-1] is symbol
 
 
-@pytest.mark.xfail(reason="Issue #928: this callback is not yet implemented")
 def test_fs_intergrid():
     '''Test that the KernelInterface class fs_intergrid method adds the
-    expected symbols to the symbol table and the _arglist list.
+    expected symbols to the symbol table and the _arglist list. The fine
+    mesh's space takes ndf, undf and a dofmap over the whole fine mesh; the
+    coarse mesh's takes what any field's space takes.
 
     '''
-    kernel_interface = KernelInterface(None)
-    kernel_interface.fs_intergrid(None)
+    kernel_interface = _intergrid_kernel_interface()
+    kernel = kernel_interface._kern
+
+    fine_arg, coarse_arg = kernel.arguments.args
+    assert coarse_arg.mesh == "gh_coarse"
+    assert fine_arg.mesh == "gh_fine"
+
+    # The coarse space: undf and a single cell's dofmap, as fs_compulsory_field
+    # gives any other field.
+    kernel_interface.fs_intergrid(coarse_arg.function_space)
+    coarse_name = coarse_arg.function_space.orig_name
+    undf_coarse, dofmap_coarse = kernel_interface._arglist[-2:]
+    assert undf_coarse is kernel_interface._symtab.lookup(
+        f"undf_{coarse_name}")
+    assert dofmap_coarse is kernel_interface._symtab.lookup(
+        f"dofmap_{coarse_name}")
+    assert isinstance(dofmap_coarse, LFRicTypes("DofMapDataSymbol"))
+    assert len(dofmap_coarse.shape) == 1
+
+    # The fine space: ndf as well, and a dofmap over every cell of the fine
+    # mesh, because which cell it is read at is the cell map's answer.
+    kernel_interface.fs_intergrid(fine_arg.function_space)
+    fine_name = fine_arg.function_space.orig_name
+    ndf_fine, undf_fine, dofmap_fine = kernel_interface._arglist[-3:]
+    assert ndf_fine is kernel_interface._symtab.lookup(f"ndf_{fine_name}")
+    assert isinstance(ndf_fine, LFRicTypes("NumberOfDofsDataSymbol"))
+    assert undf_fine is kernel_interface._symtab.lookup(f"undf_{fine_name}")
+    assert isinstance(undf_fine,
+                      LFRicTypes("NumberOfUniqueDofsDataSymbol"))
+
+    assert dofmap_fine is kernel_interface._symtab.lookup(
+        f"whole_dofmap_{fine_name}")
+    assert isinstance(dofmap_fine, LFRicTypes("WholeDofMapDataSymbol"))
+    assert isinstance(dofmap_fine.interface, ArgumentInterface)
+    assert (dofmap_fine.interface.access ==
+            kernel_interface._read_access.access)
+    assert dofmap_fine.fs == fine_name
+    assert len(dofmap_fine.shape) == 2
+    assert isinstance(dofmap_fine.shape[0].upper, Reference)
+    assert dofmap_fine.shape[0].upper.symbol is ndf_fine
+    # The second extent is the fine mesh's cell count, which cell_map() names
+    # too: one symbol, found by tag rather than made twice.
+    assert dofmap_fine.shape[1].upper.symbol is \
+        kernel_interface._symtab.lookup("ncell_f")
+
+
+def test_fs_intergrid_shares_the_fine_cell_count():
+    '''Test that fs_intergrid and cell_map name one 'ncell_f' symbol whichever
+    of the two runs first. ArgOrdering.generate() calls cell_map() first, so a
+    lookup would do there; declaring it in both keeps each method answerable
+    on its own.
+
+    '''
+    kernel_interface = _intergrid_kernel_interface()
+    fine_arg = kernel_interface._kern.arguments.args[0]
+    kernel_interface.fs_intergrid(fine_arg.function_space)
+    dofmap_fine = kernel_interface._arglist[-1]
+
+    kernel_interface.cell_map()
+    ncell_f = kernel_interface._arglist[-1]
+    assert dofmap_fine.shape[1].upper.symbol is ncell_f
 
 
 def test_fs_compulsory_field():

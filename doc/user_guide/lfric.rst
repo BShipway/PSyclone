@@ -4362,7 +4362,20 @@ a formal of the same kernel, so the ordinary scalar and View descriptions
 cover them whole; a kernel may name both shapes, and then carries a basis
 array per shape on each of its spaces. Face and edge quadrature are refused by
 name, because they replace the XYoZ pair with a face or edge count and a
-single point count and nothing here has been measured against them. The
+single point count and nothing here has been measured against them. An
+inter-grid kernel -- one whose fields carry ``mesh_arg`` and so live on a
+coarse mesh and a fine one -- is accepted, and it too adds nothing to the
+ABI. LFRic runs such a kernel once per *coarse* cell and the body reaches
+the fine cells itself, through the cell map ``cell_map(:,:,cell)`` naming
+the ``ncell_f_per_c_x`` by ``ncell_f_per_c_y`` fine cells that coarse cell
+refines into, so the launch is the flat one over cells that a single-mesh
+kernel already has. The cell map is an actual the PSy layer slices by cell,
+which makes it a rank-3 View exactly as a sliced dofmap is; the three counts
+beside it are scalars; and a field on the fine mesh brings its dofmap whole,
+``map_f(:,:)``, which is what the PSy layer passes and what the region
+therefore declares. The second mesh reaches the region as data and never as
+an iteration space: ``ncell_f`` is the extent the fine dofmap is strided by,
+not a bound anything is launched over. The
 contract it accepts, and the reasons it refuses, are given in its
 documentation below.
 
@@ -4376,10 +4389,10 @@ LFRic-specific "psyclone.domain/lfric/transformations"
 directory. Note, the early LFRic API-specific
 transformations have not yet been migrated to this directory.
 
-.. note:: Only the loop-colouring and OpenMP transformations are currently
-          supported for loops that contain inter-grid kernels. Attempting
-          to apply other transformation types will result in PSyclone raising
-          an error.
+.. note:: Only the loop-colouring, OpenMP and **LFRicKokkosTrans**
+          transformations are currently supported for loops that contain
+          inter-grid kernels. Attempting to apply other transformation types
+          will result in PSyclone raising an error.
 
 .. autoclass:: psyclone.domain.lfric.transformations.LFRicExtractTrans
     :members:

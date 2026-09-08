@@ -85,8 +85,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     impossible. ``r_single`` and ``r_solver`` are both 4 bytes, so an
     interface offering both is refused rather than resolved by coincidence,
     as is one no algorithm precision selects at all. Metadata the matcher
-    cannot model -- a stencil, a CMA or inter-grid kernel, which PSyclone's
-    issue #928 leaves unbuilt -- is a third refusal, kept distinct from
+    cannot model -- a stencil or a CMA kernel, which PSyclone's issue #928
+    leaves unbuilt -- is a third refusal, kept distinct from
     finding no match because a question that cannot be asked has not been
     answered "no".
 
@@ -107,6 +107,12 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     algorithm precision at all -- an answer about precisions it had never
     compared. The extent is instead named with a variable, exactly as the PSy
     layer names it, and it is not one of the things the matcher compares.
+
+    An inter-grid shape was one of those too, and was taught the same way:
+    the cell map with its two per-cell counts and the fine mesh's cell count,
+    and a whole dofmap for a field on the fine mesh where a per-cell one
+    serves a field on the coarse. Both are what the PSy layer already passes,
+    so what the matcher gained is a description rather than a decision.
 
     **A field's data may be real or integer.** LFRic's ``integer_field_type``
     has ``field_type``'s proxy shape with ``integer(i_def)`` data, and the
@@ -182,6 +188,24 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     is the cell. A CMA operator stays refused, as before, because a banded
     matrix carries its own bandwidth and indexing arguments that this region
     has no way to describe.
+
+    **An inter-grid kernel spans two meshes and still launches over one.**
+    Such a kernel takes a field on a coarse mesh and one on a fine mesh, and
+    LFRic runs it once per *coarse* cell: the cell map ``cell_map(:,:,cell)``
+    names the ``ncell_f_per_c_x`` by ``ncell_f_per_c_y`` fine cells that cell
+    refines into, and the body reaches them itself. So the launch is the flat
+    one it would have been over a single mesh, and the second mesh reaches
+    the region as data and never as an iteration space -- ``ncell_f`` is the
+    extent the fine mesh's dofmap is strided by, not a bound anything is
+    launched over.
+
+    Nothing had to be built for that. The cell map is an actual the PSy layer
+    slices by cell, so the per-cell rule turns it into a rank-3 View like any
+    other sliced dofmap; the three counts beside it are scalars; the fine
+    mesh's dofmap arrives whole, ``map_f(:,:)``, which the same rule leaves
+    whole because it is not sliced; and the coarse mesh is what LFRic's own
+    loop bound already names. What stood in the way was a refusal, and
+    removing it is what accepts these kernels.
 
     **The kernel's cell argument is declared rather than passed.** LFRic gives
     a leading ``cell`` formal to exactly the kernels that take an operator,
@@ -701,8 +725,9 @@ KernelModuleInlineTrans`.
         except NotImplementedError as err:
             # The matcher builds the interface the metadata implies before it
             # compares anything, and PSyclone's issue #928 leaves parts of that
-            # unbuilt -- evaluator shapes, stencils, CMA and inter-grid
-            # kernels. Not being able to ask the question is a third outcome,
+            # unbuilt -- stencils and CMA kernels, the evaluator and
+            # inter-grid shapes having since been described.
+            # Not being able to ask the question is a third outcome,
             # distinct from asking it and getting no match: reading it as one
             # would report a kind mismatch about a kernel whose kinds were
             # never examined.

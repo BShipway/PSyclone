@@ -54,7 +54,6 @@ askable on their own:
 :py:meth:`LFRicKokkosContractMixin._validate_iteration_space`,
 :py:meth:`LFRicKokkosContractMixin._validate_halo_depth`,
 :py:meth:`LFRicKokkosContractMixin._validate_evaluator`,
-:py:meth:`LFRicKokkosContractMixin._validate_intergrid`,
 :py:meth:`LFRicKokkosContractMixin._validate_field_types` and
 :py:meth:`LFRicKokkosContractMixin._validate_continuous_write`. The two
 bundling methods call them rather than repeating them, and the last two share
@@ -250,19 +249,6 @@ class LFRicKokkosContractMixin:
                     f"LFRicKokkosTrans does not support the '{shape}' "
                     f"evaluator shape.")
 
-    @staticmethod
-    def _validate_intergrid(kernel):
-        """Check that the kernel iterates over a single mesh.
-
-        :param kernel: the kernel the loop holds.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-
-        :raises TransformationError: if the kernel is an inter-grid kernel.
-        """
-        if kernel.is_intergrid:
-            raise TransformationError(
-                "LFRicKokkosTrans does not support inter-grid kernels.")
-
     @classmethod
     def _validate_field_type(cls, argument):
         """Check one argument's intrinsic type, if it is a field.
@@ -379,10 +365,10 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
 
         :raises TransformationError: if the kernel needs quadrature or
-            evaluator data, is a CMA or inter-grid kernel, takes an argument
-            that is not a field, a scalar or an LMA operator, takes an access
-            a cell-parallel launch cannot honour, takes a field of an
-            intrinsic no View can hold, uses a stencil shape outside
+            evaluator data, is a CMA kernel, takes an argument that is not a
+            field, a scalar or an LMA operator, takes an access a
+            cell-parallel launch cannot honour, takes a field of an intrinsic
+            no View can hold, uses a stencil shape outside
             :py:attr:`_SUPPORTED_STENCILS`, or writes to a field on a
             continuous space.
         """
@@ -390,8 +376,6 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
         if kernel.cma_operation is not None:
             raise TransformationError(
                 "LFRicKokkosTrans does not support CMA operators.")
-        cls._validate_intergrid(kernel)
-
         discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
         for argument in kernel.arguments.args:
             # An LMA operator needs no rule of its own beyond this one. It
