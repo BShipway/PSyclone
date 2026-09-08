@@ -576,7 +576,7 @@ value` and wraps the actual in `LOGICAL(..., c_bool)`, which the compiler
 performs. There is therefore no width to assert, and asserting one would fail
 on exactly the builds this admits -- LFRic's `l_def` is `kind(.false.)` and
 measures 4 bytes where PSyclone's precision map records 1, which is issue
-#1941. `LFRicKokkosArgumentMixin._kind_assertions` filters a logical kind out of
+#1941. `LFRicKokkosInterfaceMixin._kind_assertions` filters a logical kind out of
 both the assertions and their `use constants_mod` line for that reason, and
 `_C_LOGICAL_TYPE` is deliberately a separate attribute rather than a
 `_C_TYPES` row, since that table is keyed by width and a row would have to

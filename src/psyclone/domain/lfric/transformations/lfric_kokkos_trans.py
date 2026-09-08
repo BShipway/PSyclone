@@ -17,6 +17,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
     import LFRicKokkosConstantsMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin import (
     LFRicKokkosContractMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_interface_mixin \
+    import LFRicKokkosInterfaceMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_intrinsic_mixin \
     import LFRicKokkosIntrinsicMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_inline_mixin import (
@@ -31,14 +33,15 @@ from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Nine mixins and Transformation, which is one contract split by subject
-# rather than ten layers of behaviour: every base but the last holds only
+# Ten mixins and Transformation, which is one contract split by subject
+# rather than eleven layers of behaviour: every base but the last holds only
 # private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosArgumentMixin, LFRicKokkosBoundsMixin,
                        LFRicKokkosCallMixin,
                        LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,
+                       LFRicKokkosInterfaceMixin,
                        LFRicKokkosIntrinsicMixin, LFRicKokkosScheduleMixin,
                        Transformation):
     """Replace one supported LFRic cell-column loop with a C ABI call.

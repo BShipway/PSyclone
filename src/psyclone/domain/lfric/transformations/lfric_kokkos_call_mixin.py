@@ -40,10 +40,11 @@ instantiated. It holds no instance state and every method is a
 ``staticmethod`` or a ``classmethod``, which is what makes the mixin sound: it
 is a namespace with an inheritable ``cls``, not an object.
 
-What the region takes for each of the kernel's arguments, what the PSy layer
-passes in its place and what the ``bind(C)`` interface declares are not here
-but in ``LFRicKokkosArgumentMixin``, so that one module holds the whole of the
-correspondence between a formal and its actual.
+What the region takes for each of the kernel's arguments and what the PSy
+layer passes in its place are not here but in ``LFRicKokkosArgumentMixin``, so
+that one module holds the whole of the correspondence between a formal and its
+actual; what the ``bind(C)`` interface then declares for each of them is
+``LFRicKokkosInterfaceMixin``.
 
 The one constraint that follows is that a method reaching a helper of the
 sibling mixins ``LFRicKokkosTypesMixin`` and ``LFRicKokkosBoundsMixin`` does
