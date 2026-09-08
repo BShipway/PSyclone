@@ -15,7 +15,8 @@ import pytest
 from psyclone.psyir.backend.kokkos import (
     KokkosConstant, KokkosRegion, KokkosScalar, KokkosScratch, KokkosView,
     KokkosWriter, extent_names, is_extent, is_offset)
-from psyclone.psyir.backend.kokkos_launch import range_launch, team_launch
+from psyclone.psyir.backend.kokkos_launch import (
+    hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
@@ -54,12 +55,21 @@ end subroutine moist_dyn_gas_code
         "moist_dyn_gas_code", symbol_table=symbol_table, children=children)
 
 
-def _region():
-    """Return the explicit launch and argument contract for the test body."""
+def _region(cell_count="ncells"):
+    """Return the explicit launch and argument contract for the test body.
+
+    :param str cell_count: the formal the launch is bounded by, which is also
+        the last extent of every per-cell View. It is a parameter because the
+        count a region covers is whatever bound the loop it came from
+        carried; the default is only the commonest of those.
+
+    :returns: the region the writer is asked to generate.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
     return KokkosRegion(
         name="moist_dyn_gas_kokkos",
         schedule=_kernel_schedule(),
-        cell_count="ncells",
+        cell_count=cell_count,
         arguments=(
             KokkosScalar("nlayers", "int"),
             KokkosView(
@@ -72,10 +82,10 @@ def _region():
             KokkosScalar("undf_wtheta", "int"),
             KokkosView(
                 "map_wtheta", "map_wtheta_data", "int",
-                ("ndf_wtheta", "ncells"), index_offsets=(1,),
+                ("ndf_wtheta", cell_count), index_offsets=(1,),
                 extra_indices=("cell",), read_only=True,
                 random_access=True),
-            KokkosScalar("ncells", "int"),
+            KokkosScalar(cell_count, "int"),
             KokkosScalar("recip_epsilon", "double"),
         ))
 
@@ -110,6 +120,44 @@ def test_kokkos_writer_translation_unit():
     assert 'moist_dyn_gas("' not in code
     assert 'mr_v("' not in code
     assert 'map_wtheta("' not in code
+
+
+def test_kokkos_launch_takes_an_upper_bound_formal():
+    """Every launch shape is bounded by the region's count, whatever it is.
+
+    A region covers the cells its loop covered, and an LFRic loop is not
+    always bounded by the owned cells: an operator is assembled redundantly
+    into the first halo, and a dof loop may run to the last annexed dof. The
+    count therefore crosses the ABI as a formal the launch reads rather than
+    as anything the generated source names for itself, and every per-cell
+    View is sized by that same formal -- a View still sliced by the owned
+    count would be read past its end by the very cells the wider bound added.
+
+    ``ncells`` is the commonest bound and so the one every other test here
+    uses; asking for a different name is what tells the two apart.
+    """
+    bound = "last_halo_cell"
+
+    code = KokkosWriter()(_region(cell_count=bound))
+
+    assert f"const int {bound}" in code
+    assert f"Kokkos::RangePolicy<>(0, {bound})" in code
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            f"ReadOnly> map_wtheta(map_wtheta_data, ndf_wtheta, {bound});"
+            in code)
+    assert "ncells" not in code
+
+    # The two team shapes read the same formal, in the league they size and
+    # in the guard that stops a rank with no cell of its own.
+    flat = team_launch(_scratch_region(cell_count=bound), "", "")
+    assert f"if (cell >= {bound}) {{" in flat
+    assert (f"const int league_size = ({bound} + team_size - 1) / team_size;"
+            in flat)
+    assert "ncells" not in flat
+
+    hierarchical = hierarchical_launch(_level_region(cell_count=bound), "", "")
+    assert f"TeamPolicy({bound}, Kokkos::AUTO)" in hierarchical
+    assert "ncells" not in hierarchical
 
 
 def test_kokkos_writer_requires_an_initialised_runtime():
@@ -2469,6 +2517,32 @@ def test_kokkos_writer_reports_nothing_for_a_body_it_can_write():
     assert not refusals
 
 
+def test_kokkos_writer_reports_an_array_intrinsic_out_of_its_tier():
+    """A reduction the array tier does not write is reported, not skipped.
+
+    The tier generates a loop nest over an assignment's destination, so it
+    writes such an intrinsic on a right-hand side and nowhere else.
+    ``edge_lump_w2_mass_matrix_code`` tests for a domain edge with
+    ``if (minval(smap_sizes) == 1)``, which no tier writes: skipping it for
+    its name alone let ``validate`` accept a kernel ``apply`` then refused,
+    and the whole-model capture gate says so.
+    """
+    schedule = _array_probe("""
+  if (minval(p) == 1) then
+    x = 1.0
+  end if
+""")
+
+    refusals = KokkosWriter().unsupported_intrinsics(schedule, _ARRAY_KINDS)
+
+    assert list(refusals) == ["MINVAL/1"]
+
+    # On a right-hand side the same call is the tier's, and is not reported.
+    schedule = _array_probe("  x = minval(p)\n")
+
+    assert not KokkosWriter().unsupported_intrinsics(schedule, _ARRAY_KINDS)
+
+
 def test_kokkos_array_intrinsic_over_a_section():
     """An operand may be a section, which is the form the model writes.
 
@@ -2708,17 +2782,20 @@ def test_kae_leaves_a_whole_array_name_of_another_rank_alone():
 
 
 def test_kokkos_writer_inherits_the_integer_power_tree():
-    """The Kokkos writer renders ``**`` as the C writer does.
+    """The Kokkos writer builds ``**`` into the product tree the C writer does.
 
-    It has no handler of its own for a binary operation, and that is what is
-    being asserted: the rounding fix belongs to the C writer, and the Kokkos
-    writer must not quietly acquire a ``pow`` of its own on the way past a
-    kernel's ``edge_height ** 3``.
+    The tree is the C writer's and is inherited whole, and that is what is
+    being asserted: the rounding fix belongs there, and the Kokkos writer must
+    not acquire a second answer of its own on the way past a kernel's
+    ``edge_height ** 3``.
 
     A single-precision base keeps its width. Every operand of the tree is the
     base itself, and the reciprocal's numerator is the integer one, so C++'s
     arithmetic conversions never widen the expression to double and round it
     back.
+
+    What the tree does not write falls to a call, and only its *name* is the
+    Kokkos writer's; the test below says why.
     """
     assert _written_expressions(
         "  a = b ** 2\n"
@@ -2731,5 +2808,27 @@ def test_kokkos_writer_inherits_the_integer_power_tree():
             "((b * b) * b)",
             "((s * s) * s)",
             "(1 / (b * b))",
-            "pow(b, i)",
+            "Kokkos::pow(b, i)",
             "(j * j)"]
+
+
+def test_kokkos_writer_writes_a_power_at_its_operands_width():
+    """A power the tree does not write is ``Kokkos::pow``, not C's ``pow``.
+
+    C's ``pow`` binds ``double`` for every argument it is given, so a
+    single-precision power is computed in double and rounded back to
+    ``float``, where gfortran calls ``powf`` and rounds once. The two disagree
+    in the last bit often enough to move a whole-model checksum, which is what
+    ``sample_eos_operators_code`` -- ``exner_cell ** onemk_over_k``, both
+    ``r_solver`` -- did.
+
+    ``Kokkos::pow`` is overloaded, so the width follows the operands. Both
+    widths are asserted, because the fix would be worth nothing if it changed
+    the double case: that one is the same library call under either name, and
+    every region captured before this one relies on it.
+    """
+    assert _written_expressions(
+        "  s = s ** s\n"
+        "  a = b ** c\n") == [
+            "Kokkos::pow(s, s)",
+            "Kokkos::pow(b, c)"]

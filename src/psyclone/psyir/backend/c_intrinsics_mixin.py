@@ -116,6 +116,16 @@ class CIntrinsicsMixin:
     because there is no more general writer to fall through to.
     '''
 
+    #: The function a power falls back to when
+    #: :py:mod:`psyclone.psyir.backend.c_integer_power` does not write it as
+    #: a product tree. C's ``pow`` takes and returns ``double`` whatever it is
+    #: given, which is the right answer for C and the wrong one for a
+    #: back-end whose operands carry a Fortran kind: a single-precision
+    #: ``x ** y`` is computed in double and rounded back, where gfortran calls
+    #: ``powf`` and rounds once. A back-end that can spell a power at its
+    #: operands' own width overrides this; the Kokkos one does.
+    _POW_FUNCTION = "pow"
+
     def unaryoperation_node(self, node):
         '''This method is called when a UnaryOperation instance is found in
         the PSyIR tree.
@@ -222,8 +232,11 @@ class CIntrinsicsMixin:
             BinaryOperation.Operator.MUL: ("*", operator_format),
             BinaryOperation.Operator.DIV: ("/", operator_format),
             # Reached only by a power the tree above did not write: a
-            # non-literal or real exponent, or one out of range.
-            BinaryOperation.Operator.POW: ("pow", function_format),
+            # non-literal or real exponent, or one out of range. The name is
+            # :py:attr:`_POW_FUNCTION` rather than a literal because a
+            # back-end that knows its operands' width spells it otherwise.
+            BinaryOperation.Operator.POW: (self._POW_FUNCTION,
+                                           function_format),
             BinaryOperation.Operator.EQ: ("==", operator_format),
             BinaryOperation.Operator.NE: ("!=", operator_format),
             BinaryOperation.Operator.LT: ("<", operator_format),

@@ -205,6 +205,28 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     loop bound already names. What stood in the way was a refusal, and
     removing it is what accepts these kernels.
 
+    **A region may iterate into the halo, and the exchange stays in the PSy
+    layer.** The launch's upper bound is a formal the region reads and never
+    writes, filled by the PSy layer with the loop's own stop expression, so
+    what the bound *means* is settled outside the region and only its value
+    crosses. LFRic writes three such expressions and all three are accepted:
+    ``mesh%get_last_halo_cell(1)`` for a loop taken to the first halo depth,
+    ``field_proxy%vspace%get_last_dof_annexed()`` for a dof loop taken over
+    the annexed dofs, and ``mesh%get_last_halo_cell(depth)`` for a depth
+    computed at runtime -- that depth is evaluated where it already was, and
+    the region never sees it.
+
+    Every per-cell View is sliced to the same formal, so a region running into
+    the halo describes the cells it runs over rather than the owned ones. What
+    the accepted bounds have in common is that each counts consecutively from
+    the first cell or dof, which is :py:attr:`_COUNTED_BOUNDS`; a loop whose
+    *lower* bound is shifted -- ``cell_halo_start``, which runs the halo alone
+    -- is still refused, the launch having no lower-bound formal to fill.
+
+    The halo exchange itself does not move. The PSy layer emits it in front of
+    the loop and it is lowered there, in front of the call to the region; see
+    :py:meth:`_lower_halo_exchanges`. Nothing is exchanged inside a region.
+
     **The kernel's cell argument is declared rather than passed.** LFRic gives
     a leading ``cell`` formal to exactly the kernels that take an operator,
     because a kernel finds its own slice of a local stencil arithmetically --
@@ -543,6 +565,17 @@ KernelModuleInlineTrans`.
     *index* is the exception: it is renamed rather than refused, because a
     kernel declaring ``cell`` is a real GungHo shape and the fix is one name
     in two places rather than seven threaded through two launch shapes.
+
+    **A name Fortran allows and C++ reserves is refused, formal or local.**
+    Fortran reserves no words, so ``const``, ``new`` and ``operator`` are
+    ordinary variable names -- and ``const`` is one
+    ``project_eliminated_theta_q32_kernel_mod`` declares. Written out as an
+    identifier it gives ``const float const,`` in the signature, which no
+    compiler takes. The names are :py:attr:`_CXX_KEYWORDS` and the comparison
+    is case-sensitive, only a name already lower case colliding with the
+    keyword. A rename is not attempted: it would have to reach every place the
+    backend writes a name, and a refusal that says which name it was costs a
+    region rather than risking a wrong one.
 
     **A name the body reads that is not one of its arguments reaches the
     region one of four ways.** A module-level ``parameter`` declared beside

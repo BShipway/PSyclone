@@ -164,6 +164,73 @@ class LFRicKokkosContractMixin:
     #: name rather than accepted on the strength of the resemblance.
     _SUPPORTED_SHAPES = ("gh_quadrature_xyoz", "gh_evaluator")
 
+    #: Upper bounds a launch beginning at the first cell can cover. Each of
+    #: these names a count of consecutive cells or dofs starting from the
+    #: first, so the launch runs ``0`` to that count and every per-cell View
+    #: is sliced to it: ``ncells`` the owned cells, ``cell_halo`` those and
+    #: the halo to the depth the loop asks for, ``ndofs`` the owned dofs,
+    #: ``nannexed`` those and the annexed ones, ``dof_halo`` the dofs to a
+    #: halo depth. What each renders as in the PSy layer is
+    #: :py:meth:`~psyclone.domain.lfric.LFRicLoop.upper_bound_psyir`'s
+    #: business, and the region takes its value rather than its expression.
+    #:
+    #: The coloured bounds -- ``ncolours``, ``ncolour``, ``ntilecolours`` and
+    #: the rest -- are absent. They index a colour map rather than counting
+    #: from the first cell, and a loop carrying one is refused by
+    #: :py:meth:`_validate_iteration_space` before this is asked.
+    _COUNTED_BOUNDS = ("ncells", "cell_halo", "ndofs", "nannexed", "dof_halo")
+
+    #: Names a kernel symbol may not carry into the generated region. Fortran
+    #: and C++ do not reserve the same words, so a perfectly ordinary Fortran
+    #: dummy argument or local -- ``const``, ``operator``, ``class``, ``new``
+    #: -- becomes a syntax error the moment the backend writes it out as an
+    #: identifier. The region is refused rather than the name rewritten: a
+    #: rename would have to reach every place the backend writes a name, and
+    #: nothing here can promise that today.
+    #:
+    #: Fortran is case-insensitive and PSyIR holds these names as the source
+    #: wrote them, so the comparison is case-sensitive on purpose: only a name
+    #: that is *already* lower case collides with the C++ keyword, and a
+    #: kernel writing ``CONST`` would generate valid C++.
+    #:
+    #: The alternative tokens -- ``and``, ``or``, ``not`` and the rest -- are
+    #: keywords in C++ as much as ``if`` is, and are as likely as any to be a
+    #: Fortran variable, so they are listed with the others.
+    _CXX_KEYWORDS = frozenset((
+        "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand",
+        "bitor", "bool", "break", "case", "catch", "char", "char8_t",
+        "char16_t", "char32_t", "class", "compl", "concept", "const",
+        "consteval", "constexpr", "constinit", "const_cast", "continue",
+        "co_await", "co_return", "co_yield", "decltype", "default", "delete",
+        "do", "double", "dynamic_cast", "else", "enum", "explicit", "export",
+        "extern", "false", "float", "for", "friend", "goto", "if", "inline",
+        "int", "long", "mutable", "namespace", "new", "noexcept", "not",
+        "not_eq", "nullptr", "operator", "or", "or_eq", "private",
+        "protected", "public", "register", "reinterpret_cast", "requires",
+        "return", "short", "signed", "sizeof", "static", "static_assert",
+        "static_cast", "struct", "switch", "template", "this", "thread_local",
+        "throw", "true", "try", "typedef", "typeid", "typename", "union",
+        "unsigned", "using", "virtual", "void", "volatile", "wchar_t",
+        "while", "xor", "xor_eq"))
+
+    @classmethod
+    def _validate_cxx_name(cls, symbol, description):
+        """Check that one kernel symbol's name is writable as C++.
+
+        :param symbol: the kernel symbol the region would name.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+        :param str description: what the symbol is to the kernel, for the
+            refusal to say: ``"formal"`` or ``"local"``.
+
+        :raises TransformationError: if the name is a C++ keyword, which the
+            generated region could not write as an identifier.
+        """
+        if symbol.name in cls._CXX_KEYWORDS:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot name the kernel {description} "
+                f"'{symbol.name}' in the generated region, because it is a "
+                "C++ keyword.")
+
     @staticmethod
     def _validate_iteration_space(node):
         """Check that the loop iterates over uncoloured cell columns.
@@ -179,9 +246,9 @@ class LFRicKokkosContractMixin:
                 "LFRicKokkosTrans supports only an uncoloured cell-column "
                 "loop.")
 
-    @staticmethod
-    def _validate_halo_depth(node):
-        """Check that the loop visits the owned cells and no others.
+    @classmethod
+    def _validate_halo_depth(cls, node):
+        """Check that the loop runs from the first cell or dof to a count.
 
         The depth and the bound names are one question rather than two. A
         loop written over the halo carries a depth; one written over
@@ -189,22 +256,38 @@ class LFRicKokkosContractMixin:
         differently, so a survey that reported them apart would count one
         blocked pattern twice.
 
+        The upper bound is not the question it once was. A region is launched
+        over whatever count its loop carried -- the count crosses the ABI as
+        :py:attr:`LFRicKokkosArgumentMixin._CELL_COUNT`, filled from the
+        loop's own stop expression -- so a bound reaching into the halo needs
+        nothing of the generated code that the owned-cell bound did not. What
+        it needs of the *bound* is that it be a count from the first cell or
+        dof, which is what :py:attr:`_COUNTED_BOUNDS` lists.
+
+        The lower bound is still the question it was. The launch begins at
+        the first cell, so a loop beginning anywhere else would run the
+        cells it was told to skip -- a wrong answer rather than a compile
+        error, and the reason this refuses rather than trusting the upper
+        bound alone.
+
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
 
-        :raises TransformationError: if the loop carries a halo depth.
-        :raises TransformationError: if the loop is not bounded by the owned
-            cells.
+        :raises TransformationError: if the loop does not start at the first
+            cell or dof.
+        :raises TransformationError: if the loop's upper bound is not one of
+            :py:attr:`_COUNTED_BOUNDS`.
         """
-        if node.upper_bound_halo_depth is not None:
-            raise TransformationError(
-                "LFRicKokkosTrans does not support a halo depth.")
         # LFRicLoop does not currently expose its lower-bound name.
         # pylint: disable=protected-access
-        if (node._lower_bound_name != "start" or
-                node.upper_bound_name != "ncells"):
+        if node._lower_bound_name != "start":
             raise TransformationError(
-                "LFRicKokkosTrans supports only owned-cell bounds.")
+                "LFRicKokkosTrans supports only a loop starting at the "
+                "first cell or dof.")
+        if node.upper_bound_name not in cls._COUNTED_BOUNDS:
+            raise TransformationError(
+                f"LFRicKokkosTrans does not support the "
+                f"'{node.upper_bound_name}' loop bound.")
 
     @classmethod
     def _validate_loop(cls, node):
@@ -536,6 +619,8 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
 
         :raises TransformationError: if the kernel already declares the name
             the generated signature adds for the cell count.
+        :raises TransformationError: if a formal's name is a C++ keyword; see
+            :py:attr:`_CXX_KEYWORDS`.
         :raises TransformationError: if a formal's kind is not one
             :py:attr:`_C_TYPES` maps, or if an array formal's extent is not
             itself a formal, so the generated View could not be sized.
@@ -548,6 +633,7 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
                 f"LFRicKokkosTrans adds '{cls._CELL_COUNT}' to the generated "
                 "signature, but the kernel already declares it.")
         for symbol in formals:
+            cls._validate_cxx_name(symbol, "formal")
             if cls._c_type(symbol) is None:
                 raise TransformationError(
                     f"LFRicKokkosTrans supports {cls._supported_kinds()} "
@@ -605,6 +691,8 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
             by having an automatic array, or a loop to spread over the team --
             and declares a local named in :py:attr:`_GENERATED_NAMES`, which
             that launch declares.
+        :raises TransformationError: if a local's name is a C++ keyword; see
+            :py:attr:`_CXX_KEYWORDS`.
         :raises TransformationError: if a local array's kind is not one
             :py:attr:`_C_TYPES` maps, or if one of its extents is not a
             kernel argument, so the scratch View could not be sized.
@@ -623,6 +711,11 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
             raise TransformationError(
                 f"LFRicKokkosTrans' generated launch declares '{name}', but "
                 "the kernel declares a local of that name.")
+
+        # Sorted for the reason the collision above is: a kernel with two
+        # such locals names the same one on every run.
+        for symbol in sorted(locals_, key=lambda symbol: symbol.name):
+            cls._validate_cxx_name(symbol, "local")
 
         for symbol in table.automatic_datasymbols:
             if not symbol.is_array:
