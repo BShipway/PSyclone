@@ -888,9 +888,7 @@ def test_profiling_exit_statement(fortran_reader):
         ptrans.validate(psyir.children[0].children[0])
     assert ("Cannot apply the ProfileTrans to a code region containing a "
             "potential control flow jump, as these could skip the end of "
-            "profiling caliper. Found:\n'! PSyclone CodeBlock "
-            "(unsupported code) reason:\n!  - Unsupported statement: "
-            "Exit_Stmt\nEXIT\n'"
+            "profiling caliper. Found:\n'exit\n'"
             in str(excinfo.value))
 
 

@@ -706,6 +706,23 @@ class CWriter(LanguageWriter):
 
         return formatter(opstring, [self._visit(ch) for ch in node.arguments])
 
+    def exit_node(self, _):
+        '''This method is called when an Exit instance is found in the
+        PSyIR tree.
+
+        Fortran's unlabelled EXIT and C's break both leave the innermost
+        enclosing loop, so the translation needs nothing else. The node
+        itself checks that there is a loop to leave.
+
+        :param node: an Exit PSyIR node.
+        :type node: :py:class:`psyclone.psyir.nodes.Exit`
+
+        :returns: the C code as a string.
+        :rtype: str
+
+        '''
+        return f"{self._nindent}break;\n"
+
     def return_node(self, _):
         '''This method is called when a Return instance is found in
         the PSyIR tree.

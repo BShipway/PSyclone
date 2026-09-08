@@ -1617,6 +1617,19 @@ class FortranWriter(LanguageWriter):
             raise VisitorError(
                 f"Unexpected unary op '{node.operator}'.") from error
 
+    def exit_node(self, _):
+        '''This method is called when an Exit instance is found in the
+        PSyIR tree.
+
+        :param node: an Exit PSyIR node.
+        :type node: :py:class:`psyclone.psyir.nodes.Exit`
+
+        :returns: the Fortran code as a string.
+        :rtype: str
+
+        '''
+        return f"{self._nindent}exit\n"
+
     def return_node(self, _):
         '''This method is called when a Return instance is found in
         the PSyIR tree.

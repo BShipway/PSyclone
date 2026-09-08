@@ -40,7 +40,8 @@
 '''
 
 from psyclone.psyir.transformations import TransformationError
-from psyclone.psyir.nodes import CodeBlock, ProfileNode, Return, Routine
+from psyclone.psyir.nodes import (
+    CodeBlock, Exit, ProfileNode, Return, Routine)
 from psyclone.psyir.transformations.psy_data_trans import PSyDataTrans
 
 
@@ -116,3 +117,15 @@ class ProfileTrans(PSyDataTrans):
                         f"containing a potential control flow jump, as these "
                         f"could skip the end of profiling caliper. "
                         f"Found:\n'{block.debug_string()}'")
+            # An Exit node is the same jump with a node of its own rather
+            # than a CodeBlock, and is refused on the same terms. A region
+            # that contains the whole of the loop being left is in fact
+            # safe, but this keeps the answer the transformation gave when
+            # every EXIT was still a CodeBlock.
+            exits = node.walk(Exit)
+            if exits:
+                raise TransformationError(
+                    f"Cannot apply the ProfileTrans to a code region "
+                    f"containing a potential control flow jump, as these "
+                    f"could skip the end of profiling caliper. "
+                    f"Found:\n'{exits[0].debug_string()}'")

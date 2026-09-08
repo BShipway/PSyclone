@@ -109,6 +109,7 @@ from psyclone.psyir.nodes.omp_clauses import (
     OMPFirstprivateClause, OMPSharedClause, OMPDependClause)
 from psyclone.psyir.nodes.omp_task_directive import OMPTaskDirective
 from psyclone.psyir.nodes.while_loop import WhileLoop
+from psyclone.psyir.nodes.exit_stmt import Exit
 
 # The entities in the __all__ list are made available to import directly from
 # this package e.g. 'from psyclone.psyir.nodes import Literal'
@@ -129,6 +130,7 @@ __all__ = [
         'CodeBlock',
         'Container',
         'DataNode',
+        'Exit',
         'FileContainer',
         'IfBlock',
         'IntrinsicCall',

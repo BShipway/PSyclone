@@ -341,9 +341,11 @@ def test_codeblock_has_potential_control_flow_jump(fortran_reader):
     GOTO 1234
     i = 1
     write(*,*) "Hello"
-    do i = 1, 100
-        EXIT
-    end do
+    i = 2
+    outer: do i = 1, 100
+        EXIT outer
+    end do outer
+    i = 4
 1234 i = 3
     end subroutine"""
     psyir = fortran_reader.psyir_from_source(code)
@@ -353,7 +355,9 @@ def test_codeblock_has_potential_control_flow_jump(fortran_reader):
     assert codeblocks[0].has_potential_control_flow_jump()
     # Write statement
     assert not codeblocks[1].has_potential_control_flow_jump()
-    # Exit statement
+    # Exit statement. An unlabelled EXIT is an Exit node rather than a
+    # CodeBlock, so the loop is named here: naming the construct is what keeps
+    # the whole DO, and its EXIT, in a CodeBlock.
     assert codeblocks[2].has_potential_control_flow_jump()
     # labelled statement
     assert codeblocks[3].has_potential_control_flow_jump()

@@ -39,12 +39,12 @@
 
 import pytest
 
-from psyclone.errors import InternalError
+from psyclone.errors import GenerationError, InternalError
 from psyclone.psyir.backend.c import CWriter, _is_real_argument
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Call,
-    CodeBlock, IfBlock, Literal, Node, Reference, Return, Schedule,
+    CodeBlock, Exit, IfBlock, Literal, Node, Reference, Return, Schedule,
     UnaryOperation, Loop, OMPTaskloopDirective, OMPMasterDirective,
     OMPParallelDirective, IntrinsicCall, OMPBarrierDirective)
 from psyclone.psyir.symbols import (
@@ -258,6 +258,52 @@ def test_cw_return():
     cwriter = CWriter()
     result = cwriter(Return())
     assert "return;\n" in result
+
+
+def test_cw_exit(fortran_reader):
+    '''Check the CWriter class writes an Exit as C's break, in a counted
+    loop and in a while loop alike.
+
+    Fortran's unlabelled EXIT and C's break both leave the innermost
+    enclosing loop, so no other statement is needed to carry it across.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(a)
+          integer :: i, a
+          do i = 1, 20
+            if (a > i) then
+              exit
+            end if
+            a = a + i
+          enddo
+          do while (a < 100)
+            a = a + 1
+            if (a == 50) exit
+          end do
+        end subroutine tmp
+        end module test'''
+    container = fortran_reader.psyir_from_source(code).children[0]
+    module = container.children[0]
+
+    cwriter = CWriter()
+    counted = cwriter(module[0])
+    assert ("for(i=1; i<=20; i+=1)\n{\n  if ((a > i)) {\n    break;\n  }"
+            in counted)
+    assert "break;" in cwriter(module[1])
+
+
+def test_cw_exit_needs_a_loop():
+    '''Check that the CWriter refuses an Exit with no loop to leave: a
+    stray break would either not compile or leave a switch instead.
+
+    '''
+    cwriter = CWriter()
+    with pytest.raises(GenerationError) as error:
+        _ = cwriter(Exit())
+    assert "Exit must be inside a loop" in str(error.value)
 
 
 def test_cw_codeblock():

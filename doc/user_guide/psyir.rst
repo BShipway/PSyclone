@@ -90,6 +90,7 @@ Available language-level nodes
 - :ref_guide:`Call psyclone.psyir.nodes.html#psyclone.psyir.nodes.Call`
 - :ref_guide:`CodeBlock psyclone.psyir.nodes.html#psyclone.psyir.nodes.CodeBlock`
 - :ref_guide:`Container psyclone.psyir.nodes.html#psyclone.psyir.nodes.Container`
+- :ref_guide:`Exit psyclone.psyir.nodes.html#psyclone.psyir.nodes.Exit`
 - :ref_guide:`FileContainer psyclone.psyir.nodes.html#psyclone.psyir.nodes.FileContainer`
 - :ref_guide:`IfBlock psyclone.psyir.nodes.html#psyclone.psyir.nodes.IfBlock`
 - :ref_guide:`IntrinsicCall psyclone.psyir.nodes.html#psyclone.psyir.nodes.IntrinsicCall`
