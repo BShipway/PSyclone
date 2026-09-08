@@ -143,17 +143,19 @@ class LFRicKokkosContractMixin:
     #: Evaluator shapes whose basis data the region already carries. XYoZ
     #: quadrature adds two point counts, two weight arrays and one basis
     #: array per function space that asks for one, shaped
-    #: ``(dim, ndf, np_xy, np_z)``. Every one of those is an argument the PSy
-    #: layer has computed before the loop and every extent of it is a formal
-    #: of the same kernel, so the existing scalar and View descriptions cover
-    #: them whole.
+    #: ``(dim, ndf, np_xy, np_z)``. An evaluator adds no rule of its own at
+    #: all: it tabulates the basis at the nodal points of a target function
+    #: space, giving ``(dim, ndf, ndf of the target)`` and no weights. Every
+    #: one of those is an argument the PSy layer has computed before the loop
+    #: and every extent of it is a formal of the same kernel, so the existing
+    #: scalar and View descriptions cover them whole.
     #:
     #: Face and edge quadrature are absent. They carry a face or edge count
     #: and a single point count in place of the XYoZ pair, and while the
     #: same descriptions look as though they would cover those too, nothing
     #: here has been measured against the model for them. They are refused by
     #: name rather than accepted on the strength of the resemblance.
-    _SUPPORTED_SHAPES = ("gh_quadrature_xyoz",)
+    _SUPPORTED_SHAPES = ("gh_quadrature_xyoz", "gh_evaluator")
 
     @staticmethod
     def _validate_iteration_space(node):

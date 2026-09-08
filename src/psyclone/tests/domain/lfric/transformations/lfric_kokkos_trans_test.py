@@ -1965,6 +1965,152 @@ end module qr_weight_kernel_mod
 """
 
 
+_EVALUATOR_ALGORITHM = """
+program kokkos_evaluator_test
+  use field_mod, only : field_type
+  use eval_project_kernel_mod, only : eval_project_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(eval_project_kernel_type(out_field, in_field))
+end program kokkos_evaluator_test
+"""
+
+
+# An evaluator carries no weights and no point counts: the basis is tabulated
+# at the nodal points of the target space, which is the space of the written
+# field, so its last extent is that space's ndf.
+_EVALUATOR_KERNEL = """
+module eval_project_kernel_mod
+  use argument_mod, only : arg_type, func_type, gh_field, gh_real, gh_write, &
+                           gh_read, gh_basis, gh_diff_basis, cell_column,    &
+                           gh_evaluator
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w1, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: eval_project_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                    &
+         arg_type(gh_field, gh_real, gh_write, w3),                        &
+         arg_type(gh_field, gh_real, gh_read,  w1) /)
+    type(func_type) :: meta_funcs(2) = (/                                  &
+         func_type(w3, gh_basis),                                          &
+         func_type(w1, gh_diff_basis) /)
+    integer :: gh_shape = gh_evaluator
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: eval_project_code
+  end type eval_project_kernel_type
+contains
+  subroutine eval_project_code(nlayers, field_out, field_in,               &
+                               ndf_w3, undf_w3, map_w3, basis_w3_on_w3,    &
+                               ndf_w1, undf_w1, map_w1, diff_basis_w1_on_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_w1, undf_w1
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_w1), intent(in) :: map_w1
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w1), intent(in) :: field_in
+    real(kind=r_def), dimension(1,ndf_w3,ndf_w3), intent(in) ::            &
+                                                           basis_w3_on_w3
+    real(kind=r_def), dimension(3,ndf_w1,ndf_w3), intent(in) ::            &
+                                                      diff_basis_w1_on_w3
+    integer(kind=i_def) :: k, df, dg
+    real(kind=r_def) :: total
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        total = 0.0_r_def
+        do dg = 1, ndf_w1
+          total = total + basis_w3_on_w3(1,df,df)                          &
+                * diff_basis_w1_on_w3(3,dg,df) * field_in(map_w1(dg) + k)
+        end do
+        field_out(map_w3(df) + k) = total
+      end do
+    end do
+  end subroutine eval_project_code
+end module eval_project_kernel_mod
+"""
+
+
+_BOTH_SHAPES_ALGORITHM = """
+program kokkos_both_shapes_test
+  use field_mod, only : field_type
+  use quadrature_xyoz_mod, only : quadrature_xyoz_type
+  use both_shapes_kernel_mod, only : both_shapes_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  type(quadrature_xyoz_type) :: qr
+  call invoke(both_shapes_kernel_type(out_field, in_field, qr))
+end program kokkos_both_shapes_test
+"""
+
+
+# A kernel may ask for both shapes at once, in which case every function space
+# it names carries two basis arrays: one over the quadrature points and one
+# over the target space's nodes.
+_BOTH_SHAPES_KERNEL = """
+module both_shapes_kernel_mod
+  use argument_mod, only : arg_type, func_type, gh_field, gh_real, gh_write, &
+                           gh_read, gh_basis, cell_column,                   &
+                           gh_quadrature_XYoZ, gh_evaluator
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w1, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: both_shapes_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                    &
+         arg_type(gh_field, gh_real, gh_write, w3),                        &
+         arg_type(gh_field, gh_real, gh_read,  w1) /)
+    type(func_type) :: meta_funcs(2) = (/                                  &
+         func_type(w3, gh_basis),                                          &
+         func_type(w1, gh_basis) /)
+    integer :: gh_shape(2) = (/ gh_quadrature_XYoZ, gh_evaluator /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: both_shapes_code
+  end type both_shapes_kernel_type
+contains
+  subroutine both_shapes_code(nlayers, field_out, field_in, ndf_w3, undf_w3, &
+                              map_w3, basis_w3_qr, basis_w3_on_w3,          &
+                              ndf_w1, undf_w1, map_w1, basis_w1_qr,         &
+                              basis_w1_on_w3, np_xy, np_z, weights_xy,      &
+                              weights_z)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_w1, undf_w1, np_xy, np_z
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_w1), intent(in) :: map_w1
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w1), intent(in) :: field_in
+    real(kind=r_def), dimension(1,ndf_w3,np_xy,np_z), intent(in) ::        &
+                                                              basis_w3_qr
+    real(kind=r_def), dimension(1,ndf_w3,ndf_w3), intent(in) ::            &
+                                                           basis_w3_on_w3
+    real(kind=r_def), dimension(3,ndf_w1,np_xy,np_z), intent(in) ::        &
+                                                              basis_w1_qr
+    real(kind=r_def), dimension(3,ndf_w1,ndf_w3), intent(in) ::            &
+                                                           basis_w1_on_w3
+    real(kind=r_def), dimension(np_xy), intent(in) :: weights_xy
+    real(kind=r_def), dimension(np_z), intent(in) :: weights_z
+    integer(kind=i_def) :: k, df, qp1, qp2
+    real(kind=r_def) :: total
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        total = 0.0_r_def
+        do qp2 = 1, np_z
+          do qp1 = 1, np_xy
+            total = total + weights_xy(qp1) * weights_z(qp2)               &
+                  * basis_w3_qr(1,df,qp1,qp2) * basis_w1_qr(3,1,qp1,qp2)   &
+                  * field_in(map_w1(1) + k)
+          end do
+        end do
+        total = total + basis_w3_on_w3(1,df,df) * basis_w1_on_w3(3,1,df)
+        field_out(map_w3(df) + k) = total
+      end do
+    end do
+  end subroutine both_shapes_code
+end module both_shapes_kernel_mod
+"""
+
+
 _FACE_QUADRATURE_ALGORITHM = """
 program kokkos_face_quadrature_test
   use field_mod, only : field_type
@@ -2347,6 +2493,22 @@ def diff_basis_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel reads a basis and its derivative."""
     return _invoke(
         tmp_path, "qr_weight", _QUADRATURE_ALGORITHM, _DIFF_BASIS_KERNEL)
+
+
+@pytest.fixture(name="evaluator_target")
+# pylint: disable-next=unused-argument
+def evaluator_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads evaluator basis data."""
+    return _invoke(
+        tmp_path, "eval_project", _EVALUATOR_ALGORITHM, _EVALUATOR_KERNEL)
+
+
+@pytest.fixture(name="both_shapes_target")
+# pylint: disable-next=unused-argument
+def both_shapes_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel asks for quadrature and an evaluator."""
+    return _invoke(
+        tmp_path, "both_shapes", _BOTH_SHAPES_ALGORITHM, _BOTH_SHAPES_KERNEL)
 
 
 @pytest.fixture(name="face_quadrature_target")
@@ -3532,6 +3694,48 @@ def test_lfric_kokkos_trans_quadrature_call_passes_the_psy_arrays(
     assert "basis_w3_qr(" not in arguments
     assert "np_xy_qr = qr_proxy%np_xy" in generated
     assert "weights_xy_qr => qr_proxy%weights_xy" in generated
+
+
+def test_lfric_kokkos_trans_accepts_an_evaluator_kernel(evaluator_target):
+    """An evaluator tabulates the basis at a target space's nodal points.
+
+    There is no quadrature rule, so no weights and no point counts cross the
+    ABI at all. The basis is rank 3 -- (dim, ndf, ndf of the target space) --
+    and the target is the space of the written field, W3 here, which is why
+    the W1 derivative is shaped by ``ndf_w3`` and not by its own ``ndf_w1``.
+    """
+    _, loop, kernel = evaluator_target
+    assert kernel.eval_shapes == ["gh_evaluator"]
+    assert not kernel.qr_required
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
+        "ReadOnly> basis_w3_on_w3(basis_w3_on_w3_data, 1, ndf_w3, ndf_w3);" \
+        in code
+    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
+        "ReadOnly> diff_basis_w1_on_w3(diff_basis_w1_on_w3_data, 3, ndf_w1, " \
+        "ndf_w3);" in code
+    assert "weights" not in code
+    assert "np_xy" not in code
+    assert "np_z" not in code
+
+
+def test_lfric_kokkos_trans_accepts_a_kernel_with_both_shapes(
+        both_shapes_target):
+    """A kernel may ask for quadrature and an evaluator at once.
+
+    Each function space then carries two basis arrays of different rank, and
+    the quadrature rule is still appended once, after both of them.
+    """
+    _, loop, kernel = both_shapes_target
+    assert kernel.eval_shapes == ["gh_quadrature_xyoz", "gh_evaluator"]
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "basis_w3_qr(basis_w3_qr_data, 1, ndf_w3, np_xy, np_z);" in code
+    assert "basis_w3_on_w3(basis_w3_on_w3_data, 1, ndf_w3, ndf_w3);" in code
+    assert "basis_w1_qr(basis_w1_qr_data, 3, ndf_w1, np_xy, np_z);" in code
+    assert "basis_w1_on_w3(basis_w1_on_w3_data, 3, ndf_w1, ndf_w3);" in code
+    assert code.count("const int np_xy") == 1
 
 
 def test_lfric_kokkos_trans_accepts_a_diff_basis(diff_basis_target):
@@ -6108,10 +6312,17 @@ def test_lfric_kokkos_trans_evaluator_predicate_refuses_an_unmodelled_shape(
 
 def test_lfric_kokkos_trans_evaluator_predicate_accepts_modelled_shapes(
         target):
-    """A shape the region models passes the rule."""
+    """The two shapes the region models pass the rule, together or apart.
+
+    Asked of each shape separately and of both at once, because a rule
+    written to accept a single shape would refuse the kernels that ask for
+    both -- and those are the ones the model has most of.
+    """
     _, _, kernel = target
-    kernel._eval_shapes = ["gh_quadrature_xyoz"]
-    LFRicKokkosTrans._validate_evaluator(kernel)
+    for shapes in (["gh_quadrature_xyoz"], ["gh_evaluator"],
+                   ["gh_quadrature_xyoz", "gh_evaluator"]):
+        kernel._eval_shapes = shapes
+        LFRicKokkosTrans._validate_evaluator(kernel)
 
 
 def test_lfric_kokkos_trans_intergrid_predicate_refuses_two_meshes(target):
