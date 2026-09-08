@@ -1838,6 +1838,24 @@ _REPEATED_IMPORT_KERNEL = _KERNEL.replace(
     "            recip_epsilon + recip_epsilon * mr_v_at_dof")
 
 
+# The target kernel subscripting one field by a constant its *module* imports,
+# on both sides of an assignment. That is the shape LFRic's inter-grid
+# prolongation has -- 'fine_field(map_fine(SWB, ...))', with SWB an
+# 'integer, parameter' from reference_element_mod -- and nothing about it is
+# inter-grid: what matters is that the name is resolved through the kernel
+# module's symbol table rather than the subroutine's, and that the loop reads
+# and writes one array so that the dependence analysis has two subscripts to
+# compare symbolically. 'n_moist' is planet_config_mod's integer parameter.
+_MODULE_INDEX_KERNEL = _KERNEL.replace(
+    "  use planet_config_mod, only : recip_epsilon",
+    "  use planet_config_mod, only : n_moist, recip_epsilon").replace(
+    "        moist_dyn_gas(map_wtheta(df) + k) = &\n"
+    "            1.0_r_def + recip_epsilon * mr_v_at_dof",
+    "        moist_dyn_gas(map_wtheta(n_moist) + k) = &\n"
+    "            moist_dyn_gas(map_wtheta(n_moist) + k) + &\n"
+    "            recip_epsilon * mr_v_at_dof")
+
+
 # The target kernel renaming its imported constant, as LFRic's moisture
 # kernels rename the latent heats they read. The module declares one name and
 # the body reads another, so the generated PSy layer has to repeat the rename
@@ -3785,6 +3803,14 @@ def repeated_import_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel reads one imported constant twice."""
     return _invoke(
         tmp_path, "moist_dyn_gas", _ALGORITHM, _REPEATED_IMPORT_KERNEL)
+
+
+@pytest.fixture(name="module_index_target")
+# pylint: disable-next=unused-argument
+def module_index_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel indexes a field by a module constant."""
+    return _invoke(
+        tmp_path, "moist_dyn_gas", _ALGORITHM, _MODULE_INDEX_KERNEL)
 
 
 @pytest.fixture(name="reshaped_constant_target")
@@ -8167,3 +8193,53 @@ def test_lfric_kokkos_trans_refuses_a_field_kind_not_on_the_abi(
 
     assert "'mask_out' has 'i_native'" in str(error.value)
     assert "4-byte integer, 4-byte real and 8-byte real" in str(error.value)
+
+
+def test_lfric_kokkos_trans_validate_keeps_the_module_scope_chain(
+        module_index_target):
+    """A name the kernel *module* imports is still resolvable in the probe.
+
+    ``validate()`` predicts the rewrite on a copy, and the copy has to keep
+    the FileContainer the kernel was read from: a Routine copied on its own
+    leaves every symbol the module ``use``d at module level out of the scope
+    chain. The dependence analysis is where that is felt, because comparing
+    two subscripts symbolically means looking each name in them up --
+    ``moist_dyn_gas(map_wtheta(n_moist) + k)`` on both sides of one
+    assignment, with ``n_moist`` imported by the module.
+
+    The failure this covers is not a refusal: it is
+    ``KeyError: "Could not find 'n_moist' in the Symbol Table."`` coming
+    straight out of ``SymPyWriter``, which breaks ``validate()``'s contract
+    that a rejection is a ``TransformationError``. Found on LFRic's inter-grid
+    prolongation, where the constant is ``SWB``; reproduced here on a
+    single-mesh kernel, because nothing about it is inter-grid.
+    """
+    _, loop, _ = module_index_target
+
+    try:
+        LFRicKokkosTrans().validate(loop)
+    except TransformationError as err:
+        pytest.fail(f"the capture contract refused the kernel: {err}")
+
+
+def test_lfric_kokkos_trans_validate_probe_is_not_the_schedule(section_target):
+    """``validate()`` leaves the kernel schedule exactly as it found it.
+
+    That is the whole reason the probe is a copy, and it is worth asserting
+    directly rather than through the generated text: the probe is lowered,
+    has its bounds substituted and its allocations resolved, and every one of
+    those would be a side effect of *validating* if it reached the schedule.
+    The section kernel witnesses it, because the lowering it would undergo is
+    visible in the tree -- an array section becomes a loop nest -- rather than
+    only in a symbol's type.
+    """
+    _, loop, kernel = section_target
+    schedule = kernel.get_callees()[0]
+    before = schedule.debug_string()
+    assert schedule.walk(Range)
+
+    LFRicKokkosTrans().validate(loop)
+
+    assert kernel.get_callees()[0] is schedule
+    assert schedule.debug_string() == before
+    assert schedule.walk(Range)

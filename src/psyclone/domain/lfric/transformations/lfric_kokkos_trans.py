@@ -706,8 +706,10 @@ KernelModuleInlineTrans`.
         # because the lowering is itself a producer of loops: a kernel whose
         # only parallelisable loop is the one a section lowers to has none at
         # all until the copy is lowered. The two predicates above have already
-        # shown that both rewrites succeed on this schedule.
-        probe = schedule.copy()
+        # shown that both rewrites succeed on this schedule. The copy is taken
+        # the way _inlined_copy takes its own, and for the same reason: a
+        # Routine copied alone loses the module scope its names resolve in.
+        probe = self._rooted_copy(schedule)
         self._lower_allocations(probe)
         self._lower_sections(probe)
         self._substitute_bounds(probe)

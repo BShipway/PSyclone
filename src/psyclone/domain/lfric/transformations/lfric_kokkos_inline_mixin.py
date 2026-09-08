@@ -222,6 +222,31 @@ class LFRicKokkosInlineMixin:
         except (TransformationError, TypeError):
             pass
 
+    @staticmethod
+    def _rooted_copy(schedule):
+        """Return a copy of ``schedule`` that keeps its scope chain.
+
+        The copy is of the whole file the kernel was read from, not of the
+        schedule alone, and the routine is then found again by its position.
+        A Routine copied on its own is detached from the FileContainer and
+        the Container above it, so every name the kernel module ``use``d at
+        module level -- an ``integer, parameter`` an array subscript reads,
+        say -- is no longer resolvable from the copy. A rule asked about the
+        copy would then be answering about a scope chain the kernel does not
+        have, and the answer is not always a refusal: looking such a name up
+        raises where nothing catches it.
+
+        :param schedule: the kernel schedule to copy.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :returns: the copied schedule, inside a copy of its own file.
+        :rtype: :py:class:`psyclone.psyir.nodes.Routine`
+
+        """
+        root = schedule.root
+        index = root.walk(Routine).index(schedule)
+        return root.copy().walk(Routine)[index]
+
     @classmethod
     def _inlined_copy(cls, schedule):
         """Return a copy of ``schedule`` with its calls inlined.
@@ -241,9 +266,7 @@ class LFRicKokkosInlineMixin:
         :raises TransformationError: if a call cannot be inlined, by
             :py:meth:`_inline_calls`.
         """
-        root = schedule.root
-        index = root.walk(Routine).index(schedule)
-        copy = root.copy().walk(Routine)[index]
+        copy = cls._rooted_copy(schedule)
         cls._inline_calls(copy)
         return copy
 
