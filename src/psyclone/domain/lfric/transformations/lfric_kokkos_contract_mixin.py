@@ -447,7 +447,9 @@ class LFRicKokkosContractMixin:
         own. Passed to a routine -- ``call convert(field(:,k))`` -- the call
         is the blocker and :py:meth:`_validate_calls` is the rule that names
         it, so this one steps aside rather than reporting the argument as a
-        second, weaker reason for the same refusal.
+        second, weaker reason for the same refusal. The shape an ``ALLOCATE``
+        states is not a section at all: it is a declaration written as a
+        statement, and :py:meth:`_lower_allocations` is what reads it.
 
         :param schedule: the kernel schedule to be captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
@@ -462,6 +464,9 @@ class LFRicKokkosContractMixin:
             if section.ancestor(Assignment) is not None:
                 continue
             call = section.ancestor(Call)
+            if isinstance(call, IntrinsicCall) and \
+                    call.intrinsic in cls._ALLOCATIONS:
+                continue
             if call is not None and not isinstance(call, IntrinsicCall):
                 continue
             raise TransformationError(

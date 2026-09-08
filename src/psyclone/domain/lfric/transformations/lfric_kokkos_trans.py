@@ -15,6 +15,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
     import LFRicKokkosConstantsMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin import (
     LFRicKokkosContractMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_intrinsic_mixin \
+    import LFRicKokkosIntrinsicMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.errors import GenerationError
@@ -34,7 +36,8 @@ from psyclone.psyir.transformations import (
 
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosBoundsMixin, LFRicKokkosCallMixin,
-                       LFRicKokkosConstantsMixin, Transformation):
+                       LFRicKokkosConstantsMixin, LFRicKokkosIntrinsicMixin,
+                       Transformation):
     """Replace one supported LFRic cell-column loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
@@ -493,9 +496,15 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         # all until the copy is lowered. The two predicates above have already
         # shown that both rewrites succeed on this schedule.
         probe = schedule.copy()
+        self._lower_allocations(probe)
         self._lower_sections(probe)
         self._substitute_bounds(probe)
-        self._validate_locals(schedule, self._parallel_loops(probe))
+        # The locals are judged on the probe rather than on the schedule,
+        # because the allocation tier is what gives an allocated local its
+        # shape: on the schedule it still has the deferred one the
+        # declaration carried.
+        self._validate_locals(probe, self._parallel_loops(probe))
+        self._validate_intrinsics(probe)
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
         # so that an array parameter the generated unit could not declare is
@@ -785,6 +794,7 @@ can_loop_be_parallelised`
         self.validate(node, options=options, **kwargs)
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
+        self._lower_allocations(schedule)
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)
         self._substitute_constants(schedule)
