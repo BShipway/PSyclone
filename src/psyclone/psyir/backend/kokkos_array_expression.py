@@ -148,8 +148,11 @@ class KokkosArrayExpression:
 
         The launch, not this class, declares them: a scratch array must be in
         the region's ``shmem_size`` request, which is written before the body
-        that needs it. The writer therefore lowers the body once to collect
-        these, adds them to the region, and generates it again.
+        that needs it. So a caller that lowers an expression with no
+        destination has to add these to the region's scratch itself. Nothing
+        in the tree does yet, every array assignment on the LFRic path being
+        rewritten into loops before the writer sees it, and every
+        :py:meth:`lower` the writer performs having a destination.
 
         :returns: one description per temporary, in the order allocated.
         :rtype: Tuple[:py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`,
