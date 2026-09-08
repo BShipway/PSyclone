@@ -1050,10 +1050,163 @@ def test_quad_rule_error(monkeypatch):
             "kernel_interface." in str(info.value))
 
 
+def test_basis_evaluator():
+    '''Test that the KernelInterface class basis method adds the expected
+    classes to the symbol table and the _arglist list for an evaluator
+    shape. An evaluator carries no quadrature rule, so the last extent
+    of the array is the number of dofs of the space the basis is
+    evaluated on rather than a point count.
+
+    '''
+    _, invoke_info = parse(os.path.join(
+        BASE_PATH, "6.1_eval_invoke.f90"),
+                           api="lfric")
+    psy = PSyFactory("lfric",
+                     distributed_memory=False).create(invoke_info)
+    schedule = psy.invokes.invoke_list[0].schedule
+    kernel = schedule[0].loop_body[0]
+
+    # "w0" requires a basis function and is the first entry in the
+    # unique function spaces list
+    w0_fs = kernel.arguments.unique_fss[0]
+    fs_name = w0_fs.orig_name
+
+    kernel_interface = KernelInterface(kernel)
+    kernel_interface.basis(w0_fs)
+
+    # ndf declared
+    ndf_symbol = kernel_interface._symtab.lookup(f"ndf_{fs_name}")
+    assert isinstance(ndf_symbol, LFRicTypes("NumberOfDofsDataSymbol"))
+    assert isinstance(ndf_symbol.interface, ArgumentInterface)
+    assert (ndf_symbol.interface.access ==
+            kernel_interface._read_access.access)
+    # basis declared and added to argument list
+    basis_symbol = kernel_interface._symtab.lookup("basis_w0_on_w0")
+    assert isinstance(basis_symbol,
+                      LFRicTypes("BasisFunctionEvaluatorDataSymbol"))
+    assert isinstance(basis_symbol.interface, ArgumentInterface)
+    assert (basis_symbol.interface.access ==
+            kernel_interface._read_access.access)
+    assert basis_symbol.fs == "w0"
+    assert basis_symbol.fs_target == "w0"
+    assert kernel_interface._arglist[-1] is basis_symbol
+    assert len(basis_symbol.shape) == 3
+    assert isinstance(basis_symbol.shape[0].upper, Literal)
+    assert basis_symbol.shape[0].upper.value == "1"
+    assert isinstance(basis_symbol.shape[1].upper, Reference)
+    assert basis_symbol.shape[1].upper.symbol is ndf_symbol
+    assert isinstance(basis_symbol.shape[2].upper, Reference)
+    assert basis_symbol.shape[2].upper.symbol is ndf_symbol
+
+
+def test_diff_basis_evaluator():
+    '''Test that the KernelInterface class diff_basis method adds the
+    expected classes to the symbol table and the _arglist list for an
+    evaluator shape. The space the differential basis is on and the
+    space it is evaluated on differ here, so the last two extents are
+    distinct symbols.
+
+    '''
+    _, invoke_info = parse(os.path.join(
+        BASE_PATH, "6.1_eval_invoke.f90"),
+                           api="lfric")
+    psy = PSyFactory("lfric",
+                     distributed_memory=False).create(invoke_info)
+    schedule = psy.invokes.invoke_list[0].schedule
+    kernel = schedule[0].loop_body[0]
+
+    # "w1" requires a differential basis function and is the second
+    # entry in the unique function spaces list
+    w1_fs = kernel.arguments.unique_fss[1]
+
+    kernel_interface = KernelInterface(kernel)
+    kernel_interface.diff_basis(w1_fs)
+
+    ndf_w1_symbol = kernel_interface._symtab.lookup("ndf_w1")
+    ndf_w0_symbol = kernel_interface._symtab.lookup("ndf_w0")
+    diff_basis_symbol = kernel_interface._symtab.lookup(
+        "diff_basis_w1_on_w0")
+    assert isinstance(diff_basis_symbol,
+                      LFRicTypes("DiffBasisFunctionEvaluatorDataSymbol"))
+    assert diff_basis_symbol.fs == "w1"
+    assert diff_basis_symbol.fs_target == "w0"
+    assert kernel_interface._arglist[-1] is diff_basis_symbol
+    assert len(diff_basis_symbol.shape) == 3
+    assert isinstance(diff_basis_symbol.shape[0].upper, Literal)
+    assert diff_basis_symbol.shape[0].upper.value == "3"
+    assert diff_basis_symbol.shape[1].upper.symbol is ndf_w1_symbol
+    assert diff_basis_symbol.shape[2].upper.symbol is ndf_w0_symbol
+
+
+def test_basis_evaluator_multiple_targets():
+    '''Test that the KernelInterface class adds one array per target space
+    when a kernel is evaluated on more than one space.
+
+    '''
+    _, invoke_info = parse(os.path.join(
+        BASE_PATH, "6.8_eval_2fs_invoke.f90"),
+                           api="lfric")
+    psy = PSyFactory("lfric",
+                     distributed_memory=False).create(invoke_info)
+    schedule = psy.invokes.invoke_list[0].schedule
+    kernel = schedule[0].loop_body[0]
+
+    # "w1" requires a differential basis function that is evaluated on
+    # both of the spaces that this kernel writes to
+    w1_fs = kernel.arguments.unique_fss[1]
+
+    kernel_interface = KernelInterface(kernel)
+    kernel_interface.diff_basis(w1_fs)
+
+    assert len(kernel.eval_targets) == 2
+    names = [symbol.name for symbol in kernel_interface._arglist[-2:]]
+    assert names == ["diff_basis_w1_on_w0", "diff_basis_w1_on_w1"]
+    for name, target in zip(names, ["w0", "w1"]):
+        symbol = kernel_interface._symtab.lookup(name)
+        assert isinstance(symbol,
+                          LFRicTypes("DiffBasisFunctionEvaluatorDataSymbol"))
+        assert symbol.fs_target == target
+        assert (symbol.shape[2].upper.symbol is
+                kernel_interface._symtab.lookup(f"ndf_{target}"))
+
+
+def test_basis_first_dim_any_space():
+    '''Test that the KernelInterface class dimensions a basis array with a
+    variable when the metadata does not fix its first extent, as it
+    cannot for an any_space function space (TODO #461).
+
+    '''
+    _, invoke_info = parse(os.path.join(
+        BASE_PATH, "11_any_space.f90"),
+                           api="lfric")
+    psy = PSyFactory("lfric",
+                     distributed_memory=False).create(invoke_info)
+    schedule = psy.invokes.invoke_list[0].schedule
+    kernel = schedule[0].loop_body[0]
+
+    # The first unique function space of this kernel is "any_space_1"
+    aspc1_fs = kernel.arguments.unique_fss[0]
+    assert aspc1_fs.orig_name == "any_space_1"
+
+    kernel_interface = KernelInterface(kernel)
+    kernel_interface.basis(aspc1_fs)
+
+    basis_symbol = kernel_interface._symtab.lookup(
+        f"basis_{aspc1_fs.mangled_name}_qr_xyoz")
+    dim_symbol = kernel_interface._symtab.lookup(
+        f"dim_{aspc1_fs.mangled_name}")
+    assert isinstance(dim_symbol,
+                      LFRicTypes("LFRicIntegerScalarDataSymbol"))
+    assert isinstance(dim_symbol.interface, ArgumentInterface)
+    assert (dim_symbol.interface.access ==
+            kernel_interface._read_access.access)
+    assert isinstance(basis_symbol.shape[0].upper, Reference)
+    assert basis_symbol.shape[0].upper.symbol is dim_symbol
+
+
 def test_create_basis_errors(monkeypatch):
-    '''Check that the appropriate exceptions are raised when a) an
-    evaluator shape is provided, as they are not yet supported, and b)
-    an unrecognised quadrature or evaluator shape is found.
+    '''Check that the appropriate exception is raised when an unrecognised
+    quadrature or evaluator shape is found.
 
     '''
     _, invoke_info = parse(os.path.join(
@@ -1065,19 +1218,13 @@ def test_create_basis_errors(monkeypatch):
     kernel = schedule[0].loop_body[0]
     kernel_interface = KernelInterface(kernel)
 
-    # "w1" requires a basis function and is the first entry in the
+    # "w0" requires a basis function and is the first entry in the
     # unique function spaces list
-    w1_fs = kernel.arguments.unique_fss[0]
-    # Evaluator shapes are not yet supported.
-    with pytest.raises(NotImplementedError) as info:
-        kernel_interface.basis(w1_fs)
-    assert ("Evaluator shapes not implemented in kernel_interface class."
-            in str(info.value))
+    w0_fs = kernel.arguments.unique_fss[0]
     # Force an unsupported shape
     monkeypatch.setattr(kernel, "_eval_shapes", ["invalid_shape"])
     with pytest.raises(InternalError) as info:
-        kernel_interface.basis(w1_fs)
-        assert (
-            "Unrecognised quadrature or evaluator shape 'invalid_shape'. "
+        kernel_interface.basis(w0_fs)
+    assert ("Unrecognised quadrature or evaluator shape 'invalid_shape'. "
             "Expected one of: ['gh_quadrature_xyoz', 'gh_quadrature_face', "
             "'gh_quadrature_edge', 'gh_evaluator']." in str(info.value))
