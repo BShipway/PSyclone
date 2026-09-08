@@ -21,6 +21,7 @@ from psyclone.psyir.backend.kokkos_team_scalars import (
     team_private_scalars)
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
+from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.nodes import (
     CodeBlock, KernelSchedule, Literal, Loop, Reference)
 
@@ -222,6 +223,24 @@ class KokkosRegion:
     #: Declared among the body's locals and taking no place on the ABI, so a
     #: region built before this field existed generates what it did then.
     constants: Tuple[KokkosConstant, ...] = ()
+    #: The name of the scalar formal holding the first cell the launch runs,
+    #: or ``None`` for a launch beginning at the first cell of the mesh.
+    #: An LFRic loop over the halo cells alone begins where the owned cells
+    #: end, and that is the one shape a count on its own cannot express: a
+    #: launch from zero would run the owned cells the loop was told to skip.
+    #: It is a formal rather than anything the generated source computes,
+    #: because the PSy layer already holds the value. ``None`` writes the
+    #: text every shape wrote before this field existed; see
+    #: :py:func:`~psyclone.psyir.backend.kokkos_launch.launch_offsets`.
+    cell_start: Optional[str] = None
+    #: Whether the region's iteration space is dofs rather than cell columns.
+    #: It selects the launch shape ahead of every other field, because a dof
+    #: region has no cells to give a team; see
+    #: :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch`. Where
+    #: it is true, :py:attr:`cell_count` holds the dof count and
+    #: :py:attr:`cell_index` the name of the dof index: a region has one
+    #: iteration space and one count of it, whichever space that is.
+    dof: bool = False
 
 
 class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
@@ -273,15 +292,19 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         duration of the call and cleared afterwards, so that a writer reused
         for a second region does not carry the first one's widths into it.
 
-        One of three launch shapes is generated. A region naming any
+        One of four launch shapes is generated. A region whose
+        :py:attr:`KokkosRegion.dof` is set takes the dof launch, ahead of
+        every other selection because a dof region has no cells to give a
+        team; otherwise a region naming any
         :py:attr:`KokkosRegion.parallel_loops` takes the hierarchical launch;
         otherwise one describing any :py:attr:`KokkosRegion.scratch` takes the
-        flat team launch; otherwise the range launch. Neither of the older two
+        flat team launch; otherwise the range launch. None of the older three
         reads the fields it does not select on, so a region built before they
         existed is generated exactly as it was then; see
         :py:func:`~psyclone.psyir.backend.kokkos_launch.range_launch`,
-        :py:func:`~psyclone.psyir.backend.kokkos_launch.team_launch` and
-        :py:func:`~psyclone.psyir.backend.kokkos_launch.hierarchical_launch`.
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.team_launch`,
+        :py:func:`~psyclone.psyir.backend.kokkos_launch.hierarchical_launch`
+        and :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch`.
 
         Every scalar a chosen loop writes is declared inside that loop's
         lambda, so that each member of the team owns its own; which scalars
@@ -376,7 +399,9 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             f"{{{', '.join(self._visit(value) for value in item.values)}}};\n"
             for item in region.constants) + local_declarations
 
-        if region.parallel_loops:
+        if region.dof:
+            launch = dof_launch(region, local_declarations, body)
+        elif region.parallel_loops:
             launch = hierarchical_launch(region, local_declarations, body)
         elif region.scratch:
             launch = team_launch(region, local_declarations, body)
@@ -472,13 +497,16 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             :py:attr:`KokkosRegion.team_size` is neither ``None`` nor an
             ``int`` -- ``bool`` among them, since ``TeamPolicy(ncells, True)``
             is a legal team of one that nothing downstream would report.
-        :raises ValueError: if the region's name, its cell count, an argument
-            name, a kind name or a View's data name or region indices are not
-            C++ identifiers; if a View's or a scratch array's extent is not an
-            integer expression over named sizes; if the schedule contains a
+        :raises ValueError: if a dof region describes scratch or names a
+            loop to spread over a team, neither of which the dof launch has
+            anywhere to put; if the region's name, its cell count, its first
+            cell, an argument name, a kind name or a View's data name or
+            region indices are not C++ identifiers; if a View's or a
+            scratch array's extent is not an integer expression over named
+            sizes; if the schedule contains a
             :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
-            share a C ABI name; if the cell count is not itself a scalar
-            argument; if the cell position breaks the contract
+            share a C ABI name; if the cell count or the first cell is not
+            itself a scalar argument; if the cell position breaks the contract
             :py:meth:`_validate_cell_position` states; if a kernel argument
             has no description; if a View
             breaks the ownership or dimensional contract
@@ -507,6 +535,14 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         if not self._is_identifier(region.cell_index):
             raise ValueError(
                 f"Cell index '{region.cell_index}' is not a C++ identifier.")
+        if region.cell_start is not None and not self._is_identifier(
+                region.cell_start):
+            raise ValueError(
+                f"First cell '{region.cell_start}' is not a C++ identifier.")
+        if region.dof and (region.scratch or region.parallel_loops):
+            raise ValueError(
+                "A dof region has no team, so it can neither place scratch "
+                "nor spread a loop over one.")
         if region.schedule.walk(CodeBlock):
             raise ValueError("Kokkos regions cannot contain a CodeBlock.")
 
@@ -549,6 +585,10 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         if region.cell_count not in scalar_names:
             raise ValueError(
                 f"Cell count '{region.cell_count}' is not a scalar argument.")
+        if region.cell_start is not None and (
+                region.cell_start not in scalar_names):
+            raise ValueError(
+                f"First cell '{region.cell_start}' is not a scalar argument.")
 
         schedule_arguments = {
             symbol.name

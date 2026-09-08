@@ -44,10 +44,11 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosInterfaceMixin,
                        LFRicKokkosIntrinsicMixin, LFRicKokkosScheduleMixin,
                        Transformation):
-    """Replace one supported LFRic cell-column loop with a C ABI call.
+    """Replace one supported LFRic loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
-    an uncoloured owned-cell loop over a single kernel whose arguments are
+    an uncoloured loop -- over cell columns or over dofs -- running a single
+    kernel whose arguments are
     fields, scalars and LMA operators, whose written fields are on
     discontinuous spaces, and whose formals and referenced module constants
     all map onto the ``int``/``float``/``double`` ABI the Kokkos backend
@@ -219,13 +220,60 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     Every per-cell View is sliced to the same formal, so a region running into
     the halo describes the cells it runs over rather than the owned ones. What
     the accepted bounds have in common is that each counts consecutively from
-    the first cell or dof, which is :py:attr:`_COUNTED_BOUNDS`; a loop whose
-    *lower* bound is shifted -- ``cell_halo_start``, which runs the halo alone
-    -- is still refused, the launch having no lower-bound formal to fill.
+    the first cell or dof, which is :py:attr:`_COUNTED_BOUNDS`.
+
+    **A loop over the halo alone begins where the owned cells end**, and the
+    cell it begins at crosses as a second scalar formal beside the count. The
+    two are filled the same way and from the same place: the PSy layer passes
+    the loop's own start expression, converted once from LFRic's 1-based
+    counting to the region's 0-based indexing, so what the bound means is
+    again settled outside the region and only its value crosses. The two
+    lower bounds LFRic writes for a loop this transformation accepts are
+    therefore both accepted -- ``start``, which takes no formal at all, and
+    ``cell_halo_start``, which takes one -- and they are
+    :py:attr:`_LOWER_BOUNDS`. The bounds redundant computation produces are
+    refused by name, each being stated relative to a depth index the region
+    carries nothing for.
+
+    A region naming no first cell generates exactly the text it generated
+    before the formal existed, in all four launch shapes; see
+    :py:func:`~psyclone.psyir.backend.kokkos_launch.launch_offsets`.
 
     The halo exchange itself does not move. The PSy layer emits it in front of
     the loop and it is lowered there, in front of the call to the region; see
     :py:meth:`_lower_halo_exchanges`. Nothing is exchanged inside a region.
+
+    **A loop over dofs is launched over dofs.** LFRic's ``dof`` and
+    ``owned_dof`` iteration spaces run a kernel once per degree of freedom
+    rather than once per cell column, handing it a single dof of each field
+    it takes, and the launch follows: a flat
+    ``Kokkos::RangePolicy`` over the loop's own dof count, with no dofmap
+    reached and no cell index in the body. The shape is
+    :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch` and the
+    count is the loop's, ``ndofs`` or ``nannexed`` -- not ``undf``, which
+    would run the halo dofs the Fortran loop was told to leave.
+
+    Almost nothing had to be built for it. A per-dof formal is an actual the
+    PSy layer subscripts by the loop counter, so the same rule that makes a
+    per-cell formal a rank-1 View sliced to the count and subscripted by the
+    launch index makes a per-dof one, and nothing new crosses the ABI. One
+    iteration writes one dof and no two iterations write the same one, so
+    this shape needs neither colouring nor an atomic where a launch over cell
+    columns would need one or the other.
+
+    What it does not have is a team. A dof launch is a flat range with
+    nowhere to place scratch and no members to spread a loop over, so a
+    kernel over dofs carrying an automatic array, or a loop the dependency
+    analysis would spread, is refused by name rather than launched over a
+    shape that would silently drop it. That refusal is asked after the rules
+    a cell-column launch would apply, so a body a cell launch could not take
+    either is still refused for the reason it always was.
+
+    **An LFRic builtin is refused by name.** ``setval_c`` and its kind are
+    dof loops PSyclone generates the body of rather than reads from a kernel
+    file, so there is no source to capture and none of the metadata this
+    transformation reads from a kernel. Refusing them by name is what keeps
+    the dof space open for the kernels that do have a file.
 
     **The kernel's cell argument is declared rather than passed.** LFRic gives
     a leading ``cell`` formal to exactly the kernels that take an operator,
@@ -557,8 +605,12 @@ KernelModuleInlineTrans`.
     **A local is also read for its name, not only its type.** The generated
     launch declares identifiers of its own in the scope the kernel body is
     generated into, and a kernel-local of the same name would shadow one and
-    then overwrite it -- a wrong answer rather than a compile error. The cell
-    count is one, and the two team launches add ``body``, ``league_size``,
+    then overwrite it -- a wrong answer rather than a compile error. The bound
+    formals are three, :py:attr:`_BOUND_NAMES`, and are checked whatever the
+    launch shape: a loop takes at most two of them, but which two depends on
+    the loop rather than on the kernel, so all three are reserved for every
+    kernel and a capture cannot be made to depend on the invoke that reached
+    it. The two team launches add ``body``, ``league_size``,
     ``probe``, ``rank``, ``scratch_bytes``, ``team`` and ``team_size``, which
     are checked for a kernel that has an automatic array to place **or** a
     loop to spread -- either reaches a launch that declares them. The launch
@@ -748,7 +800,12 @@ KernelModuleInlineTrans`.
         # because the allocation tier is what gives an allocated local its
         # shape: on the schedule it still has the deferred one the
         # declaration carried.
-        self._validate_locals(probe, self._parallel_loops(probe))
+        parallel_loops = self._parallel_loops(probe)
+        self._validate_locals(probe, parallel_loops)
+        # Asked after the locals so that a kernel-local array a *cell* launch
+        # could not place is still refused for the reason it always was; this
+        # rule speaks only of what a dof launch has nowhere to put.
+        self._validate_dof_body(node, probe, parallel_loops)
         self._validate_intrinsics(probe)
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
