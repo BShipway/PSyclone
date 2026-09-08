@@ -49,7 +49,11 @@ data. The kinds of argument, and what each becomes:
 
 * A **field** is a View over the PSy layer's whole data array, and the dofmap
   beside it is a per-cell one: the actual is sliced ``map_w3(:,cell)``, so the
-  region takes the array whole and indexes it by the launch's own cell.
+  region takes the array whole and indexes it by the launch's own cell. Its
+  element type is the kernel's own declaration of that formal, read through
+  ``cls._c_type`` as every other argument's is, so a ``gh_integer`` field
+  becomes a ``View<int*>`` and a ``gh_real`` one a ``View<double*>`` without
+  either being written down here.
 * A **scalar** is passed by value, an integer or a real by width and a logical
   by conversion; see :py:meth:`LFRicKokkosArgumentMixin._as_c_bool`.
 * An **LMA operator** is a rank-3 View whose every extent is a formal of its

@@ -4128,7 +4128,20 @@ precision map decides which implementation of a kind-polymorphic kernel is
 captured: a kernel written as a generic interface over specific procedures
 that differ only in precision is resolved to the one the algorithm layer's
 arguments select, and the generated region is named after that procedure
-rather than after the interface. A kernel whose body holds a loop that
+rather than after the interface. A field's data may be real or integer:
+LFRic's ``integer_field_type`` has ``field_type``'s proxy shape with
+``integer(i_def)`` data, and the element type of the View a field crosses
+on follows that argument's own declaration, so a ``gh_integer`` field is a
+``View<int*>`` where a ``gh_real`` one is a ``View<double*>``. Nothing else
+about the field moves with the intrinsic -- the proxy member the PSy layer
+reads, the ``ndf`` and ``undf`` formals, the dofmap and the launch belong
+to the function space -- so a kernel taking both intrinsics is one region
+carrying both widths, each formal at its own. Arithmetic between two
+integer field values stays integer, the writer typing its expressions from
+their operands, so a quotient of two integer Views truncates as the Fortran
+it was generated from does. A field at a kind the ABI has no C type for is
+refused naming that kind, as any other formal at such a kind is, rather
+than admitted because its intrinsic was. A kernel whose body holds a loop that
 PSyclone's dependence analysis accepts -- in practice a loop over a column's
 levels whose iterations touch disjoint elements, rather than one sweeping a
 recurrence -- is generated over a Kokkos ``TeamPolicy`` with one team on each

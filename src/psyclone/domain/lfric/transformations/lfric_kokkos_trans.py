@@ -90,9 +90,25 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     distinct from finding no match because a question that cannot be asked has
     not been answered "no".
 
+    **A field's data may be real or integer.** LFRic's ``integer_field_type``
+    has ``field_type``'s proxy shape with ``integer(i_def)`` data, and the
+    region's element type follows the argument's own declaration rather than
+    being fixed when the field ABI is written, so a ``gh_integer`` field
+    crosses as a ``View<int*>`` where a ``gh_real`` one crosses as a
+    ``View<double*>``. Nothing else about the field moves with the intrinsic:
+    the proxy member the PSy layer reads, the ``ndf`` and ``undf`` formals,
+    the dofmap and the launch belong to the function space. A kernel taking
+    both is one region carrying both widths, each formal at its own, and the
+    arithmetic between two integer field values stays integer -- the writer
+    types its expressions from their operands, so a quotient of two integer
+    Views truncates as the Fortran it was generated from does.
+
     A kind the ABI does not name is refused rather than guessed at -- a
     16-byte ``r_quad``, an undeclared precision, a module constant whose width
-    the precision map does not carry.
+    the precision map does not carry. An integer field is not exempt: its
+    declaration is read like every other formal's, so one at a width the ABI
+    has no C type for is refused naming the kind rather than written as
+    ``int`` because its intrinsic was admitted.
 
     **A logical scalar is not one of them, because it crosses by conversion
     rather than by width.** The dummy is ``logical(c_bool), value`` and the

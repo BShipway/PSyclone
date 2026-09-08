@@ -2205,6 +2205,146 @@ contains
 end module face_weight_kernel_mod
 """
 
+
+# A field whose data is integer, and the same kernel over real data beside it.
+# LFRic's integer_field_type has field_type's proxy shape and differs in one
+# thing, the intrinsic of the data array, so both are instantiated from one
+# template: what the generated region does differently for an integer field is
+# then read off against a region differing in nothing else. The name is a
+# parameter because the two live in one directory and the kernel source is
+# reparsed by module name when the transformation resolves the body.
+_RATIO_ALGORITHM = """
+program kokkos_{name}_test
+  use {module}, only : {field}
+  use {name}_kernel_mod, only : {name}_kernel_type
+  implicit none
+  type({field}) :: mask_out, mask_in, mask_div
+  call invoke({name}_kernel_type(mask_out, mask_in, mask_div))
+end program kokkos_{name}_test
+"""
+
+
+_RATIO_KERNEL = """
+module {name}_kernel_mod
+  use argument_mod, only : arg_type, gh_field, {intrinsic}, gh_write, &
+                           gh_read, cell_column
+  use constants_mod, only : i_def, i_native, r_def
+  use fs_continuity_mod, only : w3, wtheta
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: {name}_kernel_type
+    type(arg_type) :: meta_args(3) = (/                              &
+         arg_type(gh_field, {intrinsic}, gh_write, w3),              &
+         arg_type(gh_field, {intrinsic}, gh_read,  wtheta),          &
+         arg_type(gh_field, {intrinsic}, gh_read,  wtheta) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: {name}_code
+  end type {name}_kernel_type
+contains
+  subroutine {name}_code(nlayers, mask_out, mask_in, mask_div, &
+                         ndf_w3, undf_w3, map_w3, &
+                         ndf_wtheta, undf_wtheta, map_wtheta)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_wtheta, undf_wtheta
+    {data}, dimension(undf_w3), intent(inout) :: mask_out
+    {data}, dimension(undf_wtheta), intent(in) :: mask_in
+    {data}, dimension(undf_wtheta), intent(in) :: mask_div
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_wtheta), intent(in) :: map_wtheta
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        mask_out(map_w3(df) + k) = mask_in(map_wtheta(df) + k) &
+                                 / mask_div(map_wtheta(df) + k)
+      end do
+    end do
+  end subroutine {name}_code
+end module {name}_kernel_mod
+"""
+
+
+_INTEGER_FIELD_ALGORITHM = _RATIO_ALGORITHM.format(
+    name="int_ratio", module="integer_field_mod", field="integer_field_type")
+_INTEGER_FIELD_KERNEL = _RATIO_KERNEL.format(
+    name="int_ratio", intrinsic="gh_integer", data="integer(kind=i_def)")
+_REAL_FIELD_ALGORITHM = _RATIO_ALGORITHM.format(
+    name="real_ratio", module="field_mod", field="field_type")
+_REAL_FIELD_KERNEL = _RATIO_KERNEL.format(
+    name="real_ratio", intrinsic="gh_real", data="real(kind=r_def)")
+
+
+# A field whose data is integer at a kind the ABI has no width for. i_native
+# is a real LFRic kind and is deliberately absent from the precision map
+# psyclone.cfg carries, so nothing here is monkeypatched: the element type
+# following the argument's intrinsic must not become a licence to write 'int'
+# for an integer of any width at all.
+_OFF_ABI_ALGORITHM = _RATIO_ALGORITHM.format(
+    name="native_ratio", module="integer_field_mod",
+    field="integer_field_type")
+_OFF_ABI_KERNEL = _RATIO_KERNEL.format(
+    name="native_ratio", intrinsic="gh_integer",
+    data="integer(kind=i_native)")
+
+
+# One invoke carrying both kinds of field, which is how LFRic actually uses an
+# integer one: a mask or an index array read beside the real data it selects.
+# The two field types come from two modules, and the region has to give each
+# formal its own element type without disturbing the order the PSy layer
+# passes them in.
+_MIXED_ALGORITHM = """
+program kokkos_mixed_test
+  use field_mod, only : field_type
+  use integer_field_mod, only : integer_field_type
+  use masked_copy_kernel_mod, only : masked_copy_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  type(integer_field_type) :: mask
+  call invoke(masked_copy_kernel_type(out_field, in_field, mask))
+end program kokkos_mixed_test
+"""
+
+
+_MIXED_KERNEL = """
+module masked_copy_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_integer, &
+                           gh_write, gh_read, cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3, wtheta
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: masked_copy_kernel_type
+    type(arg_type) :: meta_args(3) = (/                              &
+         arg_type(gh_field, gh_real,    gh_write, w3),               &
+         arg_type(gh_field, gh_real,    gh_read,  w3),               &
+         arg_type(gh_field, gh_integer, gh_read,  wtheta) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: masked_copy_code
+  end type masked_copy_kernel_type
+contains
+  subroutine masked_copy_code(nlayers, field_out, field_in, mask, &
+                              ndf_w3, undf_w3, map_w3, &
+                              ndf_wtheta, undf_wtheta, map_wtheta)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: ndf_wtheta, undf_wtheta
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(undf_wtheta), intent(in) :: mask
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def), dimension(ndf_wtheta), intent(in) :: map_wtheta
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = field_in(map_w3(df) + k) &
+                                  * mask(map_wtheta(df) + k)
+      end do
+    end do
+  end subroutine masked_copy_code
+end module masked_copy_kernel_mod
+"""
+
+
 # A kind-polymorphic kernel: one metadata name over several implementations
 # that differ only in the precision of their real arguments. Built from a
 # template rather than written out three times because the three fixtures below
@@ -2399,6 +2539,39 @@ def second_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an unrelated supported kernel in a minimal LFRic invoke."""
     return _invoke(
         tmp_path, "scaled_copy", _SECOND_ALGORITHM, _SECOND_KERNEL)
+
+
+@pytest.fixture(name="integer_field_target")
+# pylint: disable-next=unused-argument
+def integer_field_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose every field carries integer data."""
+    return _invoke(
+        tmp_path, "int_ratio", _INTEGER_FIELD_ALGORITHM,
+        _INTEGER_FIELD_KERNEL)
+
+
+@pytest.fixture(name="real_field_target")
+# pylint: disable-next=unused-argument
+def real_field_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create the same invoke over real fields, to read the other against."""
+    return _invoke(
+        tmp_path, "real_ratio", _REAL_FIELD_ALGORITHM, _REAL_FIELD_KERNEL)
+
+
+@pytest.fixture(name="off_abi_field_target")
+# pylint: disable-next=unused-argument
+def off_abi_field_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose integer fields are of a kind off the ABI."""
+    return _invoke(
+        tmp_path, "native_ratio", _OFF_ABI_ALGORITHM, _OFF_ABI_KERNEL)
+
+
+@pytest.fixture(name="mixed_field_target")
+# pylint: disable-next=unused-argument
+def mixed_field_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke taking real fields and an integer one together."""
+    return _invoke(
+        tmp_path, "masked_copy", _MIXED_ALGORITHM, _MIXED_KERNEL)
 
 
 @pytest.fixture(name="halo_target")
@@ -6489,17 +6662,25 @@ def test_lfric_kokkos_trans_intergrid_predicate_refuses_two_meshes(target):
             in str(error.value))
 
 
-def test_lfric_kokkos_trans_field_type_predicate_refuses_an_integer_field(
+def test_lfric_kokkos_trans_field_type_predicate_refuses_a_logical_field(
         target):
-    """The field-type rule walks every field argument on its own."""
+    """The field-type rule walks every field argument on its own.
+
+    LFRic's metadata admits ``gh_real`` and ``gh_integer`` fields and no
+    third intrinsic, and the ABI now carries both, so the witness has to be
+    made rather than found. Made rather than deleted, because the rule is
+    stated against what a View's elements may be and not against today's
+    metadata: a field intrinsic added to LFRic would be refused by name
+    instead of reaching the backend as a type it has no row for.
+    """
     _, _, kernel = target
-    kernel.arguments.args[1]._intrinsic_type = "integer"
+    kernel.arguments.args[1]._intrinsic_type = "logical"
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans._validate_field_types(kernel)
 
-    assert ("LFRicKokkosTrans supports only real fields, but 'mr' is integer."
-            in str(error.value))
+    assert ("LFRicKokkosTrans supports only integer and real fields, but "
+            "'mr' is logical." in str(error.value))
 
 
 def test_lfric_kokkos_trans_continuous_write_predicate_refuses_a_w0_write(
@@ -6965,3 +7146,143 @@ def test_lfric_kokkos_trans_generates_a_matmul_assignment(matmul_target):
     assert "MATMUL" not in cpp
     assert "+= mass(" in cpp
     assert "column_e((_kae_i0 - 1)) = _kae_r0;" in cpp
+
+
+def test_lfric_kokkos_trans_accepts_an_integer_field(
+        integer_field_target, real_field_target):
+    """A field whose data is integer crosses the ABI as a View of int.
+
+    The element type follows the argument, and nothing else about the field
+    does: the dofmap, the ndf and undf formals and the launch belong to the
+    function space rather than to the intrinsic. They are asserted to be the
+    real kernel's to the character, which the two regions being generated
+    from one template makes a statement rather than a coincidence.
+    """
+    psy, loop, _ = integer_field_target
+    _, real_loop, _ = real_field_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+    real_cpp = LFRicKokkosTrans().apply(real_loop)
+
+    assert "int *mask_out_data," in cpp
+    assert "const int *mask_in_data," in cpp
+    assert ("Kokkos::View<int*, Kokkos::LayoutLeft, MemorySpace, Unmanaged> "
+            "mask_out(mask_out_data, undf_w3);" in cpp)
+    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> mask_in(mask_in_data, undf_wtheta);" in cpp)
+    # The dofmap and the sizes are what they are for a real field.
+    assert "const int undf_w3," in cpp
+    assert "const int undf_wtheta," in cpp
+    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> map_w3(map_w3_data, ndf_w3, ncells);" in cpp)
+    assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
+
+    # The width the C++ body assumed for i_def, asserted where the generated
+    # Fortran and the generated C++ meet. A region carrying integer data and
+    # nothing else names no real kind at all, so this is the only assertion
+    # it writes and c_double never reaches its 'use' line.
+    assert "use iso_c_binding, only : c_int" in fortran
+    assert "use constants_mod, only : i_def" in fortran
+    assert ("storage_size(1_i_def) == &\n        storage_size(1_c_int))), "
+            "parameter :: assert_kind_i_def = 0" in fortran)
+    assert "c_double" not in fortran
+    assert "integer(c_int), dimension(*), intent(inout) :: mask_out" in fortran
+    assert "call int_ratio_kokkos(" in fortran
+    assert "call mask_out_proxy%set_dirty()" in fortran
+
+    # Everything the intrinsic does not decide is the real kernel's: putting
+    # the element type and the kernel's name back gives that region exactly.
+    assert real_cpp.replace("double", "int").replace(
+        "real_ratio", "int_ratio") == cpp
+    assert "double" not in cpp
+
+
+def test_lfric_kokkos_trans_accepts_a_mixed_field_kernel(mixed_field_target):
+    """Each field formal takes its own element type, in the order given.
+
+    The intrinsic is per argument rather than per kernel, and a real field
+    beside an integer one is what separates the two readings. The order is
+    asserted as well as the types, because the generated signature and the
+    actuals the PSy layer passes carry their correspondence in nothing but
+    their shared indices: a formal given the wrong element type is a region
+    that compiles and reads the wrong storage.
+    """
+    psy, loop, _ = mixed_field_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    fortran = str(psy.gen)
+
+    assert ("    double *field_out_data,\n"
+            "    const double *field_in_data,\n"
+            "    const int *mask_data,\n" in cpp)
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged> field_out(field_out_data, undf_w3);" in cpp)
+    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> mask(mask_data, undf_wtheta);" in cpp)
+
+    # One interface carrying both widths, and both kinds asserted on it.
+    assert "use iso_c_binding, only : c_int, c_double" in fortran
+    assert "use constants_mod, only : i_def, r_def" in fortran
+    assert ("storage_size(1_i_def) == &\n        storage_size(1_c_int))), "
+            "parameter :: assert_kind_i_def = 0" in fortran)
+    assert ("storage_size(1.0_r_def) == &\n        "
+            "storage_size(1.0_c_double))), parameter :: assert_kind_r_def = 0"
+            in fortran)
+    assert ("real(c_double), dimension(*), intent(inout) :: field_out\n"
+            "    real(c_double), dimension(*), intent(in) :: field_in\n"
+            "    integer(c_int), dimension(*), intent(in) :: mask\n"
+            in fortran)
+    assert ("call masked_copy_kokkos(nlayers_out_field, out_field_data, "
+            "in_field_data, mask_data, ndf_w3, undf_w3, map_w3, ndf_wtheta, "
+            "undf_wtheta, map_wtheta, loop0_stop)" in fortran)
+
+
+def test_lfric_kokkos_trans_integer_field_arithmetic_is_integer(
+        integer_field_target, real_field_target):
+    """A quotient of two integer field values is an integer quotient.
+
+    C++ takes '/' from its operands, so this is a statement about the Views
+    the region declares rather than about the expression: the writer emits
+    the same text for both kernels and the element type is the whole of what
+    makes one of them truncate. Worth asserting because a promotion anywhere
+    on the way -- a cast written round a field read, a double View over
+    integer storage -- would change the answer rather than fail to compile.
+    """
+    _, loop, _ = integer_field_target
+    _, real_loop, _ = real_field_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+    real_cpp = LFRicKokkosTrans().apply(real_loop)
+
+    quotient = ("(mask_in(((map_wtheta((df - 1), cell) + k) - 1)) / "
+                "mask_div(((map_wtheta((df - 1), cell) + k) - 1)))")
+    assert quotient in cpp
+    assert quotient in real_cpp
+    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> mask_div(mask_div_data, undf_wtheta);" in cpp)
+    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, "
+            "ReadOnly> mask_div(mask_div_data, undf_wtheta);" in real_cpp)
+    # Nothing widens the operands on the way to the division.
+    assert "double" not in cpp
+    assert "float" not in cpp
+    assert "static_cast" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_a_field_kind_not_on_the_abi(
+        off_abi_field_target):
+    """Following the argument's intrinsic did not retire the width check.
+
+    ``i_native`` is an LFRic integer kind that ``psyclone.cfg``'s precision
+    map does not carry, so there is no width to put on the ABI. Writing
+    ``int`` for it because the argument is an integer field would drop or
+    invent bytes without saying so, so it is refused naming the field and the
+    kind. Nothing here is monkeypatched: the kind really is absent.
+    """
+    _, loop, _ = off_abi_field_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "'mask_out' has 'i_native'" in str(error.value)
+    assert "4-byte integer, 4-byte real and 8-byte real" in str(error.value)
