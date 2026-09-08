@@ -374,18 +374,25 @@ Additionally, there are three partially-implemented back-ends
   called on a PSyIR node: it is called on a `KokkosRegion` holding the
   region's name, its scalar arguments, its unmanaged Views, its
   `kind_types`, its `scratch`, the `parallel_loops` and `team_size`
-  that select and size the hierarchical launch, the `cell_position`
-  naming the one formal it declares rather than takes, and the
-  `colour_map` a region captured from a coloured loop declares its cell
-  from, and it visits the loop body through `CWriter`. That description --
-  `KokkosRegion` itself and the `KokkosScalar`, `KokkosView`,
-  `KokkosScratch`, `KokkosConstant` and `KokkosColourMap` it is made of --
-  is defined in `psyclone.psyir.backend.kokkos_region` and re-exported from
+  that select and size the hierarchical launch, the `dof` that selects the
+  dof launch, the `cell_start` naming the formal a launch that does not
+  begin at zero starts from, the `cell_position` naming the one formal it
+  declares rather than takes, and the `colour_map` a region captured from a
+  coloured loop declares its cell from, and it visits the loop body through
+  `CWriter`. That description -- `KokkosRegion` itself and the
+  `KokkosScalar`, `KokkosView`, `KokkosScratch`, `KokkosConstant` and
+  `KokkosColourMap` it is made of -- is defined in
+  `psyclone.psyir.backend.kokkos_region` and re-exported from
   `psyclone.psyir.backend.kokkos`, so either module may be imported from.
+  A `colour_map` and a `cell_start` are not combined: that map's index
+  counts the cells of one colour and a first cell counts the mesh's, so a
+  region naming both is refused rather than generated, and no LFRic loop
+  produces the pair because a coloured loop always begins at `start`.
   Two parts of the back-end live beside it because they
   grow as regions are captured while the writer's own job does not:
-  `psyclone.psyir.backend.kokkos_launch` renders the launch shapes, one
-  function per shape, and `KokkosIntrinsicsMixin` in
+  `psyclone.psyir.backend.kokkos_launch` renders three of the four launch
+  shapes, one function per shape, with the fourth in
+  `psyclone.psyir.backend.kokkos_launch_dof`, and `KokkosIntrinsicsMixin` in
   `psyclone.psyir.backend.kokkos_intrinsics_mixin` holds the intrinsics,
   inherited ahead of `CWriter` so its handlers are found first and fall
   through to `CWriter`'s. `KokkosConstant` in
@@ -693,23 +700,45 @@ unwritable argument would stand in for the call it sits under. `LBOUND`,
 before the writer sees them -- and neither are the array-valued intrinsics of
 the next section, which no handler writes and which lowering replaces first.
 
-Three launch shapes
-~~~~~~~~~~~~~~~~~~~
+Four launch shapes
+~~~~~~~~~~~~~~~~~~
 
-The back-end generates one of three launches. A region naming any
+The back-end generates one of four launches. A region naming `dof` takes the
+dof launch; otherwise one naming any
 `parallel_loops` takes the hierarchical launch; otherwise one describing any
 `scratch` takes the flat team launch; otherwise the range launch. The
 selection is a chain rather than a separate selector field, so nothing can
 disagree with it, and each shape is reached only by a region carrying the
-field it selects on -- a region built before either field existed generates
+field it selects on -- a region built before any of those fields existed
+generates
 exactly the source it generated then. The launches themselves are rendered by
-`psyclone.psyir.backend.kokkos_launch`, one function per shape, and
-`KokkosWriter` chooses among them.
+`psyclone.psyir.backend.kokkos_launch`, one function per shape, except the
+dof launch which is `dof_launch` in
+`psyclone.psyir.backend.kokkos_launch_dof`; `KokkosWriter` chooses among
+them.
 
 A region with no scratch launches over `Kokkos::RangePolicy<>(0, ncells)`
 with a `KOKKOS_LAMBDA(const int cell)`. This is the shape every region had
 before scratch existed and it is generated unchanged, because a kernel with
 no local arrays has nothing to place.
+
+A region naming `dof` launches over `Kokkos::RangePolicy<>(0, ndofs)` with a
+`KOKKOS_LAMBDA(const int df)`, and that is the whole of it: the Fortran loop
+it replaces iterated over the degrees of freedom of a function space rather
+than over cell columns, so the index is a position in each of the Views the
+region carries and reaches no dofmap. The shape has no team, so a dof region
+naming `scratch` or `parallel_loops` is rejected by `_validate` rather than
+launched over a shape that would drop them.
+
+A region naming `cell_start` begins at that formal instead of at zero, which
+is what a Fortran loop over the halo cells alone needs. `launch_offsets` in
+`psyclone.psyir.backend.kokkos_launch` returns the three pieces of text this
+contributes and every shape but the dof one asks it: the range shape uses
+the first cell as the policy's own lower bound, and the two team shapes add
+it back to the cell they compute from a league rank while shortening the
+league by the cells being skipped, so one worker still takes one cell. A
+region with no `cell_start` gets `"0"`, no offset and the count unchanged,
+which is the text every shape wrote before the field existed.
 
 The index is the region's `cell_index` rather than a fixed `cell`. It
 defaults to `cell`, which is what the paragraph above describes, but a

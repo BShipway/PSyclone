@@ -113,14 +113,17 @@ import re
 from dataclasses import replace
 
 from psyclone.core import AccessType
-from psyclone.domain.lfric import KernCallArgList, KernStubArgList
+from psyclone.domain.lfric import (
+    KernCallArgList, KernStubArgList, LFRicConstants)
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
     KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView)
 from psyclone.psyir.nodes import (
-    ArrayReference, Call, IntrinsicCall, Literal, Reference, Routine)
-from psyclone.psyir.symbols import ArgumentInterface, ScalarType, SymbolTable
+    ArrayReference, BinaryOperation, Call, IntrinsicCall, Literal, Reference,
+    Routine)
+from psyclone.psyir.symbols import (
+    ArgumentInterface, ScalarType, SymbolTable)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -231,8 +234,75 @@ class LFRicKokkosArgumentMixin:
     # pylint: disable=too-few-public-methods
 
     #: The region's iteration count, and the second extent of every per-cell
-    #: array. Named by the PSy layer, not by the kernel.
+    #: array, where the loop it came from iterated over cell columns. Named
+    #: by the PSy layer, not by the kernel.
     _CELL_COUNT = "ncells"
+
+    #: The same count where the loop iterated over dofs. A separate name
+    #: rather than ``ncells`` reused, because the generated source is read:
+    #: a region whose ``RangePolicy`` runs to ``ncells`` while its index is a
+    #: dof would be telling a reviewer something untrue about what it does.
+    _DOF_COUNT = "ndofs"
+
+    #: The first cell of a launch that does not begin at the first cell of
+    #: the mesh. Only a loop over the halo cells alone has one; see
+    #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_start`.
+    _CELL_START = "first_cell"
+
+    #: The name a dof launch gives its own index, as
+    #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`
+    #: names a cell launch's. ``df`` is what every LFRic kernel calls the
+    #: same thing.
+    _DOF_INDEX = "df"
+
+    #: Every name the generated signature may add for its own bounds. All
+    #: three are reserved for every region, whichever of them that region
+    #: goes on to use, so that whether a kernel is refused for a name
+    #: collision does not depend on which iteration space its loop had.
+    _BOUND_NAMES = (_CELL_COUNT, _DOF_COUNT, _CELL_START)
+
+    @classmethod
+    def _is_dof(cls, node):
+        """Say whether ``node`` iterates over dofs rather than cell columns.
+
+        :param node: the loop being captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :returns: whether the loop's iteration space is a dof one.
+        :rtype: bool
+        """
+        return node.iteration_space in LFRicConstants().DOF_ITERATION_SPACES
+
+    @classmethod
+    def _count_name(cls, node):
+        """Name the formal the launch for ``node`` is bounded above by.
+
+        :param node: the loop being captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :returns: :py:attr:`_DOF_COUNT` for a loop over dofs and
+            :py:attr:`_CELL_COUNT` for one over cell columns.
+        :rtype: str
+        """
+        return cls._DOF_COUNT if cls._is_dof(node) else cls._CELL_COUNT
+
+    @classmethod
+    def _start_name(cls, node):
+        """Name the formal the launch for ``node`` begins at, or ``None``.
+
+        A loop starting anywhere but at the first cell or dof needs one; that
+        is the halo-only iteration space and nothing else, because every
+        other bound this transformation accepts counts from the first.
+
+        :param node: the loop being captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :returns: :py:attr:`_CELL_START` where the loop begins past the first
+            cell, and ``None`` where it does not.
+        :rtype: Optional[str]
+        """
+        # pylint: disable-next=protected-access
+        return None if node._lower_bound_name == "start" else cls._CELL_START
 
     @staticmethod
     def _region_name(schedule):
@@ -552,11 +622,15 @@ class LFRicKokkosArgumentMixin:
 
     @classmethod
     def _region_arguments(cls, formals, per_cell, cell_index, renames,
-                          shared=frozenset(), colour=()):
-        # Five descriptions of one argument list, which is what describing an
-        # argument list takes; grouping them into an object would only move
-        # the count into its constructor.
+                          count, start, shared=frozenset(), colour=()):
+        # Seven descriptions of one argument list, which is what describing
+        # an argument list takes; grouping them into an object would only
+        # move the count into its constructor. The locals are one per
+        # argument for the same reason: the list is assembled in the order
+        # the signature declares, and a shorter routine would be one that
+        # assembled part of it somewhere else.
         # pylint: disable=too-many-arguments, too-many-positional-arguments
+        # pylint: disable=too-many-locals
         """Describe the generated signature down to the cell count.
 
         The formals are passed in rather than read from the schedule because
@@ -586,6 +660,20 @@ class LFRicKokkosArgumentMixin:
             argument of its own, appended after the kernel's formals and
             before the cell count so that the order here and the order
             :py:meth:`_region` extends the actuals in are one order.
+        :param str count: the formal the launch is bounded above by, which is
+            also the last extent of every sliced View. It is
+            :py:meth:`_count_name`'s answer for the loop being captured, and
+            is passed rather than read from :py:attr:`_CELL_COUNT` because a
+            loop over dofs counts dofs, and a coloured loop counts the cells
+            of one colour.
+        :param start: the formal the launch begins at, or ``None`` for a
+            launch beginning at zero. It is :py:meth:`_start_name`'s answer,
+            and is appended after the count so that the order here and the
+            order :py:meth:`_call_region` completes the actuals in are one
+            order. It is ``None`` for every coloured loop, which
+            :py:class:`~psyclone.transformations.LFRicColourTrans` always
+            begins at the first cell of its colour.
+        :type start: Optional[str]
         :param shared: the names of the formals more than one cell of the
             launch may update, as :py:meth:`_shared_formals` gives them. Each
             becomes an atomic View, so that the contributions of two cells to
@@ -597,19 +685,24 @@ class LFRicKokkosArgumentMixin:
         :param colour: the descriptions of the colour map, the colour and the
             number of colours, as :py:meth:`_colouring` builds them, or the
             empty tuple for a loop that is not coloured. They go after the
-            renamed extents and before the cell count for the reason those
-            go where they do: :py:meth:`_region` extends the actuals in this
+            renamed extents and before the count for the reason those go
+            where they do: :py:meth:`_region` extends the actuals in this
             order and the two lists are read as one.
         :type colour: tuple[Union[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
 
         :returns: one description per generated C argument, in call order, up
-            to and including the cell count.
+            to and including the count and, where there is one, the first
+            cell after it.
         :rtype: tuple[Union[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
         """
+        # The two bounds are parameters of their own rather than one pair,
+        # because each is written into the signature in a place of its own
+        # and only one of them is optional.
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
         arguments = []
         for symbol in formals:
             c_type = cls._c_type(symbol)
@@ -624,7 +717,7 @@ class LFRicKokkosArgumentMixin:
                 continue
             arguments.append(KokkosView(
                 symbol.name, f"{symbol.name}_data", c_type,
-                extents + ((cls._CELL_COUNT,) if sliced else ()),
+                extents + ((count,) if sliced else ()),
                 index_offsets=cls._rename_extents(
                     cls._origins(symbol), renames),
                 extra_indices=(cell_index,) if sliced else (),
@@ -633,7 +726,9 @@ class LFRicKokkosArgumentMixin:
         for renamed in renames.values():
             arguments.append(KokkosScalar(renamed, "int"))
         arguments.extend(colour)
-        arguments.append(KokkosScalar(cls._CELL_COUNT, "int"))
+        arguments.append(KokkosScalar(count, "int"))
+        if start is not None:
+            arguments.append(KokkosScalar(start, "int"))
         return tuple(arguments)
 
     @classmethod
@@ -798,11 +893,12 @@ LFRicKokkosTrans.apply` makes.
         :raises TransformationError: if the PSy layer supplies a different
             number of actual arguments than the kernel has formals.
         """
-        # Each local here names one thing the region is described from, and
-        # the description has more parts than pylint's default allows a
-        # routine to hold. Splitting it would divide the argument list from
-        # the actuals that must match it position for position, which is the
-        # one property this routine exists to keep.
+        # Each local here names one of the region's fields or one step of
+        # deriving it, and the description has more parts than pylint's
+        # default allows a routine to hold. Splitting it would move the
+        # description of a region into more than one place, and would divide
+        # the argument list from the actuals that must match it position for
+        # position, which is the one property this routine exists to keep.
         # pylint: disable=too-many-locals
         formals, actuals, cell_position = cls._argument_lists(
             kernel, node, schedule)
@@ -822,19 +918,31 @@ LFRicKokkosTrans.apply` makes.
         # declarations, so a kernel declaring 'cell' would collide with it.
         # Spelt from the dataclass default so the two cannot drift: a kernel
         # that has not taken the name still generates 'cell'.
+        # A dof launch indexes dofs, so its index is named for one: the
+        # generated source is read, and 'cell' over a dof loop would be as
+        # misleading there as it would be here.
+        dof = cls._is_dof(node)
         cell_index = schedule.symbol_table.next_available_name(
-            KokkosRegion.cell_index)
+            cls._DOF_INDEX if dof else KokkosRegion.cell_index)
+        count = cls._count_name(node)
+        start = cls._start_name(node)
+        # After the index, which the colour map's own lookup declares from.
+        # A dof loop is never coloured -- LFRicColourTrans refuses one -- and
+        # a coloured loop never names a first cell, so neither of the two
+        # fields below composes with the two above.
         colours, colour_arguments, colour_actuals = cls._colouring(
             kernel, node, schedule, cell_index)
         region = KokkosRegion(
             name=cls._region_name(schedule),
             schedule=schedule,
-            cell_count=cls._CELL_COUNT,
+            cell_count=count,
+            cell_start=start,
+            dof=dof,
             cell_index=cell_index,
             cell_position=cell_position,
             colour_map=colours,
             arguments=(cls._region_arguments(
-                formals, per_cell, cell_index, renames,
+                formals, per_cell, cell_index, renames, count, start,
                 cls._shared_formals(kernel, schedule)
                 if cls._uses_atomics(node, options) else frozenset(),
                 colour_arguments)
@@ -880,9 +988,11 @@ LFRicKokkosTrans.apply` makes.
         """Replace ``node`` with the typed call into the generated region.
 
         The actuals are completed here rather than by :py:meth:`_region`,
-        because the last two of them are the PSy layer's own rather than the
-        kernel's: the cell count is the bound of the loop being replaced, and
-        each module constant is an import this routine gains.
+        because the last of them are the PSy layer's own rather than the
+        kernel's: the count is the bound of the loop being replaced, the
+        first cell -- where the region takes one -- is that loop's lower
+        bound less one, and each module constant is an import this routine
+        gains.
 
         :param node: the loop to replace with the launch call.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -903,14 +1013,29 @@ LFRicKokkosTrans.apply` makes.
         symbol_table = routine.symbol_table
         launch = cls._launch_symbol(symbol_table, region)
         actuals.append(cell_count)
+        if region.cell_start is not None:
+            # The loop's Fortran lower bound counts from one and the launch
+            # index from zero, so the conversion is a subtraction. It is made
+            # here, in the PSy layer, rather than in the generated C++: the
+            # region takes a value, as it does for the count, and nothing in
+            # the generated source has to know which convention the caller
+            # counts in.
+            actuals.append(BinaryOperation.create(
+                BinaryOperation.Operator.SUB,
+                lowered_loop.start_expr.copy(),
+                Literal("1", ScalarType.integer_type())))
         actuals.extend(
             Reference(cls._import_constant(
                 symbol_table, name, container, orig_name))
             for name, container, orig_name, _, _ in constants)
         # region.arguments is the formals, then the storage extent of each
-        # per-cell size, then the cell count, then the constants -- which is
-        # exactly the order 'actuals' is in once _region's own extension and
-        # both appends above have run. The two are index-aligned, and one
+        # per-cell size, then a coloured loop's three colour arguments, then
+        # the count, then a halo loop's first cell, then the constants --
+        # which is exactly the order 'actuals' is in once _region's own
+        # extensions and the appends above have run. The last two are
+        # optional and independent: no loop carries both, a colouring always
+        # beginning at the first cell of its colour.
+        # The two are index-aligned, and one
         # loop covers a logical formal and an imported logical constant alike.
         # That alignment is what makes this correct and it is not visible from
         # the loop itself.

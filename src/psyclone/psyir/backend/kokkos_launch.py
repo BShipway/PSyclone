@@ -46,7 +46,7 @@ writer is the only caller; nothing here visits PSyIR.
 def launch_index(region):
     """Return the name a launch gives the index it iterates over.
 
-    Every shape below counts from zero to
+    Each shape below counts from :py:func:`launch_offsets`' first index to
     :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_count`, and
     for all but one region that count is the mesh cells and the index is
     :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_index`. A
@@ -55,6 +55,15 @@ def launch_index(region):
     :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.colour_map`; the
     writer emits that lookup as the region's first local declaration, so
     what each shape here has to change is only the name it declares.
+
+    This function answers *what the index is called*; :py:func:`launch_offsets`
+    answers *where the counting starts and how far it runs*. The two are
+    independent of each other at every site, and the one region that could
+    not compose them -- a colour map together with a first cell, whose index
+    counts one colour's cells while the bound counts the mesh's -- is refused
+    by
+    :py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter._validate` rather
+    than generated.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -65,6 +74,43 @@ def launch_index(region):
     if region.colour_map is None:
         return region.cell_index
     return region.colour_map.index
+
+
+def launch_offsets(region):
+    """Return the three pieces of text a region's lower bound contributes.
+
+    An LFRic loop over the halo cells alone begins where the owned cells end,
+    so its launch cannot begin at zero. The first cell it does begin at is a
+    scalar formal the region takes, named by
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_start`, and
+    each of the three shapes below needs it in a different place: the range
+    shape as the policy's own lower bound, and the two team shapes as an
+    offset on the cell they compute from a league rank together with a league
+    shortened by the cells that are being skipped.
+
+    A region with no lower bound gets ``"0"``, no offset and the count
+    unchanged, which is the text every shape wrote before this field existed.
+    That is asserted rather than reasoned about: the captures already in the
+    model are gated on whole-model checksums and on assertions over this
+    exact text.
+
+    The name the offset is applied to is :py:func:`launch_index`'s, which is
+    the composition of the two: a halo launch of an uncoloured region offsets
+    the region's own cell index, and no region reaching here both names a
+    colour map and begins past the first cell.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the launch's first index; the offset a shape adds to an index
+        it derives from a league rank, empty where there is none; and the
+        number of cells the launch covers.
+    :rtype: Tuple[str, str, str]
+    """
+    if region.cell_start is None:
+        return "0", "", region.cell_count
+    return (region.cell_start, f"{region.cell_start} + ",
+            f"({region.cell_count} - {region.cell_start})")
 
 
 def _scratch_text(region, allocation, indent):
@@ -155,9 +201,14 @@ def scratch_guard(region):
 def range_launch(region, local_declarations, body):
     """Return the ``RangePolicy`` launch, one cell per iteration.
 
-    This is the shape every region had before scratch existed, and it is
-    reproduced here unchanged: the captures already in the model are gated
-    on whole-model checksums and on assertions over this exact text.
+    This is the shape every region had before scratch existed, and a region
+    with no first cell is reproduced here unchanged: the captures already in
+    the model are gated on whole-model checksums and on assertions over this
+    exact text.
+
+    A region that names a first cell begins the policy there instead of at
+    zero, which is what a loop over the halo alone needs; see
+    :py:func:`launch_offsets`.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -170,9 +221,10 @@ def range_launch(region, local_declarations, body):
     :returns: the ``parallel_for`` and its captured body.
     :rtype: str
     """
+    first, _, _ = launch_offsets(region)
     return (
         f'  Kokkos::parallel_for("{region.name}", '
-        f"Kokkos::RangePolicy<>(0, {region.cell_count}),\n"
+        f"Kokkos::RangePolicy<>({first}, {region.cell_count}),\n"
         f"      KOKKOS_LAMBDA(const int {launch_index(region)}) {{\n"
         f"{local_declarations}{body}"
         "      });\n")
@@ -186,6 +238,11 @@ def team_launch(region, local_declarations, body):
     identical to :py:func:`range_launch` -- one cell per worker -- while
     giving each worker fast, launch-scoped storage; on a GPU that scratch
     is shared memory rather than global.
+
+    Where the region names a first cell the league covers the cells from
+    there to the count and each rank adds it back, so the shape's
+    parallelism is unchanged and only the cells it visits move; see
+    :py:func:`launch_offsets`.
 
     The probe policy carries the scratch request and is asked for the team
     size the backend recommends for a ``parallel_for`` of this functor. On
@@ -217,6 +274,7 @@ def team_launch(region, local_declarations, body):
     """
     aliases, sizes, constructions = _scratch_text(
         region, "team.thread_scratch(0)", "      ")
+    _, offset, span = launch_offsets(region)
     return (
         f"{aliases}\n"
         f"{scratch_guard(region)}"
@@ -225,8 +283,8 @@ def team_launch(region, local_declarations, body):
         "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
         "team.team_size()),\n"
         "        [&](const int rank) {\n"
-        f"      const int {launch_index(region)} = "
-        "team.league_rank() * team.team_size() + rank;\n"
+        f"      const int {launch_index(region)} = {offset}team.league_rank()"
+        " * team.team_size() + rank;\n"
         # The league is sized by rounding up, so the last team runs with
         # ranks that have no cell. Without this they would run the body
         # for a cell past the end of every View.
@@ -241,7 +299,7 @@ def team_launch(region, local_declarations, body):
         "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes));\n"
         "  const int team_size = probe.team_size_recommended(body, "
         "Kokkos::ParallelForTag());\n"
-        f"  const int league_size = ({region.cell_count} + team_size - 1)"
+        f"  const int league_size = ({span} + team_size - 1)"
         " / team_size;\n"
         f'  Kokkos::parallel_for("{region.name}",\n'
         "      TeamPolicy(league_size, team_size)\n"
@@ -262,6 +320,10 @@ def hierarchical_launch(region, local_declarations, body):
     LFRic kernel is shaped for: a cell's levels are the inner dimension of
     every field it reads, so members of one team touch neighbouring elements
     rather than columns a stride apart.
+
+    Where the region names a first cell the league is shortened to the cells
+    from there to the count and each team adds it back to its rank, so one
+    team still takes one cell; see :py:func:`launch_offsets`.
 
     The team's own work -- the scalars, the loop control, and the boundary
     writes ``Kokkos::single`` guards -- is what a cell has that its levels do
@@ -296,7 +358,8 @@ def hierarchical_launch(region, local_declarations, body):
     team_size = (
         "Kokkos::AUTO" if region.team_size is None
         else str(region.team_size))
-    policy = f"TeamPolicy({region.cell_count}, {team_size})" + (
+    _, offset, span = launch_offsets(region)
+    policy = f"TeamPolicy({span}, {team_size})" + (
         "\n          .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))"
         if region.scratch else "")
     return (
@@ -304,6 +367,7 @@ def hierarchical_launch(region, local_declarations, body):
         f'  Kokkos::parallel_for("{region.name}",\n'
         f"      {policy},\n"
         "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
-        f"    const int {launch_index(region)} = team.league_rank();\n"
+        f"    const int {launch_index(region)} = "
+        f"{offset}team.league_rank();\n"
         f"{constructions}{local_declarations}{body}"
         "  });\n")

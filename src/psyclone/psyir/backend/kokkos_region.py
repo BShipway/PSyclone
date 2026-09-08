@@ -314,6 +314,35 @@ class KokkosRegion:
     #: Declared among the body's locals and taking no place on the ABI, so a
     #: region built before this field existed generates what it did then.
     constants: Tuple[KokkosConstant, ...] = ()
+    #: The name of the scalar formal holding the first cell the launch runs,
+    #: or ``None`` for a launch beginning at the first cell of the mesh.
+    #: An LFRic loop over the halo cells alone begins where the owned cells
+    #: end, and that is the one shape a count on its own cannot express: a
+    #: launch from zero would run the owned cells the loop was told to skip.
+    #: It is a formal rather than anything the generated source computes,
+    #: because the PSy layer already holds the value. ``None`` writes the
+    #: text every shape wrote before this field existed; see
+    #: :py:func:`~psyclone.psyir.backend.kokkos_launch.launch_offsets`.
+    #: It is not combined with :py:attr:`colour_map`: that map's index counts
+    #: the cells of one colour and this counts the mesh's, so a region naming
+    #: both is refused by
+    #: :py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter._validate`.
+    #: Nothing generates the pair either --
+    #: :py:class:`~psyclone.transformations.LFRicColourTrans` gives the
+    #: coloured loop it makes a lower bound of ``start`` whatever the loop it
+    #: replaced had, the halo moving into that loop's upper bound instead.
+    cell_start: Optional[str] = None
+    #: Whether the region's iteration space is dofs rather than cell columns.
+    #: It selects the launch shape ahead of every other field, because a dof
+    #: region has no cells to give a team; see
+    #: :py:func:`~psyclone.psyir.backend.kokkos_launch_dof.dof_launch`. Where
+    #: it is true, :py:attr:`cell_count` holds the dof count and
+    #: :py:attr:`cell_index` the name of the dof index: a region has one
+    #: iteration space and one count of it, whichever space that is. A dof
+    #: region names no :py:attr:`colour_map` and takes no atomic update: one
+    #: iteration writes one dof and no two iterations write the same one, so
+    #: there is no shared write for either answer to make safe.
+    dof: bool = False
 
 
 __all__ = ["KokkosColourMap", "KokkosRegion", "KokkosScalar",
