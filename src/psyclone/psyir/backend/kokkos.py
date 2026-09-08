@@ -17,6 +17,8 @@ from psyclone.psyir.backend.kokkos_array_expression_mixin import (
 from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.backend.kokkos_team_scalars import (
+    team_private_scalars)
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.nodes import (
@@ -259,6 +261,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         # chosen loop the members already have disjoint iterations, so the
         # write is theirs alone and needs no ``Kokkos::single``.
         self._parallel_depth = 0
+        # The scalars each chosen loop declares inside its own lambda, keyed
+        # by the ``id`` of the loop, from
+        # :py:func:`~psyclone.psyir.backend.kokkos_team_scalars.team_private_scalars`.
+        self._private_scalars = {}
 
     def __call__(self, region: KokkosRegion) -> str:
         """Generate code for ``region``.
@@ -277,16 +283,24 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         :py:func:`~psyclone.psyir.backend.kokkos_launch.team_launch` and
         :py:func:`~psyclone.psyir.backend.kokkos_launch.hierarchical_launch`.
 
+        Every scalar a chosen loop writes is declared inside that loop's
+        lambda, so that each member of the team owns its own; which scalars
+        those are, and which spread loops are refused because a scalar they
+        write cannot be anyone's own, is decided by
+        :py:func:`~psyclone.psyir.backend.kokkos_team_scalars.team_private_scalars`.
+
         :param region: the captured region to generate.
 
         :returns: a complete C++ translation unit.
 
         :raises TypeError: as :py:meth:`_validate` does.
-        :raises ValueError: as :py:meth:`_validate` does, and if the body
-            indexes an array for which the region described neither a View nor
-            scratch.
+        :raises ValueError: as :py:meth:`_validate` does; if the body indexes
+            an array for which the region described neither a View nor
+            scratch; and if a loop the region asks to spread over the team
+            writes a scalar that cannot be made private to a member.
         """
         self._validate(region)
+        self._private_scalars, private_names = team_private_scalars(region)
         self._views = {
             argument.name: argument for argument in region.arguments
             if isinstance(argument, KokkosView)
@@ -331,7 +345,15 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             # symbol must not also be declared here. ``gen_declaration``
             # renders an array local as ``double * restrict x_new`` -- a
             # pointer to nothing, which compiles and would shadow the View.
-            if symbol.name not in scratch_names)
+            # A scalar every use of which is inside a loop spread over the
+            # team is declared inside that loop's lambda instead of here, so
+            # that each member owns one. A scalar the body also uses outside
+            # those loops keeps this declaration and is shadowed by the
+            # private one, because the outer uses still need something to
+            # name; which of the two a symbol is is decided by
+            # ``team_private_scalars`` and not here.
+            if symbol.name not in scratch_names
+            and symbol.name not in private_names)
         if region.cell_position is not None:
             # First, and prepended here rather than in each launch shape: all
             # three place these declarations immediately after establishing
@@ -344,6 +366,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         constant_indent, self._depth = self._nindent, 0
         self._views, self._kind_types = {}, {}
         self._parallel_loops = ()
+        self._private_scalars = {}
 
         # Inside the body, not at file scope: nvcc will not read a namespace
         # scope array from device code. First, since a constant reads nothing.

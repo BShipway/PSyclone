@@ -79,9 +79,9 @@ class KokkosArrayExpressionMixin:
     Mixed into :py:class:`~psyclone.psyir.backend.kokkos.KokkosWriter` ahead
     of :py:class:`~psyclone.psyir.backend.c.CWriter`, so that these handlers
     are found first and reach the C writer's by ``super()``. The state they
-    read -- ``_views``, ``_kind_types``, ``_parallel_loops`` and
-    ``_parallel_depth`` -- is established by the writer for the duration of
-    one region and is documented there.
+    read -- ``_views``, ``_kind_types``, ``_parallel_loops``,
+    ``_parallel_depth`` and ``_private_scalars`` -- is established by the
+    writer for the duration of one region and is documented there.
     """
 
     #: How many of the region's chosen loops the visitor is currently
@@ -92,6 +92,10 @@ class KokkosArrayExpressionMixin:
     #: way, and pylint can only check an attribute the class states.
     _depth = 0
     _parallel_depth = 0
+    #: The scalars each spread loop declares inside its own lambda, keyed by
+    #: the ``id`` of the loop. Empty until the writer establishes it, which
+    #: is the answer for a region with no loop-private scalar in any case.
+    _private_scalars = {}
     #: The lowering this writer is using, created on first use and discarded
     #: with the region, because the names it generates are numbered and a
     #: second region must start again from zero.
@@ -158,11 +162,24 @@ class KokkosArrayExpressionMixin:
         Kokkos range is half-open, which is the ``+ 1`` on the stop
         expression.
 
+        The lambda opens with a declaration of every scalar this loop was
+        found to own -- the values it works in and the counters of the loops
+        nested inside it -- so that each iteration holds its own and no
+        statement after the loop can read what an iteration left behind. Once
+        the members share the iterations out, the value each member is left
+        holding is the one from the last iteration it happened to run, which
+        is a value nothing should be reading.
+        Which those are is
+        :py:func:`~psyclone.psyir.backend.kokkos_team_scalars.team_private_scalars`'s
+        answer, settled before any of this was generated; a loop writing a
+        scalar that cannot be made private never reaches here, because the
+        region carrying it is refused.
+
         A ``team_barrier`` follows unconditionally. A statement after the loop
-        may read what the loop wrote, and working out whether one does is a
-        second dependence analysis this writer does not perform; under
-        ``Kokkos::AUTO`` on the OpenMP backend the team has one member and the
-        barrier costs nothing measurable.
+        may read an *array element* the loop wrote, and working out whether
+        one does is a second dependence analysis this writer does not perform;
+        under ``Kokkos::AUTO`` on the OpenMP backend the team has one member
+        and the barrier costs nothing measurable.
 
         The lambda's parameter shadows the region-scope declaration of the
         loop variable, which stays because the same variable may also drive a
@@ -184,6 +201,9 @@ class KokkosArrayExpressionMixin:
         stop = self._visit(node.stop_expr)
         self._parallel_depth += 1
         self._depth += 1
+        declarations = "".join(
+            self.gen_local_variable(symbol)
+            for symbol in self._private_scalars.get(id(node), ()))
         body = "".join(self._visit(child) for child in node.loop_body)
         self._depth -= 1
         self._parallel_depth -= 1
@@ -191,7 +211,7 @@ class KokkosArrayExpressionMixin:
             f"{self._nindent}Kokkos::parallel_for("
             f"Kokkos::TeamVectorRange(team, {start}, {stop} + 1),\n"
             f"{self._nindent}    [&](const int {node.variable.name}) {{\n"
-            f"{body}{self._nindent}}});\n"
+            f"{declarations}{body}{self._nindent}}});\n"
             f"{self._nindent}team.team_barrier();\n")
 
     def assignment_node(self, node) -> str:
