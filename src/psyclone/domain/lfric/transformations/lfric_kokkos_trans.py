@@ -47,13 +47,14 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     """Replace one supported LFRic cell-column loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
-    an uncoloured owned-cell loop over a single kernel whose arguments are
-    fields, scalars and LMA operators, whose written fields are on
-    discontinuous spaces, and whose formals and referenced module constants
-    all map onto the ``int``/``float``/``double`` ABI the Kokkos backend
-    emits. Every part of the generated region -- its name, its C signature,
-    its Views and the ``bind(C)`` interface the PSy layer calls through -- is
-    derived from that kernel, so a second kernel needs no change here.
+    a cell-column loop over a single kernel, coloured or not, whose arguments
+    are fields, scalars and LMA operators, whose written fields are either on
+    discontinuous spaces or made safe by one of the two answers to a shared
+    write below, and whose formals and referenced module constants all map
+    onto the ``int``/``float``/``double`` ABI the Kokkos backend emits. Every
+    part of the generated region -- its name, its C signature, its Views and
+    the ``bind(C)`` interface the PSy layer calls through -- is derived from
+    that kernel, so a second kernel needs no change here.
 
     **Precision is carried, not chosen.** A kind is placed on the ABI by the
     width LFRic's precision map gives it, so an ``r_solver`` kernel reaches
@@ -635,6 +636,47 @@ KernelModuleInlineTrans`.
     halo-dirty calls are retained, and only the resulting generic loop is
     replaced.
 
+    **A write two cells share has two answers, and both are generated.**
+    LFRic's ``gh_inc`` and ``gh_readinc`` are read-modify-writes of a field
+    at a dof two neighbouring cells both hold, so a launch running those
+    cells at once would lose one of the two contributions. The default
+    answer is an atomic: each update of such an argument is written as
+    ``Kokkos::atomic_add`` -- or ``_sub``, ``_mul``, ``_div``, by the
+    operator the update carries -- on the View element. It is applied per
+    argument and not per region, so a ``gh_write`` to a discontinuous space
+    in the same kernel stays a plain assignment, and it is the update and
+    not the read that is atomic, so a ``gh_readinc`` reads its element
+    plainly and updates it atomically.
+
+    The other answer is colouring, which is what LFRic's own OpenMP path
+    takes. A loop
+    :py:class:`~psyclone.domain.lfric.transformations.LFRicColourTrans` has
+    already rewritten is accepted: the inner ``cells_in_colour`` loop is the
+    one captured, the outer loop over colours stays in the PSy layer and
+    enters the region once per colour, and no atomic is generated, because
+    the cells of one colour meet at no dof. Such a region carries three
+    arguments an uncoloured one does not -- LFRic's colour map, the colour
+    being launched, and the number of colours -- and declares its cell from
+    them, ``const int cell = cmap(colour - 1, cell_in_colour) - 1;``. The
+    number of colours is not redundant beside the map: the map crosses the
+    ABI as bare storage and is rebuilt as a rank-2 View inside the region,
+    where that number is the ``LayoutLeft`` stride and so the extent that
+    has to be exact.
+
+    Which answer is used follows the loop unless :py:attr:`_ATOMICS_OPTION`
+    says otherwise, and the two are alternatives rather than a ranking. Both
+    are correct; which is faster is a measurement on a GPU, and neither this
+    class nor the branch that added the second answer has taken it.
+
+    One thing a coloured region does is worth stating, because a debug build
+    will say so. Its per-cell Views are strided by the launch's cell count,
+    which for a coloured launch is the cells of *this* colour, while the
+    index they are read at is the mesh cell the colour map returns. Under
+    ``LayoutLeft`` the last extent takes no part in the address, so the
+    addresses are the ones the Fortran computes; a build with
+    ``KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK`` would nonetheless report the index
+    as out of range.
+
     **A loop this transformation leaves behind may still be transformed
     afterwards**, colouring included, even though capturing forces the
     Invoke's PSy-layer symbols to be set up early. The region's actual
@@ -661,9 +703,11 @@ KernelModuleInlineTrans`.
     is obtained from a kernel argument that capture has removed. That raises
     :py:class:`~psyclone.errors.GenerationError` at code generation, naming
     the Invoke, rather than emitting a look-up on an unassigned pointer.
-    Colouring such an Invoke before capturing it is refused by
-    :py:meth:`validate` and colouring it afterwards by this, so the case is
-    reported either way round.
+    Colouring such an Invoke *before* capturing it needs no repair and is
+    accepted: the symbols are set up from here, after the colouring, so the
+    mesh is read from an argument the capture has not yet removed. That is
+    the order the coloured arm above asks for, and the completion pass then
+    finds the look-ups already emitted and does not emit them again.
     """
 
     #: The option naming the team size the hierarchical launch asks for.
