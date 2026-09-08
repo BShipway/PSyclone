@@ -375,25 +375,24 @@ class LFRicKokkosContractMixin:
     def _validate_body(schedule):
         """Check that nothing in the body escapes the generated region.
 
-        :param schedule: the kernel schedule being captured.
+        A call is not asked about here. The generated region still has no
+        Fortran to call into, but by the time this runs the body has been
+        through
+        :py:meth:`LFRicKokkosInlineMixin._inline_calls`, which has either made
+        every callee's statements the kernel's own or refused the capture
+        naming the call it could not. A second rule here would only be able
+        to report a call that rewrite had already accepted.
+
+        :param schedule: the kernel schedule being captured, after inlining.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
         :raises TransformationError: if the body holds a
-            :py:class:`~psyclone.psyir.nodes.CodeBlock`, or a call to
-            anything other than an intrinsic, neither of which the generated
-            region has any way to express.
+            :py:class:`~psyclone.psyir.nodes.CodeBlock`, which the generated
+            region has no way to express.
         """
         if schedule.walk(CodeBlock):
             raise TransformationError(
                 "LFRicKokkosTrans cannot capture a CodeBlock.")
-        for call in schedule.walk(Call):
-            if isinstance(call, IntrinsicCall):
-                continue
-            routine = call.routine
-            name = routine.symbol.name if routine else "an unnamed routine"
-            raise TransformationError(
-                f"LFRicKokkosTrans cannot capture the call to '{name}': the "
-                "generated region has no Fortran to call into.")
 
     @staticmethod
     def _is_array_valued(assignment):
@@ -444,10 +443,13 @@ class LFRicKokkosContractMixin:
 
         A section that is not part of an assignment is out of reach of
         lowering, but it is only this rule's to refuse when it stands on its
-        own. Passed to a routine -- ``call convert(field(:,k))`` -- the call
-        is the blocker and :py:meth:`_validate_calls` is the rule that names
-        it, so this one steps aside rather than reporting the argument as a
-        second, weaker reason for the same refusal.
+        own. Passed to a routine -- ``call convert(field(:,k))`` -- it is the
+        call that decides: inlining the callee takes the argument away with
+        it, and where the callee cannot be inlined that refusal is the
+        blocker, named by
+        :py:meth:`LFRicKokkosInlineMixin._inline_calls`. So this rule steps
+        aside rather than reporting the argument as a second, weaker reason
+        for the same refusal.
 
         :param schedule: the kernel schedule to be captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`

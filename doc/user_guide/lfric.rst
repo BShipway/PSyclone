@@ -4180,9 +4180,30 @@ reading the array it writes, for which no order of loops means what the
 Fortran meant, and one whose right-hand side calls something neither
 scalar-valued nor elemental, ``MATMUL`` and the other contractions among
 them. A section that is not in an assignment is judged by where it is
-instead: as an actual argument it is left to the rule about calls, and
-anywhere else -- in the bounds of an ``ALLOCATE``, most often -- it is
-refused. A body may also fill an array from a
+instead: as an actual argument it is left to the call, since inlining the
+callee takes the argument away with it, and anywhere else -- in the bounds
+of an ``ALLOCATE``, most often -- it is refused.
+A body that calls a subroutine or a function is inlined rather than
+refused. The region is a C++ function with no Fortran to call into, so
+``InlineTrans`` makes the callee's statements the kernel's own before any
+other rule looks at the body, and a callee that itself calls is inlined in
+its turn, one call at a time until none is left; a callee brings its own
+loops, locals and sections with it and each is then judged like the
+kernel's own. The repetition is bounded at eight calls into one body, and
+the bound is load-bearing rather than defensive: ``InlineTrans`` has no
+recursion check, so a routine that calls itself would be substituted into
+itself for as long as it was asked, and reaching the bound is instead a
+refusal naming the routine still to be inlined. In scope are a procedure of
+the kernel's own module and a procedure of a module the kernel ``use``\ s
+whose source PSyclone can read, the second brought into the kernel's
+container by ``KernelModuleInlineTrans`` first; a callee whose module is
+not on the search path is out of scope, PSyclone having a name for it and
+no body. Being in scope is not being inlinable, and the rest of the
+judgement is PSyclone's rather than this transformation's: a callee reading
+data private to its own module, one whose declarations depend on an
+argument the call site writes to before calling, and one whose actual and
+formal types do not agree are each refused in ``InlineTrans``'s own words
+with the call named. A body may also fill an array from a
 constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
 dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
 generated as one assignment per element, into the array the kernel has

@@ -15,6 +15,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
     import LFRicKokkosConstantsMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_contract_mixin import (
     LFRicKokkosContractMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_inline_mixin import (
+    LFRicKokkosInlineMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.errors import GenerationError
@@ -34,7 +36,8 @@ from psyclone.psyir.transformations import (
 
 class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosBoundsMixin, LFRicKokkosCallMixin,
-                       LFRicKokkosConstantsMixin, Transformation):
+                       LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,
+                       Transformation):
     """Replace one supported LFRic cell-column loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:
@@ -165,6 +168,41 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     stencil kernel written as a generic interface is still refused there
     whatever its shape.
 
+    **A called subroutine is inlined, not called.** The generated region is
+    a C++ function and there is no Fortran for it to call into, so a kernel
+    that calls a helper has that helper's statements made its own before
+    anything else looks at the body. The rewrite is
+    :py:class:`~psyclone.psyir.transformations.InlineTrans`, applied one call
+    at a time and repeated until the body makes none: a helper that calls a
+    second helper leaves that second call behind in the statements it
+    contributes, so one pass would not be enough. It runs before every other
+    rewrite here, because a callee brings its own loops, its own locals and
+    its own array sections in with it and each of those is then judged like
+    the kernel's own.
+
+    The repetition is bounded by ``LFRicKokkosInlineMixin._INLINE_LIMIT``,
+    eight calls into one kernel body, and the bound is load-bearing rather
+    than defensive: ``InlineTrans`` has no recursion check, so a routine that
+    calls itself is substituted into itself for as long as it is asked.
+    Reaching the bound is a refusal naming the routine still to be inlined.
+
+    **A callee out of scope is refused rather than guessed at.** In scope are
+    a procedure of the kernel's own module, and a procedure of a module the
+    kernel names in a ``use`` whose source PSyclone can read -- the latter
+    is first brought into the kernel's Container by
+    :py:class:`~psyclone.domain.common.transformations.\
+KernelModuleInlineTrans`.
+    A callee whose module is not on the search path is not: PSyclone has a
+    name for it and nothing else, and there is no body to inline.
+
+    Being in scope is not being inlinable, and the rest of the judgement is
+    PSyclone's rather than this transformation's: a callee reading data
+    private to its own module, one whose declarations depend on an argument
+    the call site writes to before calling, one whose actual and formal types
+    do not agree, one holding a CodeBlock. Each is refused in ``InlineTrans``'
+    own words with the call named, because those words say what to fix and a
+    paraphrase would say less.
+
     **An array-valued assignment is lowered to an explicit loop.** Two
     shapes reach the lowering. A whole-column array section such as
     ``a(i:j) = ...``, which the finite-volume kernels use to assign a column
@@ -185,11 +223,12 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
     array a loop nest cannot subscript.
 
     A section that is not in an assignment at all is judged by where it is
-    instead. One that is an actual argument of a call is left to the rule
-    about calls, which refuses or accepts the whole call on its own terms
-    rather than being pre-empted here by the shape of one argument. Anywhere
-    else -- the bounds of an ``ALLOCATE``, most often -- it is beyond what
-    lowering can reach and is refused before the backend sees it.
+    instead. One that is an actual argument of a call is left to the call:
+    inlining the callee takes the argument away with it, so the section is
+    gone before this rule could have refused it, and where the callee cannot
+    be inlined that is the refusal worth reporting. Anywhere else -- the
+    bounds of an ``ALLOCATE``, most often -- it is beyond what lowering can
+    reach and is refused before the backend sees it.
 
     **An array constructor fills an array; it is not a value.** A kernel
     writing ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or filling one
@@ -480,7 +519,14 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         self._validate_loop(node)
         kernel = node.kernels()[0]
         self._validate_kernel_metadata(kernel)
-        schedule = self._schedule(kernel)
+        # Every rule below is asked of the body inlining leaves rather than
+        # the one the kernel file holds: a callee brings its own loops,
+        # locals, sections and constants in with it, and a rule asked before
+        # the rewrite would be answering about a body that never reaches the
+        # backend. The rewrite is made over a copy of the whole file, because
+        # validate() must leave the schedule as it found it and because a
+        # detached schedule has no Container for the callee to be found in.
+        schedule = self._inlined_copy(self._schedule(kernel))
         self._validate_body(schedule)
         self._validate_sections(schedule)
         self._validate_bounds(schedule)
@@ -785,6 +831,7 @@ can_loop_be_parallelised`
         self.validate(node, options=options, **kwargs)
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
+        self._inline_calls(schedule)
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)
         self._substitute_constants(schedule)
