@@ -8717,6 +8717,66 @@ def test_lfric_kokkos_trans_generates_a_matmul_assignment(matmul_target):
     assert "column_e((_kae_i0 - 1)) = _kae_r0;" in cpp
 
 
+# sci_w3_to_w2_correction_code's shape, and the one the whole-model capture
+# was left unable to model: a whole array assigned the value of a RESHAPE
+# whose source is a constructor of literals, `perp_cells(:,:) = reshape([5, 3,
+# 4, 2, 5, 3, 4, 2], [2,4])`. The tier writes a reshape by re-viewing its
+# source, so the source has to be an array with a place in memory; a
+# constructor is a value with none.
+_CONSTRUCTOR_OPERAND_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    integer(kind=i_def), dimension(2,4) :: perp_cells\n").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    perp_cells(:,:) = reshape([5, 3, 4, 2, 5, 3, 4, 2], [2,4])\n"
+    "    swept(nlayers) = partial(nlayers) + perp_cells(1,1)")
+
+
+@pytest.fixture(name="constructor_operand_target")
+# pylint: disable-next=unused-argument
+def constructor_operand_target_fixture(tmp_path,
+                                       clear_module_manager_instance):
+    """Create an invoke whose kernel reshapes a constructor of literals."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _CONSTRUCTOR_OPERAND_KERNEL)
+
+
+def test_lfric_kokkos_trans_validate_refuses_a_constructor_operand(
+        constructor_operand_target, matmul_target):
+    """An operand the array tier cannot shape is refused by `validate`.
+
+    Nothing `validate` accepts may be refused by `apply`, and the array tier
+    was the one part of the writer it never asked: the intrinsic probe steps
+    over a tier intrinsic on a right-hand side, because the tier rather than
+    a handler writes it there, so a RESHAPE of a constructor passed
+    validation and was refused half-way through generation. It is refused
+    here instead, in the writer's own words -- and the whole-array operand
+    the same tier does write is not refused with it, which is the other half
+    of the invariant: `apply` after a `validate` that passed generates.
+    """
+    _, loop, _ = constructor_operand_target
+    _, matmul_loop, _ = matmul_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "cannot take the shape of" in str(error.value)
+    assert ("an array-valued intrinsic's operand must be a whole array"
+            in str(error.value))
+
+    # `apply` refuses it in the same words, from `validate` rather than from
+    # the backend part-way through the region.
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().apply(loop)
+
+    assert "cannot take the shape of" in str(error.value)
+    assert "cannot express" not in str(error.value)
+
+    # The shape the tier does write is not refused with it.
+    LFRicKokkosTrans().validate(matmul_loop)
+    assert "MATMUL" not in LFRicKokkosTrans().apply(matmul_loop)
+
+
 def test_lfric_kokkos_trans_accepts_an_integer_field(
         integer_field_target, real_field_target):
     """A field whose data is integer crosses the ABI as a View of int.

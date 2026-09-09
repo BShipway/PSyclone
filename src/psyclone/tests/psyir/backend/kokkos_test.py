@@ -2546,6 +2546,73 @@ def test_kokkos_writer_reports_an_array_intrinsic_out_of_its_tier():
 
     assert not KokkosWriter().unsupported_intrinsics(schedule, _ARRAY_KINDS)
 
+    # Inside an array constructor it is not, though it is on a right-hand
+    # side: the constructor is written element by element rather than lowered
+    # to a nest, so the call reaches the handler that cannot spell it.
+    schedule = _array_probe("  p(:) = [minval(q), 1.0_r_def, 2.0_r_def]\n")
+
+    assert list(KokkosWriter().unsupported_intrinsics(
+        schedule, _ARRAY_KINDS)) == ["MINVAL/1"]
+
+
+def test_kokkos_writer_reports_an_operand_it_cannot_shape():
+    """The writer answers which array expressions it cannot shape.
+
+    Where the intrinsic probe above stops is exactly where the array tier
+    starts: a tier intrinsic on a right-hand side is not written by a
+    handler, so asking the handler about it answers nothing. What decides
+    whether the tier can write one is whether it can take the shape of its
+    operands, and that question is asked here -- of the tier itself, so that
+    the refusal a caller reports is the writer's own sentence rather than a
+    second wording to keep in step with it.
+
+    ``sci_w3_to_w2_correction_code`` reshapes a constructor of literals,
+    which has no place in memory for the reshape to re-view; the whole-model
+    capture could not model it, because ``validate`` accepted it and
+    generation then refused it.
+    """
+    schedule = _array_probe(
+        "  g(:,:) = reshape([1.0_r_def, 2.0_r_def, 3.0_r_def, 4.0_r_def, "
+        "5.0_r_def, 6.0_r_def], [2,3])\n")
+
+    refusals = KokkosWriter().unshapeable_expressions(schedule, _ARRAY_KINDS)
+
+    assert len(refusals) == 1
+    assert "cannot take the shape of" in refusals[0]
+    assert "must be a whole array or a section of one" in refusals[0]
+    # The writer's words, and not the visitor's framing of them: this is no
+    # longer an error raised while visiting anything.
+    assert "Visitor Error" not in refusals[0]
+
+
+def test_kokkos_writer_reports_nothing_for_a_shape_it_can_take():
+    """The operands the tier does write are not refused with it.
+
+    Every array named in the body stands in for the View the region will
+    describe, because the probe runs before there is a region: without them a
+    whole-array operand would be refused for having no description, which is
+    every operand the model actually writes. The same ``RESHAPE`` over an
+    array rather than over a constructor is the case that separates the two.
+
+    The last two statements are the ones the tier does not write at all: a
+    scalar assignment with no section in it, and an array constructor, whose
+    values the C writer spreads over the destination itself. Neither is
+    lowered, so neither is asked about.
+    """
+    schedule = _array_probe("""
+  g(:,:) = reshape(f, [2,3])
+  p(:) = matmul(w, q) + f(1:3)
+  x = dot_product(p, q)
+  a(:) = b(:) * x
+  x = b(1) * 2.0_r_def
+  p(:) = [1.0_r_def, 2.0_r_def, 3.0_r_def]
+""")
+
+    refusals = KokkosWriter().unshapeable_expressions(schedule, _ARRAY_KINDS)
+
+    assert isinstance(refusals, tuple)
+    assert not refusals
+
 
 def test_kokkos_array_intrinsic_over_a_section():
     """An operand may be a section, which is the form the model writes.

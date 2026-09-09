@@ -239,6 +239,44 @@ KokkosArrayExpression._space` gives one, or the empty tuple.
                 for call in self._outermost(node)
                 for access in call.walk(ArrayMixin)}
 
+    def unshapeable(self, tree):
+        """Return why this tier cannot shape an expression, if it cannot.
+
+        :py:meth:`shape` is asked of every outermost call, which is the same
+        question :py:meth:`space` asks and the same order it asks it in, with
+        one difference: nothing stops at the first call that has a shape.
+        ``space`` wants one answer and any array-valued call gives it, while
+        a caller asking what would be refused wants every refusal there is,
+        including one from a call standing beside a call that is fine.
+
+        Only the shape is asked. Whether an *element* of the result can be
+        generated is settled in :py:meth:`element`, over indices that do not
+        exist until the nest is generated, so a reduction inside a reduction
+        is not reported here.
+
+        :param tree: the expression to ask about.
+        :type tree: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: the writer's own refusal, once per distinct wording, in the
+            order met.
+        :rtype: Tuple[str, ...]
+        """
+        refusals = []
+        for call in self._outermost(tree):
+            try:
+                self.shape(call)
+            # A shape is generated as well as computed -- an extent is
+            # visited to become C++ -- so the ordinary refusal is a
+            # ``VisitorError`` and a subscript the region cannot resolve
+            # is a ``ValueError``. Both are the writer saying it will not
+            # write this, which is the whole of what is being asked.
+            except (VisitorError, ValueError) as error:
+                # The writer's sentence, without the visitor's framing of it:
+                # a caller reporting this is not visiting anything, and the
+                # words after the prefix are the ones that say what is wrong.
+                refusals.append(str(error).replace("Visitor Error: ", "", 1))
+        return tuple(dict.fromkeys(refusals))
+
     # ------------------------------------------------------------------
     # Shape
     # ------------------------------------------------------------------
