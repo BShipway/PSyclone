@@ -57,7 +57,9 @@ module that was never read, an argument whose type does not match the formal
 """
 
 from psyclone.domain.common.transformations import KernelModuleInlineTrans
-from psyclone.psyir.nodes import Call, IntrinsicCall, Routine
+from psyclone.psyir.nodes import (
+    Call, Container, IntrinsicCall, Routine)
+from psyclone.psyir.symbols import RoutineSymbol, Symbol
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -82,9 +84,16 @@ class LFRicKokkosInlineMixin:
     module the kernel names in a ``use`` is too, provided PSyclone can read
     that module's source: it is first brought into the kernel's Container by
     :py:class:`~psyclone.domain.common.transformations.KernelModuleInlineTrans`
-    and then inlined like any other. Anything else -- a callee whose module is
-    not on the search path, so that PSyclone has only a name for it -- is out
-    of scope and refused.
+    and then inlined like any other, and what it needs comes with it: a named
+    constant its own module reads from a third travels into the kernel's
+    Container beside the body. Anything else -- a callee whose module is not
+    on the search path, so that PSyclone has only a name for it -- is out of
+    scope and refused.
+
+    Where a callee could not be brought in, the refusal says so as well as
+    saying why the call could not be inlined. ``InlineTrans`` alone reports
+    the symptom -- the body is in another Container -- and
+    :py:meth:`_module_inline`'s reason is the one that names what to fix.
 
     Being in scope is not being inlinable, and the difference is PSyclone's
     to state rather than ours. A callee reading data private to its own
@@ -162,11 +171,13 @@ class LFRicKokkosInlineMixin:
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
         :raises TransformationError: if a call cannot be inlined, in which
-            case the reason is the one PSyclone gives for it. A
-            :py:exc:`TypeError` from resolving the callee is one of those
-            reasons: a name the frontend read as a call may resolve to a
-            datum, which PSyclone reports by failing to specialise the symbol
-            rather than by refusing the transformation.
+            case the reason is the one PSyclone gives for it, followed by the
+            reason the callee was not brought into the Container first where
+            there is one. A :py:exc:`TypeError` from resolving the callee is
+            one of those reasons: a name the frontend read as a call may
+            resolve to a datum, which PSyclone reports by failing to
+            specialise the symbol rather than by refusing the
+            transformation.
         :raises TransformationError: if calls are still left after
             :py:attr:`_INLINE_LIMIT` of them have been inlined, which is what
             a self-recursive callee looks like from here.
@@ -177,13 +188,15 @@ class LFRicKokkosInlineMixin:
                 return
             call = pending[0]
             name = cls._callee_name(call)
-            cls._module_inline(call)
+            refusal = cls._module_inline(call)
             try:
                 InlineTrans().apply(call)
             except (TransformationError, TypeError) as err:
+                first = (f"; bringing it into the container was refused "
+                         f"first: {refusal}") if refusal else ""
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot inline the call to '{name}' in "
-                    f"'{schedule.name}': {err}") from err
+                    f"'{schedule.name}': {err}{first}") from err
         names = ", ".join(sorted(
             {cls._callee_name(call)
              for call in cls._pending_calls(schedule)}))
@@ -193,8 +206,8 @@ class LFRicKokkosInlineMixin:
             f"a routine that calls itself is never inlined away, and no "
             f"kernel this is meant for calls that deeply.")
 
-    @staticmethod
-    def _module_inline(call):
+    @classmethod
+    def _module_inline(cls, call):
         """Bring ``call``'s callee into the Container the call is made from.
 
         A callee reached through a ``use`` has its body in another Container,
@@ -202,25 +215,75 @@ class LFRicKokkosInlineMixin:
         :py:class:`~psyclone.psyir.transformations.InlineTrans`. Moving it
         first is what puts a procedure of a ``use``d module in scope, and it
         carries the callee's own imports and declarations with it rather than
-        leaving them behind.
+        leaving them behind -- a named constant the callee reads from a third
+        module included, which is why a two-container callee such as LFRic's
+        ``face_from_face_selector`` is reachable at all.
 
-        It is attempted rather than required, and its refusals are dropped
-        rather than reported: a callee that is already local is refused for
-        being "already module inlined", which is the successful case, and for
-        any other refusal the message worth having is the one
-        :py:meth:`_inline_calls` then gets from ``InlineTrans`` about the
-        call itself. Reporting this one instead would name a rewrite the
-        reader never asked for. A :py:exc:`TypeError` from resolving the
-        callee is dropped for the same reason and on the same terms: it is
-        raised again where the call is inlined, and refused there.
+        **The callee's symbol is specialised first.** ``selector(face)`` in an
+        expression is a function reference or an element of an array, and
+        where the kernel's own file does not settle which the frontend leaves
+        the name an unspecialised :py:class:`~psyclone.psyir.symbols.Symbol`.
+        :py:class:`~psyclone.domain.common.transformations.KernelModuleInlineTrans`
+        reads such a symbol at the call site as a datum of the callee's name
+        and refuses to shadow it, which is a refusal about what the frontend
+        could tell rather than about the code. A ``Call``'s callee is a
+        routine whether or not the frontend could say so, so the symbol is
+        made one. Only a bare ``Symbol`` is: a
+        :py:class:`~psyclone.psyir.symbols.DataSymbol` is a name PSyclone has
+        typed as data, and specialising that would assert something the
+        source does not support.
+
+        It is attempted rather than required, and a refusal is returned rather
+        than raised: a callee that is already local is refused for being
+        "already module inlined", which is the successful case, and where the
+        callee did reach the Container the message worth having is the one
+        :py:meth:`_inline_calls` then gets from ``InlineTrans`` about the call
+        itself. So the refusal is returned only when the Container does not
+        hold the callee afterwards, which is the case where it explains
+        something ``InlineTrans``'s message alone does not. A
+        :py:exc:`TypeError` from resolving the callee is returned on the same
+        terms.
 
         :param call: the call whose callee is to be brought in.
         :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: why the callee was not brought into the call's Container, or
+            ``None`` where it is in it.
+        :rtype: Optional[str]
         """
+        routine = call.routine
+        # pylint: disable-next=unidiomatic-typecheck
+        if routine is not None and type(routine.symbol) is Symbol:
+            routine.symbol.specialise(RoutineSymbol)
         try:
             KernelModuleInlineTrans().apply(call)
-        except (TransformationError, TypeError):
-            pass
+            return None
+        except (TransformationError, TypeError) as err:
+            return None if cls._callee_is_local(call) else str(err)
+
+    @classmethod
+    def _callee_is_local(cls, call):
+        """Say whether ``call``'s Container holds a routine of that name.
+
+        Asked after :py:meth:`_module_inline` has tried, this separates the
+        callee that was already in the Container -- refused for being "already
+        module inlined", which is success -- from the one that could not be
+        moved into it. It is asked of the tree rather than of the refusal's
+        wording, which is another transformation's to change.
+
+        :param call: the call to look for the callee of.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: whether the Container the call is made from holds a routine
+            named as the callee is.
+        :rtype: bool
+        """
+        container = call.ancestor(Container)
+        if container is None:
+            return False
+        name = cls._callee_name(call).lower()
+        return any(routine.name.lower() == name
+                   for routine in container.walk(Routine, stop_type=Routine))
 
     @staticmethod
     def _rooted_copy(schedule):
