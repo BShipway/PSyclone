@@ -48,7 +48,8 @@ from psyclone.psyir.nodes import (
     Assignment, Call, CodeBlock, IntrinsicCall, Loop, Node, Reference,
     Routine, Statement)
 from psyclone.psyir.symbols import (
-    AutomaticInterface, DataSymbol, ImportInterface, UnresolvedType)
+    AutomaticInterface, DataSymbol, ImportInterface, Symbol,
+    UnresolvedInterface, UnresolvedType)
 from psyclone.psyir.transformations import (
     InlineTrans, TransformationError)
 from psyclone.tests.utilities import Compile, get_invoke
@@ -350,11 +351,12 @@ def test_apply_unresolved_struct_arg(fortran_reader, fortran_writer):
     # Second one should fail.
     with pytest.raises(TransformationError) as err:
         inline_trans.apply(calls[1])
-    assert ("No matching routine found for 'call sub3(mystery)':"
-            in str(err.value))
-    assert ("Argument type mismatch of call argument"
-            " 'mystery' (UnresolvedType) and routine argument 'x' (Array"
-            in str(err.value))
+    # An unresolved actual argument could be of any type, so resolving the
+    # callee no longer refuses it; the refusal comes from this
+    # transformation's own check that the array is not being reshaped.
+    assert ("Routine 'sub3' cannot be inlined because the type of the actual "
+            "argument 'mystery' corresponding to an array formal argument "
+            "('x') is unknown." in str(err.value))
     # Third one should be fine because it is a scalar argument.
     inline_trans.apply(
         calls[2],
@@ -364,13 +366,9 @@ def test_apply_unresolved_struct_arg(fortran_reader, fortran_writer):
     with pytest.raises(TransformationError) as err:
         inline_trans.apply(calls[3])
     assert (
-        "No matching routine found for 'call sub4(mystery)':"
-        in str(err.value)
-    )
-    assert (
-        "Argument type mismatch of call argument 'mystery' (UnresolvedType) "
-        "and routine argument 'x' (Array"
-        in str(err.value)
+        "Routine 'sub4' cannot be inlined because the type of the actual "
+        "argument 'mystery' corresponding to an array formal argument ('x') "
+        "is unknown." in str(err.value)
     )
     output = fortran_writer(psyir)
     assert ("    varr(1:5)%region%local%nx = 0\n"
@@ -2256,8 +2254,9 @@ def test_validate_array_arg_expression(fortran_reader):
     inline_trans = InlineTrans()
     with pytest.raises(TransformationError) as err:
         inline_trans.validate(call)
-    assert ("Argument type mismatch of call argument 'a + b' (UnresolvedType) "
-            "and routine argument 'x' (Array" in str(err.value))
+    assert ("Routine 's' cannot be inlined because the type of the actual "
+            "argument 'a + b' corresponding to an array formal argument "
+            "('x') is unknown." in str(err.value))
 
 
 def test_validate_indirect_range(fortran_reader):
@@ -2875,3 +2874,44 @@ def test_apply_array_access_check_unresolved_override_option(
     inline_trans.apply(
         call, use_first_callee_and_no_arg_check=True)
     # TODO check results
+
+
+def test_validate_symbol_clash_with_call_site(fortran_reader):
+    '''
+    Test that a routine whose symbols cannot be merged into the table at the
+    call site is refused rather than reaching the merge in apply(). Inlining
+    works on a copy of the routine, and a copy is detached from its container,
+    so a name the routine takes from there is out of reach; simplifying the
+    condition of an if-statement that uses such a name puts it back as an
+    unresolved symbol, which cannot be merged with an unresolved symbol of the
+    same name at the call site.
+
+    '''
+    code = (
+        "module test_mod\n"
+        "  use some_mod, only : flag_a, flag_b\n"
+        "contains\n"
+        "  subroutine run_it()\n"
+        "    integer :: i\n"
+        "    i = 1\n"
+        "    call sub(i)\n"
+        "  end subroutine run_it\n"
+        "  subroutine sub(x)\n"
+        "    integer :: x\n"
+        "    if (x == flag_a .or. x == flag_b) then\n"
+        "      x = x + 1\n"
+        "    end if\n"
+        "  end subroutine sub\n"
+        "end module test_mod\n")
+    psyir = fortran_reader.psyir_from_source(code)
+    call = psyir.walk(Call)[0]
+    # Give the call site an unresolved Symbol of a name the routine uses, as
+    # an earlier inlining into it would have done.
+    call.ancestor(Routine).symbol_table.add(
+        Symbol("flag_a", interface=UnresolvedInterface()))
+    with pytest.raises(TransformationError) as err:
+        InlineTrans().validate(call)
+    assert ("Routine 'sub' cannot be inlined because its symbols cannot be "
+            "added to the table at the call site" in str(err.value))
+    assert ("'flag_a' is present but unresolved in both tables"
+            in str(err.value))

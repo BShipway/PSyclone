@@ -4265,7 +4265,14 @@ judgement is PSyclone's rather than this transformation's: a callee reading
 data private to its own module, one whose declarations depend on an
 argument the call site writes to before calling, and one whose actual and
 formal types do not agree are each refused in ``InlineTrans``'s own words
-with the call named. Not every call is a call, either: an indexed name whose
+with the call named. Types agreeing is a scored judgement rather than an
+identity: a literal actual stating no kind, an actual whose type PSyclone
+cannot resolve, and an array section against a formal argument PSyclone
+holds only a partial type for are each a weaker match than an exact one
+rather than no match, and a call to a generic interface takes the strongest
+match among its candidates. Two candidates matching a relaxed call equally
+well is not settled by guessing: that call is refused as ambiguous, naming
+both. Not every call is a call, either: an indexed name whose
 meaning the kernel's own file does not settle -- ``blending_weights(index)``,
 where the array comes from a ``use`` -- is read by the frontend as a call,
 and resolving it reaches a datum rather than a routine. PSyclone reports
@@ -4816,6 +4823,28 @@ meaning of is read as one by the frontend, and resolving it can reach a
 datum and raise :py:exc:`TypeError` rather than refuse. That too is a
 refusal here, so that :py:meth:`validate` declines a kernel it cannot
 capture instead of raising out of PSyclone.
+
+**Actual and formal types agreeing is scored, not identical.**
+:py:meth:`~psyclone.psyir.nodes.Call.get_callee` scores each candidate
+routine through
+:py:func:`~psyclone.psyir.nodes.argument_matching.match_argument`: zero
+where every actual argument's type is the formal argument's, and one more
+for each argument that agrees only in what Fortran requires of it. Three
+such arguments arise in the LFRic kernels. A literal written without a
+kind -- ``2.0`` passed where the formal argument is ``real(kind=r_def)``
+-- carries no precision of its own to disagree with. An actual whose type
+PSyclone cannot resolve, typically a module datum whose declaration holds
+an attribute the PSyIR does not model, is unknown rather than wrong. And
+an array section passed where the formal argument is declared with an
+explicit shape PSyclone reads only partially is compared against that
+partial type instead of being rejected for the declaration's remainder.
+
+The lowest-scoring candidate is the callee. Relaxing a comparison this
+way is safe only while an ambiguity it creates is caught, so two
+candidates tying on a non-zero score are refused rather than chosen
+between, naming both and the score. A generic interface whose candidates
+differ only in the kind of an argument the call passes a kindless literal
+to is the case this arises in, and Fortran would not settle it either.
 
 **An array-valued assignment is lowered to an explicit loop.** Two
 shapes reach the lowering. A whole-column array section such as

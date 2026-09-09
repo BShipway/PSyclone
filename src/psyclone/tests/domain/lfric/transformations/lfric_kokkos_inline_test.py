@@ -500,3 +500,289 @@ def test_lfric_kokkos_trans_validate_keeps_the_module_scope_chain(
         LFRicKokkosTrans().validate(loop)
     except TransformationError as err:
         pytest.fail(f"the capture contract refused the kernel: {err}")
+
+
+# --------------------------------------------------------------------------
+# Task E2: what get_callee should accept. Each kernel below reaches
+# InlineTrans through a call whose actual arguments the PSyIR cannot pair
+# with the callee's formals by type alone.
+# --------------------------------------------------------------------------
+
+
+# A helper taking a repeat count, called with the literal 2. Fortran gives a
+# literal written without a kind the default kind of its type, which is the
+# formal's kind wherever the code compiles; the PSyIR records it as UNDEFINED
+# and so cannot pair 'Scalar<INTEGER, UNDEFINED>' with 'integer(kind=i_def)'
+# for itself. This is the commonest shape in the GungHo corpus.
+_LITERAL_ACTUAL_KERNEL = _LOCAL_KERNEL.replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call sweep_column(nlayers, 2, partial, swept)\n").replace(
+    "end module column_solve_kernel_mod",
+    "  subroutine sweep_column(n, repeat, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n, repeat\n"
+    "    real(kind=r_def), dimension(n), intent(in) :: source\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    integer(kind=i_def) :: j\n"
+    "    result(n) = source(n) * repeat\n"
+    "    do j = n - 1, 1, -1\n"
+    "      result(j) = result(j + 1) - source(j)\n"
+    "    end do\n"
+    "  end subroutine sweep_column\n"
+    "end module column_solve_kernel_mod")
+
+
+# A column of a rank-2 local given to a formal the PSyIR does not fully model
+# -- 'target' is enough to make a declaration unsupported, and LFRic's
+# helpers carry such attributes -- whose partial datatype is the explicit
+# shape 'source(n)'. Comparing the actual's type with that partial type
+# compares two shape expressions written in different scopes, which are never
+# equal even when they describe the same extent.
+_PARTIAL_SECTION_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    real(kind=r_def), dimension(nlayers, 2) :: column\n").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    column(:,1) = partial(:)\n"
+    "    call sweep_column(nlayers, column(:,1), swept)\n").replace(
+    "end module column_solve_kernel_mod",
+    "  subroutine sweep_column(n, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_def), dimension(n), intent(in), target :: source\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    integer(kind=i_def) :: j\n"
+    "    result(n) = source(n)\n"
+    "    do j = n - 1, 1, -1\n"
+    "      result(j) = result(j + 1) - source(j)\n"
+    "    end do\n"
+    "  end subroutine sweep_column\n"
+    "end module column_solve_kernel_mod")
+
+
+# The same section given to a formal the PSyIR does model in full. Fortran
+# passes an array actual by shape rather than by bounds, so the extents the
+# two are written with never have to agree.
+_SUBSECTION_ACTUAL_KERNEL = _PARTIAL_SECTION_KERNEL.replace(
+    "    call sweep_column(nlayers, column(:,1), swept)\n",
+    "    call sweep_column(nlayers, partial(1:nlayers), swept)\n").replace(
+    "intent(in), target :: source", "intent(in) :: source")
+
+
+# The same helper behind a generic interface of two specifics differing in
+# the kind of the column they take. The actual states its kind, so one
+# specific matches exactly and the other not at all, and the call resolves.
+_GENERIC_KIND_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, r_def, r_tran").replace(
+    "end type column_solve_kernel_type\ncontains\n",
+    "end type column_solve_kernel_type\n"
+    "  interface sweep_column\n"
+    "    module procedure sweep_column_tran, sweep_column_def\n"
+    "  end interface sweep_column\n"
+    "contains\n").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call sweep_column(nlayers, partial, swept)\n").replace(
+    "end module column_solve_kernel_mod",
+    "  subroutine sweep_column_def(n, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_def), dimension(n), intent(in) :: source\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    integer(kind=i_def) :: j\n"
+    "    result(n) = source(n)\n"
+    "    do j = n - 1, 1, -1\n"
+    "      result(j) = result(j + 1) - source(j)\n"
+    "    end do\n"
+    "  end subroutine sweep_column_def\n"
+    "  subroutine sweep_column_tran(n, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_tran), dimension(n), intent(in) :: source\n"
+    "    real(kind=r_tran), dimension(n), intent(inout) :: result\n"
+    "    integer(kind=i_def) :: j\n"
+    "    result(n) = source(n)\n"
+    "  end subroutine sweep_column_tran\n"
+    "end module column_solve_kernel_mod")
+
+
+# The same interface, called with a kindless real literal in the one position
+# the two specifics differ in. Fortran resolves this by the default kind of
+# the literal; the PSyIR does not know it, so both specifics match equally
+# well and neither may be chosen.
+_AMBIGUOUS_GENERIC_KERNEL = _LOCAL_KERNEL.replace(
+    "  use constants_mod, only : i_def, r_def",
+    "  use constants_mod, only : i_def, r_def, r_tran").replace(
+    "end type column_solve_kernel_type\ncontains\n",
+    "end type column_solve_kernel_type\n"
+    "  interface scale_column\n"
+    "    module procedure scale_column_def, scale_column_tran\n"
+    "  end interface scale_column\n"
+    "contains\n").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call scale_column(nlayers, 2.0, partial, swept)\n").replace(
+    "end module column_solve_kernel_mod",
+    "  subroutine scale_column_def(n, factor, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_def), intent(in) :: factor\n"
+    "    real(kind=r_def), dimension(n), intent(in) :: source\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    result(n) = source(n) * factor\n"
+    "  end subroutine scale_column_def\n"
+    "  subroutine scale_column_tran(n, factor, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_tran), intent(in) :: factor\n"
+    "    real(kind=r_def), dimension(n), intent(in) :: source\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    result(n) = source(n) * factor\n"
+    "  end subroutine scale_column_tran\n"
+    "end module column_solve_kernel_mod")
+
+
+@pytest.fixture(name="literal_actual_target")
+# pylint: disable-next=unused-argument
+def literal_actual_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke passing a kindless literal to a module procedure."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _LITERAL_ACTUAL_KERNEL)
+
+
+@pytest.fixture(name="subsection_actual_target")
+# pylint: disable-next=unused-argument
+def subsection_actual_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke passing a section to an explicit-shape formal."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _SUBSECTION_ACTUAL_KERNEL)
+
+
+@pytest.fixture(name="partial_section_target")
+# pylint: disable-next=unused-argument
+def partial_section_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke passing a section to a partially-typed formal."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _PARTIAL_SECTION_KERNEL)
+
+
+@pytest.fixture(name="generic_kind_target")
+# pylint: disable-next=unused-argument
+def generic_kind_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke calling through a two-specific generic interface."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _GENERIC_KIND_KERNEL)
+
+
+@pytest.fixture(name="ambiguous_generic_target")
+# pylint: disable-next=unused-argument
+def ambiguous_generic_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose generic call nothing in the PSyIR resolves."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _AMBIGUOUS_GENERIC_KERNEL)
+
+
+def test_lfric_kokkos_trans_inlines_a_literal_actual(literal_actual_target):
+    """A helper called with a literal that states no kind is inlined.
+
+    The kind of a Fortran literal is the formal's kind, which is why the
+    code compiles at all; before this the pairing was refused for
+    ``Scalar<INTEGER, UNDEFINED>`` not being ``integer(kind=i_def)`` and the
+    kernel was not captured.
+    """
+    _, loop, kernel = literal_actual_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
+
+
+def test_lfric_kokkos_trans_inlines_a_section_actual_against_a_shape(
+        subsection_actual_target):
+    """A section given to an explicit-shape formal is inlined.
+
+    ``partial(1:nlayers)`` is a section of a local column handed to
+    ``source(n)``. Fortran passes it by shape rather than by bounds, and the
+    pairing is made on rank and intrinsic type for exactly that reason.
+    """
+    _, loop, kernel = subsection_actual_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
+
+
+def test_lfric_kokkos_trans_pairs_a_section_with_a_partial_type(
+        partial_section_target):
+    """A section reaches a partially-typed formal, and is refused later.
+
+    The formal's declaration carries an attribute the PSyIR does not model,
+    so all it has of the formal is a partial datatype -- the explicit shape
+    ``source(n)``. Comparing the actual's own shape with that expression
+    compares two expressions written in different scopes and can never
+    succeed, so the rank-and-intrinsic rule is applied to it instead and the
+    callee is resolved.
+
+    Resolving it is as far as this kernel gets: ``InlineTrans`` will not
+    inline a routine having an argument whose declaration it does not model,
+    whatever the call site passes. So the refusal moves from the argument
+    pairing to that rule, which is the one a reader can act on.
+    """
+    _, loop, _ = partial_section_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "Argument partial type mismatch" not in message
+    assert ("Symbol 'source' which is an Argument of UnsupportedType"
+            in message)
+
+
+def test_lfric_kokkos_trans_inlines_through_a_generic_interface(
+        generic_kind_target):
+    """A generic call whose actual states its kind resolves and is inlined.
+
+    One specific matches exactly and the other not at all, so the scoring
+    has one candidate to choose and the ambiguity guard has nothing to say.
+    """
+    _, loop, kernel = generic_kind_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
+
+
+def test_lfric_kokkos_trans_refuses_an_ambiguous_generic_call(
+        ambiguous_generic_target):
+    """A generic call the relaxed rules cannot decide is refused.
+
+    Both specifics differ from the actual only in the kind of a literal, so
+    both match weakly and nothing in the PSyIR says which Fortran would
+    choose. Returning the first would make the capture depend on the order
+    the interface happens to name its specifics in, so it is refused
+    instead.
+    """
+    _, loop, _ = ambiguous_generic_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'scale_column'" in message
+    assert "Ambiguous call to 'scale_column'" in message
+    assert "both match with score 1" in message

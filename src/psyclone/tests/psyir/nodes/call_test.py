@@ -2086,3 +2086,110 @@ def test_call_datatype(fortran_reader):
     # TODO #1799: Improve datatype inference, the following one
     # has a definition that says is an ArrayType
     assert isinstance(calls[3].datatype, UnresolvedType)
+
+
+_CODE_SCORED_INTERFACE = '''
+module some_mod
+  implicit none
+  integer, parameter :: wp = 8
+  interface bar
+    ! Named weakest-first, so that a match found by order rather than by
+    ! score would return the wrong one.
+    module procedure bar_b, bar_a
+  end interface bar
+contains
+  subroutine main()
+    ! An integer literal states no kind, so it matches 'bar_a' exactly and
+    ! 'bar_b' only by relaxing the kind.
+    call bar(1)
+  end subroutine main
+  subroutine bar_a(a)
+    integer :: a
+    a = a + 1
+  end subroutine bar_a
+  subroutine bar_b(a)
+    integer(kind=wp) :: a
+    a = a + 1
+  end subroutine bar_b
+end module some_mod
+'''
+
+_CODE_AMBIGUOUS_INTERFACE = '''
+module some_mod
+  implicit none
+  interface bar
+    module procedure bar_a, bar_b
+  end interface bar
+contains
+  subroutine main()
+    ! Neither specific states the kind the literal has, so nothing decides
+    ! between them.
+    call bar(1)
+  end subroutine main
+  subroutine bar_a(a)
+    integer(kind=4) :: a
+    a = a + 1
+  end subroutine bar_a
+  subroutine bar_b(a)
+    integer(kind=8) :: a
+    a = a + 1
+  end subroutine bar_b
+end module some_mod
+'''
+
+
+def test_get_callee_prefers_the_exact_match(fortran_reader):
+    '''Every candidate is scored and the lowest-scoring one is returned, so
+    a specific that matches exactly beats one that needed a relaxation --
+    whichever order the interface lists them in.
+
+    '''
+    psyir = fortran_reader.psyir_from_source(_CODE_SCORED_INTERFACE)
+    call = psyir.walk(Call)[0]
+
+    (routine, arg_idx_list) = call.get_callee()
+
+    assert routine.name == "bar_a"
+    assert arg_idx_list == [0]
+
+
+def test_get_callee_refuses_an_ambiguous_call(fortran_reader):
+    '''Two specifics that match equally well are not a match: the relaxed
+    rules would otherwise pick whichever the interface happened to name
+    first.
+
+    '''
+    psyir = fortran_reader.psyir_from_source(_CODE_AMBIGUOUS_INTERFACE)
+    call = psyir.walk(Call)[0]
+
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        call.get_callee()
+    assert ("Ambiguous call to 'bar': routines 'bar_a' and 'bar_b' both "
+            "match with score 1" in str(err.value))
+
+
+def test_get_callee_unchanged_for_a_single_routine(fortran_reader):
+    '''Scoring changes nothing where there is one candidate: it is returned
+    with the same argument map as before.
+
+    '''
+    psyir = fortran_reader.psyir_from_source('''
+module some_mod
+  implicit none
+contains
+  subroutine main()
+    integer :: i
+    call bar_a(i)
+  end subroutine main
+  subroutine bar_a(a)
+    integer :: a
+    a = a + 1
+  end subroutine bar_a
+end module some_mod
+''')
+    call = psyir.walk(Call)[0]
+
+    (routine, arg_idx_list) = call.get_callee()
+
+    assert routine.name == "bar_a"
+    assert arg_idx_list == [0]
