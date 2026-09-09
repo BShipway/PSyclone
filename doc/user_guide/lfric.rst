@@ -4258,14 +4258,20 @@ itself for as long as it was asked, and reaching the bound is instead a
 refusal naming the routine still to be inlined. In scope are a procedure of
 the kernel's own module and a procedure of a module the kernel ``use``\ s
 whose source PSyclone can read, the second brought into the kernel's
-container by ``KernelModuleInlineTrans`` first; a callee whose module is
-not on the search path is out of scope, PSyclone having a name for it and
-no body. Being in scope is not being inlinable, and the rest of the
-judgement is PSyclone's rather than this transformation's: a callee reading
-data private to its own module, one whose declarations depend on an
-argument the call site writes to before calling, and one whose actual and
-formal types do not agree are each refused in ``InlineTrans``'s own words
-with the call named. Not every call is a call, either: an indexed name whose
+container by ``KernelModuleInlineTrans`` first -- and what that container
+gains it keeps, so a callee reading a named constant from a third module
+brings that constant with it. A function used this way is in scope whether
+or not the frontend could tell it from an array: ``selector(face)`` in an
+expression leaves the name an unspecialised symbol, and a ``Call``'s callee
+is treated as the routine it is. A callee whose module is not on the search
+path is out of scope, PSyclone having a name for it and no body. Being in
+scope is not being inlinable, and the rest of the judgement is PSyclone's
+rather than this transformation's: a callee reading data private to its own
+module, one whose declarations depend on an argument the call site writes to
+before calling, and one whose actual and formal types do not agree are each
+refused in ``InlineTrans``'s own words with the call named, followed by
+``KernelModuleInlineTrans``'s own where the callee could not be brought in
+either. Not every call is a call, either: an indexed name whose
 meaning the kernel's own file does not settle -- ``blending_weights(index)``,
 where the array comes from a ``use`` -- is read by the frontend as a call,
 and resolving it reaches a datum rather than a routine. PSyclone reports
@@ -4820,13 +4826,38 @@ KernelModuleInlineTrans`.
 A callee whose module is not on the search path is not: PSyclone has a
 name for it and nothing else, and there is no body to inline.
 
+Bringing the callee in moves what it needs with it, so the module it came
+from need not be a leaf: a function of one module reading a named constant
+from a second arrives with that constant declared alongside it, and the
+constant then reaches the region the way every module constant does, as a
+by-value formal the PSy layer supplies. This is what puts LFRic's
+``face_from_face_selector`` -- a pure function of
+``sci_face_selector_support_mod`` reading the face indices ``W``, ``S``,
+``E`` and ``N`` from ``reference_element_mod`` -- inside the capture.
+
+It is in scope whether or not the frontend could tell it from an array.
+``selector(face)`` standing in an expression is a function reference or an
+element of an array, and where the kernel's own file does not settle which
+the name is left an unspecialised symbol; ``KernelModuleInlineTrans`` reads
+such a symbol at the call site as a datum of the callee's name and declines
+to shadow it. A ``Call``'s callee is a routine whether or not the frontend
+could say so, so the symbol is made one before the callee is brought in.
+Only a bare symbol is: a name PSyclone has already typed as data is left
+alone, and asking for its body reaches the datum and is refused below.
+
 Being in scope is not being inlinable, and the rest of the judgement is
 PSyclone's rather than this transformation's: a callee reading data
 private to its own module, one whose declarations depend on an argument
 the call site writes to before calling, one whose actual and formal types
 do not agree, one holding a CodeBlock. Each is refused in ``InlineTrans``'
 own words with the call named, because those words say what to fix and a
-paraphrase would say less. So is a name that turns out not to be a call
+paraphrase would say less. Where the callee could not be brought into the
+Container either, that refusal is carried too, after
+``bringing it into the container was refused first:``. ``InlineTrans``
+alone would say only that the body is in another Container, which is the
+symptom; the second text names the reason -- a datum of the callee's own
+module that could not travel with it, say -- and so says which of the two
+is worth fixing. So is a name that turns out not to be a call
 at all: an indexed reference the kernel's own file does not settle the
 meaning of is read as one by the frontend, and resolving it can reach a
 datum and raise :py:exc:`TypeError` rather than refuse. That too is a
