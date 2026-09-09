@@ -700,11 +700,20 @@ generate `(int)i` and discard the conversion the Fortran asked for. A kind
 failing either test is treated as undescribed and the cast is left to
 `CWriter`, whose target is the widest of the intrinsic and so never narrows.
 
-`EPSILON` becomes `Kokkos::Experimental::epsilon_v<T>` at the argument's own
-width, and is the one intrinsic here that refuses instead of falling through.
-There is no kind-blind spelling to fall back to: the trait is a template over
-the type, so a region that does not describe the argument's kind raises a
-`VisitorError` naming `kind_types` rather than guessing at `double`.
+`EPSILON` becomes `static_cast<T>(Kokkos::Experimental::epsilon_v<T>)` at the
+argument's own width, and is the one intrinsic here that refuses instead of
+falling through. There is no kind-blind spelling to fall back to: the trait is
+a template over the type, so a region that does not describe the argument's
+kind raises a `VisitorError` naming `kind_types` rather than guessing at
+`double`. The cast is not decoration. `epsilon_v<T>` is a `constexpr` variable
+template, so passing it to a parameter declared `const T &` -- which is how
+`Kokkos::max` takes it -- odr-uses a host variable from device code, and nvcc
+rejects the region with `identifier "Kokkos::Experimental::epsilon_v<double>"
+is undefined in device code`. Reading it inside a constant expression is an
+lvalue-to-rvalue conversion instead, so the cast leaves a prvalue for the
+reference to bind a temporary to. `Kokkos::Experimental::epsilon<T>::value`
+fails the same way; `std::numeric_limits<T>::epsilon()` would compile but is a
+`<limits>` answer where this writer spells everything through Kokkos.
 
 `**` is not an intrinsic call but an operator, and the only part of it this
 writer touches is the name of the function `CWriter` falls back to when the

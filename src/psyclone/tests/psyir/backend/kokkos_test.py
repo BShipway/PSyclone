@@ -1825,8 +1825,23 @@ def test_kokkos_writer_writes_epsilon_as_a_numeric_trait():
     assert _written_expressions("""
   a = epsilon(a)
   s = epsilon(s)
-""") == ["Kokkos::Experimental::epsilon_v<double>",
-         "Kokkos::Experimental::epsilon_v<float>"]
+""") == ["static_cast<double>(Kokkos::Experimental::epsilon_v<double>)",
+         "static_cast<float>(Kokkos::Experimental::epsilon_v<float>)"]
+
+
+def test_kokkos_writer_casts_epsilon_so_device_code_can_pass_it_by_reference():
+    """The trait is cast to its own type wherever ``EPSILON`` is written.
+
+    ``epsilon_v<T>`` is a ``constexpr`` variable template, and binding it to
+    the ``const T &`` parameter of ``Kokkos::max`` odr-uses a host variable
+    from device code, which nvcc refuses. The cast makes the argument a
+    prvalue read in a constant expression, which is not an odr-use.
+    ``leonard_term_kl_kernel_mod`` is the captured kernel this shape comes
+    from, and it is asserted here rather than only in the region that failed.
+    """
+    assert _written_expressions("  a = max(a, epsilon(a))\n") == [
+        "Kokkos::max(a, "
+        "static_cast<double>(Kokkos::Experimental::epsilon_v<double>))"]
 
 
 def test_kokkos_writer_refuses_epsilon_of_an_undescribed_kind():
@@ -2507,7 +2522,8 @@ def test_kokkos_epsilon():
     """
     code = KokkosWriter()(_array_region("  a(:) = b(:) + epsilon(b(1))\n"))
 
-    assert "Kokkos::Experimental::epsilon_v<double>" in code
+    assert ("static_cast<double>(Kokkos::Experimental::epsilon_v<double>)"
+            in code)
 
 
 def test_kokkos_nint_with_a_kind_argument():
