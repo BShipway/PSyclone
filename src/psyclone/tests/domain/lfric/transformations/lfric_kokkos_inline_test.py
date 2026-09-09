@@ -11,8 +11,11 @@
 import pytest
 
 from lfric_kokkos_sources import (
-    _ALGORITHM, _HDIV_SECTION_KERNEL, _KERNEL, _LOCAL_ALGORITHM, _LOCAL_KERNEL,
-    _SECTION_ALGORITHM, _invoke)
+    _ALGORITHM, _COLUMN_SELECT_MODULE, _EDGE_INDEX_MODULE,
+    _HDIV_SECTION_KERNEL, _KERNEL, _LOCAL_ALGORITHM, _LOCAL_KERNEL,
+    _SECTION_ALGORITHM, _SIBLING_CALLEE_KERNEL, _SIBLING_CALLEE_MODULE,
+    _SIBLING_STATE_MODULE, _STATIC_SIBLING_MODULE, _USED_FUNCTION_KERNEL,
+    _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.psyir.nodes import Call, IntrinsicCall
@@ -214,53 +217,6 @@ _MODULE_INDEX_KERNEL = _KERNEL.replace(
     "        moist_dyn_gas(map_wtheta(n_moist) + k) = &\n"
     "            moist_dyn_gas(map_wtheta(n_moist) + k) + &\n"
     "            recip_epsilon * mr_v_at_dof")
-
-
-# A module holding nothing but a named constant, and a second module holding a
-# pure function that reads it. Two containers deep is the shape
-# `face_from_face_selector` has -- a function of
-# `sci_face_selector_support_mod` reading `W`, `S`, `E` and `N` from
-# `reference_element_mod` -- and it is the
-# shape that makes bringing the callee in worth doing: the function's body can
-# move into the kernel's Container, and the constant it reads moves with it.
-_EDGE_INDEX_MODULE = """
-module edge_index_mod
-  use constants_mod, only : i_def
-  implicit none
-  private
-  integer(kind=i_def), public, parameter :: top_edge = 7_i_def
-end module edge_index_mod
-"""
-
-
-_COLUMN_SELECT_MODULE = """
-module column_select_mod
-  use constants_mod, only : i_def
-  use edge_index_mod, only : top_edge
-  implicit none
-  private
-  public :: selected_level
-contains
-  pure function selected_level(n) result(level)
-    integer(kind=i_def), intent(in) :: n
-    integer(kind=i_def) :: level
-    level = n + top_edge
-  end function selected_level
-end module column_select_mod
-"""
-
-
-# The kernel that reads it. `selected_level(k)` stands in an expression, and
-# the kernel's own file does not say whether that is a function reference or an
-# array element, so the frontend leaves a Call behind and the symbol at the
-# call site an unspecialised `Symbol`. That is what the capture has to see
-# through.
-_USED_FUNCTION_KERNEL = _LOCAL_KERNEL.replace(
-    "  use kernel_mod, only : kernel_type",
-    "  use kernel_mod, only : kernel_type\n"
-    "  use column_select_mod, only : selected_level").replace(
-    "      swept(k) = swept(k + 1) - partial(k)",
-    "      swept(k) = swept(k + 1) - partial(selected_level(k) - 7)")
 
 
 @pytest.fixture(name="called_routine_target")
@@ -853,29 +809,31 @@ def test_lfric_kokkos_trans_inlines_a_section_actual_against_a_shape(
 
 def test_lfric_kokkos_trans_pairs_a_section_with_a_partial_type(
         partial_section_target):
-    """A section reaches a partially-typed formal, and is refused later.
+    """A section reaches a partially-typed formal, and the call resolves.
 
     The formal's declaration carries an attribute the PSyIR does not model,
     so all it has of the formal is a partial datatype -- the explicit shape
     ``source(n)``. Comparing the actual's own shape with that expression
     compares two expressions written in different scopes and can never
     succeed, so the rank-and-intrinsic rule is applied to it instead and the
-    callee is resolved.
+    callee is resolved. That pairing is the reason this kernel is here, and
+    it is made against the partial datatype rather than against the
+    replacement, since the callee is resolved before the formal is relaxed.
 
-    Resolving it is as far as this kernel gets: ``InlineTrans`` will not
-    inline a routine having an argument whose declaration it does not model,
-    whatever the call site passes. So the refusal moves from the argument
-    pairing to that rule, which is the one a reader can act on.
+    The unmodelled attribute is ``target``, so the capture then completes:
+    the formal is given its partial datatype and ``InlineTrans`` has nothing
+    left to object to. A formal carrying any other unmodelled attribute is
+    still refused, which
+    :py:func:`test_pointer_dummy_is_still_refused` is the case for.
     """
-    _, loop, _ = partial_section_target
+    _, loop, kernel = partial_section_target
 
-    with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
 
-    message = str(error.value)
-    assert "Argument partial type mismatch" not in message
-    assert ("Symbol 'source' which is an Argument of UnsupportedType"
-            in message)
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
 
 
 def test_lfric_kokkos_trans_inlines_through_a_generic_interface(
@@ -914,3 +872,111 @@ def test_lfric_kokkos_trans_refuses_an_ambiguous_generic_call(
     assert "cannot inline the call to 'scale_column'" in message
     assert "Ambiguous call to 'scale_column'" in message
     assert "both match with score 1" in message
+
+
+# --------------------------------------------------------------------------
+# Task E8: a callee that calls, or reads, its own module.
+# --------------------------------------------------------------------------
+
+
+def _sibling_invoke(tmp_path, module_source):
+    """Build an invoke whose kernel calls a procedure of ``module_source``.
+
+    :param tmp_path: the directory the sources are written to.
+    :type tmp_path: :py:class:`pathlib.Path`
+    :param str module_source: the helper module the kernel ``use``s.
+
+    :returns: as :py:func:`lfric_kokkos_sources._invoke` does.
+    :rtype: Tuple[:py:class:`psyclone.psyGen.PSy`,
+        :py:class:`psyclone.domain.lfric.LFRicLoop`,
+        :py:class:`psyclone.domain.lfric.LFRicKern`]
+    """
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _SIBLING_CALLEE_KERNEL,
+                   extra={"sweep_support_mod": module_source,
+                          "edge_index_mod": _EDGE_INDEX_MODULE})
+
+
+def test_callee_calling_its_own_module_is_inlined(
+        tmp_path, clear_module_manager_instance):
+    """A callee that calls its own module's procedure is still brought in.
+
+    `crosses_panel_edge`'s shape. The callee calls another procedure of its
+    own module, which ``KernelModuleInlineTrans`` reads as an access to
+    something declared beside it and refuses. It is not data, and the
+    Container the two share is where the call is already inlinable, so the
+    sibling is absorbed there before the body travels.
+
+    Both bodies end in the region and neither name survives into it. The
+    constant the sibling reads is the module's rather than the sibling's, and
+    its arriving on the ABI is what says the sibling was carried with its
+    scope rather than out of it.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    psy, loop, kernel = _sibling_invoke(tmp_path, _SIBLING_CALLEE_MODULE)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
+    assert "damping" not in cpp
+    # Twice: an unresolved symbol would have refused the second inlining.
+    assert cpp.count("1.0 / ") == 2
+    assert "const int top_edge" in cpp
+    assert "use edge_index_mod, only : top_edge" in str(psy.gen).lower()
+
+
+def test_callee_reading_a_module_variable_is_refused(
+        tmp_path, clear_module_manager_instance):
+    """A callee reading a variable of its own module is refused, and named.
+
+    `chi2xyz`'s shape. Absorbing the sibling settles the call and leaves the
+    datum, so the refusal names the datum: a variable of the callee's module
+    is neither something the body can carry nor something the PSy layer can
+    pass, the module that declares it keeping it private.
+
+    That the message moved from the sibling to the datum is the check: one
+    still naming `damping` would send the reader to fix the wrong thing.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    _, loop, _ = _sibling_invoke(tmp_path, _SIBLING_STATE_MODULE)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'sweep_column'" in message
+    assert "bringing it into the container was refused first" in message
+    assert ("contains accesses to 'relaxation' which is declared in the "
+            "callee module scope") in message
+    assert "damping" not in message
+
+
+def test_a_sibling_that_cannot_be_absorbed_leaves_the_call(
+        tmp_path, clear_module_manager_instance):
+    """A sibling ``InlineTrans`` refuses is left where the file put it.
+
+    The sibling declares a local with an initialiser, which Fortran gives the
+    SAVE attribute and ``InlineTrans`` will not inline. Absorbing it is
+    attempted and refused, and that refusal is not what the reader is told:
+    what they are told is that the callee still calls the name, which is the
+    fact the move was refused for.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    _, loop, _ = _sibling_invoke(tmp_path, _STATIC_SIBLING_MODULE)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'sweep_column'" in message
+    assert ("contains accesses to 'damping' which is declared in the callee "
+            "module scope") in message

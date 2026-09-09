@@ -765,3 +765,221 @@ contains
   end subroutine face_weight_code
 end module face_weight_kernel_mod
 """
+
+
+# ---------------------------------------------------------------------------
+# Task E7: a TARGET dummy is inlinable.
+# ---------------------------------------------------------------------------
+
+
+# A helper whose read column carries `target`, which is the shape
+# subgrid_vertical_support_mod's `third_order_vertical_edge` has:
+# `real(kind=r_tran), target, intent(in) :: field(nlayers)`. `target` says
+# only that a pointer may be aimed at the actual, which an inlined body
+# neither creates nor breaks, so the declaration is unsupported without the
+# routine being uninlinable.
+_TARGET_DUMMY_KERNEL = _LOCAL_KERNEL.replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call sweep_column(nlayers, partial, swept)\n").replace(
+    "end module column_solve_kernel_mod",
+    "  subroutine sweep_column(n, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_def), target, intent(in) :: source(n)\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    integer(kind=i_def) :: j\n"
+    "    result(n) = source(n)\n"
+    "    do j = n - 1, 1, -1\n"
+    "      result(j) = result(j + 1) - source(j)\n"
+    "    end do\n"
+    "  end subroutine sweep_column\n"
+    "end module column_solve_kernel_mod")
+
+
+# The same helper with the column a pointer instead. A pointer dummy says
+# something about storage that binding a formal to an actual does not
+# reproduce, so it stays unsupported and `InlineTrans` refuses as before.
+_POINTER_DUMMY_KERNEL = _TARGET_DUMMY_KERNEL.replace(
+    "    real(kind=r_def), target, intent(in) :: source(n)\n",
+    "    real(kind=r_def), pointer, intent(in) :: source(:)\n")
+
+
+# The same helper in a module of its own, and a kernel that `use`s it. Two
+# kernels of one invoke reach the very same parsed module, so this is the
+# shape that would show a rewrite of the callee leaking from one capture into
+# the next.
+_TARGET_HELPER_MODULE = """
+module target_helper_mod
+  use constants_mod, only : i_def, r_def
+  implicit none
+  public :: sweep_column
+contains
+  subroutine sweep_column(n, source, result)
+    integer(kind=i_def), intent(in) :: n
+    real(kind=r_def), target, intent(in) :: source(n)
+    real(kind=r_def), dimension(n), intent(inout) :: result
+    integer(kind=i_def) :: j
+    result(n) = source(n)
+    do j = n - 1, 1, -1
+      result(j) = result(j + 1) - source(j)
+    end do
+  end subroutine sweep_column
+end module target_helper_mod
+"""
+
+
+_TARGET_CALLEE_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use target_helper_mod, only : sweep_column").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call sweep_column(nlayers, partial, swept)\n")
+
+
+# The second kernel of the pair, differing from the first only in its name.
+_TARGET_TWIN_KERNEL = _TARGET_CALLEE_KERNEL.replace(
+    "column_solve", "column_twin")
+
+
+_TARGET_TWIN_ALGORITHM = """
+program kokkos_target_twin_test
+  use field_mod, only : field_type
+  use column_solve_kernel_mod, only : column_solve_kernel_type
+  use column_twin_kernel_mod, only : column_twin_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  call invoke(column_solve_kernel_type(out_field, in_field), &
+              column_twin_kernel_type(out_field, in_field))
+end program kokkos_target_twin_test
+"""
+
+
+# A module holding nothing but a named constant, and a second module holding a
+# pure function that reads it. Two containers deep is the shape
+# `face_from_face_selector` has -- a function of
+# `sci_face_selector_support_mod` reading `W`, `S`, `E` and `N` from
+# `reference_element_mod` -- and it is the
+# shape that makes bringing the callee in worth doing: the function's body can
+# move into the kernel's Container, and the constant it reads moves with it.
+_EDGE_INDEX_MODULE = """
+module edge_index_mod
+  use constants_mod, only : i_def
+  implicit none
+  private
+  integer(kind=i_def), public, parameter :: top_edge = 7_i_def
+end module edge_index_mod
+"""
+
+
+_COLUMN_SELECT_MODULE = """
+module column_select_mod
+  use constants_mod, only : i_def
+  use edge_index_mod, only : top_edge
+  implicit none
+  private
+  public :: selected_level
+contains
+  pure function selected_level(n) result(level)
+    integer(kind=i_def), intent(in) :: n
+    integer(kind=i_def) :: level
+    level = n + top_edge
+  end function selected_level
+end module column_select_mod
+"""
+
+
+# The kernel that reads it. `selected_level(k)` stands in an expression, and
+# the kernel's own file does not say whether that is a function reference or an
+# array element, so the frontend leaves a Call behind and the symbol at the
+# call site an unspecialised `Symbol`. That is what the capture has to see
+# through.
+_USED_FUNCTION_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use column_select_mod, only : selected_level").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(selected_level(k) - 7)")
+
+
+# --------------------------------------------------------------------------
+# Task E8: a callee that calls, or reads, its own module.
+# --------------------------------------------------------------------------
+
+
+# A helper module holding two procedures, the public one calling the private
+# one. This is `panel_edge_support_mod`'s shape: `crosses_panel_edge` calls
+# `rotated_panel_neighbour`, both of that module, and the kernel `use`s only
+# the first. The sibling is called twice, and reads a constant the module --
+# not the sibling -- imports, which is what makes the second inlining of it a
+# different problem from the first.
+_SIBLING_CALLEE_MODULE = """
+module sweep_support_mod
+  use constants_mod, only : i_def, r_def
+  use edge_index_mod, only : top_edge
+  implicit none
+  private
+  public :: sweep_column
+contains
+  subroutine sweep_column(n, source, result)
+    integer(kind=i_def), intent(in) :: n
+    real(kind=r_def), dimension(n), intent(in) :: source
+    real(kind=r_def), dimension(n), intent(inout) :: result
+    integer(kind=i_def) :: j
+    result(n) = source(n) * damping(n)
+    do j = n - 1, 1, -1
+      result(j) = result(j + 1) - source(j) * damping(j)
+    end do
+  end subroutine sweep_column
+  function damping(level) result(factor)
+    integer(kind=i_def), intent(in) :: level
+    real(kind=r_def) :: factor
+    factor = 1.0_r_def / real(level + top_edge, r_def)
+  end function damping
+end module sweep_support_mod
+"""
+
+
+# The same module with the sibling reading a variable of it rather than a
+# constant of a third. This is `sci_chi_transform_mod`'s shape, where
+# `chi2xyz` reads `chi2xyz_rot_mat`: the sibling call is reachable and the
+# datum is not, so which of the two the refusal names is the whole question.
+_SIBLING_STATE_MODULE = _SIBLING_CALLEE_MODULE.replace(
+    "  use edge_index_mod, only : top_edge\n",
+    "").replace(
+    "  private\n",
+    "  private\n"
+    "  real(kind=r_def) :: relaxation = 0.5_r_def\n").replace(
+    "    factor = 1.0_r_def / real(level + top_edge, r_def)",
+    "    factor = relaxation / real(level, r_def)")
+
+
+# The kernel that calls the public procedure of either module. Written the
+# same way as _EXTERNAL_CALLEE_KERNEL, so that the only difference between
+# the two is whether the callee calls anything itself.
+_SIBLING_CALLEE_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use sweep_support_mod, only : sweep_column").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call sweep_column(nlayers, partial, swept)\n")
+
+
+# The same module with the sibling declaring a local that has an initialiser,
+# which Fortran gives the SAVE attribute and InlineTrans will not inline. The
+# call to it therefore stays where the file put it, so that what happens to a
+# sibling that cannot be absorbed can be asked.
+_STATIC_SIBLING_MODULE = _SIBLING_CALLEE_MODULE.replace(
+    "    integer(kind=i_def), intent(in) :: level\n",
+    "    integer(kind=i_def), intent(in) :: level\n"
+    "    integer(kind=i_def) :: seen = 0_i_def\n").replace(
+    "    factor = 1.0_r_def / real(level + top_edge, r_def)",
+    "    seen = seen + 1_i_def\n"
+    "    factor = 1.0_r_def / real(level + top_edge + seen, r_def)")

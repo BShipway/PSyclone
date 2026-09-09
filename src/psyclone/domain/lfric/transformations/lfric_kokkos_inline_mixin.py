@@ -58,8 +58,10 @@ module that was never read, an argument whose type does not match the formal
 
 from psyclone.domain.common.transformations import KernelModuleInlineTrans
 from psyclone.psyir.nodes import (
-    Call, Container, IntrinsicCall, Routine)
-from psyclone.psyir.symbols import RoutineSymbol, Symbol
+    Call, Container, IntrinsicCall, Reference, Routine, ScopingNode)
+from psyclone.psyir.symbols import (
+    ContainerSymbol, ImportInterface, RoutineSymbol, Symbol,
+    UnsupportedFortranType)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -86,9 +88,20 @@ class LFRicKokkosInlineMixin:
     :py:class:`~psyclone.domain.common.transformations.KernelModuleInlineTrans`
     and then inlined like any other, and what it needs comes with it: a named
     constant its own module reads from a third travels into the kernel's
-    Container beside the body. Anything else -- a callee whose module is not
-    on the search path, so that PSyclone has only a name for it -- is out of
-    scope and refused.
+    Container beside the body. A procedure that procedure calls is in scope
+    too, whether it is a sibling of its own module or a name that module
+    reaches by a ``use`` of its own: a sibling is inlined where it already
+    can be, in the Container the two share, before the body travels.
+    Anything else -- a callee whose module is not on the search path, so that
+    PSyclone has only a name for it -- is out of scope and refused.
+
+    **Data of the callee's module is not in scope, and a procedure of it is
+    not data.** A callee reading a variable its own module declares --
+    LFRic's ``chi2xyz`` and ``chi2xyz_rot_mat`` -- is refused, and refused
+    for the right reason: the region would need the PSy layer to import that
+    name and pass it, which is what ``LFRicKokkosConstantsMixin`` does for a
+    variable of the *kernel's* module and cannot do for one the callee's
+    module keeps private.
 
     Where a callee could not be brought in, the refusal says so as well as
     saying why the call could not be inlined. ``InlineTrans`` alone reports
@@ -125,6 +138,15 @@ class LFRicKokkosInlineMixin:
     #: be past any hand-written LFRic kernel's call chain and far short of
     #: what would take a runaway rewrite out of memory.
     _INLINE_LIMIT = 8
+
+    #: The attributes a formal may carry and still be given its partial
+    #: datatype by :py:meth:`_relax_target_arguments`. ``TARGET`` is the one
+    #: that makes the declaration unmodelled in the first place; the other
+    #: two are matched because they are already in the partial datatype --
+    #: ``DIMENSION`` as its shape and ``INTENT`` as the symbol's argument
+    #: interface -- and so are not attributes being dropped. Matched by
+    #: prefix, since both are written with a parenthesised value.
+    _BINDABLE_ATTRIBUTES = ("TARGET", "DIMENSION", "INTENT")
 
     @staticmethod
     def _callee_name(call):
@@ -167,6 +189,12 @@ class LFRicKokkosInlineMixin:
         ran, and a call sharing a statement with the one just inlined may have
         been moved out of it.
 
+        Each callee is prepared before it is inlined: brought into the
+        Container the call is made from by :py:meth:`_module_inline`, and
+        then relaxed by :py:meth:`_relax_target_arguments`, which gives a
+        formal declared ``TARGET`` the type the frontend parsed out of that
+        declaration.
+
         :param schedule: the kernel schedule to rewrite in place.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
@@ -189,6 +217,7 @@ class LFRicKokkosInlineMixin:
             call = pending[0]
             name = cls._callee_name(call)
             refusal = cls._module_inline(call)
+            cls._relax_target_arguments(call)
             try:
                 InlineTrans().apply(call)
             except (TransformationError, TypeError) as err:
@@ -218,6 +247,18 @@ class LFRicKokkosInlineMixin:
         leaving them behind -- a named constant the callee reads from a third
         module included, which is why a two-container callee such as LFRic's
         ``face_from_face_selector`` is reachable at all.
+
+        **A callee that calls its own module is made self-contained first.**
+        ``KernelModuleInlineTrans`` refuses a routine that reads anything
+        declared beside it in its own module, a sibling *procedure* included:
+        LFRic's ``crosses_panel_edge`` calls ``rotated_panel_neighbour``,
+        which calls ``panel_neighbour``, all three of
+        ``panel_edge_support_mod``. Nothing about that chain is out of scope
+        -- each link is a routine whose source PSyclone has read -- and the
+        one place each call *is* already inlinable is the container they
+        share. So :py:meth:`_absorb_own_module_calls` inlines them there,
+        before the body travels, and what arrives in the kernel's Container
+        is a routine with no sibling left to reach for.
 
         **The callee's symbol is specialised first.** ``selector(face)`` in an
         expression is a function reference or an element of an array, and
@@ -251,6 +292,7 @@ class LFRicKokkosInlineMixin:
             ``None`` where it is in it.
         :rtype: Optional[str]
         """
+        cls._absorb_own_module_calls(call)
         routine = call.routine
         # pylint: disable-next=unidiomatic-typecheck
         if routine is not None and type(routine.symbol) is Symbol:
@@ -260,6 +302,192 @@ class LFRicKokkosInlineMixin:
             return None
         except (TransformationError, TypeError) as err:
             return None if cls._callee_is_local(call) else str(err)
+
+    @classmethod
+    def _absorb_own_module_calls(cls, call):
+        """Inline into ``call``'s callee the calls it makes to its own module.
+
+        A routine reached through a ``use`` cannot be brought into the
+        kernel's Container while it still names something declared beside it
+        in its own module: ``KernelModuleInlineTrans`` would have to add an
+        import at the call site for that name, and it does not. Where the
+        name is a *procedure* of that module there is nothing to import,
+        because the body is available and the call sites are all in the one
+        Container -- so it is inlined there instead, where
+        :py:class:`~psyclone.psyir.transformations.InlineTrans` needs no
+        Container crossed and no symbol carried across one.
+
+        The loop runs to a fixed point rather than once, because a sibling
+        brings its own siblings with it: absorbing LFRic's
+        ``rotated_panel_neighbour`` into ``crosses_panel_edge`` leaves the
+        call to ``panel_neighbour`` behind in the statements it contributed,
+        and that is a call to the same module again. It is bounded by
+        :py:attr:`_INLINE_LIMIT` for the reason the outer loop is, and the
+        callee is never absorbed into itself: a routine that calls itself is
+        reported by name by :py:meth:`_inline_calls` rather than rewritten
+        here.
+
+        **The tree rewritten is the module's, and every step is rehearsed
+        on a copy of it first.** ``KernelModuleInlineTrans`` reads the callee
+        through :py:meth:`~psyclone.psyir.nodes.Call.get_callees`, whose
+        answer is the Container the module was parsed into and is held for
+        the call, so the preparation has to be made in that Container, in
+        place, to be seen at all. But ``InlineTrans`` does not always refuse
+        before it starts: LFRic's ``physics_mappings_alg_mod`` reaches an
+        ``AttributeError`` inside it on an actual argument that is an
+        expression, and a module left half-rewritten in that cache would be
+        read as the file's own text by every later kernel. Each absorption is
+        therefore made twice -- once on a copy of the Container, which is
+        thrown away, and then, only if that worked, on the Container itself.
+        What the cache holds is the file's routine or one whole absorption
+        further on, never the middle of one.
+
+        The rewrite is meaning-preserving and idempotent -- a call replaced by
+        the statements it stood for, and no call left to replace a second time
+        -- so a later kernel calling the same routine reads a body that says
+        what the file said.
+
+        Anything raised by the rehearsal ends the loop rather than being
+        reported: the callee is left as it was, and the reason the kernel
+        cannot have it is the one :py:meth:`_module_inline` then gets from
+        ``KernelModuleInlineTrans`` for the whole body. That is why a sibling
+        ``InlineTrans`` will not take -- one declaring a static local, say --
+        is not a failure here but a call still in the body, which the refusal
+        then names. The exception caught is any, not the refusal alone,
+        because a preparation that is optional has no business turning a
+        refusal into a crash.
+
+        The Container asked for siblings is the nearest one, which is the
+        module for a procedure of a module and the file for a procedure of
+        neither. Both are answers to the same question: which routines the
+        callee can reach without a name being carried anywhere.
+
+        :param call: the call whose callee is to be made self-contained.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+        """
+        try:
+            callees = call.get_callees()
+        except Exception:                        # pylint: disable=W0703
+            # A callee PSyclone cannot resolve has nothing to prepare, and
+            # the caller reports the name it could not reach.
+            return
+        for callee in callees:
+            container = callee.ancestor(Container)
+            name = callee.name.lower()
+            for _ in range(cls._INLINE_LIMIT):
+                position = cls._own_module_call(container, name)
+                if position is None:
+                    break
+                sibling = cls._callee_name(
+                    container.walk(Call)[position]).lower()
+                trial = container.copy()
+                try:
+                    cls._localise_imports(cls._sibling(trial, sibling))
+                    InlineTrans().apply(trial.walk(Call)[position])
+                    cls._localise_imports(cls._sibling(container, sibling))
+                    InlineTrans().apply(container.walk(Call)[position])
+                except Exception:                # pylint: disable=W0703
+                    break
+
+    @classmethod
+    def _own_module_call(cls, container, name):
+        """Find the first call the routine ``name`` makes to a sibling.
+
+        The answer is a position in ``container.walk(Call)`` rather than the
+        call itself, because the caller works on a copy of the Container and
+        a copy holds no node the original does. Walk order is structural, so
+        the same position in the copy is the same call.
+
+        :param container: the Container the callee belongs to.
+        :type container: :py:class:`psyclone.psyir.nodes.Container`
+        :param str name: the callee's name, lowercased.
+
+        :returns: where in the Container's calls the first call to a sibling
+            of the callee is, or ``None`` if the callee makes none.
+        :rtype: Optional[int]
+        """
+        routines = container.walk(Routine, stop_type=Routine)
+        callee = cls._sibling(container, name)
+        siblings = {routine.name.lower() for routine in routines
+                    if routine is not callee}
+        calls = container.walk(Call)
+        for inner in cls._pending_calls(callee):
+            if cls._callee_name(inner).lower() not in siblings:
+                continue
+            for position, node in enumerate(calls):
+                if node is inner:
+                    return position
+        return None
+
+    @staticmethod
+    def _sibling(container, name):
+        """Name a routine of ``container``'s own scope.
+
+        The Container asked always holds the routine asked for: it is the
+        callee's own nearest Container, or the copy of it the caller is
+        rewriting, and the sibling's name was read out of it a moment before.
+
+        :param container: the Container to look in.
+        :type container: :py:class:`psyclone.psyir.nodes.Container`
+        :param str name: the routine's name, lowercased.
+
+        :returns: the routine of that name.
+        :rtype: :py:class:`psyclone.psyir.nodes.Routine`
+        """
+        return next((routine for routine
+                     in container.walk(Routine, stop_type=Routine)
+                     if routine.name.lower() == name), None)
+
+    @classmethod
+    def _localise_imports(cls, routine):
+        """Move into ``routine``'s own table the imports it reads from above.
+
+        :py:class:`~psyclone.psyir.transformations.InlineTrans` copies the
+        routine it is inlining, and a
+        :py:class:`~psyclone.psyir.nodes.Routine` copied on its own is
+        detached from the Container whose ``use`` statements named half of
+        what it reads. Every such name arrives at the call site *unresolved*,
+        and the second call to the same routine is then refused for a clash
+        between two unresolved symbols of that name -- a refusal about the
+        copy rather than about the code, and one that would let a routine be
+        absorbed once and not twice.
+
+        Giving the routine its own import of each name it reads is what the
+        copy then carries: ``panel_neighbour``, which reads ``W``, ``S``,
+        ``E`` and ``N`` from its module's ``use reference_element_mod``, is
+        rewritten to read them from a ``use`` of its own. That is the same
+        Fortran, and the symbol at the call site is an import that a second
+        import of the same name agrees with.
+
+        A copy of the symbol is added rather than the symbol itself: the
+        Container's own table is the one every other routine of the module
+        reads that name through, and taking it out of that table would be a
+        rewrite of routines this has no business in.
+
+        :param routine: the routine about to be inlined into its own module.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        """
+        table = routine.symbol_table
+        for signature in routine.reference_accesses().all_signatures:
+            name = signature.var_name
+            if name in table:
+                continue
+            symbol = table.lookup(name, otherwise=None)
+            if symbol is None or not symbol.is_import:
+                continue
+            source = symbol.interface.container_symbol
+            if source.name in table:
+                local_source = table.lookup(source.name)
+            else:
+                local_source = ContainerSymbol(source.name)
+                table.add(local_source)
+            local = symbol.copy()
+            local.interface = ImportInterface(
+                local_source, orig_name=symbol.interface.orig_name)
+            table.add(local)
+            for reference in routine.walk(Reference):
+                if reference.symbol is symbol:
+                    reference.symbol = local
 
     @classmethod
     def _callee_is_local(cls, call):
@@ -278,12 +506,128 @@ class LFRicKokkosInlineMixin:
             named as the callee is.
         :rtype: bool
         """
+        return bool(cls._local_callees(call))
+
+    @classmethod
+    def _local_callees(cls, call):
+        """Return the routines of ``call``'s Container named as its callee.
+
+        There is at most one where the callee is a plain procedure, and more
+        than one where the name is a generic interface: which specific the
+        call resolves to is PSyclone's to decide, so both are returned and
+        the caller says what it does with them.
+
+        :param call: the call to look for the callee of.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: the routines the Container the call is made from holds
+            under the callee's name.
+        :rtype: List[:py:class:`psyclone.psyir.nodes.Routine`]
+        """
         container = call.ancestor(Container)
         if container is None:
-            return False
+            return []
         name = cls._callee_name(call).lower()
-        return any(routine.name.lower() == name
-                   for routine in container.walk(Routine, stop_type=Routine))
+        return [routine
+                for routine in container.walk(Routine, stop_type=Routine)
+                if routine.name.lower() == name]
+
+    @staticmethod
+    def _declaration_attributes(declaration):
+        """List the attributes of a Fortran declaration, less its type.
+
+        The text is the one
+        :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` kept of a
+        declaration PSyclone could not model, so it is read rather than
+        re-parsed. Only the specification part -- what stands before ``::``
+        -- carries attributes; the entity part after it carries the name and
+        any shape given with it. Commas inside parentheses do not separate
+        attributes, which is why the split is made at depth zero:
+        ``DIMENSION(n, 2)`` is one attribute and not two.
+
+        Each attribute is returned upper-cased and stripped of every space,
+        so that ``intent ( in )`` and ``INTENT(IN)`` are one string.
+
+        A declaration written without ``::`` states no attributes, and
+        needs no case of its own: the split leaves the whole declaration as
+        one field, and dropping the type specification drops it.
+
+        :param str declaration: the declaration text to read.
+
+        :returns: the declaration's attributes, the leading type
+            specification dropped, or an empty list where it declares no
+            attributes at all.
+        :rtype: List[str]
+        """
+        attributes = []
+        current = ""
+        depth = 0
+        for character in declaration.split("::")[0]:
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            if character == "," and depth == 0:
+                attributes.append(current)
+                current = ""
+            else:
+                current += character
+        attributes.append(current)
+        return ["".join(attribute.split()).upper()
+                for attribute in attributes[1:]]
+
+    @classmethod
+    def _relax_target_arguments(cls, call):
+        """Give every ``TARGET`` formal of ``call``'s callee its own type.
+
+        ``TARGET`` says that a pointer somewhere may be aimed at the actual.
+        Inlining the callee's statements into the caller neither creates
+        such a pointer nor invalidates one that exists, so the attribute has
+        nothing to say about whether the body may be substituted -- but the
+        PSyIR does not model it, so the formal arrives as an
+        :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` and
+        :py:class:`~psyclone.psyir.transformations.InlineTrans` refuses the
+        routine for having an argument of a type it does not know. Replacing
+        such a formal's type with the partial datatype the frontend did
+        parse is what removes that refusal, and it removes only that one:
+        ``permit_unsupported_type_args`` is not passed, so a formal carrying
+        any other unmodelled attribute -- ``POINTER``, ``ALLOCATABLE``,
+        ``OPTIONAL``, ``VALUE`` -- is left as it is and refused as before.
+        This is what makes the vertical-support helpers of LFRic's FFSL
+        schemes, whose read column is declared ``TARGET``, inlinable at all.
+
+        The rewrite is made on the callee as the call site sees it, after
+        :py:meth:`_module_inline` has run: a callee reached through a ``use``
+        is by then a copy in the caller's Container, and a callee of the
+        kernel's own module is in the copy of the file
+        :py:meth:`_rooted_copy` took. Neither is the tree the frontend
+        parsed, so a later capture of another kernel calling the same helper
+        meets the routine as its own module declares it.
+
+        The partial datatype is taken rather than copied: it is part of the
+        declaration being replaced, which nothing holds afterwards.
+
+        :param call: the call whose callee is to be relaxed.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+        """
+        for routine in cls._local_callees(call):
+            for scope in routine.walk(ScopingNode):
+                for symbol in scope.symbol_table.symbols:
+                    datatype = symbol.datatype if symbol.is_argument else None
+                    if not isinstance(datatype, UnsupportedFortranType):
+                        continue
+                    attributes = cls._declaration_attributes(
+                        datatype.declaration)
+                    # Two questions with one answer: a declaration the
+                    # frontend could parse nothing of leaves nothing to put
+                    # in the symbol's place, and one that is unmodelled for
+                    # some other reason is not this rewrite's to relax.
+                    if (datatype.partial_datatype is None or
+                            "TARGET" not in attributes):
+                        continue
+                    if all(attribute.startswith(cls._BINDABLE_ATTRIBUTES)
+                           for attribute in attributes):
+                        symbol.datatype = datatype.partial_datatype
 
     @staticmethod
     def _rooted_copy(schedule):
