@@ -15,8 +15,10 @@ from lfric_kokkos_sources import (
     _LEVEL_KERNEL, _LITERAL_LOCAL_KERNEL, _LOCAL_ALGORITHM, _LOCAL_KERNEL,
     _OPERATOR_ALGORITHM, _OPERATOR_KERNEL, _SECOND_KERNEL, _SECTION_ALGORITHM,
     _SECTION_KERNEL, _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL,
-    _SOLVER_ALGORITHM, _SOLVER_KERNEL, _UNRENDERABLE_ORIGIN_KERNEL,
-    _ZERO_BASED_LOCAL_KERNEL, _invoke)
+    _SOLVER_ALGORITHM, _SOLVER_KERNEL, _TARGET_CALLEE_KERNEL,
+    _TARGET_DUMMY_KERNEL, _TARGET_HELPER_MODULE, _TARGET_TWIN_ALGORITHM,
+    _TARGET_TWIN_KERNEL, _POINTER_DUMMY_KERNEL,
+    _UNRENDERABLE_ORIGIN_KERNEL, _ZERO_BASED_LOCAL_KERNEL, _invoke)
 
 
 # An invoke whose loop runs into the halo without being asked to. LFRic
@@ -851,3 +853,34 @@ def module_allocate_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel allocates a module-scope array."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _MODULE_ALLOCATE_KERNEL)
+
+
+# ---------------------------------------------------------------------------
+# Task E7: a TARGET dummy is inlinable.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(name="target_dummy_target")
+# pylint: disable-next=unused-argument
+def target_dummy_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke calling a helper whose column is a TARGET."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _TARGET_DUMMY_KERNEL)
+
+
+@pytest.fixture(name="pointer_dummy_target")
+# pylint: disable-next=unused-argument
+def pointer_dummy_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke calling a helper whose column is a POINTER."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _POINTER_DUMMY_KERNEL)
+
+
+@pytest.fixture(name="shared_target_helper")
+# pylint: disable-next=unused-argument
+def shared_target_helper_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose two kernels call one TARGET-dummy helper."""
+    return _invoke(
+        tmp_path, "column_solve", _TARGET_TWIN_ALGORITHM,
+        _TARGET_CALLEE_KERNEL,
+        extra={"column_twin_kernel_mod": _TARGET_TWIN_KERNEL,
+               "target_helper_mod": _TARGET_HELPER_MODULE})
