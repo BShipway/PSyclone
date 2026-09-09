@@ -955,6 +955,59 @@ def test_module_inline_interface_with_renamed_import(monkeypatch,
     assert "subroutine my_sub(arg)" in result
 
 
+def test_module_inline_interface_leaves_source_module_alone(monkeypatch,
+                                                            fortran_reader,
+                                                            fortran_writer):
+    '''Test that module-inlining an interface does not alter the module the
+    routines came from. That module is shared with every other caller through
+    the ModuleManager, so making its interface symbol private there would stop
+    a later transformation resolving the import.
+
+    '''
+    make_external_module(monkeypatch, fortran_reader, "my_mod",
+                         '''\
+    module my_mod
+      interface my_interface
+        module procedure :: my_sub, my_other_sub
+      end interface my_interface
+    contains
+      subroutine my_sub(arg)
+        real*8, dimension(10), intent(inout) :: arg
+        arg(1:10) = 1.0
+      end subroutine my_sub
+      subroutine my_other_sub(arg)
+        real*4, dimension(10), intent(inout) :: arg
+        arg(1:10) = 1.0
+      end subroutine my_other_sub
+    end module my_mod
+    ''')
+    code = '''\
+    module second_mod
+    contains
+      subroutine doit()
+        implicit none
+        use my_mod, only: my_interface
+        real*4, dimension(10) :: var
+        call my_interface(var)
+      end subroutine doit
+    end module second_mod'''
+    psyir = fortran_reader.psyir_from_source(code)
+    call = psyir.walk(Call)[0]
+    KernelModuleInlineTrans().apply(call)
+    # The interface is now declared in the caller's Container, and private
+    # there.
+    local_sym = psyir.walk(Container)[1].symbol_table.lookup("my_interface")
+    assert local_sym.visibility == Symbol.Visibility.PRIVATE
+    assert "interface my_interface" in fortran_writer(psyir)
+    # The module it came from still publishes it, so the call can still be
+    # resolved -- the source symbol is a different one.
+    source = ModuleManager.get().get_module_info("my_mod").get_psyir()
+    source_sym = source.symbol_table.lookup("my_interface")
+    assert source_sym is not local_sym
+    assert source_sym.visibility == Symbol.Visibility.PUBLIC
+    assert call.get_callees()
+
+
 def test_rm_imported_routine_symbol(fortran_reader):
     '''
     Tests for the _rm_imported_routine_symbol() utility method.

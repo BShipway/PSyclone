@@ -604,18 +604,19 @@ class KernelModuleInlineTrans(Transformation):
                 self._rm_imported_routine_symbol(shadowed_sym,
                                                  codes_to_inline[0],
                                                  caller_cntr_table)
-            if caller_name != interface_sym.name:
-                # If the interface was originally renamed on import, then we
-                # must create a new symbol with the local name.
-                new_sym = GenericInterfaceSymbol(
-                    caller_name, routines=[(RoutineSymbol("dummy"), True)])
-                new_sym.copy_properties(interface_sym)
-            else:
-                # Otherwise we can use the existing symbol.
-                new_sym = interface_sym
+            # `interface_sym` belongs to the module the routines were read
+            # from, and that tree is shared with every other caller through
+            # the ModuleManager. A new symbol is created for the caller's
+            # Container -- under the local name, which may differ if the
+            # interface was renamed on import -- so that making it private
+            # here, and re-pointing it at the routines that have just been
+            # brought in, leaves the source module as it was found.
+            new_sym = GenericInterfaceSymbol(
+                caller_name, routines=[(RoutineSymbol("dummy"), True)])
+            new_sym.copy_properties(interface_sym)
             container.symbol_table.add(new_sym)
-            interface_sym.visibility = Symbol.Visibility.PRIVATE
-            interface_sym.replace_symbols_using(container.symbol_table)
+            new_sym.visibility = Symbol.Visibility.PRIVATE
+            new_sym.replace_symbols_using(container.symbol_table)
         else:
             # No interface but was the original routine symbol renamed
             # on import?
