@@ -171,3 +171,58 @@ def test_unresolvable_array_kinds_are_not_guessed_at(
 
     message = str(error.value)
     assert "Ambiguous call to 'sweep_column'" in message
+
+
+# A helper called with an expression where the dummy states a kind. This is
+# the shape LFRic's vertical FFSL kernels call `monotonic_edge` with:
+# `nlayers - 1`, an `integer(kind=i_def)` variable less a literal of no kind,
+# against an `integer(kind=i_def)` dummy. Fortran's result kind is `i_def`,
+# but the PSyIR reduces the expression's precision to UNDEFINED because one
+# operand's is, so the pair only matches once an expression of undefined
+# precision is matched the way a literal of one is.
+_EXPRESSION_KIND_KERNEL = _LOCAL_KERNEL.replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    call sweep_column(nlayers - 1, partial, swept)\n").replace(
+    "end module column_solve_kernel_mod",
+    "  subroutine sweep_column(n, source, result)\n"
+    "    integer(kind=i_def), intent(in) :: n\n"
+    "    real(kind=r_def), dimension(n), intent(in) :: source\n"
+    "    real(kind=r_def), dimension(n), intent(inout) :: result\n"
+    "    integer(kind=i_def) :: j\n"
+    "    do j = n, 1, -1\n"
+    "      result(j) = result(j + 1) - 3.0_r_def * source(j)\n"
+    "    end do\n"
+    "  end subroutine sweep_column\n"
+    "end module column_solve_kernel_mod")
+
+
+@pytest.fixture(name="expression_kind_target")
+# pylint: disable-next=unused-argument
+def expression_kind_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose helper is called with an expression actual."""
+    return _invoke(tmp_path, "column_solve", _LOCAL_ALGORITHM,
+                   _EXPRESSION_KIND_KERNEL,
+                   extra={"constants_mod": _CONSTANTS_MODULE})
+
+
+def test_expression_actual_of_undefined_kind_is_captured(
+        expression_kind_target):
+    """A helper called with `nlayers - 1` is inlined and the loop captured.
+
+    The actual is an expression, not a literal, and the PSyIR cannot settle
+    its precision; the dummy states `i_def`. Before the match was widened the
+    pair was an argument-type mismatch and no callee was found at all.
+    """
+    _, loop, kernel = expression_kind_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
+    assert "3.0" in cpp

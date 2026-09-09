@@ -842,10 +842,12 @@ class Call(Statement, DataNode):
         scored by summing the per-argument scores of
         :py:func:`~psyclone.psyir.nodes.argument_matching.match_argument`:
         zero where the types are the same and one where they agree only in
-        what Fortran requires of them (a literal that states no kind, an
-        actual of unresolved type, a section against a formal argument of
-        partially known type, or a pair of array kinds at least one of which
-        PSyclone cannot reduce to a value). Kinds it can reduce -- of arrays
+        what Fortran requires of them (a scalar actual of undefined
+        precision, whether a literal that states no kind or an expression
+        whose kind the PSyIR could not settle; an actual of unresolved type;
+        a section against a formal argument of partially known type; or a
+        pair of array kinds at least one of which PSyclone cannot reduce to a
+        value). Kinds it can reduce -- of arrays
         or of scalars -- are compared by what they reduce to: two that agree
         match exactly however they are written, and two array kinds that
         differ are no match at all. That is what tells the specific

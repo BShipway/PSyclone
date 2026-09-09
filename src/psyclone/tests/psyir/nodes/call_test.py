@@ -2283,3 +2283,79 @@ end module some_mod
 
     assert routine.name == "bar_a"
     assert arg_idx_list == [0]
+
+
+_CODE_UNDEFINED_KIND_EXPRESSION = '''
+module some_mod
+  implicit none
+  integer, parameter :: i_def = 4
+contains
+  subroutine main()
+    integer(kind=i_def) :: nlayers
+    nlayers = 10
+    ! Fortran's result kind for 'nlayers - 1' is i_def, but the PSyIR gives
+    ! the expression a precision of UNDEFINED because one operand's is.
+    call bar_a(nlayers - 1)
+  end subroutine main
+  subroutine bar_a(n)
+    integer(kind=i_def) :: n
+    n = n + 1
+  end subroutine bar_a
+end module some_mod
+'''
+
+
+_CODE_AMBIGUOUS_KIND_EXPRESSION = '''
+module some_mod
+  implicit none
+  integer, parameter :: i_def = 4
+  interface bar
+    module procedure bar_a, bar_b
+  end interface bar
+contains
+  subroutine main()
+    integer(kind=i_def) :: nlayers
+    nlayers = 10
+    ! Nothing in the expression's type decides between the two specifics.
+    call bar(nlayers - 1)
+  end subroutine main
+  subroutine bar_a(n)
+    integer(kind=4) :: n
+    n = n + 1
+  end subroutine bar_a
+  subroutine bar_b(n)
+    integer(kind=8) :: n
+    n = n + 1
+  end subroutine bar_b
+end module some_mod
+'''
+
+
+def test_get_callee_accepts_an_expression_of_undefined_kind(fortran_reader):
+    '''An actual argument that is an expression rather than a literal is
+    matched the same way where the PSyIR cannot settle its precision: the
+    call is legal Fortran and the candidate is found.
+
+    '''
+    psyir = fortran_reader.psyir_from_source(_CODE_UNDEFINED_KIND_EXPRESSION)
+    call = psyir.walk(Call)[0]
+
+    (routine, arg_idx_list) = call.get_callee()
+
+    assert routine.name == "bar_a"
+    assert arg_idx_list == [0]
+
+
+def test_get_callee_refuses_an_ambiguous_expression_of_undefined_kind(
+        fortran_reader):
+    '''The relaxation is guarded as the literal one is: two specifics that
+    differ only in kind both match weakly, and the call is refused.
+
+    '''
+    psyir = fortran_reader.psyir_from_source(_CODE_AMBIGUOUS_KIND_EXPRESSION)
+    call = psyir.walk(Call)[0]
+
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        call.get_callee()
+    assert ("Ambiguous call to 'bar': routines 'bar_a' and 'bar_b' both "
+            "match with score 1" in str(err.value))
