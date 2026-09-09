@@ -651,14 +651,24 @@ leaving an integer one to `CWriter`'s `%`.
 argument and an integer one alike: `Kokkos::max` and `Kokkos::min` are
 templates, so one spelling serves both types where `CWriter` needs `fmax` for
 one and `std::max` for the other. It is also the spelling a region's *body*
-must have, since that code runs on the device and `std::max` is a constexpr
-host function, which `nvcc` refuses to call from a `__device__` one without
-`--expt-relaxed-constexpr`. A `std::max` reaching a generated region does so
-through a declared bound, and a scratch extent is emitted twice -- once into
-the host's `shmem_size` request and once into the View constructed inside the
-`KOKKOS_LAMBDA` -- so an integer `MAX` in the bound of a *kernel-local* array
-is not yet device-safe under `nvcc`. No captured region has such a bound
-today. A fold over fewer than two arguments raises a
+must have, whereas an extent may be either. `std::max` is a constexpr host
+function, and `nvcc` refuses one from a `__device__` function unless
+`--expt-relaxed-constexpr` is passed -- which the accelerated build passes to
+every region compile, alongside `--expt-extended-lambda`. That matters
+because a scratch extent is emitted twice, once into the host's `shmem_size`
+request and once into the View constructed inside the `KOKKOS_LAMBDA`, so the
+second is device code. `psy-ir-aidev`'s CUDA gate builds a scratch
+View sized by `std::max` inside a `KOKKOS_LAMBDA` for `sm_90` and checks the
+object holds a cubin, so the lambda it was in really was device code.
+
+That gate reads the compiler's diagnostic rather than its exit status, and
+anything relying on this should do the same. In a `__global__` function the
+refusal is an error and `nvcc` exits 1; inside a `KOKKOS_LAMBDA` the
+enclosing `operator()` is `__host__ __device__`, and there `nvcc` emits
+warning #20013-D and exits 0 regardless. Without the flag the call is
+compiled as a host call from device code, silently.
+
+A fold over fewer than two arguments raises a
 `VisitorError` rather than generating a call Kokkos has no overload for.
 
 `FLOOR` and `NINT` keep the cast that `CWriter` wraps round them, since
