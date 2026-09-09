@@ -315,13 +315,28 @@ _DIVIDED_LOCAL_KERNEL = _LOCAL_KERNEL.replace(
     "    swept(nlayers) = partial(nlayers) + u_local(1)")
 
 
-# A declared shape the C writer has no way to render at all. GungHo writes
-# one: ffsl_flux_z_nirvana_kernel_mod declares
-# `field_local_upper(MAX(nlayers-monotone_above,1), 3)`. The back-end's own
-# failure is a VisitorError, which `validate` may not raise, so it is turned
-# into a refusal that names the array.
+# A declared shape the C writer has no way to render at all. The back-end's
+# own failure is a VisitorError, which `validate` may not raise, so it is
+# turned into a refusal that names the array.
+#
+# MODULO is the intrinsic used, because it has no C spelling: C's `%` is MOD,
+# which differs from MODULO for a negative operand, and the writer has no
+# entry for it. It used to be MAX -- ffsl_flux_z_nirvana_kernel_mod declares
+# `field_local_upper(MAX(nlayers-monotone_above,1), 3)`, which is where the
+# refusal was found -- but an integer MAX is now written as `std::max` and is
+# no longer unwritable. The property under test is unchanged: a shape the
+# writer refuses is reported by `validate`, not raised from inside `apply`.
 _UNWRITABLE_SHAPE_KERNEL = _LOCAL_KERNEL.replace(
-    "dimension(nlayers) :: swept", "dimension(max(nlayers,1)) :: swept")
+    "dimension(nlayers) :: swept", "dimension(modulo(nlayers,3)) :: swept")
+
+
+# The shape that used to be unwritable. ffsl_flux_z_nirvana_kernel_mod
+# declares `field_local_upper(MAX(nlayers-monotone_above,1), 3)`, and an
+# integer MAX is now written as `std::max`, so this is carried rather than
+# refused: the scratch is sized by the call and the launch is told to
+# evaluate `nlayers` alone.
+_MAXIMUM_SHAPE_KERNEL = _LOCAL_KERNEL.replace(
+    "dimension(nlayers) :: swept", "dimension(max(nlayers-1,1)) :: swept")
 
 
 # Arithmetic over a module constant rather than over a formal. Accepting
@@ -590,6 +605,14 @@ def unwritable_shape_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel takes a MAX in a declared bound."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _UNWRITABLE_SHAPE_KERNEL)
+
+
+@pytest.fixture(name="maximum_shape_target")
+# pylint: disable-next=unused-argument
+def maximum_shape_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel sizes a local by an integer MAX."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _MAXIMUM_SHAPE_KERNEL)
 
 
 @pytest.fixture(name="unsized_expression_target")
