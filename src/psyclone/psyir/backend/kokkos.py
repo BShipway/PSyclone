@@ -164,11 +164,14 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         scratch_names = {item.name for item in region.scratch}
         alias_names = {alias.name for alias in region.aliases}
         self._depth = 3 if region.scratch and not region.parallel_loops else 2
-        # Ahead of the locals and after the scratch constructions each launch
-        # shape emits, because the declaration reads its target's type and a
-        # scratch target does not exist until its View has been constructed.
+        # Ahead of the locals, and left after the scratch constructions each
+        # launch shape emits although an ``AnonymousSpace`` handle no longer
+        # needs its target to have been constructed first: moving it would
+        # rewrite the body of every region that already carries one, for
+        # nothing.
         alias_declarations = "".join(
-            f"{self._nindent}decltype({alias.targets[0]}) {alias.name};\n"
+            f"{self._nindent}"
+            f"{self._alias_declaration(alias, self._views)}\n"
             for alias in region.aliases)
         local_declarations = alias_declarations + "".join(
             self.gen_local_variable(symbol)
@@ -564,10 +567,8 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             :py:class:`KokkosAlias`.
         :raises ValueError: if the alias's name is not a C++ identifier or is
             one the region has already used; if it names no target; if a
-            target is not an array the region describes; if its targets do
-            not agree on element type and rank; or if it aliases an argument
-            and a scratch array together, which are Views of two different
-            spaces and so of two different C++ types.
+            target is not an array the region describes; or if its targets do
+            not agree on element type and rank.
         """
         if not isinstance(alias, KokkosAlias):
             raise TypeError(
@@ -595,13 +596,11 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             raise ValueError(
                 f"Kokkos alias '{alias.name}' aliases arrays of more than "
                 "one element type or rank, which no one handle can hold.")
-        if len({type(arrays[name]) for name in alias.targets}) > 1:
-            raise ValueError(
-                f"Kokkos alias '{alias.name}' aliases both an argument and a "
-                "scratch array, whose Views differ in more than element type "
-                "and rank: one is a View of the launch's scratch space and "
-                "the other of the space the region's data is in, and no one "
-                "handle can hold both.")
+        # An argument and a scratch array together are deliberately NOT
+        # refused. Their Views are of different memory spaces, but the handle
+        # is declared in ``Kokkos::AnonymousSpace``, which is assignable from
+        # both; element type, rank and layout are all that then have to
+        # agree, and the check above is where they do.
 
     def _validate_cell_position(self, region, formals, described):
         """Reject a cell position the region could not correctly declare.
@@ -879,6 +878,51 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             return f"const {argument.c_type} {argument.name}"
         const = "const " if argument.read_only else ""
         return f"{const}{argument.c_type} *{argument.data_name}"
+
+    @staticmethod
+    def _alias_declaration(alias, views):
+        """Return the declaration of one alias handle.
+
+        A handle in ``Kokkos::AnonymousSpace`` rather than the ``decltype``
+        of its first target, so that a pointer aimed at a kernel argument in
+        one branch and at a kernel-local array in the other is one handle
+        rather than a refusal. ``AnonymousSpace`` is a memory space declared
+        assignable from and to every other -- that is all
+        ``Kokkos_AnonymousSpace.hpp`` says about it -- so a ``View`` in it
+        holds a ``View`` of the region's space and a ``View`` of the launch's
+        scratch alike, provided they agree in element type, rank and layout.
+        Every ``View`` this back-end writes is ``LayoutLeft``, and the
+        targets' agreement on the rest is what
+        :py:meth:`_validate_alias` checks.
+
+        The element type, its constness and the memory traits are taken from
+        the first target, which is what ``decltype`` took them from: the
+        space is the only part of the type replaced. A read-only argument
+        therefore still gives a ``const`` handle with the ``ReadOnly``
+        traits, and a scratch array -- which is neither read-only nor
+        randomly accessed -- a plain ``Unmanaged`` one.
+
+        :param alias: the alias to declare.
+        :type alias: :py:class:`psyclone.psyir.backend.kokkos.KokkosAlias`
+        :param views: the region's arrays keyed by name, in which the alias's
+            first target is described.
+        :type views: Dict[str, Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`]]
+
+        :returns: the declaration, without indentation.
+        :rtype: str
+        """
+        target = views[alias.targets[0]]
+        read_only = isinstance(target, KokkosView) and target.read_only
+        random_access = (isinstance(target, KokkosView)
+                         and target.random_access)
+        const = "const " if read_only else ""
+        traits = "ReadOnly" if random_access else "Unmanaged"
+        rank = "*" * len(target.extents)
+        return (
+            f"Kokkos::View<{const}{target.c_type}{rank}, Kokkos::LayoutLeft, "
+            f"Kokkos::AnonymousSpace, {traits}> {alias.name};")
 
     @staticmethod
     def _view_declaration(view):

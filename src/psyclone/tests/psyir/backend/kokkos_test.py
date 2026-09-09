@@ -3978,18 +3978,20 @@ def test_kokkos_alias_is_declared_and_assigned_as_a_handle():
     """A pointer aliasing a whole array becomes a View handle copy.
 
     Three separate answers meet in this one region and none of them follows
-    from the others. The declaration takes its type from the first target
-    with ``decltype``, because an argument View and a scratch View are
-    different C++ types and the alias has to be whichever its targets are.
-    The pointer assignment is a plain handle assignment, which is Kokkos'
-    own semantics -- a copy of a View handle shares the original's elements
-    -- rather than anything the writer arranges. And the reads through the
+    from the others. The declaration takes its element type, rank and traits
+    from the first target and its memory space from neither, since a target
+    may be a View of the region's space or of the launch's scratch and
+    ``Kokkos::AnonymousSpace`` is the one space assignable from both. The
+    pointer assignment is a plain handle assignment, which is Kokkos' own
+    semantics -- a copy of a View handle shares the original's elements --
+    rather than anything the writer arranges. And the reads through the
     alias keep the subscripts the Fortran wrote, since a handle carries the
     target's extents and offsets with it.
     """
     code = KokkosWriter()(_alias_region())
 
-    assert "decltype(tri_plus_new) chosen;" in code
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in code
     assert "chosen = tri_plus_new;" in code
     assert "chosen = x_new;" in code
     assert ("y((((map((1 - 1), cell) + k) - 1) - 1)) = chosen((k - 1));"
@@ -4001,20 +4003,60 @@ def test_kokkos_alias_is_declared_and_assigned_as_a_handle():
 
 
 def test_kokkos_alias_is_declared_after_the_scratch_it_names():
-    """The alias' declaration follows the constructions it reads a type from.
+    """The alias' declaration still follows the scratch constructions.
 
-    ``decltype`` needs its argument to have been declared, and the team
-    launches emit their scratch constructions before the body's local
-    declarations for exactly that reason. Asserted by position rather than
-    by presence, because a writer that emitted the two in the other order
-    would produce source with every statement of this test's other
-    assertions in it and no C++ compiler would accept.
+    An ``AnonymousSpace`` handle names no target in its own declaration, so
+    it no longer *has* to come after the View it is first assigned from --
+    but it still does, and that is asserted rather than left to chance:
+    every region already captured with an alias in it has the two in this
+    order, and a writer that swapped them would rewrite all of their
+    generated bodies for nothing.
     """
     code = KokkosWriter()(_alias_region())
 
     assert code.index(
         "tri_plus_new_scratch_t tri_plus_new(") < code.index(
-            "decltype(tri_plus_new) chosen;")
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;")
+
+
+def test_kokkos_alias_spans_two_memory_spaces():
+    """One handle holds an argument View and a scratch View.
+
+    The shape ``third_order_vertical_edge`` has and the reason the handle is
+    declared in ``Kokkos::AnonymousSpace`` at all: ``y`` is a View of the
+    space the region's data is in and ``x_new`` a View of the launch's
+    scratch, so no ``decltype`` of either would hold the other. Kokkos
+    declares ``AnonymousSpace`` assignable from and to every space, so this
+    one declaration holds both, and nothing about the pair is refused.
+
+    Only the declaration is asserted. The schedule's pointer assignments
+    still name the two arrays ``_alias_region`` describes by default, which
+    is beside the point being made here.
+    """
+    code = KokkosWriter()(_alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("y", "x_new")),)))
+
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in code
+    assert "decltype" not in code
+
+
+def test_kokkos_alias_takes_the_constness_of_its_first_target():
+    """A read-only first target gives a const handle with its traits.
+
+    The space is the only part of the first target's View type the alias
+    replaces, and this is the case that says so: ``x`` is declared
+    ``const double*`` with the ``ReadOnly`` traits -- ``Unmanaged`` and
+    ``RandomAccess`` together -- and the handle standing in for a pointer
+    aimed at it is declared the same way. A handle that quietly dropped the
+    ``const`` would let a write through the alias compile against storage
+    the region promised not to write.
+    """
+    code = KokkosWriter()(_alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("x", "x_new")),)))
+
+    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, ReadOnly> chosen;") in code
 
 
 @pytest.mark.parametrize(
@@ -4032,17 +4074,20 @@ def test_kokkos_alias_is_declared_after_the_scratch_it_names():
      (KokkosAlias(name="chosen", targets=("x_new", "map")),
       "Kokkos alias 'chosen' aliases arrays of more than one element type "
       "or rank, which no one handle can hold."),
-     (KokkosAlias(name="chosen", targets=("x_new", "y")),
-      "Kokkos alias 'chosen' aliases both an argument and a scratch array"),
      ])
 def test_kokkos_writer_rejects_a_broken_alias(alias, message):
     """Each way of describing an alias wrongly is refused where it is said.
 
-    Not one of the six stops a build on its own. A name that is not an
+    Not one of the five stops a build on its own. A name that is not an
     identifier and a name that shadows a scratch array both generate C++ --
     the second silently redirects every later read of the shadowed name --
     and the three that disagree about the target generate a template error
     naming neither the alias nor the region it came from.
+
+    Targets in two different memory spaces are NOT among them: the handle is
+    declared in ``Kokkos::AnonymousSpace``, which holds either, and
+    :py:func:`test_kokkos_alias_spans_two_memory_spaces` is where that is
+    asserted.
     """
     with pytest.raises(ValueError) as error:
         KokkosWriter()(_alias_region(aliases=(alias,)))
@@ -4068,4 +4113,4 @@ def test_kokkos_region_has_no_aliases_unless_it_is_given_them():
     generated source of every region the prototype has captured so far.
     """
     assert _region().aliases == ()
-    assert "decltype" not in KokkosWriter()(_region())
+    assert "AnonymousSpace" not in KokkosWriter()(_region())

@@ -117,8 +117,9 @@ _ACTUAL_ALIAS_KERNEL = _ALIAS_KERNEL.replace(
 
 # The same helper choosing between a kernel argument and a kernel-local
 # array. This is the shape LFRic's vertical-support kernels have -- a field
-# passed in or a column worked out on the way -- and it is the one shape of
-# the pattern this refuses: the two are Views of different Kokkos spaces.
+# passed in or a column worked out on the way -- and the two are Views of
+# different Kokkos memory spaces, which is what the alias handle's
+# `Kokkos::AnonymousSpace` exists to hold.
 _MIXED_SPACE_ALIAS_KERNEL = _ALIAS_KERNEL.replace(
     "    call sweep_column(nlayers, partial, spare, pick_spare, swept)\n",
     "    call sweep_column(nlayers, field_in, spare, pick_spare, swept)\n")
@@ -329,17 +330,20 @@ def test_alias_pointer_is_captured_as_a_view_handle(alias_target):
 
     The three things the generated region has to say are asserted here and
     not one of them is implied by the others: the handle is declared with its
-    target's type, each branch of the choice assigns a handle rather than
-    copying elements, and the reads through the pointer are subscripts of the
-    alias exactly as the Fortran wrote them.
+    target's element type, rank and traits, each branch of the choice assigns
+    a handle rather than copying elements, and the reads through the pointer
+    are subscripts of the alias exactly as the Fortran wrote them.
     """
     _, loop, _ = alias_target
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    # Declared from the first target the body aims it at, which is the one
-    # the leading branch of the choice names.
-    assert "decltype(spare) chosen;" in cpp
+    # The element type, rank and traits come from the first target the body
+    # aims it at, which is the one the leading branch of the choice names.
+    # The memory space does not: it is anonymous, so that the same handle
+    # holds a target in any of them.
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in cpp
     assert "chosen = spare;" in cpp
     assert "chosen = partial;" in cpp
     # Read through the alias, with the target's Fortran origin applied.
@@ -430,23 +434,28 @@ def test_alias_pointer_passed_as_an_actual_is_refused(actual_alias_target):
     assert "it is passed as an actual argument" in message
 
 
-def test_alias_pointer_across_two_spaces_is_refused(mixed_space_alias_target):
-    """A pointer aimed at an argument and at a local is refused by name.
+def test_alias_pointer_across_two_spaces_is_captured(mixed_space_alias_target):
+    """A pointer aimed at an argument and at a local is one handle.
 
-    Refused at the transformation rather than left to the writer: both are
-    arrays of one element type and rank, so nothing about the description
-    says they cannot share a handle, and the C++ that results fails to
-    compile a long way from the pointer that caused it.
+    This is the shape `third_order_vertical_edge` has, and the one the
+    pattern was written for: a field passed into the kernel in one branch of
+    a flag and a column the kernel worked out on the way in the other. The
+    two are Views of different Kokkos memory spaces -- the region's and the
+    launch's scratch -- so the handle cannot be the `decltype` of either. It
+    is declared in `Kokkos::AnonymousSpace`, which is assignable from both,
+    and the capture goes through.
     """
     _, loop, _ = mixed_space_alias_target
 
-    with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
 
-    message = str(error.value)
-    assert "cannot capture the pointer 'chosen'" in message
-    assert ("aimed both at a kernel argument and at a kernel-local array"
-            in message)
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in cpp
+    # One branch aims it at the kernel-local array the launch put in scratch,
+    # the other at the argument View. Neither is a copy.
+    assert "chosen = spare;" in cpp
+    assert "chosen = field_in;" in cpp
+    assert "sweep_column" not in cpp
 
 
 def test_alias_pointer_of_two_ranks_is_refused(rank_alias_target):
@@ -473,7 +482,8 @@ def test_alias_pointer_relaxes_a_target_local(target_local_alias_target):
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "decltype(buffer) chosen;" in cpp
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in cpp
     assert "chosen = buffer;" in cpp
     assert "chosen = partial;" in cpp
     assert "sweep_column" not in cpp

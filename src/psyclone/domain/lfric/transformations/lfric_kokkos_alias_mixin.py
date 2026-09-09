@@ -381,38 +381,5 @@ class LFRicKokkosAliasMixin:
                 aliases[symbol.name] = tuple(targets)
         return aliases
 
-    @classmethod
-    def _validate_alias_spaces(cls, schedule):
-        """Check that each alias' targets are Views of one Kokkos space.
-
-        The generated region declares an alias ``decltype(t) p;`` for the
-        first array ``t`` it is aimed at, and a kernel argument and a
-        kernel-local array do not give the same ``t``. An argument is a
-        ``View`` of the space the region's data is in and a local is a
-        ``View`` of the launch's scratch, so a pointer aimed at one of each
-        -- which is the shape LFRic's vertical-support helpers have, choosing
-        between a field passed in and a column worked out on the way -- would
-        generate a handle assignment the C++ compiler rejects with a template
-        error naming neither the pointer nor the kernel. It is refused here
-        instead, by name.
-
-        :param schedule: the kernel schedule after inlining.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-
-        :raises TransformationError: if an aliasing pointer is aimed both at
-            a kernel argument and at a kernel-local array.
-        """
-        table = schedule.symbol_table
-        for name, targets in sorted(cls._alias_targets(schedule).items()):
-            if len({table.lookup(target).is_argument
-                    for target in targets}) > 1:
-                raise TransformationError(
-                    f"LFRicKokkosTrans cannot capture the pointer '{name}' "
-                    "as a Kokkos View handle because it is aimed both at a "
-                    "kernel argument and at a kernel-local array. The first "
-                    "is a View of the space the region's data is in and the "
-                    "second a View of the launch's scratch, and no one "
-                    "handle can hold both.")
-
 
 __all__ = ["LFRicKokkosAliasMixin"]
