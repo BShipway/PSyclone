@@ -2168,6 +2168,96 @@ def test_get_callee_refuses_an_ambiguous_call(fortran_reader):
             "match with score 1" in str(err.value))
 
 
+_CODE_ARRAY_KIND_INTERFACE = '''
+module some_mod
+  implicit none
+  integer, parameter :: r_single = 4
+  integer, parameter :: r_double = 8
+  integer, parameter :: r_def = 8
+  interface bar
+    ! Named single-first, so that a match found by order rather than by kind
+    ! would return the wrong one.
+    module procedure bar_r_single, bar_r_double
+  end interface bar
+contains
+  subroutine main()
+    real(kind=r_def) :: chi(10)
+    ! The two specifics differ only in the kind of their array argument, so
+    ! only resolving r_def, r_single and r_double tells them apart.
+    call bar(chi)
+  end subroutine main
+  subroutine bar_r_single(a)
+    real(kind=r_single) :: a(10)
+    a(1) = 0.0_r_single
+  end subroutine bar_r_single
+  subroutine bar_r_double(a)
+    real(kind=r_double) :: a(10)
+    a(1) = 0.0_r_double
+  end subroutine bar_r_double
+end module some_mod
+'''
+
+
+def test_get_callee_distinguishes_specifics_by_array_kind(fortran_reader):
+    '''Two specifics of a generic interface whose array arguments differ
+    only in kind are told apart by resolving the named constants the kinds
+    are written with.
+
+    '''
+    psyir = fortran_reader.psyir_from_source(_CODE_ARRAY_KIND_INTERFACE)
+    call = psyir.walk(Call)[0]
+
+    (routine, arg_idx_list) = call.get_callee()
+
+    assert routine.name == "bar_r_double"
+    assert arg_idx_list == [0]
+
+
+_CODE_SCALAR_KIND_INTERFACE = '''
+module some_mod
+  implicit none
+  integer, parameter :: r_single = 4
+  integer, parameter :: r_double = 8
+  integer, parameter :: r_def = 8
+  interface baz
+    ! Named single-first, so that a match found by order rather than by kind
+    ! would return the wrong one.
+    module procedure baz_r_single, baz_r_double
+  end interface baz
+contains
+  subroutine main()
+    real(kind=r_def) :: detj
+    ! r_def and r_double are two names for one kind, which the PSyIR holds as
+    ! two unequal scalar types until they are resolved.
+    call baz(detj)
+  end subroutine main
+  subroutine baz_r_single(dj)
+    real(kind=r_single) :: dj
+    dj = 0.0_r_single
+  end subroutine baz_r_single
+  subroutine baz_r_double(dj)
+    real(kind=r_double) :: dj
+    dj = 0.0_r_double
+  end subroutine baz_r_double
+end module some_mod
+'''
+
+
+def test_get_callee_distinguishes_specifics_by_scalar_kind(fortran_reader):
+    '''A scalar actual whose kind is a different name for the dummy's kind
+    matched no specific at all before the named constants were resolved, so
+    the call was refused; it now resolves to the specific of that kind.
+
+    '''
+    psyir = fortran_reader.psyir_from_source(_CODE_SCALAR_KIND_INTERFACE)
+    call = psyir.walk(Call)[0]
+
+    (routine, arg_idx_list) = call.get_callee()
+
+    assert routine.name == "baz_r_double"
+    assert arg_idx_list == [0]
+
+
 def test_get_callee_unchanged_for_a_single_routine(fortran_reader):
     '''Scoring changes nothing where there is one candidate: it is returned
     with the same argument map as before.
