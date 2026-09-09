@@ -4425,7 +4425,12 @@ View element. It is decided per argument rather than per region, so a
 ``gh_write`` to a *discontinuous* space in the same kernel stays a plain
 assignment; and it is the update and not the read that is made atomic, so a
 ``gh_readinc`` reads its element plainly. Each component of a field vector
-is a field of its own and is made safe separately. A caller who knows the
+is a field of its own and is made safe separately. The question is asked of
+cell iteration alone: a dof-iterating kernel writes each dof once, so its
+stores stay plain assignments whatever their function space, and the
+formals of such a kernel -- which are its fields and scalars, with no
+``nlayers``, ``ndf``, ``undf`` or dofmap among them -- are never compared
+against a cell kernel's argument order. A caller who knows the
 loop's stores reach no shared dof may say so through the
 ``disjoint_writes`` option, which is an assertion about the kernel and is
 refused where it contradicts the loop's colouring, the ``atomics`` option
@@ -5157,6 +5162,30 @@ running both cells at once would lose one of the two contributions. Under
 ``gh_write`` to a continuous space each cell *replaces* it, which loses no
 contribution because there is none, and is still two threads writing one
 element.
+
+**A dof-iterating kernel is captured with plain stores, whatever its
+spaces say.** Sharing between cells is a property of *cell* iteration:
+two cells' dofmaps meet at a dof on a continuous space, and both cell
+iterations write it. A loop over LFRic's ``dof`` or ``owned_dof``
+iteration space visits each dof once and writes it once, so there is no
+second writer to make atomic and no colour to separate, and a
+``gh_write`` on ``any_space_1`` from such a kernel is generated as an
+ordinary assignment where the same metadata on a cell kernel would take
+an ``atomic_store``. The metadata predicates alone would not say so --
+they read the access and the function space, and neither mentions what
+the loop iterates over -- so the question is answered from the kernel's
+``operates_on`` before they are asked.
+
+Answering it there also settles what would otherwise be a refusal about
+the wrong thing. Which *formal* carries a shared field is read by walking
+a cell kernel's argument order -- ``nlayers``, the data of each field,
+then ``ndf``, ``undf`` and the dofmap of each space -- where a dof
+kernel's formals are its fields and scalars alone. The two counts
+disagree, and the disagreement was reported as a kernel this
+transformation could not describe. It is instead read as the question
+being the wrong one for that kernel: ``swift_inner_update`` and
+``swift_outer_update`` in ``ffsl_advective_updates_alg_mod`` are captured
+rather than refused for a formal count they cannot meet.
 
 The default answer to both is an atomic, and the two kinds of sharing take
 different ones. A contribution is written as ``Kokkos::atomic_add`` -- or
