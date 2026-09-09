@@ -58,8 +58,9 @@ module that was never read, an argument whose type does not match the formal
 
 from psyclone.domain.common.transformations import KernelModuleInlineTrans
 from psyclone.psyir.nodes import (
-    Call, Container, IntrinsicCall, Routine)
-from psyclone.psyir.symbols import RoutineSymbol, Symbol
+    Call, Container, IntrinsicCall, Routine, ScopingNode)
+from psyclone.psyir.symbols import (
+    RoutineSymbol, Symbol, UnsupportedFortranType)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -126,6 +127,15 @@ class LFRicKokkosInlineMixin:
     #: what would take a runaway rewrite out of memory.
     _INLINE_LIMIT = 8
 
+    #: The attributes a formal may carry and still be given its partial
+    #: datatype by :py:meth:`_relax_target_arguments`. ``TARGET`` is the one
+    #: that makes the declaration unmodelled in the first place; the other
+    #: two are matched because they are already in the partial datatype --
+    #: ``DIMENSION`` as its shape and ``INTENT`` as the symbol's argument
+    #: interface -- and so are not attributes being dropped. Matched by
+    #: prefix, since both are written with a parenthesised value.
+    _BINDABLE_ATTRIBUTES = ("TARGET", "DIMENSION", "INTENT")
+
     @staticmethod
     def _callee_name(call):
         """Name the routine ``call`` calls, for a message.
@@ -167,6 +177,12 @@ class LFRicKokkosInlineMixin:
         ran, and a call sharing a statement with the one just inlined may have
         been moved out of it.
 
+        Each callee is prepared before it is inlined: brought into the
+        Container the call is made from by :py:meth:`_module_inline`, and
+        then relaxed by :py:meth:`_relax_target_arguments`, which gives a
+        formal declared ``TARGET`` the type the frontend parsed out of that
+        declaration.
+
         :param schedule: the kernel schedule to rewrite in place.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
@@ -189,6 +205,7 @@ class LFRicKokkosInlineMixin:
             call = pending[0]
             name = cls._callee_name(call)
             refusal = cls._module_inline(call)
+            cls._relax_target_arguments(call)
             try:
                 InlineTrans().apply(call)
             except (TransformationError, TypeError) as err:
@@ -278,12 +295,128 @@ class LFRicKokkosInlineMixin:
             named as the callee is.
         :rtype: bool
         """
+        return bool(cls._local_callees(call))
+
+    @classmethod
+    def _local_callees(cls, call):
+        """Return the routines of ``call``'s Container named as its callee.
+
+        There is at most one where the callee is a plain procedure, and more
+        than one where the name is a generic interface: which specific the
+        call resolves to is PSyclone's to decide, so both are returned and
+        the caller says what it does with them.
+
+        :param call: the call to look for the callee of.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: the routines the Container the call is made from holds
+            under the callee's name.
+        :rtype: List[:py:class:`psyclone.psyir.nodes.Routine`]
+        """
         container = call.ancestor(Container)
         if container is None:
-            return False
+            return []
         name = cls._callee_name(call).lower()
-        return any(routine.name.lower() == name
-                   for routine in container.walk(Routine, stop_type=Routine))
+        return [routine
+                for routine in container.walk(Routine, stop_type=Routine)
+                if routine.name.lower() == name]
+
+    @staticmethod
+    def _declaration_attributes(declaration):
+        """List the attributes of a Fortran declaration, less its type.
+
+        The text is the one
+        :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` kept of a
+        declaration PSyclone could not model, so it is read rather than
+        re-parsed. Only the specification part -- what stands before ``::``
+        -- carries attributes; the entity part after it carries the name and
+        any shape given with it. Commas inside parentheses do not separate
+        attributes, which is why the split is made at depth zero:
+        ``DIMENSION(n, 2)`` is one attribute and not two.
+
+        Each attribute is returned upper-cased and stripped of every space,
+        so that ``intent ( in )`` and ``INTENT(IN)`` are one string.
+
+        A declaration written without ``::`` states no attributes, and
+        needs no case of its own: the split leaves the whole declaration as
+        one field, and dropping the type specification drops it.
+
+        :param str declaration: the declaration text to read.
+
+        :returns: the declaration's attributes, the leading type
+            specification dropped, or an empty list where it declares no
+            attributes at all.
+        :rtype: List[str]
+        """
+        attributes = []
+        current = ""
+        depth = 0
+        for character in declaration.split("::")[0]:
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            if character == "," and depth == 0:
+                attributes.append(current)
+                current = ""
+            else:
+                current += character
+        attributes.append(current)
+        return ["".join(attribute.split()).upper()
+                for attribute in attributes[1:]]
+
+    @classmethod
+    def _relax_target_arguments(cls, call):
+        """Give every ``TARGET`` formal of ``call``'s callee its own type.
+
+        ``TARGET`` says that a pointer somewhere may be aimed at the actual.
+        Inlining the callee's statements into the caller neither creates
+        such a pointer nor invalidates one that exists, so the attribute has
+        nothing to say about whether the body may be substituted -- but the
+        PSyIR does not model it, so the formal arrives as an
+        :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` and
+        :py:class:`~psyclone.psyir.transformations.InlineTrans` refuses the
+        routine for having an argument of a type it does not know. Replacing
+        such a formal's type with the partial datatype the frontend did
+        parse is what removes that refusal, and it removes only that one:
+        ``permit_unsupported_type_args`` is not passed, so a formal carrying
+        any other unmodelled attribute -- ``POINTER``, ``ALLOCATABLE``,
+        ``OPTIONAL``, ``VALUE`` -- is left as it is and refused as before.
+        This is what makes the vertical-support helpers of LFRic's FFSL
+        schemes, whose read column is declared ``TARGET``, inlinable at all.
+
+        The rewrite is made on the callee as the call site sees it, after
+        :py:meth:`_module_inline` has run: a callee reached through a ``use``
+        is by then a copy in the caller's Container, and a callee of the
+        kernel's own module is in the copy of the file
+        :py:meth:`_rooted_copy` took. Neither is the tree the frontend
+        parsed, so a later capture of another kernel calling the same helper
+        meets the routine as its own module declares it.
+
+        The partial datatype is taken rather than copied: it is part of the
+        declaration being replaced, which nothing holds afterwards.
+
+        :param call: the call whose callee is to be relaxed.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+        """
+        for routine in cls._local_callees(call):
+            for scope in routine.walk(ScopingNode):
+                for symbol in scope.symbol_table.symbols:
+                    datatype = symbol.datatype if symbol.is_argument else None
+                    if not isinstance(datatype, UnsupportedFortranType):
+                        continue
+                    attributes = cls._declaration_attributes(
+                        datatype.declaration)
+                    # Two questions with one answer: a declaration the
+                    # frontend could parse nothing of leaves nothing to put
+                    # in the symbol's place, and one that is unmodelled for
+                    # some other reason is not this rewrite's to relax.
+                    if (datatype.partial_datatype is None or
+                            "TARGET" not in attributes):
+                        continue
+                    if all(attribute.startswith(cls._BINDABLE_ATTRIBUTES)
+                           for attribute in attributes):
+                        symbol.datatype = datatype.partial_datatype
 
     @staticmethod
     def _rooted_copy(schedule):

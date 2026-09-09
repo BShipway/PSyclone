@@ -15,7 +15,7 @@ from lfric_kokkos_sources import (
     _SECTION_ALGORITHM, _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
-from psyclone.psyir.nodes import Call, IntrinsicCall
+from psyclone.psyir.nodes import Call, IntrinsicCall, Loop
 from psyclone.psyir.symbols import RoutineSymbol
 from psyclone.psyir.transformations import TransformationError
 
@@ -853,29 +853,31 @@ def test_lfric_kokkos_trans_inlines_a_section_actual_against_a_shape(
 
 def test_lfric_kokkos_trans_pairs_a_section_with_a_partial_type(
         partial_section_target):
-    """A section reaches a partially-typed formal, and is refused later.
+    """A section reaches a partially-typed formal, and the call resolves.
 
     The formal's declaration carries an attribute the PSyIR does not model,
     so all it has of the formal is a partial datatype -- the explicit shape
     ``source(n)``. Comparing the actual's own shape with that expression
     compares two expressions written in different scopes and can never
     succeed, so the rank-and-intrinsic rule is applied to it instead and the
-    callee is resolved.
+    callee is resolved. That pairing is the reason this kernel is here, and
+    it is made against the partial datatype rather than against the
+    replacement, since the callee is resolved before the formal is relaxed.
 
-    Resolving it is as far as this kernel gets: ``InlineTrans`` will not
-    inline a routine having an argument whose declaration it does not model,
-    whatever the call site passes. So the refusal moves from the argument
-    pairing to that rule, which is the one a reader can act on.
+    The unmodelled attribute is ``target``, so the capture then completes:
+    the formal is given its partial datatype and ``InlineTrans`` has nothing
+    left to object to. A formal carrying any other unmodelled attribute is
+    still refused, which
+    :py:func:`test_pointer_dummy_is_still_refused` is the case for.
     """
-    _, loop, _ = partial_section_target
+    _, loop, kernel = partial_section_target
 
-    with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
 
-    message = str(error.value)
-    assert "Argument partial type mismatch" not in message
-    assert ("Symbol 'source' which is an Argument of UnsupportedType"
-            in message)
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
 
 
 def test_lfric_kokkos_trans_inlines_through_a_generic_interface(
@@ -914,3 +916,73 @@ def test_lfric_kokkos_trans_refuses_an_ambiguous_generic_call(
     assert "cannot inline the call to 'scale_column'" in message
     assert "Ambiguous call to 'scale_column'" in message
     assert "both match with score 1" in message
+
+
+# ---------------------------------------------------------------------------
+# Task E7: a TARGET dummy is inlinable.
+# ---------------------------------------------------------------------------
+
+
+def test_target_dummy_is_inlined(target_dummy_target):
+    """A helper taking a TARGET column is inlined as its partial type.
+
+    ``target`` is an assertion about aliasing -- a pointer may be aimed at
+    the actual -- and binding the callee's formal to that actual neither
+    creates a pointer nor invalidates one. The PSyIR does not model the
+    attribute, so the declaration arrives as an ``UnsupportedFortranType``
+    carrying the type it could parse; replacing the formal's type with that
+    partial type before inlining is what lets ``InlineTrans`` proceed,
+    without ``permit_unsupported_type_args`` being passed and so without
+    anything else unsupported being let through with it.
+    """
+    _, loop, kernel = target_dummy_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
+    # The callee's statements, reading the caller's array through the
+    # formals it was called with.
+    assert "swept((nlayers - 1)) = partial((nlayers - 1));" in cpp
+
+
+def test_pointer_dummy_is_still_refused(pointer_dummy_target):
+    """A helper taking a POINTER column is refused as before.
+
+    Only ``target`` is dropped. A pointer dummy is a name for storage the
+    call site aims elsewhere, which binding a formal to an actual does not
+    reproduce, so the declaration stays unsupported and the refusal is the
+    one ``InlineTrans`` writes.
+    """
+    _, loop, _ = pointer_dummy_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'sweep_column'" in message
+    assert ("Symbol 'source' which is an Argument of UnsupportedType"
+            in message)
+    assert "POINTER" in message
+
+
+def test_target_dummy_of_a_shared_helper_is_inlined_twice(
+        shared_target_helper):
+    """Two kernels calling one helper are each captured.
+
+    The rewrite is made on the copy of the callee the capture works on, so
+    the second kernel meets the module as its own file declares it rather
+    than as the first capture left it.
+    """
+    psy, _, _ = shared_target_helper
+    loops = psy.invokes.invoke_list[0].schedule.walk(Loop)
+    kernel_loops = [loop for loop in loops if loop.kernels()]
+
+    regions = [LFRicKokkosTrans().apply(loop) for loop in kernel_loops]
+
+    assert len(regions) == 2
+    for cpp in regions:
+        assert "sweep_column" not in cpp
+        assert "swept((nlayers - 1)) = partial((nlayers - 1));" in cpp

@@ -4271,8 +4271,14 @@ module, one whose declarations depend on an argument the call site writes to
 before calling, and one whose actual and formal types do not agree are each
 refused in ``InlineTrans``'s own words with the call named, followed by
 ``KernelModuleInlineTrans``'s own where the callee could not be brought in
-either. Types agreeing is a scored judgement rather than an identity: a
-literal actual stating no kind, an actual whose type PSyclone cannot
+either. A formal declared ``TARGET`` is none of those: the attribute
+constrains what a pointer elsewhere may be aimed at, which substituting a
+body neither creates nor breaks, so such a formal is given the type the
+frontend did parse from its declaration and the callee is then inlined like
+any other. A formal carrying any other attribute PSyclone does not model --
+``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
+``InlineTrans``'s words. Types agreeing is a scored judgement rather than
+an identity: a literal actual stating no kind, an actual whose type PSyclone cannot
 resolve, and an array section against a formal argument PSyclone holds only
 a partial type for are each a weaker match than an exact one rather than no
 match, and a call to a generic interface takes the strongest match among its
@@ -4870,6 +4876,32 @@ meaning of is read as one by the frontend, and resolving it can reach a
 datum and raise :py:exc:`TypeError` rather than refuse. That too is a
 refusal here, so that :py:meth:`validate` declines a kernel it cannot
 capture instead of raising out of PSyclone.
+
+**A TARGET formal is inlinable; another unmodelled attribute is not.** A
+dummy argument declared ``target`` reaches the PSyIR as an
+:py:class:`~psyclone.psyir.symbols.UnsupportedFortranType`, and
+``InlineTrans`` refuses a routine having an argument of a type it does not
+model, because it cannot tell whether binding the formal to the actual is
+enough. ``TARGET`` is the case where it is: the attribute says only that a
+pointer somewhere may be aimed at the actual, and an inlined body creates no
+pointer and invalidates none. So before the callee is inlined, a formal
+whose declaration carries nothing beyond its type, its shape, its ``INTENT``
+and ``TARGET`` is given the partial datatype the frontend parsed out of that
+declaration, and the refusal has nothing left to fire on. The rewrite is
+made on the copy of the callee the capture works on, so a later capture of
+another kernel calling the same helper meets the routine as its own module
+declares it.
+
+Nothing else is relaxed with it. ``permit_unsupported_type_args`` is not
+passed, so a formal declared ``POINTER``, ``ALLOCATABLE``, ``OPTIONAL`` or
+``VALUE`` -- or ``TARGET`` together with one of them -- is left as it is and
+refused in ``InlineTrans``'s own words. This is what puts LFRic's
+``subgrid_vertical_support_mod`` helpers, whose read column is declared
+``real(kind=r_tran), target, intent(in) :: field(nlayers)``, past that
+refusal; those particular routines then meet a second one, for the local
+``real(kind=r_tran), pointer :: field_ptr(:)`` they aim at either the column
+or a logarithm of it, which is a pointer this transformation does not
+reproduce and does not pretend to.
 
 **Actual and formal types agreeing is scored, not identical.**
 :py:meth:`~psyclone.psyir.nodes.Call.get_callee` scores each candidate
