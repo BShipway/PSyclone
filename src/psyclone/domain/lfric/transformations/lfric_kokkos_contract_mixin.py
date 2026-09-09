@@ -607,7 +607,6 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         for symbol in sorted(locals_, key=lambda symbol: symbol.name):
             cls._validate_cxx_name(symbol, "local")
 
-        cls._validate_alias_spaces(schedule)
         aliases = cls._alias_targets(schedule)
         for symbol in table.automatic_datasymbols:
             if not symbol.is_array:
