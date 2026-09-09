@@ -4264,7 +4264,19 @@ brings that constant with it. A function used this way is in scope whether
 or not the frontend could tell it from an array: ``selector(face)`` in an
 expression leaves the name an unspecialised symbol, and a ``Call``'s callee
 is treated as the routine it is. A callee whose module is not on the search
-path is out of scope, PSyclone having a name for it and no body. Being in
+path is out of scope, PSyclone having a name for it and no body. A procedure the
+callee itself calls is in scope on the same terms, and a call it makes to a
+sibling of its own module is settled before it travels: the sibling's
+statements are put in the call's place in the module the two share, so
+``crosses_panel_edge``'s call to ``rotated_panel_neighbour`` reaches the
+kernel as the arithmetic it stood for rather than as a name the kernel's
+container has nothing to bind. A sibling that cannot be substituted -- one
+declaring a static local, say -- leaves its call where the file put it, and
+the refusal that follows names it. Data of the callee's module is not in
+scope and is not brought into it by this: ``chi2xyz``, which reads a
+rotation matrix its module keeps at run time, is still refused for that
+datum, a named constant being the only thing that crosses a container
+boundary. Being in
 scope is not being inlinable, and the rest of the judgement is PSyclone's
 rather than this transformation's: a callee reading data private to its own
 module, one whose declarations depend on an argument the call site writes to
