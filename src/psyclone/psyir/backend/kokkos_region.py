@@ -309,6 +309,42 @@ class KokkosView:
 
 
 @dataclass(frozen=True)
+class KokkosAlias:
+    """A View handle standing in for a Fortran pointer that aliases an array.
+
+    A ``real(kind=r_tran), pointer :: p(:)`` a routine aims at one whole
+    array or another is not storage: it is a second name for storage
+    something else owns, and every read through it is a read of the array it
+    was last aimed at. A Kokkos ``View`` is the same thing -- a handle whose
+    copy shares the elements of the original -- so the Fortran is generated
+    by declaring one more handle and assigning the target's to it, and the
+    subscripts the body writes through the pointer need no rewriting at all.
+
+    The handle is declared as the ``decltype`` of its first target rather
+    than with the template arguments spelt out. A target may be an argument
+    View, in ``MemorySpace`` with the ``Unmanaged`` or ``ReadOnly`` traits, or
+    a scratch array, in ``ScratchSpace``; the two are different C++ types and
+    only the target itself names which one this alias is. Spelling it that
+    way also keeps the declaration right when the traits a View is given
+    change, since it is not a second copy of them.
+
+    Every target is described elsewhere in the region -- as an argument or as
+    scratch -- and is named here only by the name that description carries.
+    """
+
+    #: The name the body knows the pointer by, which is the name the alias
+    #: handle is declared under.
+    name: str
+    #: The arrays the body aims the pointer at, in the order the body's
+    #: pointer assignments name them. The first is the one the declaration
+    #: takes its type from; all of them have to be the same C++ type for the
+    #: generated unit to compile, which is what
+    #: :py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter._validate_alias`
+    #: checks before it is written.
+    targets: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class KokkosColourMap:
     """Where a coloured launch finds the mesh cell each of its indices names.
 
@@ -444,8 +480,14 @@ class KokkosRegion:
     #: iteration writes one dof and no two iterations write the same one, so
     #: there is no shared write for either answer to make safe.
     dof: bool = False
+    #: The pointer locals of the body that alias a whole array, each with
+    #: the arrays it is aimed at. Empty for every region captured before
+    #: aliasing was described, which is why it is last and defaulted: such a
+    #: region declares no alias handle and generates the source it generated
+    #: then, byte for byte.
+    aliases: Tuple[KokkosAlias, ...] = ()
 
 
-__all__ = ["KokkosColourMap", "KokkosRegion", "KokkosScalar",
+__all__ = ["KokkosAlias", "KokkosColourMap", "KokkosRegion", "KokkosScalar",
            "KokkosView", "extent_names", "is_extent", "is_identifier",
            "is_offset"]

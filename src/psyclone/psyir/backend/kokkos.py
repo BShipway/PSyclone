@@ -12,6 +12,8 @@ this module's name is the one every caller and every test imports those
 records by and moving them was not meant to move that.
 """
 
+from dataclasses import replace
+
 from psyclone.psyir.backend.c import CWriter
 from psyclone.psyir.backend.c_intrinsics_mixin import (
     INTEGER_INTRINSIC_ALTERNATIVES)
@@ -22,7 +24,7 @@ from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.backend.kokkos_region import (
-    KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView,
+    KokkosAlias, KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView,
     extent_names, is_extent, is_identifier, is_offset)
 from psyclone.psyir.backend.kokkos_team_scalars import (
     team_private_scalars)
@@ -122,6 +124,16 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         # ``x_new(k)`` and ``mr_v(df)`` by one lookup.
         self._views.update({item.name: item for item in region.scratch})
         self._views.update({item.name: item for item in region.constants})
+        # An alias is a second name for an array already in the table, so it
+        # joins the table as a copy of that array's description under its own
+        # name. That is what makes ``p(k)`` subscript the View the pointer
+        # was aimed at, with the origin the target's declaration carries: an
+        # alias has no origin of its own to apply, and applying the wrong one
+        # would compile and return the wrong answer.
+        self._views.update({
+            alias.name: replace(self._views[alias.targets[0]],
+                                name=alias.name)
+            for alias in region.aliases})
         self._kind_types = dict(region.kind_types)
         self._parallel_loops = region.parallel_loops
 
@@ -150,8 +162,15 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         # TeamThreadRange lambda. The hierarchical one does not: its body sits
         # directly in the functor, as the range shape's does.
         scratch_names = {item.name for item in region.scratch}
+        alias_names = {alias.name for alias in region.aliases}
         self._depth = 3 if region.scratch and not region.parallel_loops else 2
-        local_declarations = "".join(
+        # Ahead of the locals and after the scratch constructions each launch
+        # shape emits, because the declaration reads its target's type and a
+        # scratch target does not exist until its View has been constructed.
+        alias_declarations = "".join(
+            f"{self._nindent}decltype({alias.targets[0]}) {alias.name};\n"
+            for alias in region.aliases)
+        local_declarations = alias_declarations + "".join(
             self.gen_local_variable(symbol)
             for symbol in region.schedule.symbol_table.automatic_datasymbols
             # A scratch array is declared as a View over team scratch, so its
@@ -165,7 +184,12 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             # private one, because the outer uses still need something to
             # name; which of the two a symbol is is decided by
             # ``team_private_scalars`` and not here.
+            # An alias is declared above as a handle of its target's type,
+            # so its symbol must not also be declared here: the pointer's
+            # PSyIR datatype is an array of deferred shape, which
+            # ``gen_declaration`` renders as a pointer to nothing.
             if symbol.name not in scratch_names
+            and symbol.name not in alias_names
             and symbol.name not in private_names)
         if region.cell_position is not None:
             # First, and prepended here rather than in each launch shape: all
@@ -264,6 +288,39 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             headers.append("<algorithm>")
         return "".join(f"#include {header}\n" for header in headers) + "\n"
 
+    def assignment_node(self, node) -> str:
+        """Emit a pointer assignment as a View handle copy.
+
+        ``p => x`` is not a statement about values: it aims a second name at
+        the storage ``x`` names, so that every later read of ``p(k)`` reads
+        ``x(k)``. A Kokkos ``View`` is reference-semantic, so the C++ that
+        says the same thing is the handle copy ``p = x;`` -- one word of
+        assignment, and nothing copied element by element.
+
+        It is written here rather than left to the writers below because
+        every one of them would say something else about it. The C writer
+        emits ``p = x;`` for the names alone and would be right by accident,
+        but a whole-array reference on the right of an assignment is an array
+        expression, so
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
+KokkosArrayExpressionMixin.assignment_node` would first lower it into the
+        loop nest that copies ``x`` into ``p`` element by element -- storage
+        the alias does not have, and a copy the Fortran did not ask for. So
+        the pointer case is answered before either of them is reached, and
+        the two references are written as the names they are: no subscript,
+        no origin, no lowering.
+
+        :param node: the assignment in the captured body.
+        :type node: :py:class:`psyclone.psyir.nodes.Assignment`
+
+        :returns: the handle copy for a pointer assignment, and whatever the
+            writers below make of any other assignment.
+        :rtype: str
+        """
+        if node.is_pointer:
+            return f"{self._nindent}{node.lhs.name} = {node.rhs.name};\n"
+        return super().assignment_node(node)
+
     def reference_node(self, node: Reference) -> str:
         """Emit a name, subscripting it where the region made it per-cell.
 
@@ -310,7 +367,8 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             in :py:attr:`_SUPPORTED_TYPES`, if a View's index offsets are
             not integers, if a :py:attr:`KokkosRegion.parallel_loops` entry is
             not a :py:class:`~psyclone.psyir.nodes.Loop`, if a constant is
-            not a :py:class:`KokkosConstant` of a supported C type, or if the
+            not a :py:class:`KokkosConstant` of a supported C type, if an
+            alias is not a :py:class:`KokkosAlias`, or if the
             region's
             :py:attr:`KokkosRegion.team_size` is neither ``None`` nor an
             ``int`` -- ``bool`` among them, since ``TeamPolicy(ncells, True)``
@@ -337,12 +395,14 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             contract :py:meth:`_validate_scratch` states; if a parallel loop
             is not in the region's schedule, is nested inside another of them,
             or has a step other than the literal ``1``; if a constant has no
-            values or is not one dimensional; or if the team size is not
-            positive.
+            values or is not one dimensional; if an alias breaks the
+            contract :py:meth:`_validate_alias` states; or if the team size
+            is not positive.
         """
         # A validator is a list of checks, and reads better as one than as an
         # arbitrary split into halves that share every name they compute.
         # pylint: disable=too-many-branches, too-many-statements
+        # pylint: disable=too-many-locals
         if not isinstance(region, KokkosRegion):
             raise TypeError(
                 "KokkosWriter expects a KokkosRegion but found "
@@ -462,7 +522,86 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
                     f"Kokkos constant '{item.name}' must have at least one "
                     "value and exactly one index offset.")
 
+        # Last, because an alias names arrays the checks above described.
+        described_arrays = {
+            item.name: item
+            for item in (*region.arguments, *region.scratch)
+            if not isinstance(item, KokkosScalar)}
+        for alias in region.aliases:
+            self._validate_alias(alias, described_arrays, used_names)
+            used_names.add(alias.name)
+
         self._validate_launch(region)
+
+    @staticmethod
+    def _validate_alias(alias, arrays, used_names):
+        """Reject an alias the region could not correctly declare.
+
+        Each of these compiles, or fails to, a long way from the description
+        that caused it, and two of them do not fail at all. An alias sharing
+        a name with an argument or a scratch array declares a handle that
+        shadows it, so the body's every later use of that name reads the
+        alias; and an alias whose targets are of different rank or element
+        type generates a handle copy the compiler rejects with a template
+        error naming neither the pointer nor the region.
+
+        The targets' extents are deliberately not compared. Assigning one
+        View handle to another carries the target's extents with it, which is
+        exactly the Fortran's meaning: after ``p => x``, ``size(p)`` is
+        ``size(x)``.
+
+        :param alias: the alias to check.
+        :type alias: :py:class:`psyclone.psyir.backend.kokkos.KokkosAlias`
+        :param arrays: the region's arrays -- its View arguments and its
+            scratch -- keyed by name.
+        :type arrays: Dict[str, Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`]]
+        :param used_names: the names the region has already given something.
+        :type used_names: Set[str]
+
+        :raises TypeError: if ``alias`` is not a
+            :py:class:`KokkosAlias`.
+        :raises ValueError: if the alias's name is not a C++ identifier or is
+            one the region has already used; if it names no target; if a
+            target is not an array the region describes; if its targets do
+            not agree on element type and rank; or if it aliases an argument
+            and a scratch array together, which are Views of two different
+            spaces and so of two different C++ types.
+        """
+        if not isinstance(alias, KokkosAlias):
+            raise TypeError(
+                "KokkosRegion aliases must be KokkosAlias instances, found "
+                f"'{type(alias).__name__}'.")
+        if not is_identifier(alias.name):
+            raise ValueError(
+                f"Kokkos alias name '{alias.name}' is not a C++ identifier.")
+        if alias.name in used_names:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' has the name of an argument or "
+                "a scratch array it would shadow.")
+        if not alias.targets:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' names no array to alias.")
+        missing = [name for name in alias.targets if name not in arrays]
+        if missing:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' aliases "
+                f"{', '.join(sorted(set(missing)))}, which the region does "
+                "not describe as an array.")
+        shapes = {(arrays[name].c_type, len(arrays[name].extents))
+                  for name in alias.targets}
+        if len(shapes) > 1:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' aliases arrays of more than "
+                "one element type or rank, which no one handle can hold.")
+        if len({type(arrays[name]) for name in alias.targets}) > 1:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' aliases both an argument and a "
+                "scratch array, whose Views differ in more than element type "
+                "and rank: one is a View of the launch's scratch space and "
+                "the other of the space the region's data is in, and no one "
+                "handle can hold both.")
 
     def _validate_cell_position(self, region, formals, described):
         """Reject a cell position the region could not correctly declare.
@@ -761,7 +900,8 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             f"{view.data_name}, {extents});")
 
 
-__all__ = ["KokkosColourMap", "KokkosConstant", "KokkosRegion",
+__all__ = ["KokkosAlias", "KokkosColourMap", "KokkosConstant",
+           "KokkosRegion",
            "KokkosScalar",
            "KokkosScratch", "KokkosView",
            "KokkosWriter", "extent_names", "is_extent", "is_offset"]

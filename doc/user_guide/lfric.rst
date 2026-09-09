@@ -4297,7 +4297,9 @@ body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like
 any other. A formal carrying any other attribute PSyclone does not model --
 ``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
-``InlineTrans``'s words. Types agreeing is a scored judgement rather than
+``InlineTrans``'s words. A callee's own ``POINTER`` local is relaxed too
+where it only ever aims at a whole array, and becomes a ``View`` handle in
+the generated region; every other use of such a pointer is refused by name. Types agreeing is a scored judgement rather than
 an identity: a literal actual stating no kind, an actual whose type PSyclone cannot
 resolve, and an array section against a formal argument PSyclone holds only
 a partial type for are each a weaker match than an exact one rather than no
@@ -4918,10 +4920,42 @@ passed, so a formal declared ``POINTER``, ``ALLOCATABLE``, ``OPTIONAL`` or
 refused in ``InlineTrans``'s own words. This is what puts LFRic's
 ``subgrid_vertical_support_mod`` helpers, whose read column is declared
 ``real(kind=r_tran), target, intent(in) :: field(nlayers)``, past that
-refusal; those particular routines then meet a second one, for the local
-``real(kind=r_tran), pointer :: field_ptr(:)`` they aim at either the column
-or a logarithm of it, which is a pointer this transformation does not
-reproduce and does not pretend to.
+refusal. The local ``real(kind=r_tran), pointer :: field_ptr(:)`` those
+routines aim at either the column or a logarithm of it is the subject of the
+next rule.
+
+**A local POINTER aiming at whole arrays is a View handle.** A helper that
+declares ``real(kind=r_def), pointer :: p(:)``, aims it at one whole array
+or another, and then reads ``p(k)`` is not using the pointer as storage. It
+is giving one array a second name, and every ``p(k)`` after ``p => x`` reads
+``x(k)``. A Kokkos ``View`` says the same thing: a ``View`` handle assigned
+from another names the same elements, so the whole of the translation is
+``p = x;`` and the subscripts are left as the Fortran wrote them.
+
+So a local declared with ``POINTER`` and nothing else PSyclone cannot model
+is re-declared, before ``InlineTrans`` sees it, as an array of the type its
+declaration was parsed into -- which is what lets the routine be inlined at
+all, since a local of a type ``InlineTrans`` cannot place is a refusal of
+the whole callee -- and the region records it as an alias of the arrays it
+is aimed at. The generated region declares it ``decltype(x) p;`` for the
+first of those arrays and writes each pointer assignment as a handle
+assignment. This is what carries the
+``subgrid_vertical_support_mod`` shape, ``field_ptr => log_field`` in one
+branch of a flag and ``field_ptr => field`` in the other.
+
+Everything outside that equivalence is refused by name, because a ``View``
+handle does not reproduce it: a target that is a section or an expression,
+which aims the pointer at part of an array rather than at the array;
+``associated``, which asks a question a ``View`` has no answer to;
+``allocate`` or ``deallocate``, which make the pointer storage of its own;
+a statement PSyclone could not model naming the pointer, ``nullify`` among
+them, which may do either without saying so; the pointer passed as an actual
+argument, which hands the question to a routine this cannot read; targets
+differing in intrinsic, kind or rank, which are more than one handle can
+hold; and targets of which one is a kernel argument and another a
+kernel-local array, since the first is a ``View`` of the space the region's
+data is in and the second a ``View`` of the launch's scratch, and no one
+handle can hold both.
 
 **Actual and formal types agreeing is scored, not identical.**
 :py:meth:`~psyclone.psyir.nodes.Call.get_callee` scores each candidate
