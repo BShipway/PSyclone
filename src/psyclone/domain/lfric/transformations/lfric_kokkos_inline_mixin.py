@@ -190,10 +190,13 @@ class LFRicKokkosInlineMixin:
         been moved out of it.
 
         Each callee is prepared before it is inlined: brought into the
-        Container the call is made from by :py:meth:`_module_inline`, and
-        then relaxed by :py:meth:`_relax_target_arguments`, which gives a
-        formal declared ``TARGET`` the type the frontend parsed out of that
-        declaration.
+        Container the call is made from by :py:meth:`_module_inline`, then
+        relaxed by :py:meth:`_relax_target_arguments`, which gives a formal
+        declared ``TARGET`` the type the frontend parsed out of that
+        declaration, and then by
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`, which does the
+        same for a local ``POINTER`` that only ever aliases a whole array.
 
         :param schedule: the kernel schedule to rewrite in place.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
@@ -211,6 +214,10 @@ class LFRicKokkosInlineMixin:
             named in the message. This is what keeps ``validate`` raising only
             ``TransformationError``, so a kernel the inliner cannot handle is
             declined rather than aborting the caller.
+        :raises TransformationError: if a callee declares a pointer local
+            that is not an alias of whole arrays, by
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
         :raises TransformationError: if calls are still left after
             :py:attr:`_INLINE_LIMIT` of them have been inlined, which is what
             a self-recursive callee looks like from here.
@@ -223,6 +230,7 @@ class LFRicKokkosInlineMixin:
             name = cls._callee_name(call)
             refusal = cls._module_inline(call)
             cls._relax_target_arguments(call)
+            cls._alias_locals(call)
             try:
                 InlineTrans().apply(call)
             # Every failure to inline is a refusal, whatever its class: see

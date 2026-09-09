@@ -13,7 +13,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosColourMap, KokkosConstant, KokkosRegion, KokkosScalar,
+    KokkosAlias, KokkosColourMap, KokkosConstant, KokkosRegion, KokkosScalar,
     KokkosScratch, KokkosView, KokkosWriter, extent_names, is_extent,
     is_offset)
 from psyclone.psyir.backend.kokkos_launch import (
@@ -3914,3 +3914,158 @@ def test_kokkos_writer_rejects_a_first_cell_that_is_not_an_argument():
 
     assert ("First cell 'first_cell' is not a scalar argument."
             in str(error.value))
+
+
+def _alias_schedule():
+    """Create a scratch body choosing between its two arrays by a pointer.
+
+    ``_scratch_schedule``'s two sweeps with a choice between them, which is
+    the shape LFRic's vertical-support helpers have once inlined: the columns
+    are worked out, one of them is picked, and everything after reads the
+    pick. The ``POINTER`` declaration is what the frontend cannot model, so
+    the local arrives as an ``UnsupportedFortranType`` and the region has to
+    say what it is rather than the writer reading it off the symbol.
+    """
+    source = """
+subroutine tri_solve_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only : i_def, r_double
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  real(kind=r_double), dimension(nlayers) :: x_new, tri_plus_new
+  real(kind=r_double), pointer :: chosen(:)
+  do k = 1, nlayers
+    x_new(k) = x(map(1) + k - 1)
+    tri_plus_new(k) = x_new(k) * 2.0_r_double
+  end do
+  if (nlayers > 2) then
+    chosen => tri_plus_new
+  else
+    chosen => x_new
+  end if
+  do k = nlayers, 1, -1
+    y(map(1) + k - 1) = chosen(k)
+  end do
+end subroutine tri_solve_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "tri_solve_code", symbol_table=symbol_table, children=children)
+
+
+def _alias_region(**overrides):
+    """Return a scratch region one of whose locals is a View handle.
+
+    :param overrides: fields to replace on the region.
+    :type overrides: unwrapped dict
+
+    :returns: the region with an alias.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    region = replace(
+        _scratch_region(),
+        schedule=_alias_schedule(),
+        aliases=(KokkosAlias(
+            name="chosen", targets=("tri_plus_new", "x_new")),))
+    return replace(region, **overrides) if overrides else region
+
+
+def test_kokkos_alias_is_declared_and_assigned_as_a_handle():
+    """A pointer aliasing a whole array becomes a View handle copy.
+
+    Three separate answers meet in this one region and none of them follows
+    from the others. The declaration takes its type from the first target
+    with ``decltype``, because an argument View and a scratch View are
+    different C++ types and the alias has to be whichever its targets are.
+    The pointer assignment is a plain handle assignment, which is Kokkos'
+    own semantics -- a copy of a View handle shares the original's elements
+    -- rather than anything the writer arranges. And the reads through the
+    alias keep the subscripts the Fortran wrote, since a handle carries the
+    target's extents and offsets with it.
+    """
+    code = KokkosWriter()(_alias_region())
+
+    assert "decltype(tri_plus_new) chosen;" in code
+    assert "chosen = tri_plus_new;" in code
+    assert "chosen = x_new;" in code
+    assert ("y((((map((1 - 1), cell) + k) - 1) - 1)) = chosen((k - 1));"
+            in code)
+    # A handle, not storage: the launch reserves nothing for it, and the two
+    # scratch arrays it may name are the only ones counted for.
+    assert "chosen_scratch_t" not in code
+    assert code.count("shmem_size") == 2
+
+
+def test_kokkos_alias_is_declared_after_the_scratch_it_names():
+    """The alias' declaration follows the constructions it reads a type from.
+
+    ``decltype`` needs its argument to have been declared, and the team
+    launches emit their scratch constructions before the body's local
+    declarations for exactly that reason. Asserted by position rather than
+    by presence, because a writer that emitted the two in the other order
+    would produce source with every statement of this test's other
+    assertions in it and no C++ compiler would accept.
+    """
+    code = KokkosWriter()(_alias_region())
+
+    assert code.index(
+        "tri_plus_new_scratch_t tri_plus_new(") < code.index(
+            "decltype(tri_plus_new) chosen;")
+
+
+@pytest.mark.parametrize(
+    "alias, message",
+    [(KokkosAlias(name="chosen while", targets=("x_new",)),
+      "Kokkos alias name 'chosen while' is not a C++ identifier."),
+     (KokkosAlias(name="x_new", targets=("tri_plus_new",)),
+      "Kokkos alias 'x_new' has the name of an argument or a scratch array "
+      "it would shadow."),
+     (KokkosAlias(name="chosen", targets=()),
+      "Kokkos alias 'chosen' names no array to alias."),
+     (KokkosAlias(name="chosen", targets=("x_new", "absent")),
+      "Kokkos alias 'chosen' aliases absent, which the region does not "
+      "describe as an array."),
+     (KokkosAlias(name="chosen", targets=("x_new", "map")),
+      "Kokkos alias 'chosen' aliases arrays of more than one element type "
+      "or rank, which no one handle can hold."),
+     (KokkosAlias(name="chosen", targets=("x_new", "y")),
+      "Kokkos alias 'chosen' aliases both an argument and a scratch array"),
+     ])
+def test_kokkos_writer_rejects_a_broken_alias(alias, message):
+    """Each way of describing an alias wrongly is refused where it is said.
+
+    Not one of the six stops a build on its own. A name that is not an
+    identifier and a name that shadows a scratch array both generate C++ --
+    the second silently redirects every later read of the shadowed name --
+    and the three that disagree about the target generate a template error
+    naming neither the alias nor the region it came from.
+    """
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(_alias_region(aliases=(alias,)))
+
+    assert message in str(error.value)
+
+
+def test_kokkos_writer_rejects_an_alias_that_is_not_one():
+    """A region's aliases are KokkosAlias instances and are checked to be."""
+    with pytest.raises(TypeError) as error:
+        KokkosWriter()(_alias_region(aliases=("chosen",)))
+
+    assert ("KokkosRegion aliases must be KokkosAlias instances, found 'str'."
+            in str(error.value))
+
+
+def test_kokkos_region_has_no_aliases_unless_it_is_given_them():
+    """The alias field is optional, so every region without one is unchanged.
+
+    Asserted against the region the backend's other three hundred checks are
+    written over: a default that was not empty would change all of them, and
+    a writer that emitted something for an empty tuple would change the
+    generated source of every region the prototype has captured so far.
+    """
+    assert _region().aliases == ()
+    assert "decltype" not in KokkosWriter()(_region())

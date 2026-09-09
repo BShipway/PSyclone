@@ -403,6 +403,14 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
 lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         to say so.
 
+        A pointer assignment is excluded before any of that. ``p => a`` is
+        written with two whole arrays and so reads as array-valued, but it
+        copies no elements: it gives ``p`` a second name for the storage
+        ``a`` owns, which the back end writes as a ``View`` handle copy.
+        Lowering it to a loop would turn an alias into a copy, and
+        ``Reference2ArrayRangeTrans`` refuses to subscript inside one in any
+        case.
+
         :param assignment: the assignment to judge.
         :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
 
@@ -410,6 +418,8 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
             this assignment.
         :rtype: bool
         """
+        if assignment.is_pointer:
+            return False
         if isinstance(assignment.rhs, ArrayConstructor):
             return False
         if cls._written_as_a_nest(assignment):
@@ -572,7 +582,10 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
             :py:attr:`_CXX_KEYWORDS`.
         :raises TransformationError: if a local array's kind is not one
             :py:attr:`_C_TYPES` maps, or if one of its extents is not a
-            kernel argument, so the scratch View could not be sized.
+            kernel argument, so the scratch View could not be sized. A local
+            that aliases another array is not asked either question: it is a
+            ``View`` handle rather than storage, so there is no scratch to
+            size and no element type of its own to name.
         """
         table = schedule.symbol_table
         names = {symbol.name for symbol in table.argument_list}
@@ -594,8 +607,15 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         for symbol in sorted(locals_, key=lambda symbol: symbol.name):
             cls._validate_cxx_name(symbol, "local")
 
+        cls._validate_alias_spaces(schedule)
+        aliases = cls._alias_targets(schedule)
         for symbol in table.automatic_datasymbols:
             if not symbol.is_array:
+                continue
+            # An alias is a second name for an array described elsewhere, so
+            # it needs no scratch of its own and has no extent to size one
+            # with: its declaration is deferred-shape by construction.
+            if symbol.name in aliases:
                 continue
             if cls._c_type(symbol) is None:
                 raise TransformationError(

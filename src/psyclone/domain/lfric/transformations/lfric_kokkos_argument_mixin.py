@@ -119,7 +119,7 @@ from psyclone.domain.lfric import KernCallArgList
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosView)
+    KokkosAlias, KokkosRegion, KokkosScalar, KokkosView)
 from psyclone.psyir.nodes import (
     ArrayReference, BinaryOperation, Call, IntrinsicCall, Literal, Reference,
     Routine)
@@ -619,11 +619,40 @@ LFRicKokkosTrans.apply` makes.
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
             scratch=cls._scratch_arrays(schedule, renames),
+            aliases=cls._region_aliases(schedule, renames),
             parallel_loops=cls._parallel_loops(schedule),
             team_size=(options or {}).get(cls._TEAM_SIZE_OPTION))
         actuals.extend(actual.copy() for _, actual in storage.values())
         actuals.extend(colour_actuals)
         return region, actuals, constants
+
+    @classmethod
+    def _region_aliases(cls, schedule, renames):
+        """Describe every pointer local of the body as a View handle.
+
+        The pointer is one
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
+        the callee was inlined, and the arrays it is aimed at are described
+        elsewhere in this region already -- as View arguments where they are
+        the kernel's formals, and as scratch where they are its locals. Only
+        the names are carried here, and a target that a per-cell size renamed
+        is carried under the name the region gave it, since that is the name
+        the generated declaration has to say.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param dict[str, str] renames: the new name of each per-cell size.
+
+        :returns: one description per aliasing pointer, in declaration order.
+        :rtype: tuple[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosAlias`, ...]
+        """
+        return tuple(
+            KokkosAlias(name=name,
+                        targets=tuple(renames.get(target, target)
+                                      for target in targets))
+            for name, targets in cls._alias_targets(schedule).items())
 
     @classmethod
     def _scratch_arrays(cls, schedule, renames):

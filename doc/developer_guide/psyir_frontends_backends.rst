@@ -939,6 +939,37 @@ and scratch through one table without a type test; a scratch symbol is
 skipped when the kernel's locals are declared, since it is already declared
 as its View.
 
+Aliased Views
+~~~~~~~~~~~~~
+
+A `KokkosAlias` names a second handle on arrays the region already
+describes: a `name` and the `targets`, in the order the body aims at them,
+that a Fortran `POINTER` local is pointed at. It comes from a helper that
+declares `real(kind=r_def), pointer :: p(:)`, writes `p => x` and then reads
+`p(k)`, which is not storage but a second name for `x`, and a `View` handle
+says exactly that. `KokkosWriter` gives the alias the `KokkosView` of its
+first target under its own name, so `arrayreference_node` resolves `p(k)`
+through the same table as any other array and the subscripts need no
+special case; it declares it among the body's locals as
+`decltype(x) p;`, after the scratch declarations, since both team launches
+emit their constructions before the local declarations and a `decltype` of a
+scratch View has to follow the View it names. `assignment_node` then
+generates a pointer assignment -- an `Assignment` whose `is_pointer` is true
+-- as `p = x;` and nothing else, a `View` copy sharing the elements it was
+assigned from.
+
+The writer validates an alias as it validates the rest: the name must not
+collide with a described array or a local, there must be at least one
+target, every target must be a described array, and the targets must agree
+in element type and rank. They must also agree in *where* they live, which
+is a distinction only this description has to make -- an argument View is
+`Kokkos::View<T*, LayoutLeft, MemorySpace, Unmanaged>` and a scratch View
+`Kokkos::View<T*, LayoutLeft, ScratchSpace, Unmanaged>`, different C++ types
+that no one `decltype` handle can hold, so a pointer aimed at an argument in
+one branch and a kernel-local in another is refused rather than generated.
+`LFRicKokkosTrans` refuses the same shape earlier and in the kernel's own
+words; the writer's check is the back stop for a region described directly.
+
 Carried constants
 ~~~~~~~~~~~~~~~~~
 

@@ -7,6 +7,8 @@
 """Capture a supported LFRic loop as a Kokkos launch."""
 
 from psyclone.domain.lfric import LFRicLoop
+from psyclone.domain.lfric.transformations.lfric_kokkos_alias_mixin \
+    import LFRicKokkosAliasMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_argument_mixin \
     import LFRicKokkosArgumentMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_bounds_mixin import (
@@ -37,11 +39,12 @@ from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Twelve mixins and Transformation, which is one contract split by subject
-# rather than thirteen layers of behaviour: every base but the last holds only
+# Thirteen mixins and Transformation, which is one contract split by subject
+# rather than fourteen layers of behaviour: every base but the last holds only
 # private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
-class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
+class LFRicKokkosTrans(LFRicKokkosAliasMixin,
+                       LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosArgumentMixin, LFRicKokkosBoundsMixin,
                        LFRicKokkosCallMixin,
                        LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,

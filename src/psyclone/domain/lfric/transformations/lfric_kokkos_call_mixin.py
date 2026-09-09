@@ -111,7 +111,9 @@ class LFRicKokkosCallMixin:
         Each one becomes a scratch View private to the team rank running the
         cell, which is what makes the region's per-cell temporaries per-cell.
         A scalar local needs none of this and is declared in the region body,
-        so only arrays appear here.
+        so only arrays appear here, and an aliasing pointer does not: it is a
+        second name for storage something else owns and is described by
+        :py:meth:`_region_aliases` instead.
 
         :py:meth:`_validate_locals` has already refused anything this could
         not describe.
@@ -124,8 +126,15 @@ class LFRicKokkosCallMixin:
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`, ...]
         """
         scratch = []
+        aliases = cls._alias_targets(schedule)
         for symbol in schedule.symbol_table.automatic_datasymbols:
             if not symbol.is_array:
+                continue
+            # An alias owns no storage: it is described by
+            # ``_region_aliases`` as a handle over an array described here or
+            # among the region's arguments, and reserving scratch for it as
+            # well would reserve a column nothing ever reads.
+            if symbol.name in aliases:
                 continue
             extents = cls._extents(symbol)
             scratch.append(KokkosScratch(
