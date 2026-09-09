@@ -435,12 +435,17 @@ def test_lfric_kokkos_trans_reports_an_unwritable_shape(
         unwritable_shape_target):
     """A declared shape the C writer cannot render is refused, not raised.
 
-    ``dimension(max(nlayers,1))`` is what ffsl_flux_z_nirvana_kernel_mod
-    declares, and MAX has no C operator: the writer's own failure is a
-    ``VisitorError``, which ``validate`` may not raise, so a caller asking
-    whether the loop was capturable got an exception of the wrong type from
-    inside the backend instead of an answer. The refusal names the array and
-    carries the writer's reason.
+    ``dimension(modulo(nlayers,3))`` has no C spelling -- C's ``%`` is MOD,
+    which differs from MODULO for a negative operand -- so the writer's own
+    failure is a ``VisitorError``, which ``validate`` may not raise. A caller
+    asking whether the loop was capturable would otherwise get an exception of
+    the wrong type from inside the backend instead of an answer. The refusal
+    names the array and carries the writer's reason.
+
+    The shape this was found with, ``dimension(max(nlayers,1))`` in
+    ffsl_flux_z_nirvana_kernel_mod, is now written as ``std::max`` and is
+    asserted by ``test_lfric_kokkos_trans_accepts_an_integer_maximum_shape``
+    below.
     """
     _, loop, _ = unwritable_shape_target
 
@@ -448,3 +453,30 @@ def test_lfric_kokkos_trans_reports_an_unwritable_shape(
         LFRicKokkosTrans().validate(loop)
 
     assert "declared shape of 'swept' as C" in str(error.value)
+
+
+def test_lfric_kokkos_trans_accepts_an_integer_maximum_shape(
+        maximum_shape_target):
+    """``dimension(max(nlayers-1,1))`` is carried, not refused.
+
+    This is the GungHo shape the refusal above was found with:
+    ffsl_flux_z_nirvana_kernel_mod declares
+    ``field_local_upper(MAX(nlayers-monotone_above,1), 3)``. C has no integer
+    maximum, so the C writer spells one ``std::max``; the extent is therefore
+    a call rather than arithmetic, and two things follow that this asserts.
+    The scratch is sized by the call, on the host, where the request is made
+    and the View is constructed; and the launch is told to evaluate
+    ``nlayers`` alone, not ``std`` or ``max``, which a grammar reading the
+    call as a name list would have demanded as kernel arguments.
+    """
+    _, loop, kernel = maximum_shape_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    symbol = schedule.symbol_table.lookup("swept")
+
+    assert LFRicKokkosTrans._extents(symbol) == ("std::max((nlayers - 1), 1)",)
+    assert LFRicKokkosTrans._extent_names(symbol) == {"nlayers"}
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "#include <algorithm>" in cpp
+    assert "swept_scratch_t::shmem_size(std::max((nlayers - 1), 1))" in cpp

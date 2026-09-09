@@ -53,8 +53,9 @@ operator that becomes the ``pow`` function or, for a small integer exponent,
 the multiplication tree of
 :py:mod:`psyclone.psyir.backend.c_integer_power`, and ``ABS``, ``MOD``,
 ``MAX`` and ``MIN`` are chosen by the argument's type through
-:py:data:`REAL_INTRINSIC_ALTERNATIVES` because Fortran overloads on it and C
-does not. Splitting operators from intrinsics would put both halves of each
+:py:data:`REAL_INTRINSIC_ALTERNATIVES` and
+:py:data:`INTEGER_INTRINSIC_ALTERNATIVES` because Fortran overloads on it and
+C does not. Splitting operators from intrinsics would put both halves of each
 of those decisions in different modules.
 
 Everything here is inherited rather than instantiated: the mixin holds no
@@ -79,11 +80,24 @@ REAL_INTRINSIC_ALTERNATIVES = {
     IntrinsicCall.Intrinsic.MIN: "fmin",
     }
 
+#: The C++ spelling of the two intrinsics C has no integer form of.
+#: ``fmax`` returns a ``double``, so an integer maximum written with it would
+#: be computed in floating point and converted back, and the conditional
+#: expression that avoids that would evaluate its arguments twice.
+#: ``std::max`` is a template and does neither. It is C++ rather than C,
+#: which is what this writer's output is compiled as; it needs
+#: ``<algorithm>``, which the Kokkos back-end includes in a region that
+#: carries one.
+INTEGER_INTRINSIC_ALTERNATIVES = {
+    IntrinsicCall.Intrinsic.MAX: "std::max",
+    IntrinsicCall.Intrinsic.MIN: "std::min",
+    }
 
-def _is_real_argument(node):
-    '''Whether an intrinsic's argument is known to be of real type.
 
-    Deliberately answers "no" rather than raising, for every reason it
+def _scalar_intrinsic(node):
+    '''The scalar type an intrinsic's argument is known to have.
+
+    Deliberately answers ``None`` rather than raising, for every reason it
     might not know: an :py:class:`UnresolvedType`, an
     :py:class:`UnsupportedFortranType`, or a ``datatype`` property that
     raises on a tree the caller assembled by hand. The kind-blind default
@@ -94,16 +108,50 @@ def _is_real_argument(node):
     :param node: the argument to inspect.
     :type node: :py:class:`psyclone.psyir.nodes.DataNode`
 
-    :returns: whether its datatype is a real scalar.
-    :rtype: bool
+    :returns: the intrinsic of its scalar datatype, or ``None`` where it is
+        not a scalar or where its type is not known.
+    :rtype: Optional[:py:class:`psyclone.psyir.symbols.ScalarType.Intrinsic`]
 
     '''
     try:
         datatype = node.datatype
     except Exception:                            # pylint: disable=W0703
-        return False
-    return (isinstance(datatype, ScalarType) and
-            datatype.intrinsic == ScalarType.Intrinsic.REAL)
+        return None
+    if not isinstance(datatype, ScalarType):
+        return None
+    return datatype.intrinsic
+
+
+def _is_real_argument(node):
+    '''Whether an intrinsic's argument is known to be of real type.
+
+    Answers "no" rather than raising for every reason the type might not be
+    known; see :py:func:`_scalar_intrinsic`.
+
+    :param node: the argument to inspect.
+    :type node: :py:class:`psyclone.psyir.nodes.DataNode`
+
+    :returns: whether its datatype is a real scalar.
+    :rtype: bool
+
+    '''
+    return _scalar_intrinsic(node) is ScalarType.Intrinsic.REAL
+
+
+def _is_integer_argument(node):
+    '''Whether an intrinsic's argument is known to be of integer type.
+
+    Answers "no" rather than raising for every reason the type might not be
+    known; see :py:func:`_scalar_intrinsic`.
+
+    :param node: the argument to inspect.
+    :type node: :py:class:`psyclone.psyir.nodes.DataNode`
+
+    :returns: whether its datatype is an integer scalar.
+    :rtype: bool
+
+    '''
+    return _scalar_intrinsic(node) is ScalarType.Intrinsic.INTEGER
 
 
 class CIntrinsicsMixin:
@@ -375,12 +423,11 @@ class CIntrinsicsMixin:
 
         # Define a map with the intrinsic string and the formatter function
         # associated with each Intrinsic. MAX and MIN are deliberately absent:
-        # they are reached only through REAL_INTRINSIC_ALTERNATIVES below, so
-        # that an integer MAX raises rather than being written wrongly. C has
-        # no standard integer maximum, fmax returns a double, and a
-        # conditional expression would evaluate its arguments twice. The
-        # refusal is this writer's alone: Kokkos::max and Kokkos::min are
-        # type-generic, so KokkosWriter generates both.
+        # they are reached through REAL_INTRINSIC_ALTERNATIVES and
+        # INTEGER_INTRINSIC_ALTERNATIVES below, one spelling per type, so
+        # that a list whose type this writer cannot read throughout reaches
+        # the map, finds nothing, and raises rather than being written in
+        # whichever of the two the first argument happened to suggest.
         intrinsic_map = {
             IntrinsicCall.Intrinsic.MOD: ("%", binary_operator_format),
             IntrinsicCall.Intrinsic.SIGN: ("copysign", function_format),
@@ -408,12 +455,22 @@ class CIntrinsicsMixin:
         # to be real, falls through to the map; if the intrinsic is not there
         # either, raise an Error.
         alternative = REAL_INTRINSIC_ALTERNATIVES.get(node.intrinsic)
+        integer = INTEGER_INTRINSIC_ALTERNATIVES.get(node.intrinsic)
         if alternative and _is_real_argument(node.arguments[0]):
             opstring = alternative
             formatter = (fold_format
                          if node.intrinsic in (IntrinsicCall.Intrinsic.MAX,
                                                IntrinsicCall.Intrinsic.MIN)
                          else function_format)
+        # Every argument, where the real forms above read the first alone:
+        # std::max deduces one type from all of them, so a list mixing an
+        # integer with anything else would compile as whichever type won and
+        # be a bound the kernel did not declare. The real path is left
+        # reading the first argument because narrowing it would refuse
+        # expressions the back-end writes today.
+        elif integer and all(_is_integer_argument(argument)
+                             for argument in node.arguments):
+            opstring, formatter = integer, fold_format
         else:
             try:
                 opstring, formatter = intrinsic_map[node.intrinsic]
@@ -425,4 +482,5 @@ class CIntrinsicsMixin:
         return formatter(opstring, [self._visit(ch) for ch in node.arguments])
 
 
-__all__ = ["CIntrinsicsMixin", "REAL_INTRINSIC_ALTERNATIVES"]
+__all__ = ["CIntrinsicsMixin", "INTEGER_INTRINSIC_ALTERNATIVES",
+           "REAL_INTRINSIC_ALTERNATIVES"]

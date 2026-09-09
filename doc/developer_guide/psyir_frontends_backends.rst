@@ -453,12 +453,31 @@ by hand. A caller probing the writer with synthetic arguments is asking which
 intrinsics it supports rather than what one particular expression is, so the
 kind-blind path has to stay reachable rather than becoming an error.
 
-Integer `MAX` and `MIN` are refused rather than translated, which is why
-neither has a table entry and both are reachable only through the real
-dispatch. C has no standard integer maximum, `fmax` returns a double, and a
-conditional expression would evaluate its arguments twice. The refusal is
-this writer's alone: `Kokkos::max` and `Kokkos::min` are type-generic, so
-`KokkosWriter` overrides `intrinsiccall_node` and generates both.
+`MAX` and `MIN` have a second alternative, in
+`INTEGER_INTRINSIC_ALTERNATIVES`, because C has no integer maximum to put in
+the table: an integer `MAX` becomes `std::max` and an integer `MIN`
+`std::min`, folded right to left as the real forms are, so `MAX(i, j, k)`
+becomes `std::max(i, std::max(j, k))`. `fmax` would compute an integer
+maximum in floating point and convert it back, and the conditional expression
+that avoids that would evaluate its arguments twice. Both are C++ rather than
+C and need `<algorithm>`, which `KokkosWriter` adds to the includes of a
+region carrying one and to no other.
+
+The two dispatches read their arguments differently, and deliberately. The
+real one reads the first argument, as it does for `ABS` and `MOD`; the
+integer one reads every argument, because `std::max` deduces one type from
+all of them, so a list mixing an integer with anything else would compile as
+whichever type won and give a value the kernel did not ask for. A list this
+writer cannot see to be integer throughout therefore reaches the table,
+finds nothing, and is refused. Neither `MAX` nor `MIN` has a table entry, and
+that is why: an entry would be one spelling for both types.
+
+An integer `MAX` in a declared bound is where this is reached from in
+practice -- `field_local_lower(MAX(monotone_above - 1, 1), 3)` is a GungHo
+shape -- and such a bound is rendered by `CWriter` and emitted into a Kokkos
+region's scratch request and View extents. `is_extent` in
+`psyclone.psyir.backend.kokkos_region` admits those two calls for that
+reason, and no others.
 
 A cast accepts a second argument and discards it. That argument is a Fortran
 kind, so `real(x, r_solver)` and `real(x, r_def)` are both `(double)x` here.
@@ -628,12 +647,29 @@ their argument's type: this writer reuses `_is_real_argument` from
 leaving an integer one to `CWriter`'s `%`.
 
 `MAX` and `MIN` are folded right to left into nested two-argument calls, so
-`max(a, b, c)` becomes `Kokkos::max(a, Kokkos::max(b, c))`. This is where the
-integer refusal described in the C back-end section above stops applying:
-`Kokkos::max` and `Kokkos::min` are templates, so one spelling serves both
-types and neither needs a table entry per type. A fold over fewer than two
-arguments raises a `VisitorError` rather than generating a call Kokkos has no
-overload for.
+`max(a, b, c)` becomes `Kokkos::max(a, Kokkos::max(b, c))`, for a real
+argument and an integer one alike: `Kokkos::max` and `Kokkos::min` are
+templates, so one spelling serves both types where `CWriter` needs `fmax` for
+one and `std::max` for the other. It is also the spelling a region's *body*
+must have, whereas an extent may be either. `std::max` is a constexpr host
+function, and `nvcc` refuses one from a `__device__` function unless
+`--expt-relaxed-constexpr` is passed -- which the accelerated build passes to
+every region compile, alongside `--expt-extended-lambda`. That matters
+because a scratch extent is emitted twice, once into the host's `shmem_size`
+request and once into the View constructed inside the `KOKKOS_LAMBDA`, so the
+second is device code. `psy-ir-aidev`'s CUDA gate builds a scratch
+View sized by `std::max` inside a `KOKKOS_LAMBDA` for `sm_90` and checks the
+object holds a cubin, so the lambda it was in really was device code.
+
+That gate reads the compiler's diagnostic rather than its exit status, and
+anything relying on this should do the same. In a `__global__` function the
+refusal is an error and `nvcc` exits 1; inside a `KOKKOS_LAMBDA` the
+enclosing `operator()` is `__host__ __device__`, and there `nvcc` emits
+warning #20013-D and exits 0 regardless. Without the flag the call is
+compiled as a host call from device code, silently.
+
+A fold over fewer than two arguments raises a
+`VisitorError` rather than generating a call Kokkos has no overload for.
 
 `FLOOR` and `NINT` keep the cast that `CWriter` wraps round them, since
 `Kokkos::floor` and `Kokkos::round` return a real just as their C

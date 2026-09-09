@@ -13,6 +13,8 @@ records by and moving them was not meant to move that.
 """
 
 from psyclone.psyir.backend.c import CWriter
+from psyclone.psyir.backend.c_intrinsics_mixin import (
+    INTEGER_INTRINSIC_ALTERNATIVES)
 from psyclone.psyir.backend.kokkos_array_expression import KokkosScratch
 from psyclone.psyir.backend.kokkos_array_expression_mixin import (
     KokkosArrayExpressionMixin)
@@ -206,8 +208,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         else:
             launch = range_launch(region, local_declarations, body)
 
-        return (
-            "#include <Kokkos_Core.hpp>\n\n"
+        unit = (
             f'extern "C" void {region.name}(\n'
             f"    {signature}) {{\n"
             # Kokkos does not treat an uninitialised runtime as an error: the
@@ -231,6 +232,37 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             f"{launch}"
             "  Kokkos::fence();\n"
             "}\n")
+        return f"{self._includes(unit)}{unit}"
+
+    @staticmethod
+    def _includes(unit):
+        """Return the ``#include`` lines the generated unit needs.
+
+        ``<Kokkos_Core.hpp>`` always, and ``<algorithm>`` for a region that
+        carries one of the standard-library calls the C writer spells an
+        integer ``MAX`` or ``MIN`` with. Which headers are needed is read
+        from the generated text rather than from the region's description,
+        because the description says what the region is made of and not which
+        of the writers' spellings that came out as: an integer maximum
+        reaches the unit through a declared bound, a scratch size and a View
+        extent alike, and each of those is a string by the time it is here.
+
+        A region carrying none of them gets the one line it always got, byte
+        for byte, since a header emitted unconditionally would rewrite every
+        capture already in the model for a call it does not make.
+
+        :param str unit: the generated translation unit, without its
+            includes.
+
+        :returns: the include lines, ending with the blank line that
+            separates them from the unit.
+        :rtype: str
+        """
+        headers = ["<Kokkos_Core.hpp>"]
+        if any(f"{call}(" in unit
+               for call in INTEGER_INTRINSIC_ALTERNATIVES.values()):
+            headers.append("<algorithm>")
+        return "".join(f"#include {header}\n" for header in headers) + "\n"
 
     def reference_node(self, node: Reference) -> str:
         """Emit a name, subscripting it where the region made it per-cell.
