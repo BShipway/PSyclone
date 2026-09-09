@@ -843,8 +843,12 @@ class Call(Statement, DataNode):
         :py:func:`~psyclone.psyir.nodes.argument_matching.match_argument`:
         zero where the types are the same and one where they agree only in
         what Fortran requires of them (a literal that states no kind, an
-        actual of unresolved type, or a section against a formal argument of
-        partially known type). The lowest-scoring candidate is returned. Since
+        actual of unresolved type, a section against a formal argument of
+        partially known type, or a pair of array kinds at least one of which
+        PSyclone cannot reduce to a value). Two array kinds it can both
+        reduce, and which differ, are no match at all: that is what tells the
+        specific procedures of an interface written over kinds apart. The
+        lowest-scoring candidate is returned. Since
         a relaxed comparison can make two candidates look alike, two of them
         tying on a non-zero score are reported as ambiguous rather than chosen
         between; two tying on a score of zero differ in something the PSyIR
