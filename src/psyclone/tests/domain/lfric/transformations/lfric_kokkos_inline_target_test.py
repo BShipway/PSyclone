@@ -15,7 +15,8 @@ from lfric_kokkos_sources import (
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.psyir.nodes import Call, IntrinsicCall, Loop
-from psyclone.psyir.transformations import TransformationError
+from psyclone.psyir.transformations import (
+    InlineTrans, TransformationError)
 
 
 # The same kernel passing a column of the local to a routine, which is how
@@ -282,3 +283,39 @@ def test_target_dummy_of_a_shared_helper_is_inlined_twice(
     for cpp in regions:
         assert "sweep_column" not in cpp
         assert "swept((nlayers - 1)) = partial((nlayers - 1));" in cpp
+
+
+# ---------------------------------------------------------------------------
+# Task E11: an inliner error is a refusal.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unexpected_inliner_error_is_a_refusal(
+        monkeypatch, target_dummy_target):
+    """Whatever ``InlineTrans`` raises, ``validate`` refuses with it.
+
+    ``validate`` answers one question -- can this loop be captured -- and a
+    caller asking it of every loop in a model reads a
+    :py:class:`~psyclone.psyir.transformations.TransformationError` as no and
+    anything else as a crash. The inliner reaches machinery that raises on
+    its own account, so the class of what it raises is not a list this mixin
+    can keep: a symbolic comparison the SymPy writer cannot render is a
+    ``VisitorError``, and a name that resolves to a datum a ``TypeError``.
+    Every one of them is a kernel that is not captured, which is a refusal.
+    ``ValueError`` stands for all of them here, and the message names its
+    class so that the reader is not left to guess what the text came from.
+    """
+    _, loop, _ = target_dummy_target
+
+    def _raise(self, node, options=None):
+        # pylint: disable=unused-argument
+        raise ValueError("nothing sensible to say about this call")
+
+    monkeypatch.setattr(InlineTrans, "apply", _raise)
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'sweep_column'" in message
+    assert "ValueError: nothing sensible to say about this call" in message

@@ -201,11 +201,16 @@ class LFRicKokkosInlineMixin:
         :raises TransformationError: if a call cannot be inlined, in which
             case the reason is the one PSyclone gives for it, followed by the
             reason the callee was not brought into the Container first where
-            there is one. A :py:exc:`TypeError` from resolving the callee is
-            one of those reasons: a name the frontend read as a call may
-            resolve to a datum, which PSyclone reports by failing to
-            specialise the symbol rather than by refusing the
-            transformation.
+            there is one. Anything
+            :py:class:`~psyclone.psyir.transformations.InlineTrans` raises is
+            a reason, not only what it refuses with: a name the frontend read
+            as a call may resolve to a datum, which PSyclone reports with a
+            :py:exc:`TypeError` from failing to specialise the symbol, and an
+            expression its machinery cannot handle surfaces as whatever that
+            machinery raises. A class other than ``TransformationError`` is
+            named in the message. This is what keeps ``validate`` raising only
+            ``TransformationError``, so a kernel the inliner cannot handle is
+            declined rather than aborting the caller.
         :raises TransformationError: if calls are still left after
             :py:attr:`_INLINE_LIMIT` of them have been inlined, which is what
             a self-recursive callee looks like from here.
@@ -220,12 +225,19 @@ class LFRicKokkosInlineMixin:
             cls._relax_target_arguments(call)
             try:
                 InlineTrans().apply(call)
-            except (TransformationError, TypeError) as err:
+            # Every failure to inline is a refusal, whatever its class: see
+            # the docstring above.
+            except Exception as err:  # pylint: disable=broad-except
                 first = (f"; bringing it into the container was refused "
                          f"first: {refusal}") if refusal else ""
+                # A TransformationError names itself in its own text; any
+                # other class is named here, so a reader is told what the
+                # inliner raised as well as what it said.
+                kind = ("" if isinstance(err, TransformationError)
+                        else f"{type(err).__name__}: ")
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot inline the call to '{name}' in "
-                    f"'{schedule.name}': {err}{first}") from err
+                    f"'{schedule.name}': {kind}{err}{first}") from err
         names = ", ".join(sorted(
             {cls._callee_name(call)
              for call in cls._pending_calls(schedule)}))
