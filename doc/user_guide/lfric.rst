@@ -4277,9 +4277,8 @@ body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like
 any other. A formal carrying any other attribute PSyclone does not model --
 ``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
-``InlineTrans``'s words. Types agreeing is a scored judgement rather than an
-identity: a
-literal actual stating no kind, an actual whose type PSyclone cannot
+``InlineTrans``'s words. Types agreeing is a scored judgement rather than
+an identity: a literal actual stating no kind, an actual whose type PSyclone cannot
 resolve, and an array section against a formal argument PSyclone holds only
 a partial type for are each a weaker match than an exact one rather than no
 match, and a call to a generic interface takes the strongest match among its
@@ -4878,7 +4877,8 @@ datum and raise :py:exc:`TypeError` rather than refuse. That too is a
 refusal here, so that :py:meth:`validate` declines a kernel it cannot
 capture instead of raising out of PSyclone.
 
-**A TARGET formal is inlinable; another unmodelled attribute is not.** A dummy argument declared ``target`` reaches the PSyIR as an
+**A TARGET formal is inlinable; another unmodelled attribute is not.** A
+dummy argument declared ``target`` reaches the PSyIR as an
 :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType`, and
 ``InlineTrans`` refuses a routine having an argument of a type it does not
 model, because it cannot tell whether binding the formal to the actual is
