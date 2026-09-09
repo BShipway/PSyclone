@@ -63,14 +63,24 @@ to :py:class:`~psyclone.psyir.backend.c.CWriter` by ``super()``; a handler
 that is not on the writer is not called at all. It is mixed into
 :py:class:`~psyclone.psyir.backend.kokkos.KokkosWriter` ahead of that C
 writer, so that these handlers are found first.
+
+:py:meth:`KokkosArrayExpressionMixin.unshapeable_expressions` is the one
+method here that is not a handler. It is asked of the writer before there is
+a region to generate, by a caller deciding whether to accept a body at all,
+and it is on the writer for the same reason
+:py:meth:`~psyclone.psyir.backend.kokkos_intrinsics_mixin.\
+KokkosIntrinsicsMixin.unsupported_intrinsics`
+is: what the writer can shape is the writer's own knowledge, and a caller
+keeping its own account of it would keep a second list to hold in step.
 """
 
 from psyclone.psyir.backend.kokkos_array_expression import (
-    KokkosArrayExpression)
+    KokkosArrayExpression, KokkosScratch)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    ArrayConstructor, ArrayReference, BinaryOperation, Range, Reference)
+    ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Range,
+    Reference)
 from psyclone.psyir.symbols import ArrayType
 
 #: The read-modify-write shapes an atomic answers, as the PSyIR operator
@@ -195,6 +205,87 @@ class KokkosArrayExpressionMixin:
         if self._array_expressions is None:
             self._array_expressions = KokkosArrayExpression(self)
         return self._array_expressions
+
+    def _stand_in_views(self, schedule):
+        """Describe every array a body names, as the region will describe it.
+
+        The probe below runs before any region exists, and the tier takes a
+        whole-array operand's shape from the region's description of it: with
+        no description at all, ``matmul(inv_mass_matrix_w3, rhs_e)`` -- the
+        shape this tier was written for -- would be refused for a reason the
+        real generation never meets. What each array's extents are does not
+        enter the question, only how many of them there are, so each stands
+        in as one the declaration's own rank, with an origin of ``1``: an
+        LFRic array is declared from one, and a shape probe reads the origin
+        only to write it into a bound it does not compare.
+
+        :param schedule: the body whose arrays are to be described.
+        :type schedule: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: one stand-in description per array named, keyed by name.
+        :rtype: Dict[str, :py:class:`psyclone.psyir.backend.\
+kokkos_array_expression.KokkosScratch`]
+        """
+        views = {}
+        for reference in schedule.walk(Reference):
+            datatype = getattr(reference.symbol, "datatype", None)
+            if not isinstance(datatype, ArrayType):
+                continue
+            rank = len(datatype.shape)
+            views[reference.symbol.name] = KokkosScratch(
+                name=reference.symbol.name,
+                # The width nothing here asks for: a shape is counted and
+                # generated as an integer expression, never stored in.
+                c_type=self._kind_c_type(datatype) or "",
+                extents=("1",) * rank,
+                index_offsets=(1,) * rank)
+        return views
+
+    def unshapeable_expressions(self, schedule, kind_types=()):
+        """Return the array expressions in a body this writer cannot shape.
+
+        The companion to
+        :py:meth:`~psyclone.psyir.backend.kokkos_intrinsics_mixin.\
+KokkosIntrinsicsMixin.unsupported_intrinsics`,
+        and the half of the question that one does not ask. That probe steps
+        over an array-valued intrinsic where the array tier writes it,
+        because no handler writes it there and asking a handler would answer
+        about the wrong thing. Nothing then asked the tier, so a body whose
+        operand the tier cannot take the shape of -- ``RESHAPE`` of a
+        constructor of literals, in ``sci_w3_to_w2_correction_code`` -- was
+        accepted by a caller and refused part-way through generating the
+        region.
+
+        Which statements the tier writes is decided here exactly as
+        :py:meth:`assignment_node` decides it, from the same expression, so
+        that what is asked about is what will be generated.
+
+        :param schedule: the body to search.
+        :type schedule: :py:class:`psyclone.psyir.nodes.Node`
+        :param kind_types: the ``(kind name, C type)`` pairs the region will
+            be generated with.
+        :type kind_types: Iterable[Tuple[str, str]]
+
+        :returns: the writer's own refusal for each, once per distinct
+            wording and in the order met.
+        :rtype: Tuple[str, ...]
+        """
+        self._kind_types = dict(kind_types)
+        self._views = self._stand_in_views(schedule)
+        # Discarded before and after: the lowering numbers the names it
+        # generates, and a probe must leave that counter where it found it.
+        self._array_expressions = None
+        refusals = []
+        for assignment in schedule.walk(Assignment):
+            if isinstance(assignment.rhs, ArrayConstructor):
+                continue
+            if not (assignment.walk(Range)
+                    or self.array_expressions.holds(assignment.rhs)):
+                continue
+            refusals.extend(
+                self.array_expressions.unshapeable(assignment.rhs))
+        self._array_expressions = None
+        return tuple(dict.fromkeys(refusals))
 
     def _kind_c_type(self, datatype):
         """Return the C type this region generates for a datatype's kind.

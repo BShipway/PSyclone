@@ -699,6 +699,25 @@ unwritable argument would stand in for the call it sits under. `LBOUND`,
 `UBOUND` and `SIZE` are not asked -- they are resolved by the array lowering
 before the writer sees them -- and neither are the array-valued intrinsics of
 the next section, which no handler writes and which lowering replaces first.
+Where the lowering does *not* replace one, a handler writes it after all and
+it is asked like any other: `_written_by_the_array_tier` steps over such a
+call only on a right-hand side that is not itself an array constructor,
+because `assignment_node` decides which statements are lowered on exactly
+that question and a constructor is spread over its destination element by
+element.
+
+`unshapeable_expressions(schedule, kind_types)` is the other half of the same
+question, and the half that probe cannot ask. An array-valued intrinsic where
+the tier does write it is refused not for want of a spelling but for an
+operand whose shape the tier cannot take, so that is asked of the tier
+instead: `KokkosArrayIntrinsics.unshapeable` puts each outermost call through
+`shape` and reports what it raises, in the writer's own words. It is asked
+before any region exists, so every array the body names stands in as a
+description of its declaration's rank -- `_stand_in_views` -- because a whole
+array operand takes its shape from the region's description of it and would
+otherwise be refused for having none. Which statements are asked about is
+`assignment_node`'s own rule, read from the same expression, so that what is
+asked about is what will be generated.
 
 Four launch shapes
 ~~~~~~~~~~~~~~~~~~
@@ -1241,6 +1260,14 @@ and an operand that is neither a whole array nor a section of one.
 `TRANSPOSE` is refused over anything that is not a matrix, and `RESHAPE` is
 generated only from a rank-1 source with a literal shape, its element being
 index arithmetic on the source's linear position.
+
+Everything in that list `shape` decides is asked ahead of generation by
+`unshapeable`, so a caller can refuse the body rather than fail while
+writing it; what `element` decides is not, being settled over indices that
+exist only once the nest is being generated. A reduction directly inside
+another is therefore still the backend's refusal, and an operand that is
+neither a whole array nor a section of one -- `RESHAPE` of a constructor of
+literals, in `sci_w3_to_w2_correction_code` -- is `validate`'s.
 
 Lowering order
 ~~~~~~~~~~~~~~

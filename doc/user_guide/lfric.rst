@@ -4842,6 +4842,19 @@ nor a section of one. ``RESHAPE`` is generated only where the source is
 rank 1 and the shape is a literal constructor, which makes it an index
 map over storage the two languages already agree about.
 
+An operand refused for its shape is refused by :py:meth:`validate`, not
+discovered part-way through generating the region. What decides whether
+this tier can write a statement is whether it can take the shape of the
+statement's operands, so ``validate`` asks it to take each of them, over
+stand-in descriptions of the body's own arrays, and reports what it
+refuses in the backend's own words. The refusal that arises in GungHo is
+``RESHAPE`` of a constructor of literals --
+``sci_w3_to_w2_correction_code``'s ``reshape([5, 3, 4, 2, 5, 3, 4, 2],
+[2,4])`` -- which is a value with no place in memory for a reshape to
+re-view. The element rules above are not asked there and stay the
+backend's: whether one element of a fold can be written is settled over
+indices that do not exist until the nest is generated.
+
 A section that is not in an assignment at all is judged by where it is
 instead. One that is an actual argument of a call is left to the call:
 inlining the callee takes the argument away with it, so the section is
@@ -5115,6 +5128,15 @@ intrinsic the body holds is put to the writer with its arguments replaced
 by references of their own types, and the ones that raise are reported as
 ``NAME/arity``. A second list kept beside the writer would be a list to
 keep in step.
+
+The writer is asked twice, because an intrinsic can be refused for two
+different reasons and only one of them is a missing spelling. That probe
+steps over an array-valued intrinsic where the array tier writes it -- a
+right-hand side that is not itself a constructor -- because no handler
+writes it there and a handler's answer would be about the wrong thing.
+The second asks that tier what it cannot take the shape of, as the
+contract above describes. Between them, nothing this transformation
+accepts is left for the backend to refuse.
 
 It captures all information needed by the Kokkos backend before lowering
 the LFRic loop. The LFRic loop is then lowered so that its bound setup and

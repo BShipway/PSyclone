@@ -51,7 +51,8 @@ from psyclone.psyir.backend.c_intrinsics_mixin import _is_real_argument
 from psyclone.psyir.backend.kokkos_array_intrinsics import (
     KokkosArrayIntrinsics)
 from psyclone.psyir.backend.visitor import VisitorError
-from psyclone.psyir.nodes import Assignment, IntrinsicCall, Reference
+from psyclone.psyir.nodes import (
+    ArrayConstructor, Assignment, IntrinsicCall, Reference)
 from psyclone.psyir.symbols import DataSymbol
 
 
@@ -328,6 +329,14 @@ class KokkosIntrinsicsMixin:
         ordinary handler, which is why this asks where the call is as well as
         what it is.
 
+        A right-hand side that is an array constructor is such a position
+        too. Its values are positional and the C writer spreads them over the
+        destination itself, so
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
+KokkosArrayExpressionMixin.assignment_node`
+        does not lower that statement and an intrinsic inside one reaches the
+        ordinary handler after all.
+
         :param call: the intrinsic call to judge.
         :type call: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
 
@@ -337,7 +346,7 @@ class KokkosIntrinsicsMixin:
         if not KokkosArrayIntrinsics.handles(call):
             return False
         assignment = call.ancestor(Assignment)
-        if assignment is None:
+        if assignment is None or isinstance(assignment.rhs, ArrayConstructor):
             return False
         # Identity rather than equality: two calls of the same intrinsic on
         # the same operands compare equal, and which side of the assignment

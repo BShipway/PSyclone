@@ -182,6 +182,24 @@ class KokkosArrayExpression:
         """
         return KokkosArrayIntrinsics.holds(node)
 
+    def unshapeable(self, node) -> Tuple[str, ...]:
+        """Return why an expression could not be lowered, if it could not.
+
+        Asked before there is anything to generate, by a caller deciding
+        whether to accept a body at all: what it reports is what
+        :py:meth:`lower` would have raised as it took the expression's shape.
+        The answer is the writer's own wording, so that a caller reporting it
+        keeps no second account of what this can write.
+
+        :param node: the expression to ask about.
+        :type node: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: one refusal per distinct wording, in the order met, and the
+            empty tuple for an expression this can shape.
+        :rtype: Tuple[str, ...]
+        """
+        return self._intrinsics.unshapeable(node)
+
     def ranks(self, node) -> Tuple[str, ...]:
         """Return the shape ``node`` produces, one extent per dimension.
 

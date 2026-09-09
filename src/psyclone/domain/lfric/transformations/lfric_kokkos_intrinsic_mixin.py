@@ -128,21 +128,38 @@ KokkosArrayIntrinsics`, which generates the nest over the destination
     def _validate_intrinsics(cls, schedule):
         """Refuse a body naming an intrinsic the writers cannot spell.
 
+        The writer is asked twice, because an intrinsic can be refused for
+        two different reasons and only one of them is a missing spelling. A
+        handler has no spelling for ``TINY``; the array-valued tier has every
+        spelling it needs for ``RESHAPE`` and still cannot generate one whose
+        source it cannot take the shape of. The first probe steps over a tier
+        intrinsic where the tier writes it -- no handler does -- so the
+        second asks the tier there, and between them nothing this
+        transformation accepts is left for the back-end to refuse.
+
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
         :raises TransformationError: if the Kokkos writer, asked with the
             kinds this region would be generated with, refuses any intrinsic
-            the body reads.
+            the body reads, or cannot take the shape of an array expression
+            it holds.
         """
-        refused = KokkosWriter().unsupported_intrinsics(
-            schedule, cls._kind_types(schedule))
+        kind_types = cls._kind_types(schedule)
+        refused = KokkosWriter().unsupported_intrinsics(schedule, kind_types)
         if refused:
             raise TransformationError(
                 f"LFRicKokkosTrans cannot capture a kernel whose body reads "
                 f"{', '.join(refused)}: the Kokkos writer has no spelling "
                 "for it, and a region it cannot write is refused here rather "
                 "than by the back-end.")
+        unshapeable = KokkosWriter().unshapeable_expressions(
+            schedule, kind_types)
+        if unshapeable:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture this kernel: "
+                f"{' '.join(unshapeable)} The refusal is the Kokkos writer's "
+                "own, asked here rather than left to the back-end.")
 
     @classmethod
     def _lower_allocations(cls, schedule):
