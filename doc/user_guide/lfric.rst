@@ -4762,25 +4762,36 @@ kernel written as a generic interface is still refused there whatever its
 shape.
 
 **A basis is accepted by shape** too, and the accepted shapes are
-:py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ`` and
-``gh_evaluator``. Neither needs argument machinery of its own. XYoZ
-quadrature adds two point counts, two weight arrays and one basis array
-per function space that asked for one, shaped
-``(dim, ndf, np_xy, np_z)``; an evaluator adds no rule at all, tabulating
-the basis at the nodal points of a target function space to give
-``(dim, ndf, ndf of the target)`` and no weights. Every one of those is an
-argument the PSy layer has computed before the loop and every extent of it
-is a formal of the same kernel, so the existing scalar and View
-descriptions cover them whole. A kernel may name both shapes, in which
-case each space it declares carries a basis array per shape; each shape is
-checked on its own so that a refusal names the one that is not modelled
-rather than the whole set.
+:py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ``,
+``gh_quadrature_face`` and ``gh_evaluator``. None of them needs argument
+machinery of its own. XYoZ quadrature adds two point counts, two weight
+arrays and one basis array per function space that asked for one, shaped
+``(dim, ndf, np_xy, np_z)``; face quadrature adds a face count, one point
+count, a single *rank-2* weight array shaped ``(np_xyz, nfaces)`` and a
+basis shaped ``(dim, ndf, np_xyz, nfaces)``; an evaluator adds no rule at
+all, tabulating the basis at the nodal points of a target function space
+to give ``(dim, ndf, ndf of the target)`` and no weights. Every one of
+those is an argument the PSy layer has computed before the loop and every
+extent of it is a formal of the same kernel, so the existing scalar and
+View descriptions cover them whole. A kernel may name more than one shape,
+in which case each space it declares carries a basis array per shape; each
+shape is checked on its own so that a refusal names the one that is not
+modelled rather than the whole set.
 
-Face and edge quadrature are refused by name. They carry a face or edge
-count and a single point count in place of the XYoZ pair, and while the
-same descriptions look as though they would cover those too, nothing here
-has been measured against the model for them. Refusing by name says that;
-accepting on the strength of the resemblance would not.
+The face rule's weights are the one place the three shapes differ in more
+than their extents. XYoZ hands over two rank-1 arrays and a face rule one
+rank-2 array, whose leading extent is the point count and therefore the
+stride of the generated ``LayoutLeft`` View. A View built with the two
+extents the other way round reads a transposed table with every subscript
+still in range, so the claim that the shape is covered is checked against
+a compiled region and compared by value rather than asserted over
+generated text.
+
+Edge quadrature is refused by name. It carries an edge count where a face
+rule carries a face count and is otherwise the same shape of argument, but
+the released model has no kernel asking for it and nothing here has been
+measured against the model for it. Refusing by name says that; accepting
+on the strength of the resemblance would not.
 
 **A called subroutine is inlined, not called.** The generated region is
 a C++ function and there is no Fortran for it to call into, so a kernel

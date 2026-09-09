@@ -161,19 +161,22 @@ class LFRicKokkosContractMixin:
     #: Evaluator shapes whose basis data the region already carries. XYoZ
     #: quadrature adds two point counts, two weight arrays and one basis
     #: array per function space that asks for one, shaped
-    #: ``(dim, ndf, np_xy, np_z)``. An evaluator adds no rule of its own at
-    #: all: it tabulates the basis at the nodal points of a target function
-    #: space, giving ``(dim, ndf, ndf of the target)`` and no weights. Every
-    #: one of those is an argument the PSy layer has computed before the loop
-    #: and every extent of it is a formal of the same kernel, so the existing
-    #: scalar and View descriptions cover them whole.
+    #: ``(dim, ndf, np_xy, np_z)``. Face quadrature adds a face count, one
+    #: point count, a *rank-2* weight array over the two of them and a basis
+    #: array shaped ``(dim, ndf, np_xyz, nfaces)``. An evaluator adds no rule
+    #: of its own at all: it tabulates the basis at the nodal points of a
+    #: target function space, giving ``(dim, ndf, ndf of the target)`` and no
+    #: weights. Every one of those is an argument the PSy layer has computed
+    #: before the loop and every extent of it is a formal of the same kernel,
+    #: so the existing scalar and View descriptions cover them whole.
     #:
-    #: Face and edge quadrature are absent. They carry a face or edge count
-    #: and a single point count in place of the XYoZ pair, and while the
-    #: same descriptions look as though they would cover those too, nothing
-    #: here has been measured against the model for them. They are refused by
-    #: name rather than accepted on the strength of the resemblance.
-    _SUPPORTED_SHAPES = ("gh_quadrature_xyoz", "gh_evaluator")
+    #: Edge quadrature is absent. It carries an edge count where face
+    #: quadrature carries a face count and is otherwise the same shape of
+    #: argument, but the released model has no kernel asking for it, so
+    #: nothing here has been measured against the model for it. It is refused
+    #: by name rather than accepted on the strength of the resemblance.
+    _SUPPORTED_SHAPES = (
+        "gh_quadrature_xyoz", "gh_quadrature_face", "gh_evaluator")
 
     #: Names a kernel symbol may not carry into the generated region. Fortran
     #: and C++ do not reserve the same words, so a perfectly ordinary Fortran
