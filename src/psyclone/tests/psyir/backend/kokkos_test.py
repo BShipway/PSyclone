@@ -1565,6 +1565,32 @@ def test_kokkos_writer_takes_an_arithmetic_extent():
         in code
 
 
+def test_kokkos_writer_includes_algorithm_for_an_integer_maximum():
+    """A region sized from an integer MAX includes <algorithm>, once.
+
+    ``std::max`` is where the C writer spells an integer ``MAX``, and a
+    kernel-local array declared with one reaches the generated unit twice: in
+    the ``shmem_size`` that sizes its scratch and in the View that places it.
+    The header is needed once whatever the count, and a region carrying no
+    such call keeps the single include line every capture already in the
+    model was generated with.
+    """
+    extent = "std::max((nlayers - 1), 1)"
+    scratch = tuple(
+        replace(item, extents=(extent,)) if item.name == "x_new" else item
+        for item in _scratch_region().scratch)
+    code = KokkosWriter()(_scratch_region(scratch=scratch))
+
+    assert code.startswith("#include <Kokkos_Core.hpp>\n"
+                           "#include <algorithm>\n\n")
+    assert code.count("#include <algorithm>") == 1
+    assert code.count(extent) == 2
+
+    plain = KokkosWriter()(_scratch_region())
+    assert plain.startswith("#include <Kokkos_Core.hpp>\n\n")
+    assert "algorithm" not in plain
+
+
 def test_kokkos_view_takes_an_expression_extent():
     """A View sizes from an expression as scratch does.
 
@@ -1591,14 +1617,21 @@ def test_kokkos_view_takes_an_expression_extent():
     ("(nlayers", False), ("nlayers)", False), (")nlayers(", False),
     ("nlayers % 2", False), ("nlayers.size", False), (4, False), (None, False),
     ("pow(nlayers, 2)", False), ("max(nlayers, 1)", False),
+    ("std::max((monotone_above - 1), 1)", True), ("()", False),
+    ("std::min(std::max(n, m), 4)", True), ("std::max(n, 1) + 2", True),
+    ("(nlayers, 1)", False), ("std::foo(nlayers, 1)", False),
+    ("std::max", False), ("std::max(nlayers, 1", False),
 ])
 def test_is_extent(extent, accepted):
     """The extent predicate accepts arithmetic and refuses everything else.
 
     Division is accepted: Fortran and C++ both truncate an integer quotient
     toward zero, so an extent that divides is the extent the kernel declared.
-    A call is not, because the comma in one is what a generated
-    ``shmem_size`` argument may not carry. ``)nlayers(`` is here because a
+    ``std::max`` and ``std::min`` are accepted, because a GungHo kernel
+    declares a local with an integer ``MAX`` in its shape and that is how the
+    C writer spells one. Every other call is refused, and so is a comma
+    outside one of those two: the text reaches a generated ``shmem_size``
+    argument with nothing to rewrite it. ``)nlayers(`` is here because a
     depth count that only checked the total would accept it.
     """
     assert is_extent(extent) is accepted
@@ -1626,9 +1659,16 @@ def test_is_offset(offset, accepted):
 @pytest.mark.parametrize("extent, names", [
     ("nlayers", {"nlayers"}), ("4", set()), ("(nlayers + 1)", {"nlayers"}),
     ("2 * nrows - ncols", {"nrows", "ncols"}), (4, set()),
+    ("std::max((monotone_above - 1), 1)", {"monotone_above"}),
 ])
 def test_extent_names(extent, names):
-    """An extent reports the sizes it is built from, and only those."""
+    """An extent reports the sizes it is built from, and only those.
+
+    The name of a call it carries is not one of them: ``std::max`` is written
+    by the back-end rather than evaluated by the launch, and a caller
+    checking every name against the kernel's arguments would otherwise refuse
+    the shape for the spelling of its own maximum.
+    """
     assert extent_names(extent) == names
 
 
@@ -1785,8 +1825,23 @@ def test_kokkos_writer_writes_epsilon_as_a_numeric_trait():
     assert _written_expressions("""
   a = epsilon(a)
   s = epsilon(s)
-""") == ["Kokkos::Experimental::epsilon_v<double>",
-         "Kokkos::Experimental::epsilon_v<float>"]
+""") == ["static_cast<double>(Kokkos::Experimental::epsilon_v<double>)",
+         "static_cast<float>(Kokkos::Experimental::epsilon_v<float>)"]
+
+
+def test_kokkos_writer_casts_epsilon_so_device_code_can_pass_it_by_reference():
+    """The trait is cast to its own type wherever ``EPSILON`` is written.
+
+    ``epsilon_v<T>`` is a ``constexpr`` variable template, and binding it to
+    the ``const T &`` parameter of ``Kokkos::max`` odr-uses a host variable
+    from device code, which nvcc refuses. The cast makes the argument a
+    prvalue read in a constant expression, which is not an odr-use.
+    ``leonard_term_kl_kernel_mod`` is the captured kernel this shape comes
+    from, and it is asserted here rather than only in the region that failed.
+    """
+    assert _written_expressions("  a = max(a, epsilon(a))\n") == [
+        "Kokkos::max(a, "
+        "static_cast<double>(Kokkos::Experimental::epsilon_v<double>))"]
 
 
 def test_kokkos_writer_refuses_epsilon_of_an_undescribed_kind():
@@ -2467,7 +2522,8 @@ def test_kokkos_epsilon():
     """
     code = KokkosWriter()(_array_region("  a(:) = b(:) + epsilon(b(1))\n"))
 
-    assert "Kokkos::Experimental::epsilon_v<double>" in code
+    assert ("static_cast<double>(Kokkos::Experimental::epsilon_v<double>)"
+            in code)
 
 
 def test_kokkos_nint_with_a_kind_argument():

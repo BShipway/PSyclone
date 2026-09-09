@@ -10,7 +10,8 @@
 
 import pytest
 
-from lfric_kokkos_sources import _invoke
+from lfric_kokkos_sources import (
+    _FACE_QUADRATURE_ALGORITHM, _FACE_QUADRATURE_KERNEL, _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 
@@ -451,3 +452,206 @@ def test_lfric_kokkos_trans_basis_indexing_matches_the_kernel(
     assert "basis_w3((1 - 1), (df - 1), (qp1 - 1), (qp2 - 1))" in code
     assert "weights_xy((qp1 - 1))" in code
     assert "weights_z((qp2 - 1))" in code
+
+
+_FACE_AND_XYOZ_ALGORITHM = """
+program kokkos_face_and_xyoz_test
+  use field_mod, only : field_type
+  use quadrature_xyoz_mod, only : quadrature_xyoz_type
+  use quadrature_face_mod, only : quadrature_face_type
+  use two_rules_kernel_mod, only : two_rules_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  type(quadrature_xyoz_type) :: qr
+  type(quadrature_face_type) :: qrf
+  call invoke(two_rules_kernel_type(out_field, in_field, qr, qrf))
+end program kokkos_face_and_xyoz_test
+"""
+
+
+# A kernel naming both quadrature shapes. Each function space asking for a
+# basis then carries two arrays of the same rank but different extents, and
+# each rule appends its own counts and weights, in the order 'gh_shape' names
+# the shapes. The two are told apart by their extents alone, which is why
+# this is the case that would catch a rule whose arguments were built once
+# and reused.
+_FACE_AND_XYOZ_KERNEL = """
+module two_rules_kernel_mod
+  use argument_mod, only : arg_type, func_type, gh_field, gh_real, gh_write, &
+                           gh_read, gh_basis, cell_column,                   &
+                           gh_quadrature_XYoZ, gh_quadrature_face
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: two_rules_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                    &
+         arg_type(gh_field, gh_real, gh_write, w3),                        &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    type(func_type) :: meta_funcs(1) = (/                                  &
+         func_type(w3, gh_basis) /)
+    integer :: gh_shape(2) = (/ gh_quadrature_XYoZ, gh_quadrature_face /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: two_rules_code
+  end type two_rules_kernel_type
+contains
+  subroutine two_rules_code(nlayers, field_out, field_in,                   &
+                            ndf_w3, undf_w3, map_w3, basis_w3_qr,           &
+                            basis_w3_faces, np_xy, np_z, weights_xy,        &
+                            weights_z, nfaces, nqp_faces, wqp_faces)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: np_xy, np_z, nfaces, nqp_faces
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    real(kind=r_def), dimension(np_xy), intent(in) :: weights_xy
+    real(kind=r_def), dimension(np_z), intent(in) :: weights_z
+    real(kind=r_def), dimension(nqp_faces,nfaces), intent(in) :: wqp_faces
+    real(kind=r_def), dimension(1,ndf_w3,np_xy,np_z), intent(in) ::         &
+                                                              basis_w3_qr
+    real(kind=r_def), dimension(1,ndf_w3,nqp_faces,nfaces), intent(in) ::   &
+                                                           basis_w3_faces
+    integer(kind=i_def) :: k, df, qp1, qp2, qp, face
+    real(kind=r_def) :: total
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        total = 0.0_r_def
+        do qp2 = 1, np_z
+          do qp1 = 1, np_xy
+            total = total + weights_xy(qp1) * weights_z(qp2)               &
+                  * basis_w3_qr(1,df,qp1,qp2)
+          end do
+        end do
+        do face = 1, nfaces
+          do qp = 1, nqp_faces
+            total = total + wqp_faces(qp,face)                             &
+                  * basis_w3_faces(1,df,qp,face)
+          end do
+        end do
+        field_out(map_w3(df) + k) = total * field_in(map_w3(df) + k)
+      end do
+    end do
+  end subroutine two_rules_code
+end module two_rules_kernel_mod
+"""
+
+
+@pytest.fixture(name="face_quadrature_target")
+# pylint: disable-next=unused-argument
+def face_quadrature_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel reads face-quadrature basis data."""
+    return _invoke(
+        tmp_path, "face_weight", _FACE_QUADRATURE_ALGORITHM,
+        _FACE_QUADRATURE_KERNEL)
+
+
+@pytest.fixture(name="face_and_xyoz_target")
+# pylint: disable-next=unused-argument
+def face_and_xyoz_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel asks for both quadrature shapes."""
+    return _invoke(
+        tmp_path, "two_rules", _FACE_AND_XYOZ_ALGORITHM,
+        _FACE_AND_XYOZ_KERNEL)
+
+
+def test_face_quadrature_arguments_are_declared(face_quadrature_target):
+    """Face quadrature crosses the ABI as counts, weights and basis data.
+
+    The rule adds three formals rather than XYoZ's four -- a face count and a
+    point count by value, and one *rank-2* weight array over the two of them
+    -- and each function space asking for a basis adds a rank-4 View shaped
+    ``(dim, ndf, np_xyz, nfaces)``. The weights are the one place face
+    quadrature is not XYoZ quadrature with different names: XYoZ hands over
+    two rank-1 arrays and this hands over one rank-2 array, whose leading
+    extent is the point count and so is the stride that has to be exact under
+    ``LayoutLeft``.
+
+    None of it is per-cell, so every one of them is an unmanaged View over
+    the whole array the PSy layer computed before the loop, and the
+    ``bind(C)`` interface declares each as an assumed-size dummy of the
+    matching ``iso_c_binding`` kind.
+    """
+    psy, loop, kernel = face_quadrature_target
+    assert kernel.eval_shapes == ["gh_quadrature_face"]
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "const int nfaces" in code
+    assert "const int np_xyz" in code
+    assert "Kokkos::View<const double**, Kokkos::LayoutLeft, MemorySpace, " \
+        "ReadOnly> weights_xyz(weights_xyz_data, np_xyz, nfaces);" in code
+    assert "Kokkos::View<const double****, Kokkos::LayoutLeft, MemorySpace, " \
+        "ReadOnly> basis_w3(basis_w3_data, 1, ndf_w3, np_xyz, nfaces);" in code
+    assert "weights_xyz((qp - 1), (face - 1))" in code
+    assert "basis_w3((1 - 1), (df - 1), (qp - 1), (face - 1))" in code
+
+    # The rule goes last, after the per-function-space arguments, and the
+    # face count precedes the point count as 'nfaces_qr, np_xyz_qr' does in
+    # the Fortran call the PSy layer would otherwise have written.
+    signature = code.split(") {\n")[0]
+    parameters = [
+        parameter.strip().split()[-1].lstrip("*")
+        for parameter in signature.split(",") if parameter.strip().split()]
+    assert parameters.index("basis_w3_data") < parameters.index("nfaces")
+    assert parameters.index("nfaces") < parameters.index("np_xyz")
+    assert parameters.index("np_xyz") < parameters.index("weights_xyz_data")
+
+    fortran = str(psy.gen)
+    assert "integer(c_int), value :: nfaces" in fortran
+    assert "integer(c_int), value :: np_xyz" in fortran
+    assert "real(c_double), dimension(*), intent(in) :: weights_xyz" in fortran
+    assert "real(c_double), dimension(*), intent(in) :: basis_w3" in fortran
+
+
+def test_face_quadrature_call_passes_the_psy_arrays(face_quadrature_target):
+    """The PSy layer passes the arrays the quadrature proxy holds.
+
+    Face quadrature's weights are a rank-2 pointer component,
+    ``qr_proxy%weights_xyz``, and the basis array is filled by
+    ``compute_function`` before the loop. Both are whole-array data, so
+    passing either sliced would give the region a cell dimension it does not
+    have.
+    """
+    psy, loop, _ = face_quadrature_target
+    LFRicKokkosTrans().apply(loop)
+    generated = str(psy.gen).lower()
+
+    call = [line for line in generated.splitlines()
+            if "call face_weight_kokkos(" in line]
+    assert call, generated
+    arguments = call[0].split("(", 1)[1]
+    for actual in ("basis_w3_qr", "nfaces_qr", "np_xyz_qr", "weights_xyz_qr"):
+        assert actual in arguments
+    assert "basis_w3_qr(" not in arguments
+    assert "nfaces_qr = qr_proxy%nfaces" in generated
+    assert "weights_xyz_qr => qr_proxy%weights_xyz" in generated
+
+
+def test_face_and_xyoz_together(face_and_xyoz_target):
+    """A kernel may ask for face and XYoZ quadrature at once.
+
+    Its one function space then carries two basis arrays of the same rank,
+    told apart by their extents alone, and each rule appends its own counts
+    and weights in the order ``gh_shape`` names the shapes. A region that
+    described the second rule from the first would generate two Views of
+    identical extents here, and every subscript of the wrong one would still
+    be in range.
+    """
+    _, loop, kernel = face_and_xyoz_target
+    assert kernel.eval_shapes == ["gh_quadrature_xyoz", "gh_quadrature_face"]
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "basis_w3_qr(basis_w3_qr_data, 1, ndf_w3, np_xy, np_z);" in code
+    assert "basis_w3_faces(basis_w3_faces_data, 1, ndf_w3, nqp_faces, " \
+        "nfaces);" in code
+    assert "weights_xy(weights_xy_data, np_xy);" in code
+    assert "weights_z(weights_z_data, np_z);" in code
+    assert "wqp_faces(wqp_faces_data, nqp_faces, nfaces);" in code
+
+    signature = code.split(") {\n")[0]
+    parameters = [
+        parameter.strip().split()[-1].lstrip("*")
+        for parameter in signature.split(",") if parameter.strip().split()]
+    assert parameters.index("basis_w3_qr_data") < parameters.index(
+        "basis_w3_faces_data")
+    assert parameters.index("weights_z_data") < parameters.index("nfaces")

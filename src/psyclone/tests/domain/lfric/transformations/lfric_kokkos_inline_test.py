@@ -16,6 +16,7 @@ from lfric_kokkos_sources import (
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.psyir.nodes import Call, IntrinsicCall
+from psyclone.psyir.symbols import RoutineSymbol
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -215,6 +216,53 @@ _MODULE_INDEX_KERNEL = _KERNEL.replace(
     "            recip_epsilon * mr_v_at_dof")
 
 
+# A module holding nothing but a named constant, and a second module holding a
+# pure function that reads it. Two containers deep is the shape
+# `face_from_face_selector` has -- a function of
+# `sci_face_selector_support_mod` reading `W`, `S`, `E` and `N` from
+# `reference_element_mod` -- and it is the
+# shape that makes bringing the callee in worth doing: the function's body can
+# move into the kernel's Container, and the constant it reads moves with it.
+_EDGE_INDEX_MODULE = """
+module edge_index_mod
+  use constants_mod, only : i_def
+  implicit none
+  private
+  integer(kind=i_def), public, parameter :: top_edge = 7_i_def
+end module edge_index_mod
+"""
+
+
+_COLUMN_SELECT_MODULE = """
+module column_select_mod
+  use constants_mod, only : i_def
+  use edge_index_mod, only : top_edge
+  implicit none
+  private
+  public :: selected_level
+contains
+  pure function selected_level(n) result(level)
+    integer(kind=i_def), intent(in) :: n
+    integer(kind=i_def) :: level
+    level = n + top_edge
+  end function selected_level
+end module column_select_mod
+"""
+
+
+# The kernel that reads it. `selected_level(k)` stands in an expression, and
+# the kernel's own file does not say whether that is a function reference or an
+# array element, so the frontend leaves a Call behind and the symbol at the
+# call site an unspecialised `Symbol`. That is what the capture has to see
+# through.
+_USED_FUNCTION_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use column_select_mod, only : selected_level").replace(
+    "      swept(k) = swept(k + 1) - partial(k)",
+    "      swept(k) = swept(k + 1) - partial(selected_level(k) - 7)")
+
+
 @pytest.fixture(name="called_routine_target")
 # pylint: disable-next=unused-argument
 def called_routine_target_fixture(tmp_path, clear_module_manager_instance):
@@ -274,6 +322,16 @@ def array_like_call_target_fixture(tmp_path, clear_module_manager_instance):
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _ARRAY_LIKE_CALL_KERNEL,
         extra={"weights_config_mod": _ARRAY_LIKE_MODULE})
+
+
+@pytest.fixture(name="used_function_target")
+# pylint: disable-next=unused-argument
+def used_function_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel calls a function of a used module."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _USED_FUNCTION_KERNEL,
+        extra={"column_select_mod": _COLUMN_SELECT_MODULE,
+               "edge_index_mod": _EDGE_INDEX_MODULE})
 
 
 @pytest.fixture(name="module_index_target")
@@ -473,6 +531,76 @@ def test_lfric_kokkos_trans_refuses_an_array_like_call(
     message = str(error.value)
     assert "cannot inline the call to 'blend_weights'" in message
     assert "specialise" in message
+
+
+def test_module_inline_refusal_is_reported(external_callee_target):
+    """A callee that cannot be brought in is refused with both reasons.
+
+    ``sweep_column`` lives in a module that is on the search path and reads a
+    datum that module keeps private, so bringing it into the kernel's
+    Container is refused first and inlining it where it stands is refused
+    after. Reporting only the second would name the Container the call site is
+    in and leave the reader to guess why the callee was not moved into it, so
+    the refusal carries both texts: what ``InlineTrans`` said, and what
+    ``KernelModuleInlineTrans`` said before it.
+    """
+    _, loop, _ = external_callee_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    message = str(error.value)
+    assert "cannot inline the call to 'sweep_column'" in message
+    # InlineTrans's own words: the callee's body is in another Container.
+    assert "column_solve_kernel_mod" in message
+    # And KernelModuleInlineTrans's, which say why it is still there.
+    assert "bringing it into the container was refused first" in message
+    assert "relaxation" in message
+
+
+def test_captures_a_kernel_calling_a_used_function(used_function_target):
+    """A pure function of a used module is brought in and then inlined.
+
+    This is `face_from_face_selector`'s shape: the callee is a function of a
+    second module the kernel names in a ``use``, and that module reads a named
+    constant from a third. The symbol at the call site is an unspecialised
+    ``Symbol``, because an indexed name in an expression could as easily be an
+    array element, and a Call's callee is a routine whether or not the
+    frontend could say so.
+
+    Bringing the function into the kernel's Container carries the constant
+    with it, so the capture has no import left to follow: ``top_edge`` reaches
+    the region the way every module constant does, as a by-value formal the
+    PSy layer supplies from the module that declares it, rather than as a name
+    the generated C++ has no declaration for.
+    """
+    psy, loop, kernel = used_function_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    # The callee is gone: its statements are the kernel's own.
+    assert "selected_level" not in cpp
+    assert "inlined_level = (k + top_edge)" in cpp
+    # And the constant it read, two containers away, came with it.
+    assert "const int top_edge" in cpp
+    generated = str(psy.gen).lower()
+    assert "use edge_index_mod, only : top_edge" in generated
+    assert "top_edge" in generated.split("column_solve_kokkos(")[1]
+
+
+def test_callee_is_local_of_a_detached_call():
+    """A call outside any Container has no Container holding its callee.
+
+    Every call this mixin is asked about is read from a file and so sits
+    inside at least a FileContainer, but the question is asked of the tree
+    rather than assumed of it: a detached Call answers no, so that a refusal
+    is reported rather than an AttributeError raised from a helper.
+    """
+    assert not LFRicKokkosTrans._callee_is_local(
+        Call.create(RoutineSymbol("sweep_column")))
 
 
 def test_lfric_kokkos_trans_validate_keeps_the_module_scope_chain(

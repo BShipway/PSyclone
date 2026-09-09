@@ -11,9 +11,10 @@
 import pytest
 
 from lfric_kokkos_sources import (
-    _ALGORITHM, _DEPENDENT_SECTION_KERNEL, _KERNEL, _LEVEL_ALGORITHM,
-    _LEVEL_KERNEL, _LOCAL_ALGORITHM, _LOCAL_KERNEL, _SECTION_ALGORITHM,
-    _SECTION_KERNEL, _coloured_inner, _invoke)
+    _ALGORITHM, _DEPENDENT_SECTION_KERNEL, _FACE_QUADRATURE_ALGORITHM,
+    _FACE_QUADRATURE_KERNEL, _KERNEL, _LEVEL_ALGORITHM, _LEVEL_KERNEL,
+    _LOCAL_ALGORITHM, _LOCAL_KERNEL, _SECTION_ALGORITHM, _SECTION_KERNEL,
+    _coloured_inner, _invoke)
 
 from psyclone.core import AccessType
 from psyclone.domain.lfric import KernCallArgList
@@ -93,71 +94,6 @@ _KEYWORD_FORMAL_KERNEL = _LOCAL_KERNEL.replace("field_in", "const")
 # generates the kernel body into. `new` is a C++ keyword and an ordinary
 # Fortran name.
 _KEYWORD_LOCAL_KERNEL = _LOCAL_KERNEL.replace("swept", "new")
-
-
-_FACE_QUADRATURE_ALGORITHM = """
-program kokkos_face_quadrature_test
-  use field_mod, only : field_type
-  use quadrature_face_mod, only : quadrature_face_type
-  use face_weight_kernel_mod, only : face_weight_kernel_type
-  implicit none
-  type(field_type) :: out_field, in_field
-  type(quadrature_face_type) :: qr
-  call invoke(face_weight_kernel_type(out_field, in_field, qr))
-end program kokkos_face_quadrature_test
-"""
-
-
-# Face quadrature is a third shape, with a point count and a face count of its
-# own. It is outside what this capability models and is refused by name.
-_FACE_QUADRATURE_KERNEL = """
-module face_weight_kernel_mod
-  use argument_mod, only : arg_type, func_type, gh_field, gh_real, gh_write, &
-                           gh_read, gh_basis, cell_column, gh_quadrature_face
-  use constants_mod, only : i_def, r_def
-  use fs_continuity_mod, only : w3
-  use kernel_mod, only : kernel_type
-  implicit none
-  type, public, extends(kernel_type) :: face_weight_kernel_type
-    type(arg_type) :: meta_args(2) = (/                                    &
-         arg_type(gh_field, gh_real, gh_write, w3),                        &
-         arg_type(gh_field, gh_real, gh_read,  w3) /)
-    type(func_type) :: meta_funcs(1) = (/                                  &
-         func_type(w3, gh_basis) /)
-    integer :: gh_shape = gh_quadrature_face
-    integer :: operates_on = cell_column
-  contains
-    procedure, nopass :: face_weight_code
-  end type face_weight_kernel_type
-contains
-  subroutine face_weight_code(nlayers, field_out, field_in,                &
-                              ndf_w3, undf_w3, map_w3, basis_w3,           &
-                              nfaces, np_xyz, weights_xyz)
-    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
-    integer(kind=i_def), intent(in) :: nfaces, np_xyz
-    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
-    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
-    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
-    real(kind=r_def), dimension(np_xyz,nfaces), intent(in) :: weights_xyz
-    real(kind=r_def), dimension(1,ndf_w3,np_xyz,nfaces), intent(in) ::     &
-                                                                 basis_w3
-    integer(kind=i_def) :: k, df, qp, face
-    real(kind=r_def) :: total
-    do k = 0, nlayers - 1
-      total = 0.0_r_def
-      do df = 1, ndf_w3
-        do face = 1, nfaces
-          do qp = 1, np_xyz
-            total = total + weights_xyz(qp,face)                           &
-                  * basis_w3(1,df,qp,face) * field_in(map_w3(df) + k)
-          end do
-        end do
-      end do
-      field_out(map_w3(1) + k) = total
-    end do
-  end subroutine face_weight_code
-end module face_weight_kernel_mod
-"""
 
 
 @pytest.fixture(name="face_quadrature_target")
@@ -278,22 +214,39 @@ def test_lfric_kokkos_trans_refuses_a_section_outside_an_assignment(
         LFRicKokkosTrans().validate(loop)
 
 
-def test_lfric_kokkos_trans_refuses_an_unhandled_eval_shape(
-        face_quadrature_target):
-    """A shape outside the two modelled ones is refused by name.
+def test_lfric_kokkos_trans_accepts_face_quadrature(face_quadrature_target):
+    """Face quadrature is modelled, and a kernel asking for it validates.
 
-    Face and edge quadrature carry a face count and a single point count
-    rather than the XYoZ pair. Nothing here has been measured against the
-    model for them, so the refusal stays and says which shape it is about
-    rather than reporting quadrature as a whole as unsupported.
+    Its arguments are the same kinds as XYoZ quadrature's -- counts by value,
+    weights and basis data as read-only whole arrays -- so the contract has
+    nothing shape-specific to say about it once the shape itself is
+    admitted. The assertion is on ``validate`` rather than on the predicate
+    so that no other rule refuses the kernel first.
     """
     _, loop, kernel = face_quadrature_target
     assert kernel.eval_shapes == ["gh_quadrature_face"]
 
+    LFRicKokkosTrans().validate(loop)
+
+
+def test_lfric_kokkos_trans_refuses_an_unhandled_eval_shape(
+        face_quadrature_target):
+    """A shape outside the three modelled ones is refused by name.
+
+    Edge quadrature carries an edge count in place of the face count, and
+    while the resemblance to face quadrature is exact nothing here has been
+    measured against the model for it. The refusal therefore stays and says
+    which shape it is about rather than reporting quadrature as a whole as
+    unsupported. The shape is set on the kernel rather than written into one,
+    because the released model has no edge-quadrature kernel to write from.
+    """
+    _, loop, kernel = face_quadrature_target
+    kernel._eval_shapes = ["gh_quadrature_edge"]
+
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
-    assert ("LFRicKokkosTrans does not support the 'gh_quadrature_face' "
+    assert ("LFRicKokkosTrans does not support the 'gh_quadrature_edge' "
             "evaluator shape." in str(error.value))
 
 
@@ -563,7 +516,7 @@ def test_lfric_kokkos_trans_evaluator_predicate_refuses_an_unmodelled_shape(
 
 def test_lfric_kokkos_trans_evaluator_predicate_accepts_modelled_shapes(
         target):
-    """The two shapes the region models pass the rule, together or apart.
+    """The three shapes the region models pass the rule, together or apart.
 
     Asked of each shape separately and of both at once, because a rule
     written to accept a single shape would refuse the kernels that ask for
@@ -571,7 +524,9 @@ def test_lfric_kokkos_trans_evaluator_predicate_accepts_modelled_shapes(
     """
     _, _, kernel = target
     for shapes in (["gh_quadrature_xyoz"], ["gh_evaluator"],
-                   ["gh_quadrature_xyoz", "gh_evaluator"]):
+                   ["gh_quadrature_face"],
+                   ["gh_quadrature_xyoz", "gh_evaluator"],
+                   ["gh_quadrature_xyoz", "gh_quadrature_face"]):
         kernel._eval_shapes = shapes
         LFRicKokkosTrans._validate_evaluator(kernel)
 
@@ -620,7 +575,7 @@ def test_lfric_kokkos_trans_field_type_predicate_ignores_the_shape(target):
     ever name the shape because it is checked first.
     """
     _, _, kernel = target
-    kernel._eval_shapes = ["gh_quadrature_face"]
+    kernel._eval_shapes = ["gh_quadrature_edge"]
     kernel.arguments.args[0]._intrinsic_type = "logical"
 
     with pytest.raises(TransformationError) as error:
@@ -629,7 +584,7 @@ def test_lfric_kokkos_trans_field_type_predicate_ignores_the_shape(target):
 
     with pytest.raises(TransformationError) as second:
         LFRicKokkosTrans._validate_evaluator(kernel)
-    assert "does not support the 'gh_quadrature_face' evaluator shape" in str(
+    assert "does not support the 'gh_quadrature_edge' evaluator shape" in str(
         second.value)
 
 

@@ -50,12 +50,22 @@ from dataclasses import dataclass
 import re
 from typing import Optional, Tuple, Union
 
+from psyclone.psyir.backend.c_intrinsics_mixin import (
+    INTEGER_INTRINSIC_ALTERNATIVES)
 from psyclone.psyir.backend.kokkos_array_expression import KokkosScratch
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
 from psyclone.psyir.nodes import KernelSchedule, Loop
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+#: The calls an extent may carry, over and above arithmetic: the C++
+#: spellings of an integer ``MAX`` and ``MIN``. They are read from the C
+#: writer's own table rather than restated, since what may appear in an
+#: extent is exactly what that writer emits for a declared bound. Nothing
+#: else is admitted, and an unqualified ``max`` is not one of them: it would
+#: name whatever the generated translation unit happened to have declared.
+_EXTENT_CALLS = tuple(sorted(INTEGER_INTRINSIC_ALTERNATIVES.values()))
 
 
 def is_identifier(value):
@@ -73,6 +83,24 @@ def is_identifier(value):
     return isinstance(value, str) and bool(_IDENTIFIER.fullmatch(value))
 
 
+def _without_extent_calls(value):
+    """Return an extent with the names of :py:data:`_EXTENT_CALLS` removed.
+
+    ``std::max`` is punctuation as far as either grammar is concerned: it is
+    not a size the launch has to be able to evaluate, and it is not a token
+    an identifier check should meet. Removing it leaves the parenthesised
+    argument list behind, which both grammars already know what to do with.
+
+    :param str value: the extent to strip.
+
+    :returns: the same text with each call name replaced by a space.
+    :rtype: str
+    """
+    for name in _EXTENT_CALLS:
+        value = value.replace(name, " ")
+    return value
+
+
 def extent_names(value):
     """Return the identifiers an extent expression is sized from.
 
@@ -81,6 +109,11 @@ def extent_names(value):
     whether an extent can be evaluated where it is written, without having to
     parse the expression themselves.
 
+    The name of a call the extent is allowed to carry is not one of them:
+    ``std::max`` is written by the back-end, not evaluated by the launch, and
+    a caller checking every name against the kernel's arguments would refuse
+    the shape for the spelling of its own maximum.
+
     :param value: the candidate extent, which need not be a string.
 
     :returns: every C++ identifier appearing in it.
@@ -88,7 +121,69 @@ def extent_names(value):
     """
     if not isinstance(value, str):
         return set()
-    return set(_IDENTIFIER.findall(value))
+    return set(_IDENTIFIER.findall(_without_extent_calls(value)))
+
+
+def _extent_tokens(value):
+    """Split an extent into its operand tokens, or ``None`` if it is not one.
+
+    The grammar :py:func:`is_extent` documents, applied once: arithmetic over
+    names and integer literals, with balanced parentheses, and with the calls
+    of :py:data:`_EXTENT_CALLS`. A comma is admitted inside one of those
+    calls' own parentheses and nowhere else, so ``std::max(n, 1)`` is an
+    extent and ``(n, 1)`` is not.
+
+    :param value: the candidate extent, which need not be a string.
+
+    :returns: its operand tokens, or ``None`` where it is not an extent at
+        all. An empty tuple is not returned: an extent with no operands is
+        not one.
+    :rtype: Optional[Tuple[str, ...]]
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    # Checked with the call names taken out, so that the two colons of the
+    # one qualified name an extent may carry do not have to be admitted
+    # everywhere else.
+    if not re.fullmatch(r"[A-Za-z0-9_ (),+\-*/]+",
+                        _without_extent_calls(value)):
+        return None
+    #: One entry per open parenthesis, saying whether it opened a call, so
+    #: that a comma can be admitted by what encloses it rather than by
+    #: whether the text contains a call anywhere.
+    opened = []
+    plain = []
+    index = 0
+    while index < len(value):
+        for name in _EXTENT_CALLS:
+            if value.startswith(name + "(", index):
+                opened.append(True)
+                plain.append(" (")
+                index += len(name) + 1
+                break
+        else:
+            character = value[index]
+            index += 1
+            if character == "(":
+                opened.append(False)
+            elif character == ")":
+                if not opened:
+                    return None
+                opened.pop()
+            elif character == ",":
+                # A separator between a call's arguments, which is where an
+                # operator would be in any other extent.
+                if not opened or not opened[-1]:
+                    return None
+                character = " "
+            plain.append(character)
+    if opened:
+        return None
+    # Split on the operators rather than searching for names, so that a
+    # malformed token such as ``4nlayers`` is seen whole and refused instead
+    # of reading as a literal beside an identifier.
+    return tuple(token for token in re.split(r"[ ()+\-*/]+", "".join(plain))
+                 if token)
 
 
 def is_offset(value):
@@ -131,13 +226,20 @@ def is_extent(value):
     source and stops on an extent that has come out negative; see
     :py:func:`~psyclone.psyir.backend.kokkos_launch.scratch_guard`.
 
-    What is still refused is anything that is not arithmetic over names and
-    integers -- a call such as ``pow(nlayers, nlayers)`` or
-    ``max(nlayers, 1)``, which is where a comma reaches an extent -- because
-    the generated ``shmem_size`` argument is this text and nothing rewrites
-    it. A power reaches an extent as a call only when its exponent is not an
-    integer literal: ``nlayers ** 2`` is written as ``(nlayers * nlayers)``
-    and is arithmetic this accepts. See
+    The two calls of :py:data:`_EXTENT_CALLS` are accepted, so
+    ``std::max((monotone_above - 1), 1)`` is an extent: a GungHo kernel
+    declares a local with an integer ``MAX`` in its shape, and the C writer
+    spells that with ``std::max``. They are accepted by name and by position
+    -- a comma is admitted inside one of their argument lists and nowhere
+    else -- rather than by admitting the comma generally, because the text is
+    a ``shmem_size`` argument that nothing rewrites and every other call
+    reaching one would be a name the generated unit never declared.
+
+    What is still refused is anything that is not that: a call such as
+    ``pow(nlayers, nlayers)``, or an unqualified ``max(nlayers, 1)``. A power
+    reaches an extent as a call only when its exponent is not an integer
+    literal: ``nlayers ** 2`` is written as ``(nlayers * nlayers)`` and is
+    arithmetic this accepts. See
     :py:mod:`psyclone.psyir.backend.c_integer_power`.
 
     :param value: the candidate extent, which need not be a string.
@@ -145,25 +247,11 @@ def is_extent(value):
     :returns: whether it can be written into generated C++ as an extent.
     :rtype: bool
     """
-    if not isinstance(value, str) or not value.strip():
+    tokens = _extent_tokens(value)
+    if not tokens:
         return False
-    if not re.fullmatch(r"[A-Za-z0-9_ ()+\-*/]+", value):
-        return False
-    depth = 0
-    for character in value:
-        depth += (character == "(") - (character == ")")
-        if depth < 0:
-            return False
-    if depth:
-        return False
-    # Split on the operators rather than searching for names, so that a
-    # malformed token such as ``4nlayers`` is seen whole and refused instead
-    # of reading as a literal beside an identifier.
-    for token in re.split(r"[ ()+\-*/]+", value):
-        if token and not (token.isdigit()
-                          or _IDENTIFIER.fullmatch(token)):
-            return False
-    return True
+    return all(token.isdigit() or _IDENTIFIER.fullmatch(token)
+               for token in tokens)
 
 
 @dataclass(frozen=True)

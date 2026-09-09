@@ -4258,21 +4258,27 @@ itself for as long as it was asked, and reaching the bound is instead a
 refusal naming the routine still to be inlined. In scope are a procedure of
 the kernel's own module and a procedure of a module the kernel ``use``\ s
 whose source PSyclone can read, the second brought into the kernel's
-container by ``KernelModuleInlineTrans`` first; a callee whose module is
-not on the search path is out of scope, PSyclone having a name for it and
-no body. Being in scope is not being inlinable, and the rest of the
-judgement is PSyclone's rather than this transformation's: a callee reading
-data private to its own module, one whose declarations depend on an
-argument the call site writes to before calling, and one whose actual and
-formal types do not agree are each refused in ``InlineTrans``'s own words
-with the call named. Types agreeing is a scored judgement rather than an
-identity: a literal actual stating no kind, an actual whose type PSyclone
-cannot resolve, and an array section against a formal argument PSyclone
-holds only a partial type for are each a weaker match than an exact one
-rather than no match, and a call to a generic interface takes the strongest
-match among its candidates. Two candidates matching a relaxed call equally
-well is not settled by guessing: that call is refused as ambiguous, naming
-both. Not every call is a call, either: an indexed name whose
+container by ``KernelModuleInlineTrans`` first -- and what that container
+gains it keeps, so a callee reading a named constant from a third module
+brings that constant with it. A function used this way is in scope whether
+or not the frontend could tell it from an array: ``selector(face)`` in an
+expression leaves the name an unspecialised symbol, and a ``Call``'s callee
+is treated as the routine it is. A callee whose module is not on the search
+path is out of scope, PSyclone having a name for it and no body. Being in
+scope is not being inlinable, and the rest of the judgement is PSyclone's
+rather than this transformation's: a callee reading data private to its own
+module, one whose declarations depend on an argument the call site writes to
+before calling, and one whose actual and formal types do not agree are each
+refused in ``InlineTrans``'s own words with the call named, followed by
+``KernelModuleInlineTrans``'s own where the callee could not be brought in
+either. Types agreeing is a scored judgement rather than an identity: a
+literal actual stating no kind, an actual whose type PSyclone cannot
+resolve, and an array section against a formal argument PSyclone holds only
+a partial type for are each a weaker match than an exact one rather than no
+match, and a call to a generic interface takes the strongest match among its
+candidates. Two candidates matching a relaxed call equally well is not
+settled by guessing: that call is refused as ambiguous, naming both. Not
+every call is a call, either: an indexed name whose
 meaning the kernel's own file does not settle -- ``blending_weights(index)``,
 where the array comes from a ``use`` -- is read by the frontend as a call,
 and resolving it reaches a datum rather than a routine. PSyclone reports
@@ -4432,7 +4438,12 @@ View element. It is decided per argument rather than per region, so a
 ``gh_write`` to a *discontinuous* space in the same kernel stays a plain
 assignment; and it is the update and not the read that is made atomic, so a
 ``gh_readinc`` reads its element plainly. Each component of a field vector
-is a field of its own and is made safe separately. A caller who knows the
+is a field of its own and is made safe separately. The question is asked of
+cell iteration alone: a dof-iterating kernel writes each dof once, so its
+stores stay plain assignments whatever their function space, and the
+formals of such a kernel -- which are its fields and scalars, with no
+``nlayers``, ``ndf``, ``undf`` or dofmap among them -- are never compared
+against a cell kernel's argument order. A caller who knows the
 loop's stores reach no shared dof may say so through the
 ``disjoint_writes`` option, which is an assertion about the kernel and is
 refused where it contradicts the loop's colouring, the ``atomics`` option
@@ -4764,25 +4775,36 @@ kernel written as a generic interface is still refused there whatever its
 shape.
 
 **A basis is accepted by shape** too, and the accepted shapes are
-:py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ`` and
-``gh_evaluator``. Neither needs argument machinery of its own. XYoZ
-quadrature adds two point counts, two weight arrays and one basis array
-per function space that asked for one, shaped
-``(dim, ndf, np_xy, np_z)``; an evaluator adds no rule at all, tabulating
-the basis at the nodal points of a target function space to give
-``(dim, ndf, ndf of the target)`` and no weights. Every one of those is an
-argument the PSy layer has computed before the loop and every extent of it
-is a formal of the same kernel, so the existing scalar and View
-descriptions cover them whole. A kernel may name both shapes, in which
-case each space it declares carries a basis array per shape; each shape is
-checked on its own so that a refusal names the one that is not modelled
-rather than the whole set.
+:py:attr:`_SUPPORTED_SHAPES` -- ``gh_quadrature_XYoZ``,
+``gh_quadrature_face`` and ``gh_evaluator``. None of them needs argument
+machinery of its own. XYoZ quadrature adds two point counts, two weight
+arrays and one basis array per function space that asked for one, shaped
+``(dim, ndf, np_xy, np_z)``; face quadrature adds a face count, one point
+count, a single *rank-2* weight array shaped ``(np_xyz, nfaces)`` and a
+basis shaped ``(dim, ndf, np_xyz, nfaces)``; an evaluator adds no rule at
+all, tabulating the basis at the nodal points of a target function space
+to give ``(dim, ndf, ndf of the target)`` and no weights. Every one of
+those is an argument the PSy layer has computed before the loop and every
+extent of it is a formal of the same kernel, so the existing scalar and
+View descriptions cover them whole. A kernel may name more than one shape,
+in which case each space it declares carries a basis array per shape; each
+shape is checked on its own so that a refusal names the one that is not
+modelled rather than the whole set.
 
-Face and edge quadrature are refused by name. They carry a face or edge
-count and a single point count in place of the XYoZ pair, and while the
-same descriptions look as though they would cover those too, nothing here
-has been measured against the model for them. Refusing by name says that;
-accepting on the strength of the resemblance would not.
+The face rule's weights are the one place the three shapes differ in more
+than their extents. XYoZ hands over two rank-1 arrays and a face rule one
+rank-2 array, whose leading extent is the point count and therefore the
+stride of the generated ``LayoutLeft`` View. A View built with the two
+extents the other way round reads a transposed table with every subscript
+still in range, so the claim that the shape is covered is checked against
+a compiled region and compared by value rather than asserted over
+generated text.
+
+Edge quadrature is refused by name. It carries an edge count where a face
+rule carries a face count and is otherwise the same shape of argument, but
+the released model has no kernel asking for it and nothing here has been
+measured against the model for it. Refusing by name says that; accepting
+on the strength of the resemblance would not.
 
 **A called subroutine is inlined, not called.** The generated region is
 a C++ function and there is no Fortran for it to call into, so a kernel
@@ -4811,13 +4833,38 @@ KernelModuleInlineTrans`.
 A callee whose module is not on the search path is not: PSyclone has a
 name for it and nothing else, and there is no body to inline.
 
+Bringing the callee in moves what it needs with it, so the module it came
+from need not be a leaf: a function of one module reading a named constant
+from a second arrives with that constant declared alongside it, and the
+constant then reaches the region the way every module constant does, as a
+by-value formal the PSy layer supplies. This is what puts LFRic's
+``face_from_face_selector`` -- a pure function of
+``sci_face_selector_support_mod`` reading the face indices ``W``, ``S``,
+``E`` and ``N`` from ``reference_element_mod`` -- inside the capture.
+
+It is in scope whether or not the frontend could tell it from an array.
+``selector(face)`` standing in an expression is a function reference or an
+element of an array, and where the kernel's own file does not settle which
+the name is left an unspecialised symbol; ``KernelModuleInlineTrans`` reads
+such a symbol at the call site as a datum of the callee's name and declines
+to shadow it. A ``Call``'s callee is a routine whether or not the frontend
+could say so, so the symbol is made one before the callee is brought in.
+Only a bare symbol is: a name PSyclone has already typed as data is left
+alone, and asking for its body reaches the datum and is refused below.
+
 Being in scope is not being inlinable, and the rest of the judgement is
 PSyclone's rather than this transformation's: a callee reading data
 private to its own module, one whose declarations depend on an argument
 the call site writes to before calling, one whose actual and formal types
 do not agree, one holding a CodeBlock. Each is refused in ``InlineTrans``'
 own words with the call named, because those words say what to fix and a
-paraphrase would say less. So is a name that turns out not to be a call
+paraphrase would say less. Where the callee could not be brought into the
+Container either, that refusal is carried too, after
+``bringing it into the container was refused first:``. ``InlineTrans``
+alone would say only that the body is in another Container, which is the
+symptom; the second text names the reason -- a datum of the callee's own
+module that could not travel with it, say -- and so says which of the two
+is worth fixing. So is a name that turns out not to be a call
 at all: an indexed reference the kernel's own file does not settle the
 meaning of is read as one by the frontend, and resolving it can reach a
 datum and raise :py:exc:`TypeError` rather than refuse. That too is a
@@ -5186,6 +5233,30 @@ running both cells at once would lose one of the two contributions. Under
 ``gh_write`` to a continuous space each cell *replaces* it, which loses no
 contribution because there is none, and is still two threads writing one
 element.
+
+**A dof-iterating kernel is captured with plain stores, whatever its
+spaces say.** Sharing between cells is a property of *cell* iteration:
+two cells' dofmaps meet at a dof on a continuous space, and both cell
+iterations write it. A loop over LFRic's ``dof`` or ``owned_dof``
+iteration space visits each dof once and writes it once, so there is no
+second writer to make atomic and no colour to separate, and a
+``gh_write`` on ``any_space_1`` from such a kernel is generated as an
+ordinary assignment where the same metadata on a cell kernel would take
+an ``atomic_store``. The metadata predicates alone would not say so --
+they read the access and the function space, and neither mentions what
+the loop iterates over -- so the question is answered from the kernel's
+``operates_on`` before they are asked.
+
+Answering it there also settles what would otherwise be a refusal about
+the wrong thing. Which *formal* carries a shared field is read by walking
+a cell kernel's argument order -- ``nlayers``, the data of each field,
+then ``ndf``, ``undf`` and the dofmap of each space -- where a dof
+kernel's formals are its fields and scalars alone. The two counts
+disagree, and the disagreement was reported as a kernel this
+transformation could not describe. It is instead read as the question
+being the wrong one for that kernel: ``swift_inner_update`` and
+``swift_outer_update`` in ``ffsl_advective_updates_alg_mod`` are captured
+rather than refused for a formal count they cannot meet.
 
 The default answer to both is an atomic, and the two kinds of sharing take
 different ones. A contribution is written as ``Kokkos::atomic_add`` -- or
