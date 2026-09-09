@@ -462,6 +462,21 @@ class LFRicKokkosWriteMixin:
         dropped the cell-position formal from the front of its list and
         appended the extents it measured to the back. A name survives both.
 
+        A dof-iterating kernel shares nothing, and is answered before the
+        walk rather than by it. Sharing between cells is a property of cell
+        iteration: two cells' dofmaps meet at a dof on a continuous space,
+        and both cell iterations write it. A dof loop visits each dof once
+        and writes it once, so there is no second writer to make atomic and
+        no colour to separate. The walk cannot be asked the question either.
+        ``_SharedArgumentPositions`` extends
+        :py:class:`~psyclone.domain.lfric.KernStubArgList`, which walks a
+        *cell* kernel's argument order -- ``nlayers``, the data of each
+        field, then ``ndf``, ``undf`` and the dofmap of each space -- where a
+        dof kernel's formals are its fields and scalars alone. The two counts
+        the check below compares therefore disagree because the question is
+        the wrong one for the kernel, not because the kernel is malformed,
+        and refusing it there would refuse a capture that is safe.
+
         Each name is mapped to what the sharing cells do to the element:
         ``False`` where they add to it and ``True`` where they each store it.
         The two need different statements generated for them, and reading one
@@ -489,6 +504,8 @@ class LFRicKokkosWriteMixin:
             number of formals than its metadata describes, so that no
             position can be trusted.
         """
+        if kernel.iterates_over in LFRicConstants().DOF_ITERATION_SPACES:
+            return {}
         builder = _SharedArgumentPositions(kernel)
         builder.generate()
         positions = builder.shared_positions

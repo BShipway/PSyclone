@@ -520,3 +520,134 @@ def test_lfric_kokkos_trans_refuses_a_formal_count_the_metadata_denies(
     counts = re.search(
         r"declares (\d+) of them and its metadata describes (\d+)\.", message)
     assert counts and int(counts.group(2)) - int(counts.group(1)) == 1
+
+
+# A kernel that operates on a dof and writes a space this library cannot call
+# discontinuous. 'any_space_1' is answered as continuous everywhere else in
+# this module, because LFRic states nowhere which continuity such a space will
+# have -- so a *cell* kernel writing it has a shared write and takes an
+# atomic. The point of this pair is that the same metadata on a *dof* kernel
+# does not: the sharing an atomic answers is a property of cell iteration.
+# The formals are the fields and the scalar alone, with no nlayers, no ndf,
+# no undf and no dofmap, which is the disagreement the formal-count check
+# used to report about a kernel it could not describe.
+_DOF_SHARED_KERNEL = """
+module dof_scale_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_scalar, gh_real, &
+                           gh_write, gh_read, any_space_1, dof
+  use constants_mod, only : r_def
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: dof_scale_kernel_type
+    type(arg_type) :: meta_args(3) = (/                        &
+         arg_type(gh_field,  gh_real, gh_write, any_space_1),  &
+         arg_type(gh_field,  gh_real, gh_read,  any_space_1),  &
+         arg_type(gh_scalar, gh_real, gh_read) /)
+    integer :: operates_on = dof
+  contains
+    procedure, nopass :: dof_scale_code
+  end type dof_scale_kernel_type
+contains
+  subroutine dof_scale_code(out_dof, in_dof, scale)
+    real(kind=r_def), intent(inout) :: out_dof
+    real(kind=r_def), intent(in) :: in_dof, scale
+    out_dof = scale * in_dof
+  end subroutine dof_scale_code
+end module dof_scale_kernel_mod
+"""
+
+
+_DOF_SHARED_ALGORITHM = """
+program kokkos_dof_shared_test
+  use constants_mod, only : r_def
+  use field_mod, only : field_type
+  use dof_scale_kernel_mod, only : dof_scale_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  real(kind=r_def) :: scale
+  call invoke(dof_scale_kernel_type(out_field, in_field, scale))
+end program kokkos_dof_shared_test
+"""
+
+
+@pytest.fixture(name="dof_shared_target")
+# pylint: disable-next=unused-argument
+def dof_shared_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create a dof-iterating invoke writing a space that may be continuous.
+
+    :param tmp_path: the directory the sources are written to.
+    :type tmp_path: :py:class:`pathlib.Path`
+    :param clear_module_manager_instance: fixture resetting the module
+        manager so that this invoke's kernel is the one resolved.
+
+    :returns: the PSy layer, its first loop and that loop's first kernel.
+    :rtype: Tuple[:py:class:`psyclone.psyGen.PSy`,
+        :py:class:`psyclone.domain.lfric.LFRicLoop`,
+        :py:class:`psyclone.domain.lfric.LFRicKern`]
+    """
+    return _invoke(
+        tmp_path, "dof_scale", _DOF_SHARED_ALGORITHM, _DOF_SHARED_KERNEL)
+
+
+def test_shared_formals_are_none_for_a_dof_kernel(dof_shared_target):
+    """A dof-iterating kernel shares nothing, whatever its spaces say.
+
+    Two cells meet at a dof of a continuous space and both write it; that is
+    what makes a cell kernel's store shared. A dof loop visits each dof once
+    and writes it once, so there is no second writer to make atomic and no
+    colour to separate. The metadata predicates would answer otherwise --
+    'any_space_1' is not among the discontinuous names -- and the walk that
+    turns their answer into formal positions is a *cell* kernel's argument
+    order, so it would then refuse the kernel for a formal count that
+    disagrees. The question is the wrong one for this kernel, and the answer
+    is that it has no shared formals at all.
+    """
+    _, loop, kernel = dof_shared_target
+    assert loop.iteration_space in ("dof", "owned_dof")
+    assert kernel.iterates_over == "dof"
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._shared_formals(kernel, schedule) == {}
+    assert LFRicKokkosTrans._shared_formals(kernel, schedule, True) == {}
+    # The rule is not reached at all, rather than reached and satisfied: the
+    # loop is accepted where it was refused for a count it cannot meet.
+    LFRicKokkosTrans().validate(loop)
+
+
+def test_dof_kernel_capture_generates_no_atomic(dof_shared_target):
+    """The captured dof loop stores plainly and runs the dof launch.
+
+    The two halves of the claim are asserted together because either alone
+    would be satisfied by something wrong: a region with no atomic could be a
+    cell launch that lost its guard, and a dof launch is only safe without
+    one because its index is the dof.
+    """
+    _, loop, _ = dof_shared_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::atomic_" not in cpp
+    assert "Kokkos::RangePolicy<>(0, ndofs)" in cpp
+    assert "KOKKOS_LAMBDA(const int df) {" in cpp
+    assert re.search(r"^\s*out_dof\(df\) = ", cpp, re.MULTILINE)
+    # No colouring either: the other answer to a shared write is as absent as
+    # the atomic, and for the same reason.
+    assert "cmap" not in cpp
+
+
+def test_cell_kernel_shared_formals_are_unchanged(shared_write_target):
+    """A cell kernel still reports its shared formal.
+
+    The dof answer is an early return, so the test that matters beside it is
+    that it is not reached where the question is the right one: this kernel
+    accumulates into 'acc' on W2 and the walk still says so, mapped to
+    ``False`` because the cells contribute to the element rather than each
+    replacing it.
+    """
+    _, _, kernel = shared_write_target
+    assert kernel.iterates_over == "cell_column"
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    assert LFRicKokkosTrans._shared_formals(kernel, schedule) == {"acc": False}
