@@ -387,14 +387,16 @@ def test_sym_writer_parse_expr(fortran_reader):
 
 def test_sym_writer_parse_errors(fortran_reader):
     '''Tests that unsupported syntax (e.g. array ranges) raise the
-    expected VisitorError
+    expected VisitorError. Concatenation is an operator the writer does not
+    map, so the ranges are written as Fortran spells them rather than as the
+    three arguments SymPy is given, and the result does not parse.
 
     '''
     # A dummy program to easily create the PSyIR for the
     # expressions we need. We just take the RHS of the assignments
     source = '''program test_prog
-                real :: x, a(10), b(10)
-                x = a(:) /= b(:)
+                character(len=10) :: x, a(10), b(10)
+                x = a(:) // b(:)
                 end program test_prog '''
 
     psyir = fortran_reader.psyir_from_source(source)
@@ -403,8 +405,7 @@ def test_sym_writer_parse_errors(fortran_reader):
     with pytest.raises(VisitorError) as err:
         _ = SymPyWriter(exp1)
 
-    assert ("Visitor Error: Invalid SymPy expression: "
-            "'a(sympy_lower,sympy_upper,1) /= b(sympy_lower,sympy_upper,1)'"
+    assert ("Visitor Error: Invalid SymPy expression: 'a(:) // b(:)'"
             in str(err.value))
 
 
@@ -554,6 +555,7 @@ def test_sympy_writer_user_types(fortran_reader, fortran_writer,
                           ("a .eqv. b", "Equivalent(a, b)"),
                           ("a .neqv. b", "Xor(a, b)"),
                           ("a == b", "Eq(a, b)"),
+                          ("a /= b", "Ne(a, b)"),
                           ])
 def test_sympy_writer_logicals(fortran_reader: FortranReader,
                                fortran_expr: str,
