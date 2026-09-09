@@ -4415,17 +4415,22 @@ shifted into the halo -- ``halo_cell_column``, which runs the halo alone --
 is still refused, there being no lower-bound formal to fill. Nothing is
 exchanged inside a region: the exchange the PSy layer emits in front of the
 loop is lowered in front of the call to the region.
-A field two cells both increment -- a ``gh_inc`` or a ``gh_readinc``
-argument, which is what a write to a continuous function space is -- has two
-answers here, and both are generated. The default is an atomic: the update
-is emitted as ``Kokkos::atomic_add``, or ``_sub``, ``_mul`` or ``_div`` by
-the operator it carries, on the View element. It is decided per argument
-rather than per region, so a ``gh_write`` to a discontinuous space in the
-same kernel stays a plain assignment; and it is the update and not the read
-that is made atomic, so a ``gh_readinc`` reads its element plainly. Each
-component of a field vector is a field of its own and is made safe
-separately. The other answer is colouring, which is what LFRic's own OpenMP
-path takes: a loop
+A field written at a dof two cells share -- a ``gh_inc`` or ``gh_readinc``
+argument, where the two cells each contribute to it, or a ``gh_write`` to a
+continuous function space, where they each replace it -- has two answers
+here, and both are generated. The default is an atomic: a contribution is
+emitted as ``Kokkos::atomic_add``, or ``_sub``, ``_mul`` or ``_div`` by the
+operator it carries, and a replacement as ``Kokkos::atomic_store``, on the
+View element. It is decided per argument rather than per region, so a
+``gh_write`` to a *discontinuous* space in the same kernel stays a plain
+assignment; and it is the update and not the read that is made atomic, so a
+``gh_readinc`` reads its element plainly. Each component of a field vector
+is a field of its own and is made safe separately. A caller who knows the
+loop's stores reach no shared dof may say so through the
+``disjoint_writes`` option, which is an assertion about the kernel and is
+refused where it contradicts the loop's colouring, the ``atomics`` option
+or the metadata. The other answer is colouring, which is what LFRic's own
+OpenMP path takes: a loop
 :py:class:`~psyclone.domain.lfric.transformations.LFRicColourTrans` has
 already rewritten is accepted, the inner ``cells_in_colour`` loop being the
 one captured while the outer loop over colours stays in the PSy layer and
@@ -5122,16 +5127,60 @@ halo-dirty calls are retained, and only the resulting generic loop is
 replaced.
 
 **A write two cells share has two answers, and both are generated.**
-LFRic's ``gh_inc`` and ``gh_readinc`` are read-modify-writes of a field
-at a dof two neighbouring cells both hold, so a launch running those
-cells at once would lose one of the two contributions. The default
-answer is an atomic: each update of such an argument is written as
-``Kokkos::atomic_add`` -- or ``_sub``, ``_mul``, ``_div``, by the
-operator the update carries -- on the View element. It is applied per
-argument and not per region, so a ``gh_write`` to a discontinuous space
-in the same kernel stays a plain assignment, and it is the update and
-not the read that is atomic, so a ``gh_readinc`` reads its element
-plainly and updates it atomically.
+Two cells of one launch meet at a dof whenever the field they write is on
+a function space LFRic does not name discontinuous, and they meet there in
+one of two ways. Under ``gh_inc`` and ``gh_readinc`` each cell
+*contributes* to the dof, which is a read-modify-write of it, so a launch
+running both cells at once would lose one of the two contributions. Under
+``gh_write`` to a continuous space each cell *replaces* it, which loses no
+contribution because there is none, and is still two threads writing one
+element.
+
+The default answer to both is an atomic, and the two kinds of sharing take
+different ones. A contribution is written as ``Kokkos::atomic_add`` -- or
+``_sub``, ``_mul``, ``_div``, by the operator the update carries -- on the
+View element; a replacement is written as ``Kokkos::atomic_store`` of the
+value the statement computed. It is applied per argument and not per
+region, so a ``gh_write`` to a *discontinuous* space in the same kernel
+stays a plain assignment, and it is the update and not the read that is
+atomic, so a ``gh_readinc`` reads its element plainly and updates it
+atomically. Where a ``gh_write`` field is written by a read-modify-write
+all the same, the update is what is generated: an ``atomic_store`` of
+``acc + src`` would drop one cell's contribution where ``atomic_add``
+keeps both.
+
+**What an atomic store buys is narrow, and worth being exact about.** It
+makes the write indivisible, so the element is written whole and no reader
+sees a value neither cell stored. It decides nothing about which of the
+two cells stores last, and it does not make the two values agree. LFRic
+permits ``gh_write`` on a continuous space precisely because the kernel's
+author guarantees that every iteration writes the same value to a given
+shared dof -- see :ref:`lfric-kernel-valid-access`, which says in the same
+breath that PSyclone cannot check it -- and where that guarantee holds the
+order does not matter. Neither the metadata nor the body records the
+guarantee, so the transformation does not rely on it; the atomic is what
+can be done without it.
+
+One shape is refused rather than stored: a statement whose value reads the
+element it replaces. The read happens before the store and outside it, so
+making the store indivisible leaves the race exactly where it was, and the
+refusal names colouring, which removes it.
+
+**A caller who knows the stores are disjoint may say so.** The default is
+conservative -- a ``gh_write`` to a continuous space is read as shared
+because the space says the dofs *can* be shared -- and many such kernels
+write only dofs their own cell owns. Nothing here can tell the two apart,
+so it is the caller's to state, through the ``disjoint_writes`` option of
+:py:meth:`apply`, whose name says what is being asserted about the kernel
+rather than what the transformation should emit, because it is the
+assertion that has to be true. Under it the stores are generated as plain
+assignments and the fields are not read as shared anywhere else either, so
+``atomics=False`` on such an uncoloured loop stops being a refusal. Three
+ways of making the assertion are refused rather than resolved: on a
+coloured loop, which says the opposite about the same loop; beside an
+explicit ``atomics`` request, which asks for an answer to the sharing it
+denies; and on a kernel with a ``gh_inc`` or ``gh_readinc`` argument,
+whose metadata states a sharing no assertion about the loop makes untrue.
 
 The other answer is colouring, which is what LFRic's own OpenMP path
 takes. A loop

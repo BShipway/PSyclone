@@ -50,23 +50,21 @@ message.
 
 The survey reports every blocker a loop carries rather than the first, so the
 rules ``_validate_kernel_metadata`` bundles are each askable on their own:
-:py:meth:`LFRicKokkosContractMixin._validate_evaluator`,
-:py:meth:`LFRicKokkosContractMixin._validate_field_types` and
-``LFRicKokkosWriteMixin._validate_continuous_write``. The bundling method
-calls them rather than repeating them, and the last two share the per-argument
-:py:meth:`LFRicKokkosContractMixin._validate_field_type` and
-``LFRicKokkosWriteMixin._validate_written_space`` with the argument walk in
-``_validate_kernel_metadata``, so the order the bundled refusals come in is
+:py:meth:`LFRicKokkosContractMixin._validate_evaluator` and
+:py:meth:`LFRicKokkosContractMixin._validate_field_types`. The bundling method
+calls them rather than repeating them, and the second shares the per-argument
+:py:meth:`LFRicKokkosContractMixin._validate_field_type` with the argument walk
+in ``_validate_kernel_metadata``, so the order the bundled refusals come in is
 unchanged by their being nameable apart.
 
 Some predicates of that set are not here. ``_validate_bounds`` lives beside
 the declaration reading it predicts, in ``LFRicKokkosBoundsMixin``; the rules
 about where the loop iterates -- ``_validate_iteration_space``,
 ``_validate_halo_depth`` and the ``_validate_loop`` that bundles them -- are
-``LFRicKokkosIterationMixin``'s; and the rules about what the loop may write
--- ``_validate_written_space``, ``_validate_continuous_write`` and
-``_validate_shared_updates`` -- are ``LFRicKokkosWriteMixin``'s. Each is asked
-of ``LFRicKokkosTrans`` exactly as these are.
+``LFRicKokkosIterationMixin``'s; and the rule about how the loop may write to
+what it shares -- ``_validate_shared_updates`` -- is
+``LFRicKokkosWriteMixin``'s. Each is asked of ``LFRicKokkosTrans`` exactly as
+these are.
 
 The sibling mixins are reached through ``cls``, resolved on
 ``LFRicKokkosTrans``: :py:meth:`LFRicKokkosContractMixin._validate_sections`
@@ -80,7 +78,6 @@ therefore not supported.
 """
 
 from psyclone.core import AccessType
-from psyclone.domain.lfric import LFRicConstants
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, Call, CodeBlock,
     IntrinsicCall, Range, Reference)
@@ -102,12 +99,17 @@ class LFRicKokkosContractMixin:
     # design; the class it is mixed into carries the public interface.
     # pylint: disable=too-few-public-methods
 
-    #: Accesses a cell-parallel launch can honour. The first three are each
-    #: cell's own and need nothing; ``INC`` and ``READINC`` are shared
-    #: between the cells that meet at a dof, and are answered either by an
-    #: atomic update or by colouring the loop, which is the choice
-    #: ``LFRicKokkosTrans._uses_atomics`` makes. Which of the two is in force
-    #: is not asked here: both make the same accesses safe.
+    #: Accesses a cell-parallel launch can honour. ``READ`` and ``READWRITE``
+    #: are each cell's own and need nothing -- LFRic's metadata admits
+    #: ``gh_readwrite`` on a discontinuous space only; ``WRITE`` is each
+    #: cell's own on a discontinuous space too, but on a continuous one the
+    #: cells meeting at a dof each *replace* its value; ``INC`` and
+    #: ``READINC`` are shared between those cells and each *contribute* to
+    #: it. Both kinds of sharing are answered either by an atomic -- a store
+    #: for a replacement, an update for a contribution -- or by colouring the
+    #: loop, which is the choice ``LFRicKokkosTrans._uses_atomics`` makes.
+    #: Which of the two is in force is not asked here: both make the same
+    #: accesses safe.
     #: ``REDUCTION`` is not here: it is shared between *all* cells
     #: rather than between neighbours, so neither answer reaches it.
     _SAFE_ACCESSES = (AccessType.READ, AccessType.WRITE, AccessType.READWRITE,
@@ -306,12 +308,10 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
         is walked once, each argument answering every rule before the next
         argument is looked at. A kernel with two blockers on two arguments
         therefore reports the first *argument's*, which is not what running
-        :py:meth:`_validate_field_types` and
-        ``LFRicKokkosWriteMixin._validate_continuous_write`` in turn would
-        report. Those two share :py:meth:`_validate_field_type` and
-        ``LFRicKokkosWriteMixin._validate_written_space`` with the walk below
-        rather than
-        restating them, so there is one copy of each rule and two ways to ask
+        the separately askable rules in turn would report.
+        :py:meth:`_validate_field_types` shares
+        :py:meth:`_validate_field_type` with the walk below rather than
+        restating it, so there is one copy of the rule and two ways to ask
         it.
 
         :param kernel: the kernel the loop holds.
@@ -321,15 +321,13 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
             evaluator data, is a CMA kernel, takes an argument that is not a
             field, a scalar or an LMA operator, takes an access a
             cell-parallel launch cannot honour, takes a field of an intrinsic
-            no View can hold, uses a stencil shape outside
-            :py:attr:`_SUPPORTED_STENCILS`, or writes to a field on a
-            continuous space.
+            no View can hold, or uses a stencil shape outside
+            :py:attr:`_SUPPORTED_STENCILS`.
         """
         cls._validate_evaluator(kernel)
         if kernel.cma_operation is not None:
             raise TransformationError(
                 "LFRicKokkosTrans does not support CMA operators.")
-        discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
         for argument in kernel.arguments.args:
             # An LMA operator needs no rule of its own beyond this one. It
             # reaches the kernel as a rank-3 array whose every extent is
@@ -346,9 +344,10 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot capture the '{argument.access}' "
                     f"access of '{argument.name}': a cell-parallel launch "
-                    "answers a shared write with an atomic update or with "
-                    "colouring, and both of those model gh_inc and "
-                    "gh_readinc only.")
+                    "answers a write shared between neighbouring cells -- "
+                    "gh_inc, gh_readinc, and gh_write to a continuous space "
+                    "-- with an atomic or with colouring, and neither of "
+                    "those answers a value shared between every cell.")
             if argument.argument_type != "gh_field":
                 continue
             cls._validate_field_type(argument)
@@ -359,7 +358,6 @@ VALID_FIELD_DATA_TYPES` admits ``gh_real`` and ``gh_integer`` and no third
                         f"LFRicKokkosTrans supports the "
                         f"{', '.join(cls._SUPPORTED_STENCILS)} stencil shapes "
                         f"only, but '{argument.name}' has '{shape}'.")
-            cls._validate_written_space(argument, discontinuous)
 
     @staticmethod
     def _validate_body(schedule):

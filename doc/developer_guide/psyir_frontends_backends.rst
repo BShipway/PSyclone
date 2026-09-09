@@ -972,6 +972,20 @@ is not atomic. A View that is both `atomic` and `read_only` is rejected by
 `_validate_view`, an atomic on data nothing writes being a contradiction in
 the description.
 
+`KokkosView.atomic_store` qualifies that flag rather than adding a third
+answer. It says the cells sharing an element *replace* it rather than
+contribute to it, which is what an LFRic `gh_write` to a continuous space
+is, and it widens what `_atomic_update` accepts: a statement matching none
+of the four update shapes is generated as `Kokkos::atomic_store` of its
+whole right-hand side, through `atomic_store_operand`. The order the two
+are read in matters -- an update shape is matched first, so `acc = acc +
+src` under this flag is still an `atomic_add` and not a store of the sum,
+which would drop one cell's contribution. One statement is still refused:
+one whose value reads the element it replaces, the read happening before
+the store and outside it. A View setting `atomic_store` without `atomic` is
+rejected by `_validate_view`, the flag saying which kind of sharing there
+is and not that there is any.
+
 The second is `KokkosColourMap`, which is how a region generated from an
 already-coloured loop finds its cell. Such a region is launched over the
 cells of one colour rather than over the mesh, so the launch index is no

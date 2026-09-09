@@ -49,22 +49,31 @@ questions of a loop, and this is the second of them: what those iterations may
 the contract, and the walk over the kernel body, is
 ``LFRicKokkosContractMixin``.
 
-One fact decides everything here. LFRic's ``gh_inc`` and ``gh_readinc`` say
-that two cells of one launch contribute to the same element of a field, and
-every rule below follows from that. A plain write to a continuous space is
-refused outright -- :py:meth:`LFRicKokkosWriteMixin._validate_written_space`
--- because neither answer helps a cell that *decides* an element rather than
-adding to it. A shared contribution is admitted, and answered in one of two
-ways: an atomic update, or a colouring that puts the neighbouring cells in
-different launches. :py:meth:`LFRicKokkosWriteMixin._uses_atomics` says which
-is in force, :py:meth:`LFRicKokkosWriteMixin._validate_atomics_option` refuses
-a caller asking for both or for neither, and
+One fact decides everything here: two cells of one launch can reach the same
+element of a field, and every rule below follows from that. They reach it in
+two ways, which the module keeps apart because they need different statements
+generated. LFRic's ``gh_inc`` and ``gh_readinc`` say that the cells
+*contribute* to the element -- :py:func:`_accumulated` -- and a store to a
+field on a space whose dofs neighbouring cells share says that they each
+*replace* it -- :py:func:`_replaced`.
+
+Both are admitted, and answered in one of two ways: an atomic, or a colouring
+that puts the neighbouring cells in different launches.
+:py:meth:`LFRicKokkosWriteMixin._uses_atomics` says which is in force,
+:py:meth:`LFRicKokkosWriteMixin._validate_atomics_option` refuses a caller
+asking for both or for neither, and
 :py:meth:`LFRicKokkosWriteMixin._validate_shared_updates` checks that the
-atomic arm's statements are ones a single atomic carries out. The colouring
-arm's three extra arguments -- the map, the colour and the colour count -- are
-built by :py:meth:`LFRicKokkosWriteMixin._colouring`, which is here rather
-than in ``LFRicKokkosArgumentMixin`` because a coloured region exists only as
-the alternative answer to a shared write.
+atomic arm's statements are ones a single atomic carries out -- a
+read-modify-write where the cells contribute, and any value that does not read
+the element where they replace it. A caller who knows the loop's stores reach
+no shared element may say so through
+:py:meth:`LFRicKokkosWriteMixin._asserts_disjoint`'s option, which
+:py:meth:`LFRicKokkosWriteMixin._validate_disjoint_option` refuses where the
+assertion contradicts the loop or the metadata. The colouring arm's three
+extra arguments -- the map, the colour and the colour count -- are built by
+:py:meth:`LFRicKokkosWriteMixin._colouring`, which is here rather than in
+``LFRicKokkosArgumentMixin`` because a coloured region exists only as the
+alternative answer to a shared write.
 
 Which formals carry shared data is asked twice, of two different things. The
 metadata answers it per *argument*, which is
@@ -72,9 +81,9 @@ metadata answers it per *argument*, which is
 rewrite; the stub argument walk answers it per *formal*, which is
 :py:meth:`LFRicKokkosWriteMixin._shared_formals` and needs the schedule.
 ``_SharedArgumentPositions`` is the walk that makes the second askable without
-side effects. The two name the same pair of accesses and still write that pair
-out separately, once here and once on the walk; joining them is a change of
-its own.
+side effects. Both read the two module-level predicates rather than restating
+them, which is what keeps the argument's answer and the formal's answer one
+answer.
 
 The sibling mixins are reached through ``cls``, resolved on
 ``LFRicKokkosTrans``: :py:meth:`LFRicKokkosWriteMixin._shared_formals` asks
@@ -94,11 +103,64 @@ from psyclone.psyir.backend.kokkos import (
 from psyclone.psyir.backend.kokkos_array_expression import (
     KokkosArrayExpression)
 from psyclone.psyir.backend.kokkos_array_expression_mixin import (
-    ATOMIC_UPDATES, atomic_update_operands)
+    ATOMIC_UPDATES, atomic_store_operand, atomic_update_operands)
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, Range, Reference)
 from psyclone.psyir.symbols import SymbolTable
 from psyclone.psyir.transformations import TransformationError
+
+
+#: The accesses under which one cell's contribution to an element has to be
+#: combined with another's rather than replacing it.
+_ACCUMULATED = (AccessType.INC, AccessType.READINC)
+
+
+def _accumulated(argument):
+    """Whether the cells sharing an element of this argument add to it.
+
+    Read from the access alone: ``gh_inc`` and ``gh_readinc`` are declared on
+    continuous spaces only -- the metadata parser refuses them anywhere else
+    -- so the space adds nothing to the answer.
+
+    :param argument: the kernel argument to classify.
+    :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
+
+    :returns: whether two cells of one launch may contribute to one element.
+    :rtype: bool
+    """
+    return argument.access in _ACCUMULATED
+
+
+def _replaced(argument, discontinuous):
+    """Whether the cells sharing an element of this argument each store it.
+
+    ``gh_write`` on a continuous space is legal LFRic, and what makes it
+    legal is a promise the kernel's author gives and neither the metadata nor
+    the body records: that every cell reaching a shared dof stores the same
+    value to it. Nothing here can check that promise, so it is not relied on.
+    What *is* read is the function space: a written field on a space this
+    library does not name discontinuous has dofs the neighbouring cells
+    share, and the store to one of them is a shared write like any other.
+
+    ``any_space_*`` is not among the discontinuous names and is answered the
+    same way for the same reason -- LFRic states nowhere which continuity
+    such a space will have, so the launch is built for the one that needs an
+    answer.
+
+    :param argument: the kernel argument to classify.
+    :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
+    :param discontinuous: the names of the discontinuous function spaces, as
+        :py:class:`psyclone.domain.lfric.LFRicConstants` gives them.
+    :type discontinuous: List[str]
+
+    :returns: whether two cells of one launch may each store one element.
+    :rtype: bool
+    """
+    if argument.argument_type != "gh_field":
+        return False
+    if argument.access == AccessType.READ or _accumulated(argument):
+        return False
+    return argument.function_space.orig_name.lower() not in discontinuous
 
 
 class _SharedArgumentPositions(KernStubArgList):
@@ -106,8 +168,9 @@ class _SharedArgumentPositions(KernStubArgList):
 
     The question it answers is which *formal* of the kernel carries an
     argument whose metadata says two cells may update one element of it --
-    ``gh_inc`` and ``gh_readinc``. Nothing already in PSyclone answers it
-    without side effects.
+    an accumulation, which is ``gh_inc`` and ``gh_readinc``, or a store to a
+    space whose dofs neighbouring cells share. Nothing already in PSyclone
+    answers it without side effects.
     :py:meth:`~psyclone.domain.lfric.ArgOrdering.\
 metadata_index_from_actual_index`
     would, but only
@@ -144,16 +207,15 @@ LFRicKokkosTrans.validate`
     # is free to leave to the base, and this one adds no coverage of its own.
     # pylint: disable=abstract-method
 
-    #: The accesses under which one cell's contribution to an element has to
-    #: be combined with another's rather than replacing it.
-    _SHARED = (AccessType.INC, AccessType.READINC)
-
     def __init__(self, kernel):
         super().__init__(kernel)
         # Everything this walk declares goes here and is dropped with it.
         self._forced_symtab = SymbolTable()
         #: The positions in the argument list that carry shared data.
         self.shared_positions = set()
+        #: Those of them the sharing cells replace rather than add to.
+        self.store_positions = set()
+        self._discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
 
     def _record(self, argument, first):
         """Record the entries one argument added, if cells share it.
@@ -162,8 +224,12 @@ LFRicKokkosTrans.validate`
         :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
         :param int first: the argument count before it was appended.
         """
-        if argument.access in self._SHARED:
-            self.shared_positions.update(range(first, self.num_args))
+        positions = range(first, self.num_args)
+        if _accumulated(argument):
+            self.shared_positions.update(positions)
+        elif _replaced(argument, self._discontinuous):
+            self.shared_positions.update(positions)
+            self.store_positions.update(positions)
 
     def field(self, arg, var_accesses=None):
         """Append a field and record whether cells share it.
@@ -195,11 +261,11 @@ LFRicKokkosTrans.validate`
 class LFRicKokkosWriteMixin:
     """What a captured loop may write, and how a shared write is made safe.
 
-    Every question here is about a field the launch updates: whether its
-    function space admits the write at all, whether more than one cell of the
-    launch reaches the same element, and, where one does, which of the two
-    answers -- an atomic update or a colouring -- is in force and what each
-    needs built for it. The rest of the capture contract is
+    Every question here is about a field the launch updates: whether more
+    than one cell of the launch reaches the same element, what those cells do
+    to it, and, where more than one does, which of the two answers -- an
+    atomic or a colouring -- is in force and what each needs built for it.
+    The rest of the capture contract is
     ``LFRicKokkosContractMixin``; where the loop iterates is
     ``LFRicKokkosIterationMixin``; how every other argument is described is
     ``LFRicKokkosArgumentMixin``.
@@ -209,8 +275,10 @@ class LFRicKokkosWriteMixin:
     # pylint: disable=too-few-public-methods
 
     #: The accesses under which two cells contribute to one element, so that
-    #: the update has to be made indivisible or serialised by colour.
-    _SHARED_ACCESSES = (AccessType.INC, AccessType.READINC)
+    #: the update has to be made indivisible or serialised by colour. A store
+    #: to a space whose dofs neighbouring cells share is the other half of
+    #: the question and is not an access: see :py:func:`_replaced`.
+    _SHARED_ACCESSES = _ACCUMULATED
 
     #: The option choosing between the two answers to a write two cells of
     #: one launch share. ``True`` generates a ``Kokkos::atomic_*`` update for
@@ -225,6 +293,82 @@ class LFRicKokkosWriteMixin:
     #: which is faster is a measurement neither this class nor the branch
     #: that added it has made.
     _ATOMICS_OPTION = "atomics"
+
+    #: The option by which a caller states that no two cells of the loop
+    #: store to one element, so that a write to a continuous space needs
+    #: neither answer. It is named for the claim rather than for its effect
+    #: -- it is not "no atomics" -- because the claim is what has to be true:
+    #: a kernel whose dofmaps happen not to collide is one this library
+    #: cannot recognise, and the caller asserting it takes on saying so
+    #: wrongly. Absent is the same as ``False``, which is what makes the
+    #: conservative answer the default.
+    #:
+    #: It says nothing about an accumulation. ``gh_inc`` states that two
+    #: cells reach one element, and no assertion about the loop makes that
+    #: false, so the option is refused rather than narrowed on a kernel that
+    #: carries one.
+    _DISJOINT_OPTION = "disjoint_writes"
+
+    @classmethod
+    def _asserts_disjoint(cls, options):
+        """Say whether the caller has asserted the loop's writes are disjoint.
+
+        :param options: the transformation options.
+        :type options: Optional[Dict[str, Any]]
+
+        :returns: whether no two cells are stated to store to one element.
+        :rtype: bool
+        """
+        return bool((options or {}).get(cls._DISJOINT_OPTION))
+
+    def _validate_disjoint_option(self, node, options):
+        """Check the disjointness assertion against the loop it is made of.
+
+        Three ways of making it are refused rather than resolved. On a
+        coloured loop it asserts away the reason the loop was coloured; beside
+        an explicit ``atomics`` request it says both that the writes are
+        shared and that they are not; and on a kernel that accumulates it
+        contradicts the metadata, which states the sharing that the assertion
+        denies.
+
+        :param node: the loop that is to be captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+        :param options: the transformation options.
+        :type options: Optional[Dict[str, Any]]
+
+        :raises TransformationError: if the option is neither absent nor a
+            bool; or if it is ``True`` on a coloured loop, beside an explicit
+            request for atomics, or on a kernel accumulating into a shared
+            element.
+        """
+        requested = (options or {}).get(self._DISJOINT_OPTION)
+        if requested is not None and not isinstance(requested, bool):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._DISJOINT_OPTION}' option must be "
+                f"absent or a bool, but found '{requested}'.")
+        if not requested:
+            return
+        if node.loop_type == self._COLOURED_LOOP_TYPE:
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._DISJOINT_OPTION}' option is True "
+                "on a coloured loop. Colouring is the answer to cells that do "
+                "share an element, so the two say opposite things about the "
+                "same loop; capture the uncoloured loop if the writes really "
+                "are disjoint.")
+        if (options or {}).get(self._ATOMICS_OPTION):
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._DISJOINT_OPTION}' option is True "
+                f"beside a '{self._ATOMICS_OPTION}' request, which asks for "
+                "an answer to the sharing it says there is none of.")
+        accumulated = [argument.name
+                       for argument in node.kernels()[0].arguments.args
+                       if _accumulated(argument)]
+        if accumulated:
+            raise TransformationError(
+                f"LFRicKokkosTrans' '{self._DISJOINT_OPTION}' option is True "
+                f"on a kernel that accumulates into '{accumulated[0]}'. The "
+                "metadata states that two cells contribute to one element of "
+                "it, which no assertion about the loop makes untrue.")
 
     @classmethod
     def _uses_atomics(cls, node, options):
@@ -277,7 +421,8 @@ class LFRicKokkosWriteMixin:
                 "cell of the launch reaches; ask for one answer to a shared "
                 "write or the other.")
         if (requested is False and not coloured
-                and self._shared_arguments(node.kernels()[0])):
+                and self._shared_arguments(
+                    node.kernels()[0], self._asserts_disjoint(options))):
             raise TransformationError(
                 f"LFRicKokkosTrans' '{self._ATOMICS_OPTION}' option is False "
                 "on a loop that is not coloured, whose kernel writes a field "
@@ -285,30 +430,44 @@ class LFRicKokkosWriteMixin:
                 "out and take the atomic update.")
 
     @classmethod
-    def _shared_arguments(cls, kernel):
-        """Return the kernel arguments more than one cell of a launch updates.
+    def _shared_arguments(cls, kernel, disjoint=False):
+        """Return the kernel arguments more than one cell of a launch writes.
 
         Read from the kernel's metadata rather than from its body, and so
-        askable before any rewrite: what makes an argument shared is the
-        access LFRic declares for it, ``gh_inc`` or ``gh_readinc``, and not
-        the statement that carries out the update.
+        askable before any rewrite. Two things make an argument shared and
+        they are read from different places: the access LFRic declares for
+        it, ``gh_inc`` or ``gh_readinc``, says that cells add to one element,
+        and the function space of a written field says that cells store to
+        one. Neither is the statement that carries out the write.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param bool disjoint: whether the caller has asserted that no two
+            cells store to one element, which removes the stores from the
+            answer and leaves the accumulations, which no assertion reaches.
 
         :returns: the shared arguments, in metadata order.
         :rtype: list[:py:class:`psyclone.lfric.LFRicKernelArgument`]
         """
+        discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
         return [argument for argument in kernel.arguments.args
-                if argument.access in cls._SHARED_ACCESSES]
+                if _accumulated(argument)
+                or (not disjoint and _replaced(argument, discontinuous))]
 
     @classmethod
-    def _shared_formals(cls, kernel, schedule):
-        """Return the names of the formals two cells may both update.
+    def _shared_formals(cls, kernel, schedule, disjoint=False):
+        """Return the formals two cells may both write, and how.
 
         The names, and not the positions, because the caller has by then
         dropped the cell-position formal from the front of its list and
         appended the extents it measured to the back. A name survives both.
+
+        Each name is mapped to what the sharing cells do to the element:
+        ``False`` where they add to it and ``True`` where they each store it.
+        The two need different statements generated for them, and reading one
+        as the other is silently wrong in both directions -- a store
+        generated for an accumulation keeps one contribution, and an
+        accumulation required of a store refuses a kernel that is correct.
 
         :param kernel: the kernel being captured.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
@@ -316,10 +475,15 @@ class LFRicKokkosWriteMixin:
             order :py:meth:`~psyclone.domain.lfric.ArgOrdering.generate`
             fixes -- which is what makes the positions comparable.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param bool disjoint: whether the caller has asserted that no two
+            cells store to one element, as
+            :py:meth:`_validate_disjoint_option` has checked the assertion is
+            one this kernel can carry.
 
-        :returns: the names of the kernel's own formals that carry data an
-            element of which more than one cell contributes to.
-        :rtype: set[str]
+        :returns: the kernel's own formals an element of which more than one
+            cell writes, each mapped to whether the cells replace it rather
+            than contribute to it.
+        :rtype: dict[str, bool]
 
         :raises TransformationError: if the kernel declares a different
             number of formals than its metadata describes, so that no
@@ -327,8 +491,11 @@ class LFRicKokkosWriteMixin:
         """
         builder = _SharedArgumentPositions(kernel)
         builder.generate()
-        if not builder.shared_positions:
-            return set()
+        positions = builder.shared_positions
+        if disjoint:
+            positions = positions - builder.store_positions
+        if not positions:
+            return {}
         implicit = cls._implicit_extents(schedule.symbol_table)
         formals = [symbol.name
                    for symbol in schedule.symbol_table.argument_list
@@ -339,72 +506,11 @@ class LFRicKokkosWriteMixin:
                 f"'{kernel.name}' are shared between cells: the kernel "
                 f"declares {len(formals)} of them and its metadata describes "
                 f"{builder.num_args}.")
-        return {formals[position] for position in builder.shared_positions}
-
-    @staticmethod
-    def _validate_written_space(argument, discontinuous):
-        """Check one argument's function space, if it is a written field.
-
-        A read field is passed over, as is anything that is not a field:
-        only a written space decides whether cells may run in parallel.
-
-        :param argument: the kernel argument to check.
-        :type argument: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param discontinuous: the names of the discontinuous function spaces,
-            as :py:class:`psyclone.domain.lfric.LFRicConstants` gives them.
-        :type discontinuous: List[str]
-
-        A field accumulated into is passed over too. ``gh_inc`` is illegal
-        on a discontinuous space -- the metadata parser refuses it -- so
-        every shared write there is on a continuous one by construction, and
-        a rule refusing those would refuse the whole pattern. What makes such
-        a write safe is not the space but the update: an atomic combines the
-        two cells' contributions, and a coloured launch keeps them apart in
-        time. Which of the two is in force is decided by
-        :py:meth:`~psyclone.domain.lfric.transformations.\
-LFRicKokkosTrans._uses_atomics`,
-        and the shape of the update itself is checked by
-        :py:meth:`_validate_shared_updates`. What remains refused here is a
-        plain ``gh_write`` or ``gh_readwrite`` to a continuous space, which
-        neither answer helps: two cells there do not contribute to a value,
-        they each decide it.
-
-        :raises TransformationError: if the argument is a field written on a
-            continuous space by an access that replaces the element rather
-            than contributing to it, where one cell's write could overwrite
-            another's.
-        """
-        if argument.argument_type != "gh_field":
-            return
-        if argument.access == AccessType.READ:
-            return
-        if argument.access in LFRicKokkosWriteMixin._SHARED_ACCESSES:
-            return
-        space = argument.function_space.orig_name.lower()
-        if space not in discontinuous:
-            raise TransformationError(
-                f"LFRicKokkosTrans requires a discontinuous space for "
-                f"the written field '{argument.name}', but found "
-                f"'{space}': one cell's contribution could overwrite "
-                "another's.")
+        return {formals[position]: position in builder.store_positions
+                for position in positions}
 
     @classmethod
-    def _validate_continuous_write(cls, kernel):
-        """Check every field the kernel writes for a discontinuous space.
-
-        :param kernel: the kernel the loop holds.
-        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
-
-        :raises TransformationError: if any written field argument is on a
-            continuous space, for the reason
-            :py:meth:`_validate_written_space` gives.
-        """
-        discontinuous = LFRicConstants().VALID_DISCONTINUOUS_NAMES
-        for argument in kernel.arguments.args:
-            cls._validate_written_space(argument, discontinuous)
-
-    @classmethod
-    def _validate_shared_updates(cls, kernel, schedule):
+    def _validate_shared_updates(cls, kernel, schedule, disjoint=False):
         """Check that every write to a shared field is one an atomic answers.
 
         Asked only when the atomic arm is in force: a coloured launch runs
@@ -413,14 +519,25 @@ LFRicKokkosTrans._uses_atomics`,
 
         The rules are the writer's own, asked here so that a loop the backend
         could not express is refused rather than captured and then failed
-        part-way through. Two shapes are refused. One is an update that is
-        not a read-modify-write of the element by one of the operators in
+        part-way through. Three shapes are refused. The first is a statement
+        the backend lowers to a nest of its own, such as one holding a
+        section or an array-valued intrinsic: what the atomic has to cover is
+        then a whole loop rather than a statement, and that is refused
+        whichever way the element is shared.
+
+        The other two are each about one kind of sharing. Where the cells
+        *add* to an element, an update that is not a read-modify-write of it
+        by one of the operators in
         :py:data:`~psyclone.psyir.backend.\
 kokkos_array_expression_mixin.ATOMIC_UPDATES`
-        -- there is no indivisible instruction for an arbitrary computation.
-        The other is a statement the backend lowers to a nest of its own,
-        such as one holding a section or an array-valued intrinsic: what the
-        atomic has to cover is then a whole loop rather than a statement.
+        is refused -- there is no indivisible instruction for an arbitrary
+        computation. Where they each *store* it, any value is carried by
+        ``Kokkos::atomic_store`` except one that reads the element being
+        stored, which races with the other cell's store however it is
+        written; that is
+        :py:func:`~psyclone.psyir.backend.\
+kokkos_array_expression_mixin.atomic_store_operand`'s
+        answer, and the same rule the operand of an accumulation is held to.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
@@ -430,11 +547,14 @@ LFRicKokkosTrans.apply`
             makes, because those rewrites decide which statements survive as
             statements.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param bool disjoint: whether the caller has asserted that no two
+            cells store to one element, which leaves the stores with no shape
+            to answer for.
 
         :raises TransformationError: if a shared field is written by a
             statement no single atomic carries out.
         """
-        shared = cls._shared_formals(kernel, schedule)
+        shared = cls._shared_formals(kernel, schedule, disjoint)
         if not shared:
             return
         shapes = ", ".join(sorted(name for name, _ in ATOMIC_UPDATES.values()))
@@ -449,13 +569,21 @@ LFRicKokkosTrans.apply`
                     f"updates the shared field '{target.name}' with a "
                     "whole-array expression, which no single atomic carries "
                     "out. Colour the loop instead.")
-            if atomic_update_operands(assignment) is None:
+            if atomic_update_operands(assignment) is not None:
+                continue
+            if not shared[target.name]:
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot capture '{kernel.name}': it "
                     f"writes the shared field '{target.name}' with a "
                     "statement that is not one of the read-modify-write "
                     f"shapes an atomic answers ({shapes}). Colour the loop "
                     "instead.")
+            if atomic_store_operand(assignment) is None:
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot capture '{kernel.name}': it "
+                    f"replaces an element of the shared field "
+                    f"'{target.name}' with a value that reads it, which is a "
+                    "race no atomic store answers. Colour the loop instead.")
 
     @staticmethod
     def _is_lowered(assignment):

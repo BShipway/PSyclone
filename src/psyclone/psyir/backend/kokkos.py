@@ -648,9 +648,11 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             identifiers; if an extent is not an integer expression over named
             sizes; if its rank does not match the kernel and region indices
             supplied for it; if it is writable while asking for
-            ``RandomAccess``; or if it is read only while asking for atomic
+            ``RandomAccess``; if it is read only while asking for atomic
             updates, which would be a description of an update that cannot
-            happen.
+            happen; or if it asks for an atomic store without being atomic at
+            all, which would say that cells replace an element no two of them
+            reach.
         :raises TypeError: if an index offset is neither an integer nor an
             integer expression over named sizes.
         """
@@ -684,6 +686,10 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         if view.atomic and view.read_only:
             raise ValueError(
                 f"Kokkos View '{view.name}' is atomic but read only.")
+        if view.atomic_store and not view.atomic:
+            raise ValueError(
+                f"Kokkos View '{view.name}' stores atomically but is not "
+                "atomic.")
 
     @staticmethod
     def _argument_declaration(argument):

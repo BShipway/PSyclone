@@ -205,6 +205,19 @@ class KokkosView:
     #: argument of every region captured before this field existed, so those
     #: regions generate the source they generated then, byte for byte.
     atomic: bool = False
+    #: Whether the cells sharing an element *replace* it rather than
+    #: contribute to it, so that a statement assigning to one is generated as
+    #: a ``Kokkos::atomic_store`` instead of being refused. It is set only
+    #: beside :py:attr:`atomic`, and the two say different things: that one
+    #: says an element is shared, and this one says what the cells sharing it
+    #: do to it.
+    #:
+    #: What the store buys is exactly one thing, and it is worth being exact
+    #: about: the element is written whole, so no reader sees a value neither
+    #: cell stored. It settles nothing about *which* cell wrote last. A
+    #: description setting this for a field cells accumulate into would
+    #: generate a store that kept one contribution and lost the rest.
+    atomic_store: bool = False
 
 
 @dataclass(frozen=True)
