@@ -424,3 +424,70 @@ def test_match_argument_array_kind_absent_from_its_module_is_weak(
     dummy = DataSymbol("x", _real_array(_kind("r_single",
                                               _integer_literal(4))))
     assert match_argument(actual, dummy, interface_call=True) == 1
+
+
+def _real_scalar(precision):
+    '''
+    :param precision: the kind of the scalar.
+    :type precision: int | :py:class:`psyclone.psyir.nodes.DataNode` |
+        :py:class:`psyclone.psyir.symbols.ScalarType.Precision`
+
+    :returns: the type of a real scalar of that kind.
+    :rtype: :py:class:`psyclone.psyir.symbols.ScalarType`
+    '''
+    return ScalarType(ScalarType.Intrinsic.REAL, precision)
+
+
+def test_match_argument_scalars_of_the_same_kind_score_zero():
+    '''R4 for scalars: two kinds written as different constants of the same
+    value are the same type, and the PSyIR's unequal types are not evidence
+    otherwise.'''
+    actual = Reference(DataSymbol(
+        "detj", _real_scalar(_kind("r_def", _integer_literal(8)))))
+    dummy = DataSymbol(
+        "dj", _real_scalar(_kind("r_double", _integer_literal(8))))
+    assert match_argument(actual, dummy, interface_call=True) == 0
+
+
+def test_match_argument_scalars_of_different_kinds_do_not_match():
+    '''R4 for scalars: two kinds that reduce to different values are refused,
+    as two unequal scalar types always were.'''
+    actual = Reference(DataSymbol(
+        "detj", _real_scalar(_kind("r_def", _integer_literal(8)))))
+    dummy = DataSymbol(
+        "dj", _real_scalar(_kind("r_single", _integer_literal(4))))
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        match_argument(actual, dummy, interface_call=True)
+    assert "Argument type mismatch of call argument 'detj'" in str(err.value)
+
+
+def test_match_argument_scalar_kinds_of_one_name_score_zero():
+    '''R4 for scalars: a kind neither side can reduce is compared by name,
+    and two declarations naming the same constant are the same type.'''
+    actual = Reference(DataSymbol("detj", _real_scalar(_kind("r_def"))))
+    dummy = DataSymbol("dj", _real_scalar(_kind("r_def")))
+    assert match_argument(actual, dummy, interface_call=True) == 0
+
+
+def test_match_argument_scalars_of_unresolvable_kinds_do_not_match():
+    '''R4 for scalars: two kinds that cannot be reduced keep the behaviour
+    they had -- a scalar is passed by kind, and a pair that cannot be shown
+    to agree is refused rather than matched weakly.'''
+    actual = Reference(DataSymbol("detj", _real_scalar(_kind("r_solver"))))
+    dummy = DataSymbol("dj", _real_scalar(_kind("r_tran")))
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        match_argument(actual, dummy, interface_call=True)
+    assert "Argument type mismatch of call argument 'detj'" in str(err.value)
+
+
+def test_match_argument_scalars_of_different_intrinsics_do_not_match():
+    '''R4 for scalars is about kinds; an integer is not a real whatever the
+    two kinds reduce to.'''
+    actual = Reference(DataSymbol(
+        "n", ScalarType(ScalarType.Intrinsic.INTEGER,
+                        _kind("i_def", _integer_literal(4)))))
+    dummy = DataSymbol("x", _real_scalar(_kind("r_single",
+                                               _integer_literal(4))))
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        match_argument(actual, dummy, interface_call=True)
+    assert "Argument type mismatch of call argument 'n'" in str(err.value)

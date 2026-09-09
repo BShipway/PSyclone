@@ -845,9 +845,11 @@ class Call(Statement, DataNode):
         what Fortran requires of them (a literal that states no kind, an
         actual of unresolved type, a section against a formal argument of
         partially known type, or a pair of array kinds at least one of which
-        PSyclone cannot reduce to a value). Two array kinds it can both
-        reduce, and which differ, are no match at all: that is what tells the
-        specific procedures of an interface written over kinds apart. The
+        PSyclone cannot reduce to a value). Kinds it can reduce -- of arrays
+        or of scalars -- are compared by what they reduce to: two that agree
+        match exactly however they are written, and two array kinds that
+        differ are no match at all. That is what tells the specific
+        procedures of an interface written over kinds apart. The
         lowest-scoring candidate is returned. Since
         a relaxed comparison can make two candidates look alike, two of them
         tying on a non-zero score are reported as ambiguous rather than chosen

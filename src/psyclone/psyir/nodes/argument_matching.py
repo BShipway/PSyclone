@@ -354,6 +354,44 @@ def _match_kinds(actual: DataNode, actual_precision,
     return WEAK_MATCH
 
 
+def _scalar_kinds_agree(actual: DataNode, actual_type, dummy_type) -> bool:
+    '''Say whether two scalars of the same intrinsic type are written with
+    kinds that reduce to the same thing.
+
+    Two scalar types are equal only if their kinds are, and a kind written as
+    a named constant is held as a reference to a symbol, so two declarations
+    of the same kind under two names -- LFRic's ``r_def`` and ``r_double``
+    are both ``real64`` -- are unequal types and the call was refused. The
+    kinds are reduced by :py:func:`_reduced_kind`, the same way an array's
+    are, and where they reduce to the same thing the two scalars are the same
+    type after all.
+
+    Only agreement is answered here. Two kinds that reduce to different
+    things, and two that cannot be reduced, are both left to the type
+    comparison the caller has already made, which refuses them: a scalar is
+    passed by kind and a caller that got it wrong is not helped by a weak
+    match.
+
+    :param actual: one argument of the call.
+    :param actual_type: the type of that argument.
+    :type actual_type: :py:class:`psyclone.psyir.symbols.DataType`
+    :param dummy_type: the type of the corresponding routine argument.
+    :type dummy_type: :py:class:`psyclone.psyir.symbols.DataType`
+
+    :returns: True if the two are scalars of the same intrinsic type whose
+        kinds reduce to the same value or the same name.
+
+    '''
+    if not (isinstance(actual_type, ScalarType) and
+            isinstance(dummy_type, ScalarType)):
+        return False
+    if actual_type.intrinsic != dummy_type.intrinsic:
+        return False
+    actual_kind, _ = _reduced_kind(actual_type.precision, actual)
+    dummy_kind, _ = _reduced_kind(dummy_type.precision, actual)
+    return actual_kind is not None and actual_kind == dummy_kind
+
+
 def _is_kindless_literal(actual: DataNode, actual_type, dummy_type) -> bool:
     '''Say whether the actual is a literal whose kind the dummy supplies.
 
@@ -402,6 +440,12 @@ def match_argument(actual: DataNode, dummy: DataSymbol, *,
       two values. Two kinds that *were* reduced and differ are not a match at
       all; see :py:func:`_match_kinds`.
 
+    One match is not relaxed but widened: two scalars of the same intrinsic
+    type whose kinds are written as different names for the same thing are
+    equal types that the PSyIR held as unequal, and are an exact match; see
+    :py:func:`_scalar_kinds_agree`. A scalar kind that cannot be reduced, or
+    that reduces to something else, is refused as it was before.
+
     :param actual: one argument of the call.
     :param dummy: the corresponding argument of the candidate routine.
     :param interface_call: whether the call is made through a generic
@@ -429,7 +473,8 @@ def match_argument(actual: DataNode, dummy: DataSymbol, *,
                               interface_call)
 
     if actual_type != dummy_type:
-        if _type_symbols_match(actual_type, dummy_type):
+        if (_type_symbols_match(actual_type, dummy_type) or
+                _scalar_kinds_agree(actual, actual_type, dummy_type)):
             return EXACT_MATCH
         if _is_kindless_literal(actual, actual_type, dummy_type):
             return WEAK_MATCH
