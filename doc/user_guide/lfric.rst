@@ -4299,7 +4299,14 @@ any other. A formal carrying any other attribute PSyclone does not model --
 ``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
 ``InlineTrans``'s words. A callee's own ``POINTER`` local is relaxed too
 where it only ever aims at a whole array, and becomes a ``View`` handle in
-the generated region; every other use of such a pointer is refused by name. Types agreeing is a scored judgement rather than
+the generated region; every other use of such a pointer is refused by name. A name the two
+scopes hold differently -- an import in one and, in the other, a name that
+scope cannot say the origin of, which is how LFRic's FFSL kernels and their
+support routines reach ``reference_element_mod``'s ``S`` -- is given the
+module both name before the two tables are merged, and refused as it was
+where that module cannot be read. An imported name a later pass needs the
+type of is read from its module too, so an array section bounded by a
+module's parameter is lowered by that parameter's value. Types agreeing is a scored judgement rather than
 an identity: a literal actual stating no kind, an actual whose type PSyclone cannot
 resolve, and an array section against a formal argument PSyclone holds only
 a partial type for are each a weaker match than an exact one rather than no
@@ -4957,6 +4964,56 @@ them, which may do either without saying so; the pointer passed as an actual
 argument, which hands the question to a routine this cannot read; and
 targets differing in intrinsic, kind or rank, which are more than one
 handle can hold.
+
+**A name a wildcard** ``use`` **was to supply is resolved before inlining.**
+Inlining merges the callee's symbol table into the call site's, and a name
+both tables hold has to mean the same thing in each. It may be held
+differently: LFRic's FFSL kernels name ``W``, ``S``, ``E`` and ``N`` in a
+``use`` of ``reference_element_mod``, and a support routine written beside
+the kernel reads the same ``S`` while holding nothing of its own, so one
+scope has the name as an import and the other says nothing about where it
+came from. That is
+:py:meth:`~psyclone.psyir.symbols.SymbolTable.check_for_clashes`'s refusal
+about a symbol *present in both tables but unresolved in one*, and it stops
+``ffsl_flux_xy_panel_remap_code``, ``hori_dep_dist_ffsl_sphere_code`` and
+their neighbours.
+
+The message names a wildcard ``use`` because that is the import which would
+settle it, not because one was written. Two things leave a scope unable to
+say where a name came from: a wildcard ``use``, and being copied away from
+the scope that named it -- ``InlineTrans`` copies the callee, and a routine
+detached from its Container no longer has the ``use`` its module wrote.
+LFRic's is the second.
+
+So before ``InlineTrans`` is applied, each name the two scopes share is
+settled. One that is unresolved in a scope's own table is looked up in the
+module the other scope names, through
+:py:meth:`~psyclone.psyir.symbols.SymbolTable.resolve_imports` and the
+``ModuleManager``'s search path, and becomes an import of that module too.
+One a scope holds nothing of and reads from the Container it sits in is
+copied down into the routine's own table as a ``use ..., only`` of its own,
+so the copy carries the declaration rather than losing it. Only names the
+two scopes share are settled -- not every name a wildcard ``use`` might
+supply -- and the work is done on the copy of the callee the capture works
+on, so the module tree is left as it was for a later kernel.
+
+Where the module cannot be read, or does not publish the name, nothing is
+asserted about it: the symbol is left unresolved and the refusal stands in
+``InlineTrans``'s own words, which name the module that was not read.
+
+**An imported name a later pass needs the type of is read.** A name brought
+in by a ``use ..., only`` that PSyclone never had to type is a bare
+:py:class:`~psyclone.psyir.symbols.Symbol`, recording which module it came
+from and nothing more. Lowering an array section to a loop needs a type:
+``ffsl_flux_z_ppm_code`` bounds a section by ``eps_r_tran``, a
+``real(kind=r_tran), parameter`` of LFRic's ``constants_mod``, and the
+section lowering refuses *the supplied node should be a Reference to a
+DataSymbol*. So each such name a call site or a callee reads is resolved
+against the module it already names, on the search path the capture passes
+with ``-d``, and the section lowering and the module-constant argument both
+then see the module's own declaration, its type and its value. A module the
+search path cannot reach leaves the name as it was, and the pass that needed
+the type refuses as it did before.
 
 **Actual and formal types agreeing is scored, not identical.**
 :py:meth:`~psyclone.psyir.nodes.Call.get_callee` scores each candidate
