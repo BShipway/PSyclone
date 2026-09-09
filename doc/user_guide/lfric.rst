@@ -4963,9 +4963,13 @@ routine through
 :py:func:`~psyclone.psyir.nodes.argument_matching.match_argument`: zero
 where every actual argument's type is the formal argument's, and one more
 for each argument that agrees only in what Fortran requires of it. Three
-such arguments arise in the LFRic kernels. A literal written without a
-kind -- ``2.0`` passed where the formal argument is ``real(kind=r_def)``
--- carries no precision of its own to disagree with. An actual whose type
+such arguments arise in the LFRic kernels. An actual of no settled kind
+-- ``2.0`` passed where the formal argument is ``real(kind=r_def)``, or
+an expression such as ``nlayers - 1`` whose precision the PSyIR reports
+as undefined because one operand's is, passed where the formal argument
+is ``integer(kind=i_def)`` -- carries no precision of its own to
+disagree with. A variable is not in that position: a declaration that
+names no kind names the default one, which is a kind. An actual whose type
 PSyclone cannot resolve, typically a module datum whose declaration holds
 an attribute the PSyIR does not model, is unknown rather than wrong. And
 an array section passed where the formal argument is declared with an
@@ -4976,8 +4980,9 @@ The lowest-scoring candidate is the callee. Relaxing a comparison this
 way is safe only while an ambiguity it creates is caught, so two
 candidates tying on a non-zero score are refused rather than chosen
 between, naming both and the score. A generic interface whose candidates
-differ only in the kind of an argument the call passes a kindless literal
-to is the case this arises in, and Fortran would not settle it either.
+differ only in the kind of an argument the call passes an actual of no
+settled kind to is the case this arises in, and Fortran would not settle
+it either.
 
 **An array-valued assignment is lowered to an explicit loop.** Two
 shapes reach the lowering. A whole-column array section such as

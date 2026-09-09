@@ -491,3 +491,81 @@ def test_match_argument_scalars_of_different_intrinsics_do_not_match():
     with pytest.raises(CallMatchingArgumentsNotFound) as err:
         match_argument(actual, dummy, interface_call=True)
     assert "Argument type mismatch of call argument 'n'" in str(err.value)
+
+
+def _undefined_kind_expression():
+    '''
+    :returns: an expression of the shape LFRic writes an argument as --
+        ``nlayers - 1``, a variable of a named kind less a literal of none --
+        whose datatype the PSyIR reduces to a scalar of UNDEFINED precision
+        even though Fortran's result kind is the variable's.
+    :rtype: :py:class:`psyclone.psyir.nodes.BinaryOperation`
+    '''
+    nlayers = DataSymbol("nlayers", ScalarType(
+        ScalarType.Intrinsic.INTEGER, _kind("i_def")))
+    return BinaryOperation.create(BinaryOperation.Operator.SUB,
+                                  Reference(nlayers),
+                                  Literal("1", _KINDLESS_INT))
+
+
+def test_expression_of_undefined_kind_has_the_type_the_rule_is_about():
+    '''The premise of R2's extension: the PSyIR gives such an expression a
+    scalar type of UNDEFINED precision, which is what a literal without a
+    kind has.'''
+    actual_type = _undefined_kind_expression().datatype
+    assert isinstance(actual_type, ScalarType)
+    assert actual_type.intrinsic is ScalarType.Intrinsic.INTEGER
+    assert actual_type.precision is ScalarType.Precision.UNDEFINED
+
+
+def test_match_argument_expression_of_undefined_kind_is_a_weak_match():
+    '''R2: an expression whose precision the PSyIR cannot settle matches any
+    kind of its own intrinsic type, weakly, as a literal does.'''
+    dummy = DataSymbol("nlayers", ScalarType(ScalarType.Intrinsic.INTEGER,
+                                             _kind("i_def")))
+    assert match_argument(_undefined_kind_expression(), dummy,
+                          interface_call=False) == 1
+
+
+def test_match_argument_expression_of_undefined_kind_across_intrinsics():
+    '''R2 is relaxed about the kind and about nothing else: an integer
+    expression is not a real however undefined its precision is.'''
+    dummy = DataSymbol("x", _real_scalar(_kind("r_def")))
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        match_argument(_undefined_kind_expression(), dummy,
+                       interface_call=False)
+    assert ("Argument type mismatch of call argument 'nlayers - 1'"
+            in str(err.value))
+
+
+def test_match_argument_expression_of_undefined_kind_ties_on_kind():
+    '''R2's extension is guarded the way the literal rule is: an expression
+    of undefined precision scores one against every kind of its intrinsic
+    type, so two specifics differing only in kind tie and
+    :py:meth:`psyclone.psyir.nodes.Call.get_callee` refuses the call as
+    ambiguous rather than choosing between them.'''
+    for precision in (4, 8):
+        dummy = DataSymbol("n", ScalarType(ScalarType.Intrinsic.INTEGER,
+                                           precision))
+        assert match_argument(_undefined_kind_expression(), dummy,
+                              interface_call=True) == 1
+
+
+def test_match_argument_partial_type_that_agrees_scores_zero():
+    '''A dummy the PSyIR does not model, whose partial datatype is the
+    actual's type, is an exact match: the part of the declaration that was
+    not modelled is not evidence of a mismatch.'''
+    dummy = DataSymbol("x", UnsupportedFortranType(
+        "INTEGER, POINTER :: x", partial_datatype=_KIND8_INT))
+    actual = Reference(DataSymbol("i", _KIND8_INT))
+    assert match_argument(actual, dummy, interface_call=False) == 0
+
+
+def test_match_argument_an_array_actual_is_not_a_scalar_dummy():
+    '''Reducing the two kinds is a question about two scalars; an array
+    passed where a scalar is declared is refused before it is asked.'''
+    actual = Reference(DataSymbol("chi", _real_array(_kind("r_def"))))
+    dummy = DataSymbol("dj", _real_scalar(_kind("r_def")))
+    with pytest.raises(CallMatchingArgumentsNotFound) as err:
+        match_argument(actual, dummy, interface_call=False)
+    assert "Argument type mismatch of call argument 'chi'" in str(err.value)

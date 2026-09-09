@@ -392,8 +392,10 @@ def _scalar_kinds_agree(actual: DataNode, actual_type, dummy_type) -> bool:
     return actual_kind is not None and actual_kind == dummy_kind
 
 
-def _is_kindless_literal(actual: DataNode, actual_type, dummy_type) -> bool:
-    '''Say whether the actual is a literal whose kind the dummy supplies.
+def _is_undefined_kind_scalar(actual: DataNode, actual_type,
+                              dummy_type) -> bool:
+    '''Say whether the actual is a scalar of no settled kind, which the dummy
+    therefore supplies.
 
     A Fortran literal written without a kind takes the default kind of its
     intrinsic type, and the compiler has already accepted the call, so where
@@ -401,17 +403,35 @@ def _is_kindless_literal(actual: DataNode, actual_type, dummy_type) -> bool:
     records the literal's kind as ``UNDEFINED`` and cannot conclude that for
     itself, which is why a match found this way is a weak one.
 
+    An expression is in the same position for a different reason. Fortran
+    gives ``nlayers - 1`` the kind of ``nlayers``, but a
+    :py:class:`psyclone.psyir.nodes.BinaryOperation`'s datatype reports
+    ``UNDEFINED`` precision as soon as one operand's precision is undefined,
+    which the literal ``1``'s is. The precision is therefore not evidence of
+    anything and the pair is matched by intrinsic type alone, weakly, exactly
+    as the literal is -- so that a generic interface whose specifics differ
+    only in kind ties on score one and
+    :py:meth:`psyclone.psyir.nodes.Call.get_callee` refuses it as ambiguous.
+
+    A :py:class:`psyclone.psyir.nodes.Reference` is what the rule excludes,
+    and is why it is written as an exclusion rather than as a list of the
+    node types it admits. There, and only there, ``UNDEFINED`` is what the
+    program says rather than what the PSyIR could not work out: the variable
+    is declared with the default kind of its intrinsic type, which is a kind,
+    and a caller that passed it where another kind was declared is refused as
+    it was before.
+
     :param actual: one argument of the call.
     :param actual_type: the type of that argument.
     :type actual_type: :py:class:`psyclone.psyir.symbols.DataType`
     :param dummy_type: the type of the corresponding routine argument.
     :type dummy_type: :py:class:`psyclone.psyir.symbols.DataType`
 
-    :returns: True if the two are scalars of the same intrinsic type and the
-        actual is a literal that states no kind.
+    :returns: True if the two are scalars of the same intrinsic type, and the
+        actual is not a reference and has undefined precision.
 
     '''
-    return (isinstance(actual, Literal) and
+    return (not isinstance(actual, Reference) and
             isinstance(actual_type, ScalarType) and
             isinstance(dummy_type, ScalarType) and
             actual_type.precision is ScalarType.Precision.UNDEFINED and
@@ -429,8 +449,10 @@ def match_argument(actual: DataNode, dummy: DataSymbol, *,
     * an actual whose type is unresolved -- its symbol comes from a module
       PSyclone has not read -- could be of any type, so it matches any dummy
       weakly rather than refusing every candidate;
-    * a literal that states no kind takes the dummy's kind, so it matches any
-      kind of its own intrinsic type, weakly;
+    * a scalar actual of undefined precision -- a literal that states no
+      kind, or an expression the PSyIR reduces to undefined precision because
+      one operand's is -- takes the dummy's kind, so it matches any kind of
+      its own intrinsic type, weakly;
     * an array actual passed to a dummy the PSyIR does not fully model is
       compared with the dummy's partial datatype by the array rule, rather
       than by comparing two shape expressions written in different scopes.
@@ -476,7 +498,7 @@ def match_argument(actual: DataNode, dummy: DataSymbol, *,
         if (_type_symbols_match(actual_type, dummy_type) or
                 _scalar_kinds_agree(actual, actual_type, dummy_type)):
             return EXACT_MATCH
-        if _is_kindless_literal(actual, actual_type, dummy_type):
+        if _is_undefined_kind_scalar(actual, actual_type, dummy_type):
             return WEAK_MATCH
         raise CallMatchingArgumentsNotFound(
             f"Argument type mismatch of call argument "
