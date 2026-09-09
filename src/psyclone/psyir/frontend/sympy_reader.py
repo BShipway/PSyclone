@@ -75,6 +75,19 @@ class FortranPrinter(Printer):
         is =='''
         return f"({'==' .join(self._print(i) for i in expr.args)})"
 
+    def _print_Unequality(self, expr) -> str:
+        '''Called when converting a Ne expression, which in Fortran
+        is /=. SymPy names the class Unequality, ``Ne`` being an alias for
+        it, and it is the class name the printer dispatches on.
+
+        :param expr: the SymPy inequality to convert.
+        :type expr: :py:class:`sympy.core.relational.Unequality`
+
+        :returns: the Fortran spelling of the inequality.
+
+        '''
+        return f"({'/=' .join(self._print(i) for i in expr.args)})"
+
     def _print_BooleanTrue(self, expr) -> str:
         '''Called when converting a SymPy value of True.'''
         # pylint: disable=unused-argument

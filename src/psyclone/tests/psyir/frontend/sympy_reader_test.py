@@ -95,6 +95,11 @@ def test_sympy_reader_constructor():
                                           ".false."),
                                          ("b(i) == 3 .and. c(i,i) == 5",
                                           "b(i) == 3 .AND. c(i,i) == 5"),
+                                         ("b(i) /= 3", "b(i) /= 3"),
+                                         # SymPy reorders the arguments of
+                                         # a commutative operator.
+                                         ("b(i) /= 3 .or. i .neqv. j",
+                                          "j .NEQV. i .OR. b(i) /= 3"),
                                          ])
 def test_sympy_psyir_from_expression(fortran_reader: FortranReader,
                                      fortran_writer: FortranWriter,

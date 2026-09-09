@@ -112,7 +112,10 @@ class SymPyWriter(FortranWriter):
          BinaryOperation.Operator.OR: "Or({lhs}, {rhs})",
          BinaryOperation.Operator.EQV: "Equivalent({lhs}, {rhs})",
          BinaryOperation.Operator.NEQV: "Xor({lhs}, {rhs})",
-         BinaryOperation.Operator.EQ: "Eq({lhs}, {rhs})"
+         BinaryOperation.Operator.EQ: "Eq({lhs}, {rhs})",
+         # Without this, '/=' would be handed to SymPy as Fortran spells it,
+         # which is not valid Python and so not parseable.
+         BinaryOperation.Operator.NE: "Ne({lhs}, {rhs})"
          }
 
     def __init__(self):
