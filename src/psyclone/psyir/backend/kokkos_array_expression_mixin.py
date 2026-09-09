@@ -141,6 +141,30 @@ def atomic_update_operands(assignment):
     return None
 
 
+def atomic_store_operand(assignment):
+    """Return the value a replacing write stores, if a store can carry it.
+
+    The counterpart of :py:func:`atomic_update_operands` for the other kind
+    of sharing: where the cells reaching an element replace it rather than
+    contribute to it, the whole right-hand side is what the store writes and
+    no shape is required of it. One thing disqualifies it, and it is the rule
+    that function applies to the operand of an accumulation: a value naming
+    the target reads an element another cell may be storing to at that
+    moment, which is a race the store does not answer -- the value is read
+    before the store begins and is no part of it.
+
+    :param assignment: the statement to inspect.
+    :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
+
+    :returns: the expression stored into the target, or None if it reads the
+        element being replaced.
+    :rtype: Optional[:py:class:`psyclone.psyir.nodes.Node`]
+    """
+    if _names(assignment.rhs, assignment.lhs):
+        return None
+    return assignment.rhs
+
+
 def _names(expression, target):
     """Whether an expression reads the array the update is writing.
 
@@ -392,23 +416,45 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
     def _atomic_update(self, node, lowered):
         """Return the atomic call this assignment needs, if it needs one.
 
+        Two kinds of sharing reach here and they are answered differently.
+        Where the cells sharing an element *contribute* to it the statement
+        has to be a read-modify-write by one of the operators in
+        :py:data:`ATOMIC_UPDATES`, because combining the contributions is the
+        whole of what the atomic is for. Where they *replace* it -- a View
+        the region describes with
+        :py:attr:`~psyclone.psyir.backend.kokkos.KokkosView.atomic_store` --
+        a plain assignment is answered too, by ``Kokkos::atomic_store``: the
+        element is written whole, so no reader sees a value neither cell
+        stored. Which cell wrote last is settled by neither, and for a
+        replacing write it is the kernel that promises it does not matter.
+
+        A replacing write whose value reads the element it is replacing is
+        refused all the same. The value is read before the store begins and
+        is no part of it, so the read races with another cell's store however
+        the store itself is generated -- the same rule
+        :py:func:`atomic_update_operands` applies to the operand of an
+        accumulation.
+
         :param node: the assignment in the captured body.
         :type node: :py:class:`psyclone.psyir.nodes.Assignment`
         :param bool lowered: whether the statement is an array expression
             that :py:class:`KokkosArrayExpression` will lower to a nest.
 
-        :returns: the Kokkos function and the expression contributed to the
-            target, or None if the target is not shared between cells.
+        :returns: the Kokkos function and the expression contributed to or
+            stored into the target, or None if the target is not shared
+            between cells.
         :rtype: Optional[Tuple[str, :py:class:`psyclone.psyir.nodes.Node`]]
 
         :raises VisitorError: if the target is shared but the statement is
-            not a read-modify-write an atomic can carry out, or is a whole
-            section rather than one element.
+            not a read-modify-write an atomic can carry out, or replaces the
+            element with a value that reads it, or is a whole section rather
+            than one element.
         """
         target = node.lhs
         if not isinstance(target, ArrayReference):
             return None
-        if not getattr(self._views.get(target.name), "atomic", False):
+        view = self._views.get(target.name)
+        if not getattr(view, "atomic", False):
             return None
         if lowered:
             raise VisitorError(
@@ -416,14 +462,22 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
                 "whole-array expression, which no single atomic carries out. "
                 "Capture it as an element assignment or colour the loop.")
         operands = atomic_update_operands(node)
-        if operands is None:
-            shapes = ", ".join(
-                sorted(name for name, _ in ATOMIC_UPDATES.values()))
-            raise VisitorError(
-                f"Kokkos region writes shared array '{target.name}' with a "
-                "statement that is not one of the read-modify-write shapes "
-                f"an atomic answers ({shapes}). Colour the loop instead.")
-        return operands
+        if operands is not None:
+            return operands
+        if getattr(view, "atomic_store", False):
+            value = atomic_store_operand(node)
+            if value is None:
+                raise VisitorError(
+                    f"Kokkos region replaces an element of shared array "
+                    f"'{target.name}' with a value that reads it, which is a "
+                    "race no atomic store answers. Colour the loop instead.")
+            return ("Kokkos::atomic_store", value)
+        shapes = ", ".join(
+            sorted(name for name, _ in ATOMIC_UPDATES.values()))
+        raise VisitorError(
+            f"Kokkos region writes shared array '{target.name}' with a "
+            "statement that is not one of the read-modify-write shapes "
+            f"an atomic answers ({shapes}). Colour the loop instead.")
 
     def _atomic_statement(self, node, function, value):
         """Return one indivisible update as a generated statement.

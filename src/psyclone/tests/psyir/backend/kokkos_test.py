@@ -3299,6 +3299,116 @@ def test_kokkos_writer_refuses_a_subtraction_the_wrong_way_round():
     assert "not one of the read-modify-write shapes" in str(err.value)
 
 
+def _replacing_write_region(update=None):
+    """Return a region whose shared field is replaced rather than added to.
+
+    The same region as ``_shared_write_region``'s with one flag more: the
+    cells meeting at a dof of ``acc`` each store it, which is what an LFRic
+    ``gh_write`` to a continuous space is, rather than each contributing to
+    it. Which of the two a field carries is the driving transformation's to
+    decide and reaches the writer as this pair of flags.
+    """
+    region = _shared_write_region()
+    arguments = list(region.arguments)
+    arguments[1] = replace(arguments[1], atomic_store=True)
+    overrides = {"arguments": tuple(arguments)}
+    if update is not None:
+        overrides["schedule"] = _shared_write_schedule(update)
+    return replace(region, **overrides)
+
+
+def test_kokkos_atomic_store_for_a_replacing_shared_write():
+    """A store to a shared element becomes ``Kokkos::atomic_store``.
+
+    No shape is required of the value, because nothing is being combined:
+    the store writes whatever the cell computed. What that buys is worth
+    stating exactly, and the guide states it -- the element is written whole,
+    so no reader sees a value neither cell stored -- and what it does not buy
+    is any say in which of the two cells stores last. A kernel declaring this
+    access promises the two agree; the writer neither checks that promise nor
+    relies on it beyond making each store indivisible.
+    """
+    code = KokkosWriter()(_replacing_write_region(
+        "acc(map_w2(df) + k) = src(map_w3(1) + k)"))
+
+    assert "Kokkos::atomic_store(&acc(((map_w2((df - 1), cell) + k) - 1)), " \
+        "src(((map_w3((1 - 1), cell) + k) - 1)));" in code
+    assert code.count("Kokkos::atomic") == 1
+
+
+def test_kokkos_atomic_add_survives_the_store_flag():
+    """A read-modify-write is still an update where the cells store.
+
+    The two flags are read in order, and an accumulation shape is matched
+    first: were the store consulted first, ``acc = acc + src`` under a
+    ``gh_write`` would be generated as a store of ``acc + src`` and lose one
+    cell's contribution entirely. The generated source is the same as
+    without the flag, which is the whole of the claim.
+    """
+    code = KokkosWriter()(_replacing_write_region())
+
+    assert "Kokkos::atomic_add(&acc(((map_w2((df - 1), cell) + k) - 1)), " \
+        "src(((map_w3((1 - 1), cell) + k) - 1)));" in code
+    assert "atomic_store" not in code
+
+
+def test_kokkos_writer_refuses_a_replacing_write_reading_its_target():
+    """A store computed from the element it replaces is refused.
+
+    ``Kokkos::atomic_store`` makes the write indivisible and says nothing
+    about the read that preceded it, so the value stored may be computed
+    from what the neighbouring cell has since overwritten. The target is put
+    under a product rather than at the top of one because ``acc = 2.0*acc``
+    is a read-modify-write the table above answers.
+    """
+    region = _replacing_write_region(
+        "acc(map_w2(df) + k) = 2.0_r_def*acc(map_w2(df) + k)"
+        "*src(map_w3(1) + k)")
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "Kokkos region replaces an element of shared array 'acc' with a " \
+        "value that reads it, which is a race no atomic store answers. " \
+        "Colour the loop instead." in str(err.value)
+
+
+def test_kokkos_writer_refuses_a_whole_array_replacement():
+    """A section written to a shared field is refused whichever way it shares.
+
+    The array tier lowers a section without knowing which of its
+    destinations are shared, so the refusal is the same one an accumulation
+    meets and for the same reason -- and the message says 'updates' of a
+    store too, because what cannot be done is the same.
+    """
+    region = _replacing_write_region("acc(1:3) = src(1:3)")
+
+    with pytest.raises(VisitorError) as err:
+        KokkosWriter()(region)
+
+    assert "whole-array expression, which no single atomic carries out" in \
+        str(err.value)
+
+
+def test_kokkos_writer_rejects_a_storing_view_that_is_not_atomic():
+    """A View cannot store atomically without being atomic.
+
+    The store flag qualifies the atomic one -- it says which kind of sharing
+    the element has, not that there is any -- so a description setting it
+    alone is a mistake in the transformation, and one that would be silent:
+    the writer would generate the plain assignment for a shared element.
+    """
+    region = _shared_write_region()
+    arguments = list(region.arguments)
+    arguments[1] = replace(arguments[1], atomic=False, atomic_store=True)
+
+    with pytest.raises(ValueError) as err:
+        KokkosWriter()(replace(region, arguments=tuple(arguments)))
+
+    assert "Kokkos View 'acc' stores atomically but is not atomic." in \
+        str(err.value)
+
+
 def test_kokkos_writer_refuses_a_whole_array_update_of_a_shared_field():
     """A shared field updated as a section is refused before it is lowered.
 

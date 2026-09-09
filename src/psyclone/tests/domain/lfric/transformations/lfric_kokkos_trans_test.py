@@ -472,6 +472,81 @@ end program kokkos_shared_write_test
 """
 
 
+# The continuous-write shape, in the smallest form that carries both halves
+# of it. 'flux' is 'gh_write' onto W2, whose dofs the neighbouring cells
+# share, so two cells of one launch store to the same element; 'out' is
+# 'gh_write' onto W3, which no other cell touches. LFRic permits the first
+# because the kernel author guarantees the two cells store the same value,
+# and neither the metadata nor the body states that guarantee -- so the
+# transformation reads the sharing and not the guarantee. It is the shape
+# 'ffsl_unify_flux_kernel_code' has in GungHo, which is where the survey
+# found it.
+_CONTINUOUS_WRITE_KERNEL = """
+module flux_probe_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w2, w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: flux_probe_kernel_type
+    type(arg_type) :: meta_args(3) = (/                        &
+         arg_type(gh_field, gh_real, gh_write, w2),            &
+         arg_type(gh_field, gh_real, gh_write, w3),            &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: flux_probe_code
+  end type flux_probe_kernel_type
+contains
+  subroutine flux_probe_code(nlayers, flux, out, src, &
+                             ndf_w2, undf_w2, map_w2, &
+                             ndf_w3, undf_w3, map_w3)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w2, undf_w2
+    integer(kind=i_def), intent(in) :: ndf_w3, undf_w3
+    real(kind=r_def), dimension(undf_w2), intent(inout) :: flux
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: src
+    integer(kind=i_def), dimension(ndf_w2), intent(in) :: map_w2
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w2
+        flux(map_w2(df) + k) = 2.0_r_def*src(map_w3(1) + k)
+      end do
+      do df = 1, ndf_w3
+        out(map_w3(df) + k) = src(map_w3(df) + k)
+      end do
+    end do
+  end subroutine flux_probe_code
+end module flux_probe_kernel_mod
+"""
+
+
+_CONTINUOUS_WRITE_ALGORITHM = """
+program kokkos_continuous_write_test
+  use field_mod, only : field_type
+  use flux_probe_kernel_mod, only : flux_probe_kernel_type
+  implicit none
+  type(field_type) :: flux, src, out
+  call invoke(flux_probe_kernel_type(flux, out, src))
+end program kokkos_continuous_write_test
+"""
+
+
+# The one store to a shared dof that no atomic carries: the value reads back
+# the element it is replacing. 'Kokkos::atomic_store' makes the write
+# indivisible and says nothing at all about the read that preceded it, so a
+# cell can store a value computed from what the neighbouring cell has since
+# overwritten. The scaling is written with the target under a product rather
+# than at the top of one, because 'flux = 2.0*flux' is a read-modify-write an
+# atomic does carry and would be answered rather than refused.
+_CONTINUOUS_READ_BACK_KERNEL = _CONTINUOUS_WRITE_KERNEL.replace(
+    "flux(map_w2(df) + k) = 2.0_r_def*src(map_w3(1) + k)",
+    "flux(map_w2(df) + k) = 2.0_r_def*flux(map_w2(df) + k)"
+    "*src(map_w3(1) + k)")
+
+
 # The shape of shared write an atomic cannot answer: the shared field takes
 # the value of an array-valued intrinsic, which the C writer accumulates in
 # a nest of its own. A section alone does not do it -- those are lowered to
@@ -3412,6 +3487,25 @@ def shared_write_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL)
 
 
+@pytest.fixture(name="continuous_write_target")
+# pylint: disable-next=unused-argument
+def continuous_write_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel stores to a dof two cells share."""
+    return _invoke(
+        tmp_path, "flux_probe", _CONTINUOUS_WRITE_ALGORITHM,
+        _CONTINUOUS_WRITE_KERNEL)
+
+
+@pytest.fixture(name="continuous_read_back_target")
+# pylint: disable-next=unused-argument
+def continuous_read_back_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose store to a shared dof reads that dof."""
+    return _invoke(
+        tmp_path, "flux_probe", _CONTINUOUS_WRITE_ALGORITHM,
+        _CONTINUOUS_READ_BACK_KERNEL)
+
+
 @pytest.fixture(name="shared_write_operator_target")
 # pylint: disable-next=unused-argument
 def shared_write_operator_target_fixture(
@@ -4946,12 +5040,43 @@ def test_lfric_kokkos_trans_rejects_a_shifted_lower_bound(target):
         LFRicKokkosTrans().validate(loop)
 
 
-def test_lfric_kokkos_trans_rejects_continuous_write(target):
-    """A continuous-space write would require colouring or atomics."""
-    _, loop, kernel = target
-    kernel.arguments.args[0].function_space._orig_name = "w0"
-    with pytest.raises(TransformationError, match="discontinuous space"):
+def test_lfric_kokkos_trans_refuses_a_continuous_write_reading_its_target(
+        continuous_read_back_target):
+    """A store to a shared dof computed from that dof is still refused.
+
+    The one continuous write the atomic arm has no answer for, and the rule
+    is the one the operand of an accumulation has always been held to: the
+    read happens before the store and outside it, so making the store
+    indivisible leaves the race exactly where it was. Refused rather than
+    generated with a note, because the generated source would be wrong and
+    would look right.
+    """
+    _, loop, _ = continuous_read_back_target
+
+    with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
+
+    assert ("replaces an element of the shared field 'flux' with a value "
+            "that reads it, which is a race no atomic store answers. Colour "
+            "the loop instead." in str(error.value))
+
+
+def test_lfric_kokkos_trans_colours_a_continuous_write_reading_its_target(
+        continuous_read_back_target):
+    """The refusal's advice is advice that works.
+
+    Colouring runs the cells that meet at a dof in different launches, so
+    the read and the store are one cell's own and the statement needs no
+    shape at all -- which is why the coloured arm asks nothing of it.
+    """
+    psy, loop, _ = continuous_read_back_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(_coloured_inner(schedule))
+
+    assert "atomic" not in cpp
+    assert re.search(r"^\s*flux\(.*\) = ", cpp, re.MULTILINE)
 
 
 def test_lfric_kokkos_trans_permits_a_continuous_read(target):
@@ -5434,6 +5559,81 @@ def test_lfric_kokkos_trans_atomics_reach_a_continuous_gh_inc(
     fortran = str(psy.gen)
     assert "real(c_double), dimension(*), intent(inout) :: acc" in fortran
     assert "call inc_probe_kokkos(" in fortran
+
+
+def test_lfric_kokkos_trans_accepts_a_continuous_gh_inc(shared_write_target):
+    """An accumulation into a shared dof keeps the answer D3 gave it.
+
+    The continuous-write work routes a *store* to a shared dof through the
+    same two arms, and the two kinds of sharing are not the same question:
+    a contribution has to be combined with the other cell's, and a store has
+    only to be indivisible. Reading them as one would generate an
+    ``atomic_store`` for an accumulation, which compiles, runs and loses
+    every contribution but the last.
+    """
+    _, loop, _ = shared_write_target
+
+    LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::atomic_add(&acc(" in cpp
+    assert "atomic_store" not in cpp
+    assert cpp.count("Kokkos::atomic") == 1
+
+
+def test_lfric_kokkos_trans_treats_a_continuous_gh_write_as_shared(
+        continuous_write_target):
+    """A store to a continuous space is a shared write, and takes an atomic.
+
+    LFRic permits ``gh_write`` on a continuous space because the kernel
+    author guarantees that every cell reaching a shared dof stores the same
+    value to it. That guarantee is not in the metadata, is not in the body,
+    and is not checkable here, so the transformation does not rely on it: it
+    reads the sharing the function space states and gives the store the
+    default arm, which is an atomic. What that buys is narrow and worth being
+    exact about -- the element is written whole, so no reader sees a value
+    neither cell stored -- and the order of the two stores is still not
+    decided by anything. Agreeing values make the order not matter, and it is
+    the kernel that promises they agree.
+
+    The write beside it is on W3, which no neighbouring cell reaches, and
+    stays the plain assignment stages 5 to 10 generated.
+    """
+    _, loop, _ = continuous_write_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "Kokkos::atomic_store(&flux(" in cpp
+    assert cpp.count("Kokkos::atomic") == 1
+    # Nothing in the generated source assumes the two cells agree: the shared
+    # field is never the target of a plain assignment, and no comment claims
+    # a guarantee the transformation cannot check.
+    assert not re.search(r"^\s*flux\(.*\) = ", cpp, re.MULTILINE)
+    assert re.search(r"^\s*out\(.*\) = ", cpp, re.MULTILINE)
+    # The View is declared as any other written field's is, for the reason
+    # the 'gh_inc' one is: the atomic is a property of the statement, not of
+    # the interface.
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged> flux(flux_data, undf_w2);" in cpp)
+    assert "Kokkos::Atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_discontinuous_write_is_unchanged(target):
+    """A write to a discontinuous space stays the plain assignment it was.
+
+    The path stages 5 to 10 built, asserted here because the continuous-write
+    work is the first to make a written space decide how the statement is
+    generated. A rule that read 'written field' where it meant 'shared field'
+    would put an atomic on every capture in the model, which is a cost paid
+    by every loop to answer a question none of them asks: two cells never
+    meet at a dof of W3 or of Wtheta.
+    """
+    _, loop, _ = target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert re.search(r"^\s*moist_dyn_gas\(.*\) = ", cpp, re.MULTILINE)
+    assert "atomic" not in cpp
 
 
 def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
@@ -8252,22 +8452,8 @@ def test_lfric_kokkos_trans_field_type_predicate_refuses_a_logical_field(
             "'mr' is logical." in str(error.value))
 
 
-def test_lfric_kokkos_trans_continuous_write_predicate_refuses_a_w0_write(
-        target):
-    """The written-space rule walks every field argument on its own."""
-    _, _, kernel = target
-    kernel.arguments.args[0].function_space._orig_name = "w0"
-
-    with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans._validate_continuous_write(kernel)
-
-    assert ("LFRicKokkosTrans requires a discontinuous space for the written "
-            "field 'moist_dyn', but found 'w0': one cell's contribution "
-            "could overwrite another's." in str(error.value))
-
-
 def test_lfric_kokkos_trans_predicates_accept_a_supported_loop(target):
-    """Each of the five returns for a loop that does not fail it.
+    """Each of the four returns for a loop that does not fail it.
 
     A predicate that raised for everything would report every pattern as
     blocked, which is the failure mode a survey cannot see from the inside.
@@ -8278,26 +8464,23 @@ def test_lfric_kokkos_trans_predicates_accept_a_supported_loop(target):
     LFRicKokkosTrans._validate_halo_depth(loop)
     LFRicKokkosTrans._validate_evaluator(kernel)
     LFRicKokkosTrans._validate_field_types(kernel)
-    LFRicKokkosTrans._validate_continuous_write(kernel)
 
 
-def test_lfric_kokkos_trans_continuous_write_predicate_ignores_the_shape(
-        target):
+def test_lfric_kokkos_trans_field_type_predicate_ignores_the_shape(target):
     """A predicate answers for its own rule, not for the first blocker.
 
-    This is the whole point of naming the five. A kernel that asks for an
-    unmodelled evaluator shape *and* writes a continuous space is two blocked
-    patterns, and asking through 'validate' would only ever name the shape
-    because it is checked first.
+    This is the whole point of naming them. A kernel that asks for an
+    unmodelled evaluator shape *and* carries a field of an intrinsic no View
+    holds is two blocked patterns, and asking through 'validate' would only
+    ever name the shape because it is checked first.
     """
     _, _, kernel = target
     kernel._eval_shapes = ["gh_quadrature_face"]
-    kernel.arguments.args[0].function_space._orig_name = "w0"
+    kernel.arguments.args[0]._intrinsic_type = "logical"
 
     with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans._validate_continuous_write(kernel)
-    assert "discontinuous space for the written field 'moist_dyn'" in str(
-        error.value)
+        LFRicKokkosTrans._validate_field_types(kernel)
+    assert "'moist_dyn' is logical" in str(error.value)
 
     with pytest.raises(TransformationError) as second:
         LFRicKokkosTrans._validate_evaluator(kernel)
@@ -8308,41 +8491,41 @@ def test_lfric_kokkos_trans_continuous_write_predicate_ignores_the_shape(
 def test_lfric_kokkos_trans_metadata_refuses_by_argument_order(target):
     """The bundled check still refuses in argument order, not rule order.
 
-    The first argument is written to a continuous space and the second is a
-    non-real field. Walking the arguments -- which is what the transformation
-    has always done -- reports the first argument's blocker; running the two
-    rules as separate passes over all the arguments would report the second
-    argument's instead. The predicates share the per-argument helpers with
-    this loop so that only one answer exists.
+    The first argument is a field of an intrinsic no View holds and the
+    second is not an argument type the region can describe at all. Walking
+    the arguments -- which is what the transformation has always done --
+    reports the first argument's blocker; running the two rules as separate
+    passes over all the arguments would report the second argument's
+    instead, because the argument-type rule comes first within an argument.
+    The named predicate shares the per-argument helper with this loop so
+    that only one answer exists.
     """
     _, _, kernel = target
-    kernel.arguments.args[0].function_space._orig_name = "w0"
-    kernel.arguments.args[1]._intrinsic_type = "integer"
+    kernel.arguments.args[0]._intrinsic_type = "logical"
+    kernel.arguments.args[1]._argument_type = "gh_columnwise_operator"
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans._validate_kernel_metadata(kernel)
 
-    assert "discontinuous space for the written field 'moist_dyn'" in str(
-        error.value)
-    assert "real fields" not in str(error.value)
+    assert "'moist_dyn' is logical" in str(error.value)
+    assert "gh_columnwise_operator" not in str(error.value)
 
 
-def test_lfric_kokkos_trans_field_predicates_pass_over_a_non_field(
+def test_lfric_kokkos_trans_field_predicate_passes_over_a_non_field(
         operator_target):
-    """The two field rules walk the whole argument list and skip the rest.
+    """The field rule walks the whole argument list and skips the rest.
 
-    Asked through 'validate' they only ever see an argument the walk has
-    already accepted as a field. Asked on their own -- which is how the
-    survey asks them -- they meet the scalars and operators too, and a rule
-    that read a function space off an LMA operator would raise something
-    other than a refusal.
+    Asked through 'validate' it only ever sees an argument the walk has
+    already accepted as a field. Asked on its own -- which is how the survey
+    asks it -- it meets the scalars and operators too, and a rule that read
+    an intrinsic off an LMA operator would raise something other than a
+    refusal.
     """
     _, _, kernel = operator_target
     assert any(argument.argument_type != "gh_field"
                for argument in kernel.arguments.args)
 
     LFRicKokkosTrans._validate_field_types(kernel)
-    LFRicKokkosTrans._validate_continuous_write(kernel)
 
 
 # ---------------------------------------------------------------------------
@@ -9178,6 +9361,132 @@ def test_lfric_kokkos_trans_atomics_may_be_asked_for_explicitly(
     cpp = LFRicKokkosTrans().apply(loop, options={"atomics": True})
 
     assert cpp.count("Kokkos::atomic_add") == 1
+
+
+def test_lfric_kokkos_trans_accepts_an_asserted_disjoint_write(
+        continuous_write_target):
+    """A caller may state that the loop's stores reach no shared element.
+
+    The default is conservative and costs an atomic on every store to a
+    continuous space, including the many where the dofs a kernel writes are
+    its own cell's after all. Nothing here can read that from the metadata,
+    so it is the caller's to state -- and the option is named for what is
+    being asserted about the kernel rather than for what the transformation
+    should do with it, because it is the assertion that has to be true.
+    """
+    _, loop, _ = continuous_write_target
+
+    cpp = LFRicKokkosTrans().apply(loop, options={"disjoint_writes": True})
+
+    assert re.search(r"^\s*flux\(.*\) = ", cpp, re.MULTILINE)
+    assert "atomic" not in cpp
+    # The name states the caller's claim about the kernel, not an instruction
+    # about the generated source.
+    assert LFRicKokkosTrans._DISJOINT_OPTION == "disjoint_writes"
+
+
+def test_lfric_kokkos_trans_refuses_a_non_bool_disjoint_option(
+        continuous_write_target):
+    """The assertion is made or not made, so it takes no third value."""
+    _, loop, _ = continuous_write_target
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop, options={"disjoint_writes": "yes"})
+
+    assert ("LFRicKokkosTrans' 'disjoint_writes' option must be absent or a "
+            "bool, but found 'yes'." in str(err.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_disjoint_assertion_when_coloured(
+        continuous_write_target):
+    """Asserting disjointness on a coloured loop says two opposite things.
+
+    Colouring is the other answer to cells that do share an element, so a
+    loop that has been coloured and a caller saying nothing is shared cannot
+    both be right about the same loop. Refused rather than resolved: which
+    of the two the caller meant decides whether the uncoloured loop is safe.
+    """
+    psy, loop, _ = continuous_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(
+            _coloured_inner(schedule), options={"disjoint_writes": True})
+
+    assert ("'disjoint_writes' option is True on a coloured loop" in
+            str(err.value))
+    assert "capture the uncoloured loop" in str(err.value)
+
+
+def test_lfric_kokkos_trans_refuses_a_disjoint_assertion_beside_atomics(
+        continuous_write_target):
+    """Asking for an answer to the sharing there is said to be none of.
+
+    The two options are read in this order so that the caller is told about
+    the assertion they made rather than about what it did to the other
+    option, which is the one of the two they can act on.
+    """
+    _, loop, _ = continuous_write_target
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(
+            loop, options={"disjoint_writes": True, "atomics": True})
+
+    assert ("'disjoint_writes' option is True beside a 'atomics' request" in
+            str(err.value))
+
+
+def test_lfric_kokkos_trans_refuses_a_disjoint_assertion_over_an_accumulation(
+        shared_write_target):
+    """No assertion about a loop makes 'gh_inc' mean something else.
+
+    The option answers the one kind of sharing the metadata leaves open --
+    a store to a continuous space, which may or may not reach a dof another
+    cell reaches. An accumulation is not open: LFRic states that two cells
+    contribute to one element, and a caller asserting otherwise has
+    misunderstood the option rather than described their kernel.
+    """
+    _, loop, _ = shared_write_target
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop, options={"disjoint_writes": True})
+
+    assert ("'disjoint_writes' option is True on a kernel that accumulates "
+            "into 'acc'" in str(err.value))
+
+
+def test_lfric_kokkos_trans_disjoint_writes_permit_atomics_off(
+        continuous_write_target):
+    """With the sharing asserted away, asking for no atomic is not a race.
+
+    The refusal that stands between the two options is the one about an
+    uncoloured loop whose kernel writes a shared field, and the assertion is
+    read where that rule asks which fields those are. Otherwise a caller
+    would have to state the same thing twice or not at all.
+    """
+    _, loop, _ = continuous_write_target
+
+    cpp = LFRicKokkosTrans().apply(
+        loop, options={"disjoint_writes": True, "atomics": False})
+
+    assert "atomic" not in cpp
+
+
+def test_lfric_kokkos_trans_atomics_off_passes_over_a_scalar(second_target):
+    """The question of what cells share is asked of every argument.
+
+    A scalar is not a field and no cell of the launch writes it, so the walk
+    that answers which arguments are shared passes over it rather than asking
+    its function space, which it does not have. The option is then accepted
+    on a kernel that shares nothing, which is what says the walk got to the
+    end of the argument list.
+    """
+    _, loop, _ = second_target
+
+    cpp = LFRicKokkosTrans().apply(loop, options={"atomics": False})
+
+    assert "atomic" not in cpp
 
 
 def test_lfric_kokkos_trans_atomics_off_is_redundant_when_coloured(

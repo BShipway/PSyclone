@@ -90,8 +90,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         :param node: the loop that is to be captured as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations. The
-            two read here are ``"team_size"`` and ``"atomics"``; see
-            :py:meth:`apply`.
+            three read here are ``"team_size"``, ``"atomics"`` and
+            ``"disjoint_writes"``; see :py:meth:`apply`.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.validate`.
@@ -107,12 +107,19 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         :raises TransformationError: if the ``"atomics"`` option and the
             loop's colouring contradict each other, as
             ``LFRicKokkosWriteMixin._validate_atomics_option`` states.
+        :raises TransformationError: if the ``"disjoint_writes"`` option
+            contradicts the loop, the other option or the metadata, as
+            ``LFRicKokkosWriteMixin._validate_disjoint_option`` states.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
                 "LFRicKokkosTrans expects an LFRicLoop but found "
                 f"'{type(node).__name__}'.")
 
+        # Before the atomics option, because a caller stating both gets the
+        # message about the assertion they made rather than about the
+        # consequence it had for the other option.
+        self._validate_disjoint_option(node, options)
         self._validate_atomics_option(node, options)
         team_size = (options or {}).get(self._TEAM_SIZE_OPTION)
         if team_size is not None and (
@@ -169,7 +176,8 @@ class LFRicKokkosTrans(LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
         # update is what decides whether an atomic can carry it out and the
         # lowering is what settles that shape.
         if self._uses_atomics(node, options):
-            self._validate_shared_updates(kernel, probe)
+            self._validate_shared_updates(
+                kernel, probe, self._asserts_disjoint(options))
         self._constants(schedule)
         # The file-scope constants are described here as well as in apply(),
         # so that an array parameter the generated unit could not declare is

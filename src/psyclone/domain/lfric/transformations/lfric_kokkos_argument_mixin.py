@@ -337,15 +337,17 @@ class LFRicKokkosArgumentMixin:
             :py:class:`~psyclone.transformations.LFRicColourTrans` always
             begins at the first cell of its colour.
         :type start: Optional[str]
-        :param shared: the names of the formals more than one cell of the
-            launch may update, as ``LFRicKokkosWriteMixin._shared_formals``
-            gives them. Each
+        :param shared: the formals more than one cell of the launch may
+            write, mapped to whether those cells replace an element rather
+            than contribute to it, as
+            ``LFRicKokkosWriteMixin._shared_formals`` gives them. Each
             becomes an atomic View, so that the contributions of two cells to
-            one element are combined rather than one of them lost. Empty is
-            the answer for every kernel whose writes are its own cell's, and
-            is what makes such a region generate the source it generated
-            before this argument existed.
-        :type shared: Container[str]
+            one element are combined rather than one of them lost, and one
+            they each store is stored whole. Empty is the answer for every
+            kernel whose writes are its own cell's, and is what makes such a
+            region generate the source it generated before this argument
+            existed.
+        :type shared: Mapping[str, bool]
         :param colour: the descriptions of the colour map, the colour and the
             number of colours, as ``LFRicKokkosWriteMixin._colouring``
             builds them, or the
@@ -387,7 +389,8 @@ class LFRicKokkosArgumentMixin:
                     cls._origins(symbol), renames),
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only,
-                atomic=symbol.name in shared))
+                atomic=symbol.name in shared,
+                atomic_store=bool(shared.get(symbol.name))))
         for renamed in renames.values():
             arguments.append(KokkosScalar(renamed, "int"))
         arguments.extend(colour)
@@ -608,8 +611,9 @@ LFRicKokkosTrans.apply` makes.
             colour_map=colours,
             arguments=(cls._region_arguments(
                 formals, per_cell, cell_index, renames, count, start,
-                cls._shared_formals(kernel, schedule)
-                if cls._uses_atomics(node, options) else frozenset(),
+                cls._shared_formals(kernel, schedule,
+                                    cls._asserts_disjoint(options))
+                if cls._uses_atomics(node, options) else {},
                 colour_arguments)
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
