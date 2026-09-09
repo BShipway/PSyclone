@@ -60,8 +60,8 @@ from psyclone.domain.common.transformations import KernelModuleInlineTrans
 from psyclone.psyir.nodes import (
     Call, Container, IntrinsicCall, Reference, Routine, ScopingNode)
 from psyclone.psyir.symbols import (
-    ContainerSymbol, ImportInterface, RoutineSymbol, Symbol,
-    UnsupportedFortranType)
+    ContainerSymbol, GenericInterfaceSymbol, ImportInterface, RoutineSymbol,
+    Symbol, UnsupportedFortranType)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -91,7 +91,9 @@ class LFRicKokkosInlineMixin:
     Container beside the body. A procedure that procedure calls is in scope
     too, whether it is a sibling of its own module or a name that module
     reaches by a ``use`` of its own: a sibling is inlined where it already
-    can be, in the Container the two share, before the body travels.
+    can be, in the Container the two share, before the body travels, and
+    where the call names a generic interface of that Container it is the
+    specific the arguments select that is inlined.
     Anything else -- a callee whose module is not on the search path, so that
     PSyclone has only a name for it -- is out of scope and refused.
 
@@ -378,12 +380,14 @@ class LFRicKokkosInlineMixin:
                 position = cls._own_module_call(container, name)
                 if position is None:
                     break
-                sibling = cls._callee_name(
-                    container.walk(Call)[position]).lower()
+                sibling = cls._sibling_called(
+                    container, container.walk(Call)[position])
                 trial = container.copy()
                 try:
+                    cls._name_the_sibling(trial, position, sibling)
                     cls._localise_imports(cls._sibling(trial, sibling))
                     InlineTrans().apply(trial.walk(Call)[position])
+                    cls._name_the_sibling(container, position, sibling)
                     cls._localise_imports(cls._sibling(container, sibling))
                     InlineTrans().apply(container.walk(Call)[position])
                 except Exception:                # pylint: disable=W0703
@@ -406,18 +410,81 @@ class LFRicKokkosInlineMixin:
             of the callee is, or ``None`` if the callee makes none.
         :rtype: Optional[int]
         """
-        routines = container.walk(Routine, stop_type=Routine)
         callee = cls._sibling(container, name)
-        siblings = {routine.name.lower() for routine in routines
-                    if routine is not callee}
         calls = container.walk(Call)
         for inner in cls._pending_calls(callee):
-            if cls._callee_name(inner).lower() not in siblings:
+            sibling = cls._sibling_called(container, inner)
+            if sibling is None or sibling == name:
                 continue
             for position, node in enumerate(calls):
                 if node is inner:
                     return position
         return None
+
+    @classmethod
+    def _sibling_called(cls, container, call):
+        """Name the routine of ``container`` that ``call`` calls, if any.
+
+        The name the call carries is the answer where a routine of the
+        Container has it. Where it is a generic interface of that Container
+        it is not: the interface is a name for several routines and Fortran
+        picks between them by the arguments, so the one the call makes is
+        asked for by :py:meth:`~psyclone.psyir.nodes.Call.get_callee`, which
+        is the rule this transformation settles a kernel's own generic call
+        by. LFRic's ``pointwise_coordinate_jacobian_r_single`` calls
+        ``jacobian_abr2XYZ``, a generic of its own module, and nothing but
+        that rule says which of its two specifics runs.
+
+        A name the arguments do not settle is no answer: an interface whose
+        specifics differ in a kind PSyclone cannot reduce to a value is
+        reported ambiguous rather than chosen between, and choosing here
+        would be guessing where the call site refuses to. It is left for the
+        caller to leave alone.
+
+        :param container: the Container the callee belongs to.
+        :type container: :py:class:`psyclone.psyir.nodes.Container`
+        :param call: the call the callee makes.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: the lowercased name of the routine of ``container`` the
+            call runs, or ``None`` where it runs none of them.
+        :rtype: Optional[str]
+        """
+        routines = {routine.name.lower() for routine
+                    in container.walk(Routine, stop_type=Routine)}
+        name = cls._callee_name(call).lower()
+        if name in routines:
+            return name
+        if not isinstance(call.routine.symbol, GenericInterfaceSymbol):
+            return None
+        try:
+            chosen, _ = call.get_callee()
+        except Exception:                        # pylint: disable=W0703
+            return None
+        chosen = chosen.name.lower()
+        return chosen if chosen in routines else None
+
+    @classmethod
+    def _name_the_sibling(cls, container, position, sibling):
+        """Point the call at ``position`` at the routine it runs.
+
+        A call written to a generic interface names the interface, and
+        ``InlineTrans`` has no body for a name that stands for several. The
+        one it runs is already known -- :py:meth:`_sibling_called` asked the
+        arguments -- so the call is made to say it, which is what Fortran
+        settles the same call to and leaves the interface's other specifics
+        where they are rather than carrying them along.
+
+        A call that already names a routine is left as it is.
+
+        :param container: the Container being rewritten.
+        :type container: :py:class:`psyclone.psyir.nodes.Container`
+        :param int position: where in the Container's calls the call is.
+        :param str sibling: the routine the call runs, lowercased.
+        """
+        call = container.walk(Call)[position]
+        if cls._callee_name(call).lower() != sibling:
+            call.routine.symbol = cls._sibling(container, sibling).symbol
 
     @staticmethod
     def _sibling(container, name):

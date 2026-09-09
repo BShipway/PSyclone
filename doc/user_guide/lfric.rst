@@ -4270,9 +4270,17 @@ sibling of its own module is settled before it travels: the sibling's
 statements are put in the call's place in the module the two share, so
 ``crosses_panel_edge``'s call to ``rotated_panel_neighbour`` reaches the
 kernel as the arithmetic it stood for rather than as a name the kernel's
-container has nothing to bind. A sibling that cannot be substituted -- one
-declaring a static local, say -- leaves its call where the file put it, and
-the refusal that follows names it. Data of the callee's module is not in
+container has nothing to bind. A sibling reached through a *generic
+interface* of that module is settled the same way and by the same rule as a
+kernel's own generic call, which is the arguments rather than the order the
+interface lists its specifics in:
+``pointwise_coordinate_jacobian_r_single``'s call to ``jacobian_abr2XYZ``
+becomes a call to the specific its arguments select, and only that specific
+travels. A sibling that cannot be substituted -- one declaring a static
+local, say, or one reached through an interface whose specifics differ in a
+kind PSyclone cannot reduce to a value, so that the arguments settle nothing
+-- leaves its call where the file put it, and the refusal that follows names
+it. Data of the callee's module is not in
 scope and is not brought into it by this: ``chi2xyz``, which reads a
 rotation matrix its module keeps at run time, is still refused for that
 datum, a named constant being the only thing that crosses a container
