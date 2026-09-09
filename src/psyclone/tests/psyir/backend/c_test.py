@@ -507,8 +507,7 @@ def test_cw_intrinsiccall():
 def test_cw_intrinsiccall_integer():
     '''Check that the intrinsics Fortran overloads on the argument's type
     are written by that type: an integer keeps C's integer spelling where a
-    real takes the maths-library one, and an integer maximum, which C has no
-    standard spelling for, is refused rather than written wrongly.
+    real takes the maths-library one.
 
     '''
     cwriter = CWriter()
@@ -522,17 +521,51 @@ def test_cw_intrinsiccall_integer():
                                  [int1.copy(), int2.copy()])
     assert cwriter(icall) == '(i % j)'
 
-    # fmax returns a double, C has no standard integer maximum, and a
-    # conditional expression would evaluate its arguments twice. KokkosWriter
-    # handles both types, with the type-generic Kokkos::max.
-    for intrinsic in (IntrinsicCall.Intrinsic.MAX,
-                      IntrinsicCall.Intrinsic.MIN):
+
+def test_cw_intrinsiccall_integer_max_min():
+    '''Check that an integer MAX or MIN is written with C++'s type-generic
+    std::max and std::min, folded right to left as the real forms are, while
+    a real one still takes fmax and an argument list this writer cannot see
+    to be integer throughout is still refused.
+
+    '''
+    cwriter = CWriter()
+    int1 = Reference(DataSymbol("i", ScalarType.integer_type()))
+    int2 = Reference(DataSymbol("j", ScalarType.integer_type()))
+    int3 = Reference(DataSymbol("k", ScalarType.integer_type()))
+    real1 = Reference(DataSymbol("a", ScalarType.real_type()))
+    real2 = Reference(DataSymbol("b", ScalarType.real_type()))
+
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.MAX,
+                                 [int1.copy(), int2.copy()])
+    assert cwriter(icall) == 'std::max(i, j)'
+
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.MAX,
+                                 [int1.copy(), int2.copy(), int3.copy()])
+    assert cwriter(icall) == 'std::max(i, std::max(j, k))'
+
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.MIN,
+                                 [int1.copy(), int2.copy()])
+    assert cwriter(icall) == 'std::min(i, j)'
+
+    # The real forms are untouched: std::max would compile for them too, but
+    # every region generated before this existed would change with them.
+    icall = IntrinsicCall.create(IntrinsicCall.Intrinsic.MAX,
+                                 [real1.copy(), real2.copy()])
+    assert cwriter(icall) == 'fmax(a, b)'
+
+    # A list this writer cannot see to be integer throughout is refused where
+    # it was refused before: std::max would deduce one type from two, and an
+    # integer argument promoted to a real bound is a shape the kernel did not
+    # declare. An argument of unresolved type is the same case.
+    unknown = Reference(DataSymbol("u", UnresolvedType()))
+    for arguments in ([int1.copy(), real1.copy()],
+                      [int1.copy(), unknown.copy()]):
         with pytest.raises(VisitorError) as err:
-            icall = IntrinsicCall.create(intrinsic,
-                                         [int1.copy(), int2.copy()])
-            _ = cwriter(icall)
-        assert (f"The C backend does not support the '{intrinsic.name}' "
-                f"intrinsic." in str(err.value))
+            _ = cwriter(IntrinsicCall.create(IntrinsicCall.Intrinsic.MAX,
+                                             arguments))
+        assert ("The C backend does not support the 'MAX' intrinsic."
+                in str(err.value))
 
 
 def test_cw_is_real_argument():
