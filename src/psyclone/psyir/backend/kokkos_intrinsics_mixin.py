@@ -229,6 +229,29 @@ class KokkosIntrinsicsMixin:
         The argument is consumed for its type and never visited, since the
         intrinsic asks a question about a type rather than about a value.
 
+        The trait is written inside a ``static_cast`` to its own type, and
+        that cast is what lets the expression compile as device code.
+        ``Kokkos::Experimental::epsilon_v<T>`` is a ``constexpr`` variable
+        template, so it is a variable with an address; passing it to a
+        parameter declared ``const T &`` -- which is how
+        ``Kokkos::max(const T &, const T &)`` takes it -- binds a reference to
+        that variable and so *odr-uses* it, and nvcc refuses the region with
+        ``identifier "Kokkos::Experimental::epsilon_v<double>" is undefined in
+        device code``. Reading the same variable in a constant expression is
+        an lvalue-to-rvalue conversion rather than an odr-use, so the cast
+        yields a prvalue, the reference binds to a temporary and no host
+        address is asked for. ``leonard_term_kl_kernel_mod`` is the first
+        captured kernel whose ``EPSILON`` reaches a by-reference parameter,
+        and it was the only region of the whole-model CUDA build to fail.
+
+        ``Kokkos::Experimental::epsilon<T>::value``, the older spelling of the
+        same trait, is not an alternative: it names a member of a helper class
+        template and nvcc refuses it for the same reason.
+        ``std::numeric_limits<T>::epsilon()`` compiles in both places but is a
+        ``<limits>`` answer rather than a Kokkos one, and this back-end spells
+        traits and functions through Kokkos so that a region follows the
+        execution space it is compiled for rather than the host's library.
+
         :param node: the intrinsic call to write.
         :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
 
@@ -246,7 +269,8 @@ class KokkosIntrinsicsMixin:
                 "EPSILON needs the width of its argument's kind, which this "
                 "region does not describe. Add the kind to the region's "
                 "'kind_types'.")
-        return f"Kokkos::Experimental::epsilon_v<{c_type}>"
+        return (f"static_cast<{c_type}>"
+                f"(Kokkos::Experimental::epsilon_v<{c_type}>)")
 
     def _kokkos_function(self, node):
         """Write an intrinsic that becomes a qualified Kokkos function call.
