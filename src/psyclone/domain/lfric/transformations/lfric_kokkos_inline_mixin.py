@@ -61,7 +61,7 @@ from psyclone.psyir.nodes import (
     Call, Container, IntrinsicCall, Reference, Routine, ScopingNode)
 from psyclone.psyir.symbols import (
     ContainerSymbol, GenericInterfaceSymbol, ImportInterface, RoutineSymbol,
-    Symbol, UnsupportedFortranType)
+    Symbol, SymbolError, UnsupportedFortranType)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -199,6 +199,12 @@ class LFRicKokkosInlineMixin:
         :py:meth:`~psyclone.domain.lfric.transformations.\
 lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`, which does the
         same for a local ``POINTER`` that only ever aliases a whole array.
+        Then :py:meth:`_agree_on_imports` settles a name the two scopes
+        disagree about the origin of, one holding it as an import and the
+        other as a name some wildcard ``use`` was to supply. Last,
+        :py:meth:`_read_declarations` reads the declaration of an imported
+        name the frontend recorded the origin of and nothing else, so a later
+        pass that needs its type or its value has one.
 
         :param schedule: the kernel schedule to rewrite in place.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
@@ -233,6 +239,8 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
             refusal = cls._module_inline(call)
             cls._relax_target_arguments(call)
             cls._alias_locals(call)
+            cls._agree_on_imports(call)
+            cls._read_declarations(call)
             try:
                 InlineTrans().apply(call)
             # Every failure to inline is a refusal, whatever its class: see
@@ -542,14 +550,8 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
         Giving the routine its own import of each name it reads is what the
         copy then carries: ``panel_neighbour``, which reads ``W``, ``S``,
         ``E`` and ``N`` from its module's ``use reference_element_mod``, is
-        rewritten to read them from a ``use`` of its own. That is the same
-        Fortran, and the symbol at the call site is an import that a second
-        import of the same name agrees with.
-
-        A copy of the symbol is added rather than the symbol itself: the
-        Container's own table is the one every other routine of the module
-        reads that name through, and taking it out of that table would be a
-        rewrite of routines this has no business in.
+        rewritten to read them from a ``use`` of its own -- the same Fortran,
+        and an import the call site's own import of the name agrees with.
 
         :param routine: the routine about to be inlined into its own module.
         :type routine: :py:class:`psyclone.psyir.nodes.Routine`
@@ -562,19 +564,248 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
             symbol = table.lookup(name, otherwise=None)
             if symbol is None or not symbol.is_import:
                 continue
-            source = symbol.interface.container_symbol
-            if source.name in table:
-                local_source = table.lookup(source.name)
-            else:
-                local_source = ContainerSymbol(source.name)
-                table.add(local_source)
-            local = symbol.copy()
-            local.interface = ImportInterface(
-                local_source, orig_name=symbol.interface.orig_name)
-            table.add(local)
-            for reference in routine.walk(Reference):
-                if reference.symbol is symbol:
-                    reference.symbol = local
+            cls._localise_import(routine, symbol)
+
+    @staticmethod
+    def _localise_import(routine, symbol):
+        """Give ``routine`` its own import of a name it reads from above.
+
+        A copy of the symbol is added rather than the symbol itself, because
+        the table it is read from is the one every other routine of that
+        scope reads the name through. The references in ``routine`` are
+        re-pointed at the copy.
+
+        :param routine: the routine to give the import to.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param symbol: the imported symbol of an enclosing scope.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+        """
+        table = routine.symbol_table
+        source = symbol.interface.container_symbol
+        if source.name in table:
+            local_source = table.lookup(source.name)
+        else:
+            local_source = ContainerSymbol(source.name)
+            table.add(local_source)
+        local = symbol.copy()
+        local.interface = ImportInterface(
+            local_source, orig_name=symbol.interface.orig_name)
+        table.add(local)
+        for reference in routine.walk(Reference):
+            if reference.symbol is symbol:
+                reference.symbol = local
+
+    @classmethod
+    def _agree_on_imports(cls, call):
+        """Give the two scopes of ``call`` one origin for each shared name.
+
+        ``InlineTrans`` merges the callee's table into the call site's, and
+        refuses a name the two scopes hold differently:
+
+            A symbol named 's' is present in both tables but is unresolved in
+            one. That scope does not contain a direct wildcard import from the
+            module 'reference_element_mod' from which it is imported in the
+            other scope.
+
+        The message names a wildcard because that is the import PSyclone
+        would accept as the missing origin, not because one was written: any
+        name one scope holds as an import and the other holds unresolved is
+        refused this way. That is LFRic's ``W``, ``S``, ``E`` and ``N``, the
+        face indices of ``reference_element_mod``: the FFSL flux kernels name
+        them in a ``use ..., only`` of their own and their helpers -- siblings
+        of the same module -- read them through the module's own ``use``, so
+        copied away from it the helper's names arrive unresolved.
+
+        The two are the same name of the same module, and PSyclone can say
+        so rather than this being asserted: the resolved side names the
+        module, and where the scope holds the name itself
+        :py:meth:`~psyclone.psyir.symbols.SymbolTable.resolve_imports` reads
+        that module through the ``ModuleManager``'s search path -- the one
+        the build and the survey already set with ``-d``. Where the scope
+        holds nothing of the name and reads it from the Container it sits in,
+        that declaration is already in the tree and is copied down into the
+        routine instead. Either way both sides are imports of one name from
+        one module, which the merge accepts.
+
+        Only a name the two scopes share is resolved, and only towards the
+        module the other scope proves it comes from: resolving every wildcard
+        import wholesale would pull the whole of each module into the table
+        and answer a question nothing asked. What is written is a
+        ``use <module>, only : <name>``, the name being the whole of what the
+        region needs. Where PSyclone cannot resolve it -- a module the search
+        path does not reach, or one that does not publish the name -- nothing
+        is changed and the refusal stands as it did, which is the reader's
+        evidence that the module was not readable rather than that the
+        rewrite was not tried.
+
+        The tables rewritten are the call site's and the callee's *as the call
+        site sees them*, which is what :py:meth:`_local_callees` answers: by
+        then each is in a copy, either the one :py:meth:`_module_inline`
+        brought into the caller's Container or the one :py:meth:`_rooted_copy`
+        took of the file. Neither is the tree the frontend parsed, so the
+        module the ``ModuleManager`` caches is left as its file declares it
+        and a later capture of another kernel meets it unchanged.
+
+        :param call: the call about to be inlined.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+        """
+        site = call.ancestor(Routine)
+        if site is None:
+            return
+        for callee in cls._local_callees(call):
+            cls._resolve_shared_names(site, callee.symbol_table)
+            cls._resolve_shared_names(callee, site.symbol_table)
+
+    @classmethod
+    def _resolve_shared_names(cls, routine, other):
+        """Settle each name ``routine`` reads that ``other`` imports.
+
+        A name of ``other``'s own table is one the merge will compare, and
+        there are two ways ``routine`` can hold the same name without the
+        merge agreeing. It is *unresolved* in ``routine``'s own table -- what
+        a wildcard ``use`` leaves -- and :py:meth:`_import_by_name` gives it
+        the other scope's module as its origin; or it is not in ``routine``'s
+        own table at all, read through a ``use`` of the Container the routine
+        sits in, and the copy ``InlineTrans`` takes is detached from that
+        Container, so :py:meth:`_localise_import` gives the routine its own
+        ``use`` of it first.
+
+        Both are narrow: only a name ``routine`` reads, only a name the other
+        scope has of its own, and only towards the module it proves.
+
+        :param routine: the routine whose names are to be settled.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param other: the table this routine's is about to be merged with.
+        :type other: :py:class:`psyclone.psyir.symbols.SymbolTable`
+        """
+        table = routine.symbol_table
+        for signature in routine.reference_accesses().all_signatures:
+            name = signature.var_name
+            if name not in other:
+                continue
+            twin = other.lookup(name)
+            if not twin.is_import:
+                continue
+            module = twin.interface.container_symbol.name
+            if name in table:
+                symbol = table.lookup(name)
+                if symbol.is_unresolved:
+                    cls._import_by_name(table, symbol, module)
+                continue
+            symbol = table.lookup(name, otherwise=None)
+            if (symbol is not None and symbol.is_import and
+                    symbol.interface.container_symbol.name == module):
+                cls._localise_import(routine, symbol)
+
+    @staticmethod
+    def _import_by_name(table, symbol, module):
+        """Make ``symbol`` an import of ``module``'s declaration of the name.
+
+        The module is read by ``resolve_imports``, which needs a
+        ``ContainerSymbol`` to read it through and imports a name it was not
+        already asked for only under a wildcard. So the Container is given a
+        wildcard for the length of the call and narrowed again afterwards:
+        what the table ends with is an import of the one name, which is the
+        ``use ..., only`` the region needs and not the whole module.
+
+        A module that could not be read or does not publish the name leaves
+        nothing behind: ``resolve_imports`` reports both by raising, and any
+        ``ContainerSymbol`` added for the attempt is taken out again.
+
+        :param table: the table holding the unresolved symbol.
+        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+        :param symbol: the unresolved symbol to give an origin.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+        :param str module: the module the other scope imports the name from.
+        """
+        source = table.lookup(module, otherwise=None) \
+            if module in table else None
+        added = source is None
+        if added:
+            source = ContainerSymbol(module)
+            table.add(source)
+        elif not isinstance(source, ContainerSymbol):
+            return
+        wildcard = source.wildcard_import
+        source.wildcard_import = True
+        try:
+            table.resolve_imports(container_symbols=[source],
+                                  symbol_target=symbol)
+        # A module that cannot be read raises KeyError, having found the
+        # target in none of the containers it searched; one that publishes the
+        # name in a way the table cannot take raises SymbolError. Both are a
+        # refusal and not a failure: see the docstring above.
+        except (KeyError, SymbolError):
+            if added:
+                table.remove(source)
+                return
+        source.wildcard_import = wildcard
+
+    @classmethod
+    def _read_declarations(cls, call):
+        """Read the declaration of each imported name the two scopes use.
+
+        A name imported by a ``use ..., only`` that PSyclone never had to
+        know the type of is a bare
+        :py:class:`~psyclone.psyir.symbols.Symbol`: where it comes from is
+        recorded and nothing else, which is enough to write it out again and
+        not enough to reason about. A pass needing the *type* or the *value*
+        stops on it, and lowering an array section to a loop is one:
+
+            The supplied node should be a Reference to a DataSymbol but found
+            'eps_r_tran: Symbol<Import(container='constants_mod')>'.
+
+        ``eps_r_tran`` is a ``real(kind=r_tran), parameter`` of LFRic's
+        ``constants_mod`` and a bound of a section an FFSL vertical helper
+        takes. That declaration is on the search path the capture already
+        passes with ``-d``, so it is read rather than guessed:
+        :py:meth:`~psyclone.psyir.symbols.SymbolTable.resolve_imports` asked
+        for the one name specialises the symbol in place, and the section
+        lowering and the constants mixin then see the module's own
+        :py:class:`~psyclone.psyir.symbols.DataSymbol`, type and value both.
+
+        Only a name a body reads is asked for, and only one already imported
+        from a named module: this reads a declaration the code depends on and
+        goes looking for no other. A module the search path does not reach
+        leaves the symbol as it was, for the later pass to refuse as it did.
+
+        :param call: the call about to be inlined.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+        """
+        site = call.ancestor(Routine)
+        if site is None:
+            return
+        for routine in [site] + cls._local_callees(call):
+            for signature in routine.reference_accesses().all_signatures:
+                symbol = routine.symbol_table.lookup(signature.var_name,
+                                                     otherwise=None)
+                # pylint: disable-next=unidiomatic-typecheck
+                if symbol is None or type(symbol) is not Symbol:
+                    continue
+                if not symbol.is_import:
+                    continue
+                table = symbol.find_symbol_table(routine)
+                if table is not None:
+                    cls._read_declaration(table, symbol)
+
+    @staticmethod
+    def _read_declaration(table, symbol):
+        """Specialise ``symbol`` to the declaration its module gives it.
+
+        :param table: the table holding the symbol.
+        :type table: :py:class:`psyclone.psyir.symbols.SymbolTable`
+        :param symbol: the bare imported symbol to read the declaration of.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+        """
+        try:
+            table.resolve_imports(
+                container_symbols=[symbol.interface.container_symbol],
+                symbol_target=symbol)
+        # A module that cannot be read raises KeyError and one that publishes
+        # the name in a way the table cannot take raises SymbolError; either
+        # way the symbol is left as it was: see the docstring above.
+        except (KeyError, SymbolError):
+            pass
 
     @classmethod
     def _callee_is_local(cls, call):
