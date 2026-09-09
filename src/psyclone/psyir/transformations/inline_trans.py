@@ -956,6 +956,8 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
             from different containers at the call site and within the routine.
         :raises TransformationError: if the routine accesses an un-resolved
             symbol.
+        :raises TransformationError: if the symbols of the routine cannot be
+            added to the table at the call site.
         :raises TransformationError: if the number of arguments in the call
             does not match the number of formal arguments of the routine.
         :raises TransformationError: if a symbol declared in the parent
@@ -1118,6 +1120,29 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
                 f"{err.value}") from err
 
         routine_table = routine.symbol_table
+
+        # apply() merges the symbols of a *copy* of the routine into the table
+        # at the call site, which is only possible if the two have no clash
+        # that renaming cannot settle. What has to be checked is the copy as
+        # apply() will have left it: detaching a routine from its container
+        # puts any name it took from there out of reach, and resolving the
+        # optional arguments then adds that name back as an unresolved symbol,
+        # which clashes with an unresolved symbol of the same name at the call
+        # site. Asking here makes such a clash a refusal rather than the
+        # InternalError that the merge would otherwise raise.
+        copy = routine.copy()
+        self._optional_arg_resolve_present_intrinsics(copy, arg_match_list)
+        self._optional_arg_eliminate_ifblock_if_const_condition(copy)
+        copy_table = copy.symbol_table
+        try:
+            parent_routine.symbol_table.check_for_clashes(
+                copy_table, symbols_to_skip=copy_table.argument_list[:])
+        except SymbolError as err:
+            raise TransformationError(
+                f"Routine '{routine.name}' cannot be inlined because its "
+                f"symbols cannot be added to the table at the call site: "
+                f"{err.value}") from err
+
         # Create a list of routine arguments that is actually used
         routine_arg_list = [
             routine_table.argument_list[i] for i in arg_match_list

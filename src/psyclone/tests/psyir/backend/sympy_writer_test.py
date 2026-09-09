@@ -48,7 +48,8 @@ from psyclone.psyir.frontend.sympy_reader import SymPyReader
 from psyclone.psyir.backend.sympy_writer import SymPyWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-        Assignment, Literal, Node, IntrinsicCall, Reference, Call
+        Assignment, IfBlock, Literal, Node, IntrinsicCall, Reference, Call,
+        Routine
 )
 from psyclone.psyir.symbols import ArrayType, ScalarType, SymbolTable
 
@@ -700,3 +701,30 @@ def test_sym_writer_intrinsiccall_node(fortran_reader):
     sympy_writer._symbol_table = SymbolTable()
     res = sympy_writer.intrinsiccall_node(psyir.walk(IntrinsicCall)[0])
     assert "call MVBITS(b, b, b, b, b)\n" == res
+
+
+def test_sym_writer_symbol_of_a_detached_scope(fortran_reader):
+    '''An expression may name a Symbol that the scope containing it cannot
+    look up: a Routine detached from its Container keeps its references to
+    that Container's symbols but no longer reaches its table. The writer
+    falls back on the Symbol the Reference itself holds rather than raising.
+
+    '''
+    code = """module my_mod
+    integer :: s
+contains
+    subroutine my_sub(a)
+        integer :: a
+        if (a == s) then
+            a = 1
+        end if
+    end subroutine my_sub
+end module my_mod"""
+    psyir = fortran_reader.psyir_from_source(code)
+    # A copy of the Routine has no Container above it, so 's' is only
+    # reachable through the Reference.
+    routine = psyir.walk(Routine)[0].copy()
+    condition = routine.walk(IfBlock)[0].condition
+    assert condition.ancestor(Routine) is routine
+    sympy_writer = SymPyWriter()
+    assert str(sympy_writer(condition)) == "Eq(a, s)"

@@ -44,7 +44,9 @@ from typing import List, Tuple, Union, Optional
 
 from psyclone.configuration import Config
 from psyclone.core import AccessType, VariablesAccessMap
-from psyclone.errors import GenerationError, PSycloneError
+from psyclone.errors import GenerationError
+from psyclone.psyir.nodes.argument_matching import (
+    CallMatchingArgumentsNotFound, match_argument)
 from psyclone.psyir.nodes.codeblock import CodeBlock
 from psyclone.psyir.nodes.container import Container
 from psyclone.psyir.nodes.statement import Statement
@@ -54,24 +56,12 @@ from psyclone.psyir.nodes.routine import Routine
 from psyclone.psyir.symbols import (
     DataSymbol,
     DataType,
-    DataTypeSymbol,
     GenericInterfaceSymbol,
     RoutineSymbol,
     Symbol,
     SymbolError,
-    UnsupportedFortranType,
     UnresolvedType
 )
-from psyclone.psyir.symbols.datatypes import ArrayType
-
-
-class CallMatchingArgumentsNotFound(PSycloneError):
-    '''Exception to signal that matching arguments have not been found
-    for this routine
-    '''
-    def __init__(self, value):
-        PSycloneError.__init__(self, value)
-        self.value = "CallMatchingArgumentsNotFound: " + str(value)
 
 
 class Call(Statement, DataNode):
@@ -700,92 +690,26 @@ class Call(Statement, DataNode):
                 self,
                 call_arg: DataNode,
                 routine_arg: DataSymbol
-            ) -> None:
+            ) -> int:
         """Checks whether the supplied call and routine arguments are
-        compatible. This also supports 'optional' arguments by using
-        partial types. Array arguments are only required to have the same
-        rank if we are dealing with an interface call (polymorphism) or
-        the dummy argument does not have an explicit shape (in which
-        case Fortran permits implicit reshaping).
+        compatible, scoring the match. The rules themselves, and what makes
+        a match a weak one, are in
+        :py:func:`psyclone.psyir.nodes.argument_matching.match_argument`.
 
         :param call_arg: One argument of the call
         :param routine_arg: One argument of the routine
+
+        :returns: 0 if the two match exactly, 1 if the match relied on a
+            relaxation of the Fortran rules the types alone do not carry.
 
         :raises CallMatchingArgumentsNotFound: if the supplied arguments
             do not match.
 
         """
-        def type_symbols_match(type1: Union[DataTypeSymbol, DataType],
-                               type2: Union[DataTypeSymbol, DataType]) -> bool:
-            '''
-            :returns: True if the two types correspond to DataTypeSymbols with
-                      the same name (case insensitive), False otherwise.
-            '''
-            return (isinstance(type1, DataTypeSymbol) and
-                    isinstance(type2, DataTypeSymbol) and
-                    (type1.name.lower() == type2.name.lower()))
-
-        actual_type = call_arg.datatype
-        dummy_type = routine_arg.datatype
-        if isinstance(actual_type, ArrayType) and isinstance(dummy_type,
-                                                             ArrayType):
-            # Is the dummy argument an explicit-shape array?
-            has_explicit_shape = all([
-                isinstance(dim, ArrayType.ArrayBounds) and
-                dim.lower is not ArrayType.Extent.ATTRIBUTE and
-                dim.upper is not ArrayType.Extent.ATTRIBUTE
-                for dim in dummy_type.shape])
-            # Arguments are only required to have the same rank if we are
-            # dealing with an interface call (polymorphism) or the dummy
-            # argument does not have an explicit shape (in which case
-            # Fortran permits implicit reshaping)
-            match_rank = (isinstance(self.routine.symbol,
-                                     GenericInterfaceSymbol) or
-                          not has_explicit_shape)
-            # Check that ranks of arguments match, if necessary
-            if match_rank and len(actual_type.shape) != len(dummy_type.shape):
-                call_arg_str = call_arg.debug_string().strip()
-                routine_arg_str = routine_arg.name
-                raise CallMatchingArgumentsNotFound(
-                    f"Rank mismatch of call argument '{call_arg_str}' "
-                    f"(rank {len(actual_type.shape)}) and routine argument "
-                    f"'{routine_arg_str}' (rank {len(dummy_type.shape)})")
-            # Arguments must have the same intrinsic type.
-            if actual_type.intrinsic != dummy_type.intrinsic:
-                if type_symbols_match(actual_type.intrinsic,
-                                      dummy_type.intrinsic):
-                    return
-                call_arg_str = call_arg.debug_string().strip()
-                routine_arg_str = routine_arg.name
-                raise CallMatchingArgumentsNotFound(
-                    f"Array argument type mismatch of call argument "
-                    f"'{call_arg_str}' ({actual_type.intrinsic}) and routine "
-                    f"argument '{routine_arg_str}' ({dummy_type.intrinsic})")
-            return
-
-        if isinstance(dummy_type, UnsupportedFortranType):
-            # This could be an 'optional' argument. If so, it will have at
-            # least a partial datatype which we can check.
-            if actual_type != dummy_type.partial_datatype:
-                call_arg_str = call_arg.debug_string().strip()
-                routine_arg_str = routine_arg.name
-                raise CallMatchingArgumentsNotFound(
-                    f"Argument partial type mismatch of call argument "
-                    f"'{call_arg_str}' ({actual_type}) and routine "
-                    f"argument '{routine_arg_str}' ("
-                    f"{dummy_type.partial_datatype})"
-                )
-        else:
-            if actual_type != dummy_type:
-                if type_symbols_match(actual_type, dummy_type):
-                    return
-                call_arg_str = call_arg.debug_string().strip()
-                routine_arg_str = routine_arg.name
-                raise CallMatchingArgumentsNotFound(
-                    f"Argument type mismatch of call argument '{call_arg_str}'"
-                    f" ({actual_type}) and routine argument "
-                    f"'{routine_arg_str}' ({dummy_type})"
-                )
+        return match_argument(
+            call_arg, routine_arg,
+            interface_call=isinstance(self.routine.symbol,
+                                      GenericInterfaceSymbol))
 
     def get_argument_map(self, routine: Routine) -> List[int]:
         '''Return a list of indices mapping from each argument of this
@@ -796,6 +720,25 @@ class Call(Statement, DataNode):
 
         :return: list of integers referring to matching arguments of the
                  supplied routine.
+
+        :raises CallMatchingArgumentsNotFound: If there was some problem in
+            finding matching arguments.
+
+        '''
+        return self._argument_map_and_score(routine)[0]
+
+    def _argument_map_and_score(self, routine: Routine) -> Tuple[List[int],
+                                                                 int]:
+        '''Return the argument map for the supplied routine together with the
+        score of the match, which is the sum of the scores of the individual
+        arguments: zero if every one of them matched exactly, and one more
+        for each that needed a relaxation of the Fortran rules the types
+        alone do not carry.
+
+        :param routine: the target of this Call.
+
+        :returns: the list of integers referring to matching arguments of the
+            supplied routine, and how well the arguments matched.
 
         :raises CallMatchingArgumentsNotFound: If there was some problem in
             finding matching arguments.
@@ -815,6 +758,7 @@ class Call(Statement, DataNode):
             )
 
         ret_arg_idx_list = []
+        score = 0
         # Iterate over all arguments to the call
         for call_arg_idx, call_arg in enumerate(self.arguments):
             call_arg_idx: int
@@ -826,7 +770,8 @@ class Call(Statement, DataNode):
                 routine_arg = routine_argument_list[call_arg_idx]
                 routine_arg: DataSymbol
 
-                self._check_argument_type_matches(call_arg, routine_arg)
+                score += self._check_argument_type_matches(call_arg,
+                                                           routine_arg)
 
                 ret_arg_idx_list.append(call_arg_idx)
                 routine_argument_list[call_arg_idx] = None
@@ -848,7 +793,7 @@ class Call(Statement, DataNode):
                     continue
 
                 if arg_name.lower() == routine_arg.name.lower():
-                    self._check_argument_type_matches(
+                    score += self._check_argument_type_matches(
                         call_arg,
                         routine_arg,
                     )
@@ -883,7 +828,7 @@ class Call(Statement, DataNode):
                     f"'{call_name}' and is not OPTIONAL."
                 )
 
-        return ret_arg_idx_list
+        return (ret_arg_idx_list, score)
 
     def get_callee(
             self,
@@ -892,6 +837,18 @@ class Call(Statement, DataNode):
         '''
         Searches for the implementation(s) of the target routine for this Call
         including argument checks.
+
+        Every candidate whose arguments can be mapped onto this call's is
+        scored by summing the per-argument scores of
+        :py:func:`~psyclone.psyir.nodes.argument_matching.match_argument`:
+        zero where the types are the same and one where they agree only in
+        what Fortran requires of them (a literal that states no kind, an
+        actual of unresolved type, or a section against a formal argument of
+        partially known type). The lowest-scoring candidate is returned. Since
+        a relaxed comparison can make two candidates look alike, two of them
+        tying on a non-zero score are reported as ambiguous rather than chosen
+        between; two tying on a score of zero differ in something the PSyIR
+        does not model, and the first is taken as before.
 
         .. warning::
             If `use_first_callee_and_no_arg_check` is set to True, the very
@@ -909,6 +866,9 @@ class Call(Statement, DataNode):
 
         :raises NotImplementedError: if the routine is not local and not found
             in any containers in scope at the call site.
+        :raises CallMatchingArgumentsNotFound: if no candidate matches the
+            arguments of this call, or if two candidates match it equally
+            well.
 
         '''
         routine_list = self.get_callees()
@@ -919,24 +879,44 @@ class Call(Statement, DataNode):
             return (routine_list[0], arg_match_list)
 
         err_info_list = []
+        matches = []
 
-        # Search for the routine matching the right arguments
+        # Search for the routines matching the right arguments
         for routine in routine_list:
             routine: Routine
 
             try:
-                arg_match_list = self.get_argument_map(routine)
+                arg_match_list, score = self._argument_map_and_score(routine)
 
             except CallMatchingArgumentsNotFound as err:
                 err_info_list.append(err.value)
                 continue
 
-            return (routine, arg_match_list)
+            matches.append((score, routine, arg_match_list))
 
-        error_msg = "\n".join(err_info_list)
+        if not matches:
+            error_msg = "\n".join(err_info_list)
 
-        call_str = self.debug_string().replace("\n", "")
-        raise CallMatchingArgumentsNotFound(
-            f"No matching routine found for '{call_str}':"
-            "\n" + error_msg
-        )
+            call_str = self.debug_string().replace("\n", "")
+            raise CallMatchingArgumentsNotFound(
+                f"No matching routine found for '{call_str}':"
+                "\n" + error_msg
+            )
+
+        # The best match is the one that needed the fewest relaxations of the
+        # Fortran rules the argument types alone do not carry. Two candidates
+        # that both needed one are not a match at all: whichever of them is
+        # right, the types do not say which, and returning the first would
+        # make the answer depend on the order the candidates were found in.
+        # Two that both matched exactly are left as they were: Fortran does
+        # not permit an ambiguous generic interface, so such a pair differs
+        # in something the PSyIR does not model rather than in nothing.
+        matches.sort(key=lambda match: match[0])
+        if (len(matches) > 1 and matches[0][0] == matches[1][0] and
+                matches[0][0] != 0):
+            raise CallMatchingArgumentsNotFound(
+                f"Ambiguous call to '{self.routine.symbol.name}': routines "
+                f"'{matches[0][1].name}' and '{matches[1][1].name}' both "
+                f"match with score {matches[0][0]}")
+
+        return (matches[0][1], matches[0][2])

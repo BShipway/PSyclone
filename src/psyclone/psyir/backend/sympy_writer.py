@@ -390,9 +390,12 @@ class SymPyWriter(FortranWriter):
 
             try:
                 # Depending on the situation, we won't always
-                # have a scope, hence the try...except.
+                # have a scope, hence the try...except. A name the scope does
+                # not hold raises KeyError rather than SymbolError, which
+                # happens for a symbol of an enclosing Container when the
+                # expression is in a Routine that has been detached from it.
                 orig_sym = sva[0].node.scope.symbol_table.lookup(sig.var_name)
-            except SymbolError:
+            except (KeyError, SymbolError):
                 # If we can't find it, use the symbol associated to the sva
                 orig_sym = None
                 if isinstance(sva[0].node, Reference):
