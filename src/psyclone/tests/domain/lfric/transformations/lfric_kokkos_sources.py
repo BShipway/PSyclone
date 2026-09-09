@@ -697,3 +697,71 @@ _HALO_CELL_ALGORITHM = _OWNED_AND_HALO_ALGORITHM.replace(
 _HALO_CELL_KERNEL = _OWNED_AND_HALO_KERNEL.replace(
     "wide_write", "halo_write").replace(
     "owned_and_halo_cell_column", "halo_cell_column")
+
+
+_FACE_QUADRATURE_ALGORITHM = """
+program kokkos_face_quadrature_test
+  use field_mod, only : field_type
+  use quadrature_face_mod, only : quadrature_face_type
+  use face_weight_kernel_mod, only : face_weight_kernel_type
+  implicit none
+  type(field_type) :: out_field, in_field
+  type(quadrature_face_type) :: qr
+  call invoke(face_weight_kernel_type(out_field, in_field, qr))
+end program kokkos_face_quadrature_test
+"""
+
+
+# Face quadrature is a third shape: one point count, a face count, rank-2
+# weights over the two of them and a basis array shaped (dim, ndf, np_xyz,
+# nfaces). PSyclone's own generic names are used for the formals, which is
+# what a stub-generated kernel declares and what the model's own face kernels
+# name differently -- the region reads the names from the kernel either way.
+_FACE_QUADRATURE_KERNEL = """
+module face_weight_kernel_mod
+  use argument_mod, only : arg_type, func_type, gh_field, gh_real, gh_write, &
+                           gh_read, gh_basis, cell_column, gh_quadrature_face
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: face_weight_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                    &
+         arg_type(gh_field, gh_real, gh_write, w3),                        &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    type(func_type) :: meta_funcs(1) = (/                                  &
+         func_type(w3, gh_basis) /)
+    integer :: gh_shape = gh_quadrature_face
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: face_weight_code
+  end type face_weight_kernel_type
+contains
+  subroutine face_weight_code(nlayers, field_out, field_in,                &
+                              ndf_w3, undf_w3, map_w3, basis_w3,           &
+                              nfaces, np_xyz, weights_xyz)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: nfaces, np_xyz
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    real(kind=r_def), dimension(np_xyz,nfaces), intent(in) :: weights_xyz
+    real(kind=r_def), dimension(1,ndf_w3,np_xyz,nfaces), intent(in) ::     &
+                                                                 basis_w3
+    integer(kind=i_def) :: k, df, qp, face
+    real(kind=r_def) :: total
+    do k = 0, nlayers - 1
+      total = 0.0_r_def
+      do df = 1, ndf_w3
+        do face = 1, nfaces
+          do qp = 1, np_xyz
+            total = total + weights_xyz(qp,face)                           &
+                  * basis_w3(1,df,qp,face) * field_in(map_w3(df) + k)
+          end do
+        end do
+      end do
+      field_out(map_w3(1) + k) = total
+    end do
+  end subroutine face_weight_code
+end module face_weight_kernel_mod
+"""
