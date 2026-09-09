@@ -809,29 +809,31 @@ def test_lfric_kokkos_trans_inlines_a_section_actual_against_a_shape(
 
 def test_lfric_kokkos_trans_pairs_a_section_with_a_partial_type(
         partial_section_target):
-    """A section reaches a partially-typed formal, and is refused later.
+    """A section reaches a partially-typed formal, and the call resolves.
 
     The formal's declaration carries an attribute the PSyIR does not model,
     so all it has of the formal is a partial datatype -- the explicit shape
     ``source(n)``. Comparing the actual's own shape with that expression
     compares two expressions written in different scopes and can never
     succeed, so the rank-and-intrinsic rule is applied to it instead and the
-    callee is resolved.
+    callee is resolved. That pairing is the reason this kernel is here, and
+    it is made against the partial datatype rather than against the
+    replacement, since the callee is resolved before the formal is relaxed.
 
-    Resolving it is as far as this kernel gets: ``InlineTrans`` will not
-    inline a routine having an argument whose declaration it does not model,
-    whatever the call site passes. So the refusal moves from the argument
-    pairing to that rule, which is the one a reader can act on.
+    The unmodelled attribute is ``target``, so the capture then completes:
+    the formal is given its partial datatype and ``InlineTrans`` has nothing
+    left to object to. A formal carrying any other unmodelled attribute is
+    still refused, which
+    :py:func:`test_pointer_dummy_is_still_refused` is the case for.
     """
-    _, loop, _ = partial_section_target
+    _, loop, kernel = partial_section_target
 
-    with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
 
-    message = str(error.value)
-    assert "Argument partial type mismatch" not in message
-    assert ("Symbol 'source' which is an Argument of UnsupportedType"
-            in message)
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "sweep_column" not in cpp
 
 
 def test_lfric_kokkos_trans_inlines_through_a_generic_interface(
@@ -870,11 +872,6 @@ def test_lfric_kokkos_trans_refuses_an_ambiguous_generic_call(
     assert "cannot inline the call to 'scale_column'" in message
     assert "Ambiguous call to 'scale_column'" in message
     assert "both match with score 1" in message
-
-
-# --------------------------------------------------------------------------
-# Task E7's checks belong here, and are added by the branch that writes them.
-# --------------------------------------------------------------------------
 
 
 # --------------------------------------------------------------------------
