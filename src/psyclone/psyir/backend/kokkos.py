@@ -32,7 +32,7 @@ from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.nodes import (
-    CodeBlock, KernelSchedule, Literal, Loop, Reference)
+    Assignment, CodeBlock, KernelSchedule, Literal, Loop, Reference)
 
 
 class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
@@ -530,14 +530,22 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             item.name: item
             for item in (*region.arguments, *region.scratch)
             if not isinstance(item, KokkosScalar)}
+        # The names the body assigns *through* rather than aims: a pointer
+        # assignment is where the alias is aimed and is not a write to what
+        # it names. Read once and passed down, since a walk of the schedule
+        # per alias would say the same thing every time.
+        written = {
+            assignment.lhs.symbol.name
+            for assignment in region.schedule.walk(Assignment)
+            if not assignment.is_pointer} if region.aliases else set()
         for alias in region.aliases:
-            self._validate_alias(alias, described_arrays, used_names)
+            self._validate_alias(alias, described_arrays, used_names, written)
             used_names.add(alias.name)
 
         self._validate_launch(region)
 
     @staticmethod
-    def _validate_alias(alias, arrays, used_names):
+    def _validate_alias(alias, arrays, used_names, written):
         """Reject an alias the region could not correctly declare.
 
         Each of these compiles, or fails to, a long way from the description
@@ -553,6 +561,16 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         exactly the Fortran's meaning: after ``p => x``, ``size(p)`` is
         ``size(x)``.
 
+        A pointer aimed at a read-only array and *written through* is the
+        one refusal here that is not about the declaration. The handle is
+        declared ``const`` because one of its targets is
+        (:py:meth:`_alias_declaration` says why), so the write does not
+        compile; but the Fortran behind it was writing through an array the
+        callee may only read, which is a program error rather than a shape
+        this could capture differently. It is refused by name so that the
+        error read is that one rather than a template failure inside a
+        ``View``'s ``operator()``.
+
         :param alias: the alias to check.
         :type alias: :py:class:`psyclone.psyir.backend.kokkos.KokkosAlias`
         :param arrays: the region's arrays -- its View arguments and its
@@ -562,13 +580,17 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`]]
         :param used_names: the names the region has already given something.
         :type used_names: Set[str]
+        :param written: the names the body assigns through, as opposed to
+            the ones it aims with a pointer assignment.
+        :type written: Set[str]
 
         :raises TypeError: if ``alias`` is not a
             :py:class:`KokkosAlias`.
         :raises ValueError: if the alias's name is not a C++ identifier or is
             one the region has already used; if it names no target; if a
-            target is not an array the region describes; or if its targets do
-            not agree on element type and rank.
+            target is not an array the region describes; if its targets do
+            not agree on element type and rank; or if the body writes through
+            it and any of its targets is read-only.
         """
         if not isinstance(alias, KokkosAlias):
             raise TypeError(
@@ -601,6 +623,15 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         # is declared in ``Kokkos::AnonymousSpace``, which is assignable from
         # both; element type, rank and layout are all that then have to
         # agree, and the check above is where they do.
+        read_only = sorted(
+            name for name in set(alias.targets)
+            if getattr(arrays[name], "read_only", False))
+        if alias.name in written and read_only:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' is written through, but it "
+                f"aliases {', '.join(read_only)}, which the region may only "
+                "read: the Fortran writes through a pointer aimed at an "
+                "array it was given to read.")
 
     def _validate_cell_position(self, region, formals, described):
         """Reject a cell position the region could not correctly declare.
@@ -895,17 +926,28 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         targets' agreement on the rest is what
         :py:meth:`_validate_alias` checks.
 
-        The element type, its constness and the memory traits are taken from
-        the first target, which is what ``decltype`` took them from: the
-        space is the only part of the type replaced. A read-only argument
-        therefore still gives a ``const`` handle with the ``ReadOnly``
-        traits, and a scratch array -- which is neither read-only nor
-        randomly accessed -- a plain ``Unmanaged`` one.
+        **The element type is ``const`` where ANY target is ``const``**, and
+        not where the first one happens to be. A ``View`` of ``T`` cannot be
+        assigned from a ``View`` of ``const T`` -- that is the one direction
+        Kokkos refuses, and it refuses it at the assignment rather than at
+        the declaration -- while the reverse is allowed and costs nothing.
+        So a pointer aimed at a kernel-local column and at a read-only
+        argument is a handle of ``const T`` whichever branch the body writes
+        first, and both of its assignments compile. Reading through such a
+        handle is all the body may do, which
+        :py:meth:`_validate_alias` is where it is required.
+
+        The rank and the memory traits are still the first target's, which
+        is what ``decltype`` took them from. The traits need no widening
+        with the constness: ``ReadOnly`` -- ``Unmanaged | RandomAccess`` --
+        is carried only by a read-only argument, whose element type is
+        already ``const``, so a first target that gives ``Unmanaged`` gives
+        it whether or not a later target made the handle ``const``.
 
         :param alias: the alias to declare.
         :type alias: :py:class:`psyclone.psyir.backend.kokkos.KokkosAlias`
         :param views: the region's arrays keyed by name, in which the alias's
-            first target is described.
+            targets are described.
         :type views: Dict[str, Union[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`,
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`]]
@@ -914,7 +956,8 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         :rtype: str
         """
         target = views[alias.targets[0]]
-        read_only = isinstance(target, KokkosView) and target.read_only
+        read_only = any(getattr(views[name], "read_only", False)
+                        for name in alias.targets)
         random_access = (isinstance(target, KokkosView)
                          and target.random_access)
         const = "const " if read_only else ""

@@ -327,10 +327,17 @@ class KokkosAlias:
     traits, or a scratch array, in ``ScratchSpace``, and a pointer aimed at
     one of each in the two branches of an ``if`` -- which is the shape
     LFRic's vertical-support helpers have -- is one alias rather than a
-    refusal. Element type, constness, rank and the memory traits are taken
-    from the first target, which is where the ``decltype`` this replaces took
-    them from; the space is the only part of that View's type replaced, and
-    the layout is ``LayoutLeft`` for every View this back-end writes.
+    refusal. Rank and the memory traits are taken from the first target,
+    which is where the ``decltype`` this replaces took them from; the space
+    is the only part of that View's type replaced, and the layout is
+    ``LayoutLeft`` for every View this back-end writes.
+
+    The element type is ``const`` where **any** target is ``const``, and not
+    merely where the first one is. A ``View`` of ``T`` cannot be assigned
+    from a ``View`` of ``const T``, so a pointer aimed at a kernel-local
+    column first and at a read-only argument second would otherwise declare
+    a handle the second branch could not assign to. Reading through such a
+    handle is then all the body may do.
 
     Every target is described elsewhere in the region -- as an argument or as
     scratch -- and is named here only by the name that description carries.
@@ -341,9 +348,10 @@ class KokkosAlias:
     name: str
     #: The arrays the body aims the pointer at, in the order the body's
     #: pointer assignments name them. The first is the one the declaration
-    #: takes its element type, constness, rank and traits from; all of them
-    #: have to agree in element type and rank for the generated unit to
-    #: compile -- their memory spaces need not -- which is what
+    #: takes its rank and traits from, and any of them being read-only makes
+    #: its element type ``const``; all of them have to agree in element type
+    #: and rank for the generated unit to compile -- their memory spaces need
+    #: not -- which is what
     #: :py:meth:`~psyclone.psyir.backend.kokkos.KokkosWriter._validate_alias`
     #: checks before it is written.
     targets: Tuple[str, ...]

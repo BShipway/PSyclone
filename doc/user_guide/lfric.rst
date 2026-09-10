@@ -4946,8 +4946,12 @@ all, since a local of a type ``InlineTrans`` cannot place is a refusal of
 the whole callee -- and the region records it as an alias of the arrays it
 is aimed at. The generated region declares it as a ``Kokkos::View`` handle
 in ``Kokkos::AnonymousSpace`` -- a memory space assignable from and to every
-other -- of the element type, rank and traits its first target has, and
-writes each pointer assignment as a handle assignment. Because the space is
+other -- of the rank and traits its first target has, and writes each
+pointer assignment as a handle assignment. The element type is ``const``
+where **any** of the targets is: a handle aimed at a kernel-local column and
+at a read-only argument has to be a ``View`` of ``const``, since Kokkos will
+not assign a ``View`` of ``const T`` to a ``View`` of ``T``. Because the
+space is
 anonymous, the two targets need not live in the same one: this is what
 carries the ``subgrid_vertical_support_mod`` shape, ``field_ptr =>
 log_field`` in one branch of a flag, where ``log_field`` is a kernel-local
@@ -4961,9 +4965,11 @@ which aims the pointer at part of an array rather than at the array;
 ``allocate`` or ``deallocate``, which make the pointer storage of its own;
 a statement PSyclone could not model naming the pointer, ``nullify`` among
 them, which may do either without saying so; the pointer passed as an actual
-argument, which hands the question to a routine this cannot read; and
-targets differing in intrinsic, kind or rank, which are more than one
-handle can hold.
+argument, which hands the question to a routine this cannot read; targets
+differing in intrinsic, kind or rank, which are more than one handle can
+hold; and a write *through* a pointer any of whose targets is read-only,
+which is the Fortran writing through an array the routine was given only to
+read.
 
 **A name a wildcard** ``use`` **was to supply is resolved before inlining.**
 Inlining merges the callee's symbol table into the call site's, and a name

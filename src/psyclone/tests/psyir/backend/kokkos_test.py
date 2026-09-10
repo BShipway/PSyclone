@@ -3916,8 +3916,13 @@ def test_kokkos_writer_rejects_a_first_cell_that_is_not_an_argument():
             in str(error.value))
 
 
-def _alias_schedule():
+def _alias_schedule(write_through=False):
     """Create a scratch body choosing between its two arrays by a pointer.
+
+    :param bool write_through: whether the body's last sweep writes through
+        the pointer rather than reading through it. The Fortran is a program
+        error where a target is read-only, and is what the writer's refusal
+        of that pairing is checked against.
 
     ``_scratch_schedule``'s two sweeps with a choice between them, which is
     the shape LFRic's vertical-support helpers have once inlined: the columns
@@ -3950,6 +3955,10 @@ subroutine tri_solve_code(nlayers, y, x, ndf, undf, map)
   end do
 end subroutine tri_solve_code
 """
+    if write_through:
+        source = source.replace(
+            "    y(map(1) + k - 1) = chosen(k)\n",
+            "    chosen(k) = y(map(1) + k - 1)\n")
     routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
     symbol_table = routine.symbol_table.detach()
     children = [child.detach() for child in routine.children[:]]
@@ -3960,15 +3969,18 @@ end subroutine tri_solve_code
 def _alias_region(**overrides):
     """Return a scratch region one of whose locals is a View handle.
 
-    :param overrides: fields to replace on the region.
+    :param overrides: fields to replace on the region, and the schedule's
+        own ``write_through`` switch, which is not a field of the region and
+        is taken out before the rest are applied.
     :type overrides: unwrapped dict
 
     :returns: the region with an alias.
     :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     """
+    write_through = overrides.pop("write_through", False)
     region = replace(
         _scratch_region(),
-        schedule=_alias_schedule(),
+        schedule=_alias_schedule(write_through=write_through),
         aliases=(KokkosAlias(
             name="chosen", targets=("tri_plus_new", "x_new")),))
     return replace(region, **overrides) if overrides else region
@@ -4057,6 +4069,63 @@ def test_kokkos_alias_takes_the_constness_of_its_first_target():
 
     assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, "
             "Kokkos::AnonymousSpace, ReadOnly> chosen;") in code
+
+
+def test_kokkos_alias_is_const_where_any_target_is():
+    """A const target anywhere in the list makes the whole handle const.
+
+    The case the whole-model build failed on, and the one the test above
+    does not cover: ``x_new`` is a scratch array of ``double`` and is the
+    FIRST target, and ``x`` is the read-only argument, a View of ``const
+    double``. Kokkos will assign a View of ``double`` to a View of ``const
+    double`` and not the other way round, so a handle taking its constness
+    from the first target alone is one the second branch cannot assign to.
+
+    The traits stay the first target's. ``ReadOnly`` is carried only by a
+    read-only argument, whose element type is already const, so a first
+    target giving ``Unmanaged`` gives it whether or not a later target made
+    the handle const.
+    """
+    code = KokkosWriter()(_alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("x_new", "x")),)))
+
+    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in code
+
+
+def test_kokkos_writer_rejects_a_write_through_a_const_alias():
+    """A body writing through an alias with a read-only target is refused.
+
+    The handle is const because one of its targets is, so the write does not
+    compile -- but what the Fortran was doing is writing through a pointer
+    aimed at an array the routine may only read, which is a program error and
+    not a shape to generate differently. The refusal names the pointer and
+    the array so that this is what a reader meets rather than a template
+    failure inside a View's ``operator()``.
+    """
+    with pytest.raises(ValueError) as error:
+        KokkosWriter()(_alias_region(
+            write_through=True,
+            aliases=(KokkosAlias(name="chosen", targets=("x_new", "x")),)))
+
+    assert ("Kokkos alias 'chosen' is written through, but it aliases x, "
+            "which the region may only read: the Fortran writes through a "
+            "pointer aimed at an array it was given to read."
+            in str(error.value))
+
+
+def test_kokkos_alias_of_no_const_target_may_be_written_through():
+    """An alias all of whose targets are writable is written through freely.
+
+    The control for the refusal above, and the case every region captured
+    before it existed is: two scratch columns, neither read-only, so the
+    handle is a plain ``double`` one and the write generates.
+    """
+    code = KokkosWriter()(_alias_region(write_through=True))
+
+    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+            "Kokkos::AnonymousSpace, Unmanaged> chosen;") in code
+    assert "chosen((k - 1)) =" in code
 
 
 @pytest.mark.parametrize(
