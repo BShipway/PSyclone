@@ -972,16 +972,27 @@ and to every other -- that is the whole content of
 `Kokkos_AnonymousSpace.hpp` -- so this handle holds either. A pointer aimed
 at a kernel argument in one branch of an `if` and at a kernel-local array in
 the other is therefore generated rather than refused, which is the shape
-`subgrid_vertical_support_mod` has. The element type, its constness, the
-rank and the memory traits are taken from the first target, exactly as the
-`decltype` took them; the memory space is the only part of that View's type
-replaced, and the layout is `LayoutLeft` for every View this back-end
-writes.
+`subgrid_vertical_support_mod` has. The rank and the memory traits are taken
+from the first target, exactly as the `decltype` took them; the memory space
+is the only part of that View's type replaced, and the layout is
+`LayoutLeft` for every View this back-end writes.
+
+The element type is `const` where **any** target is `const`, and not merely
+where the first one is. Kokkos assigns a View of `const T` from a View of
+`T` and refuses the reverse, so a pointer aimed at a kernel-local column
+first and at a read-only argument second -- `ffsl_flux_z_ppm`'s shape --
+would otherwise declare a handle of `T` that the second branch cannot
+assign to. The traits need no widening with it: `ReadOnly` -- `Unmanaged |
+RandomAccess` -- is carried only by a read-only argument, whose element type
+is already `const`.
 
 The writer validates an alias as it validates the rest: the name must not
 collide with a described array or a local, there must be at least one
 target, every target must be a described array, and the targets must agree
-in element type and rank.
+in element type and rank. One further check is about the body rather than
+the description: an alias any of whose targets is read-only and which the
+body assigns *through* is refused by name, because the Fortran behind it
+writes through a pointer aimed at an array the routine may only read.
 
 Carried constants
 ~~~~~~~~~~~~~~~~~

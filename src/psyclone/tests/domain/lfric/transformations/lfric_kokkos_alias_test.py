@@ -125,6 +125,17 @@ _MIXED_SPACE_ALIAS_KERNEL = _ALIAS_KERNEL.replace(
     "    call sweep_column(nlayers, field_in, spare, pick_spare, swept)\n")
 
 
+# The mixed-space helper writing THROUGH the pointer instead of reading
+# through it. One of its targets is the kernel's read-only argument, so the
+# handle is a View of `const double` and the write is one the Fortran had no
+# business making either: it writes through a pointer aimed at an array the
+# callee was given to read. It is refused by name rather than left to fail as
+# a template error inside a View's `operator()`.
+_WRITTEN_CONST_ALIAS_KERNEL = _MIXED_SPACE_ALIAS_KERNEL.replace(
+    "    result(n) = chosen(n)\n",
+    "    chosen(n) = result(n)\n")
+
+
 # The same helper aiming one pointer at arrays of two different ranks. One
 # View handle holds one rank, so this is refused rather than generated as a
 # copy the C++ compiler would reject a long way from its cause.
@@ -260,6 +271,15 @@ def mixed_space_alias_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose helper aliases an argument and a local."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _MIXED_SPACE_ALIAS_KERNEL)
+
+
+@pytest.fixture(name="written_const_alias")
+# pylint: disable-next=unused-argument
+def written_const_alias_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose helper writes through a const-target alias."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _WRITTEN_CONST_ALIAS_KERNEL)
 
 
 @pytest.fixture(name="rank_alias_target")
@@ -444,18 +464,48 @@ def test_alias_pointer_across_two_spaces_is_captured(mixed_space_alias_target):
     launch's scratch -- so the handle cannot be the `decltype` of either. It
     is declared in `Kokkos::AnonymousSpace`, which is assignable from both,
     and the capture goes through.
+
+    The element type is the second thing this asserts, and it is not implied
+    by the first. The kernel argument is read-only, so its View is of `const
+    double`; the kernel-local column is not, and it is the FIRST target the
+    body aims the pointer at. A handle taking its constness from the first
+    target alone is a View of `double`, which Kokkos will not assign from a
+    View of `const double` -- so it is const where ANY target is, and both
+    branches then assign.
     """
     _, loop, _ = mixed_space_alias_target
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
+    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, "
             "Kokkos::AnonymousSpace, Unmanaged> chosen;") in cpp
     # One branch aims it at the kernel-local array the launch put in scratch,
     # the other at the argument View. Neither is a copy.
     assert "chosen = spare;" in cpp
     assert "chosen = field_in;" in cpp
     assert "sweep_column" not in cpp
+
+
+def test_alias_written_through_a_const_target_is_refused(
+        written_const_alias):
+    """Writing through an alias any of whose targets is read-only is refused.
+
+    The handle is a View of `const double` because one of its targets is a
+    read-only argument, so the write does not compile; but the Fortran behind
+    it is writing through a pointer aimed at an array the callee was given to
+    read, which is a program error rather than a shape that could be captured
+    some other way. The refusal names the pointer and the array.
+    """
+    _, loop, _ = written_const_alias
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().apply(loop)
+
+    message = str(error.value)
+    assert "Kokkos alias 'chosen' is written through" in message
+    assert "aliases field_in, which the region may only read" in message
+    assert ("the Fortran writes through a pointer aimed at an array it was "
+            "given to read") in message
 
 
 def test_alias_pointer_of_two_ranks_is_refused(rank_alias_target):
