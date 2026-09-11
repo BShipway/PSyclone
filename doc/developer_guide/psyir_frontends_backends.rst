@@ -407,7 +407,10 @@ Additionally, there are three partially-implemented back-ends
   one of per region -- a sixth, and `team_private_scalars` in
   `psyclone.psyir.backend.kokkos_team_scalars` -- which decides, before any
   code is generated, which of the body's scalars belong to one member of a
-  team -- a seventh; all are described below. The
+  team -- a seventh, and `psyclone.psyir.backend.kokkos_staging` -- which
+  holds the C++ header a region obtains its Views from, and the Python that
+  writes the three statements naming it -- an eighth; all are described
+  below. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
   also fixes the C ABI the region is generated against. `kind_types` is
@@ -595,6 +598,83 @@ generated, and a node in the body that `CWriter` has no handler for raises
 the usual `VisitorError`. Either reaching a caller means the driving
 transformation's own validation was too weak, since it is that validation,
 not this back-end, which decides what may be captured.
+
+Staging a region's arrays
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A region does not construct its Views over the pointers it was passed. It
+asks for them::
+
+  auto x = lfric_kokkos::stage<
+      Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, ReadOnly>>(
+      x_data, lfric_kokkos::Role::readonly, nlayers, ndf);
+
+and, for a View whose kernel writes it, gives it back after the fence::
+
+  lfric_kokkos::unstage(y, y_data);
+  lfric_kokkos::release();
+
+`stage` returns exactly the View type it is given, so the launch body is
+compiled against the same type in every mode and nothing below the
+declaration changes. The role precedes the extents because C++ cannot take a
+fixed parameter after a parameter pack.
+
+The three statements are written by `stage_declaration`, `unstage_statement`
+and `release_statement` in `psyclone.psyir.backend.kokkos_staging`, and
+`view_declaration` there is what `KokkosWriter` calls for each of a region's
+Views. The header itself is `header_text()` in the same module, a single C++
+string; the module imports nothing from PSyclone, so a build script can load
+it from source and write the header out beside the regions it generates
+without a PSyclone environment.
+
+`LFRIC_KOKKOS_STAGING` is read once, at the first region entry of the
+process, and names one of three modes. `none`, the default, is an unmanaged
+View over the caller's pointer -- exactly what the back-end generated before
+staging existed, which is why no existing result moves. `all` allocates a
+View in the execution space, `deep_copy`s the caller's storage into it on
+entry and copies a written one back on exit; it is a correctness mode and the
+header says on stderr, once, that timings taken in it mean nothing. `non-field`
+mirrors only what needs mirroring: an LFRic field is already in a space the
+device can reach, so a `field` role is left unmanaged over its pointer, while
+a `readonly` role is a device mirror cached by `(pointer, bytes)` and a
+`readwrite` or `transient` one is staged in and out per call. `LFRIC_KOKKOS_STAGING_CACHE=0`
+copies every call instead of consulting that cache. An unrecognised value is
+`Kokkos::abort`ed rather than treated as `none`: a misspelt mode that fell
+back silently would be reported as a run in the mode it names.
+
+The role is not the writer's to decide. `KokkosView.role` carries it, and it
+is set by the LFRic transformation, which is the only part of the system that
+knows what an argument *is*: `field` for a field or field vector, `readonly`
+for a dofmap, a stencil map or size, a colour map, an inter-grid cell map, a
+reference-element array or a module array, `readwrite` for an operator's
+local stencil and for caller-supplied scratch, and `transient` for a basis or
+differential-basis array and for a rule's quadrature weights. A description
+that states no role falls back to `readonly` or `readwrite` from the View's
+own constness -- never to `field`, which is a claim about where the storage
+lives and cannot be guessed.
+
+An operator is `readwrite` even where the kernel only reads it, and that is
+the point of taking the role from the metadata rather than from the access.
+The role says how long a copy of the storage stays good, not what one kernel
+does with it: an operator is assembled by one kernel and applied by another,
+so a mirror cached on the first apply is stale on the next assembly. Read
+off the access it would look like a dofmap -- read-only, so immutable, so
+cacheable -- and the whole model's solver stops converging in `non-field`
+mode while every unit test and every extracted region still passes. The
+arrays that remain `readonly` are the ones LFRic fills once at
+initialisation.
+
+A basis table is `transient` for the mirror image of that reason. It *is*
+read-only, and stays so for the whole life of the storage; what it does not
+have is a stable address. The PSy layer allocates a basis or
+differential-basis table at the head of the invoke that needs it, fills it
+from the quadrature rule and deallocates it at the foot, so the allocator
+hands the same address to a different space's table in the next invoke. A
+cache keyed by `(pointer, bytes)` then answers a question about one table
+with another one's contents, which the whole-model gate saw as an abort
+inside `stage` on a differential-basis argument. `transient` keeps the
+read-only traits of the View and takes the per-call path, so the copy is
+made afresh each time and the address is never trusted.
 
 `kind_types` governs the body alone: `gen_declaration` declares a local at
 its own kind's width and `literal_node` suffixes a `float` literal, so a

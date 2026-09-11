@@ -729,7 +729,7 @@ KokkosArrayExpressionMixin.assignment_node`
             # here rather than left at nothing so the description is true.
             KokkosView(map_name, f"{map_name}_data", "int",
                        (ncolours, cls._CELL_COUNT), index_offsets=(1, 1),
-                       read_only=True, random_access=True),
+                       read_only=True, random_access=True, role="readonly"),
             KokkosScalar(colour_name, "int"),
             KokkosScalar(ncolours, "int"),
         )

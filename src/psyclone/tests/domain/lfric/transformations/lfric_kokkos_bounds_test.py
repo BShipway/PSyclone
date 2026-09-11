@@ -229,9 +229,11 @@ def test_lfric_kokkos_trans_sizes_an_assumed_shape_from_the_actual(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> adjacent_face(adjacent_face_data, "
-            "adjacent_face_extent_1, ncells);" in cpp)
+    assert (("auto adjacent_face = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      adjacent_face_data, lfric_kokkos::Role::readonly, "
+             "adjacent_face_extent_1, ncells);") in cpp)
     assert "const int adjacent_face_extent_1" in cpp
     assert "for(face=1; face<=adjacent_face_extent_1; face+=1)" in cpp
 
@@ -253,9 +255,11 @@ def test_lfric_kokkos_trans_sizes_a_rank_2_assumed_shape(implicit_target):
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<const double**, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> outward_normals(outward_normals_data, "
-            "outward_normals_extent_1, outward_normals_extent_2);" in cpp)
+    assert (("auto outward_normals = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const double**, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      outward_normals_data, lfric_kokkos::Role::readonly, "
+             "outward_normals_extent_1, outward_normals_extent_2);") in cpp)
     assert "const int outward_normals_extent_1" in cpp
     assert "const int outward_normals_extent_2" in cpp
 

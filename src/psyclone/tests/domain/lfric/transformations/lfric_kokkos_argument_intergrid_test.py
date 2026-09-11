@@ -180,10 +180,16 @@ def test_lfric_kokkos_trans_accepts_a_prolongation(prolongation_target):
     # The fine dofmap is indexed by a cell the map chooses, so it arrives
     # whole; the coarse one is the launch's own cell and is sliced as any
     # single-mesh dofmap is.
-    assert "Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> map_f(map_f_data, ndf, ncell_f);" in code
-    assert "Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> map_c(map_c_data, ndf, ncells);" in code
+    assert ("auto map_f = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      map_f_data, lfric_kokkos::Role::readonly, ndf, "
+            "ncell_f);") in code
+    assert ("auto map_c = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      map_c_data, lfric_kokkos::Role::readonly, ndf, "
+            "ncells);") in code
     assert "map_f((df - 1), (fine_cell - 1))" in code
     assert "map_c((df - 1), cell)" in code
 
@@ -234,10 +240,16 @@ def test_lfric_kokkos_trans_accepts_a_restriction(restriction_target):
                  "ncell_f", "map_c_data", "map_f_data"]
     assert [formal for formal in _formals(code) if formal in intergrid] == \
         intergrid
-    assert "Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "Unmanaged> coarse_field(coarse_field_data, undf_c);" in code
-    assert "Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> fine_field(fine_field_data, undf_f);" in code
+    assert ("auto coarse_field = lfric_kokkos::stage<\n"
+            "      Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged>>(\n"
+            "      coarse_field_data, lfric_kokkos::Role::field, "
+            "undf_c);") in code
+    assert ("auto fine_field = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double*, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      fine_field_data, lfric_kokkos::Role::field, "
+            "undf_f);") in code
     assert "double *coarse_field_data" in code
     assert "const double *fine_field_data" in code
 
@@ -255,7 +267,9 @@ def test_lfric_kokkos_trans_intergrid_cell_map_indexing(prolongation_target):
     _, loop, _ = prolongation_target
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "Kokkos::View<const int***, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> cell_map(cell_map_data, ncell_f_per_c_x, " \
-        "ncell_f_per_c_y, ncells);" in code
+    assert ("auto cell_map = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const int***, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      cell_map_data, lfric_kokkos::Role::readonly, "
+            "ncell_f_per_c_x, ncell_f_per_c_y, ncells);") in code
     assert "fine_cell = cell_map((x_idx - 1), (y_idx - 1), cell);" in code

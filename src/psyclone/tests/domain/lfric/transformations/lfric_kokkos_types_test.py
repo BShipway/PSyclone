@@ -508,15 +508,24 @@ def test_lfric_kokkos_trans_accepts_an_integer_field(
 
     assert "int *mask_out_data," in cpp
     assert "const int *mask_in_data," in cpp
-    assert ("Kokkos::View<int*, Kokkos::LayoutLeft, MemorySpace, Unmanaged> "
-            "mask_out(mask_out_data, undf_w3);" in cpp)
-    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> mask_in(mask_in_data, undf_wtheta);" in cpp)
+    assert (("auto mask_out = lfric_kokkos::stage<\n"
+             "      Kokkos::View<int*, Kokkos::LayoutLeft, MemorySpace, "
+             "Unmanaged>>(\n"
+             "      mask_out_data, lfric_kokkos::Role::field, "
+             "undf_w3);") in cpp)
+    assert (("auto mask_in = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      mask_in_data, lfric_kokkos::Role::field, "
+             "undf_wtheta);") in cpp)
     # The dofmap and the sizes are what they are for a real field.
     assert "const int undf_w3," in cpp
     assert "const int undf_wtheta," in cpp
-    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> map_w3(map_w3_data, ndf_w3, ncells);" in cpp)
+    assert (("auto map_w3 = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      map_w3_data, lfric_kokkos::Role::readonly, ndf_w3, "
+             "ncells);") in cpp)
     assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
 
     # The width the C++ body assumed for i_def, asserted where the generated
@@ -557,10 +566,16 @@ def test_lfric_kokkos_trans_accepts_a_mixed_field_kernel(mixed_field_target):
     assert ("    double *field_out_data,\n"
             "    const double *field_in_data,\n"
             "    const int *mask_data,\n" in cpp)
-    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
-            "Unmanaged> field_out(field_out_data, undf_w3);" in cpp)
-    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> mask(mask_data, undf_wtheta);" in cpp)
+    assert (("auto field_out = lfric_kokkos::stage<\n"
+             "      Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+             "Unmanaged>>(\n"
+             "      field_out_data, lfric_kokkos::Role::field, "
+             "undf_w3);") in cpp)
+    assert (("auto mask = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      mask_data, lfric_kokkos::Role::field, "
+             "undf_wtheta);") in cpp)
 
     # One interface carrying both widths, and both kinds asserted on it.
     assert "use iso_c_binding, only : c_int, c_double" in fortran
@@ -600,10 +615,16 @@ def test_lfric_kokkos_trans_integer_field_arithmetic_is_integer(
                 "mask_div(((map_wtheta((df - 1), cell) + k) - 1)))")
     assert quotient in cpp
     assert quotient in real_cpp
-    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> mask_div(mask_div_data, undf_wtheta);" in cpp)
-    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> mask_div(mask_div_data, undf_wtheta);" in real_cpp)
+    assert (("auto mask_div = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      mask_div_data, lfric_kokkos::Role::field, "
+             "undf_wtheta);") in cpp)
+    assert (("auto mask_div = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const double*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      mask_div_data, lfric_kokkos::Role::field, "
+             "undf_wtheta);") in real_cpp)
     # Nothing widens the operands on the way to the division.
     assert "double" not in cpp
     assert "float" not in cpp

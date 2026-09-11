@@ -23,6 +23,8 @@ from psyclone.psyir.backend.kokkos_array_expression_mixin import (
 from psyclone.psyir.backend.kokkos_intrinsics_mixin import (
     KokkosIntrinsicsMixin)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.backend.kokkos_staging import (
+    include_line, staging_epilogue, view_declaration)
 from psyclone.psyir.backend.kokkos_region import (
     KokkosAlias, KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView,
     extent_names, is_extent, is_identifier, is_offset)
@@ -141,8 +143,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             self._argument_declaration(argument)
             for argument in region.arguments)
         views = "\n".join(
-            self._view_declaration(argument)
-            for argument in region.arguments
+            view_declaration(argument) for argument in region.arguments
             if isinstance(argument, KokkosView))
         # Both team shapes need the policy and its member type. Only a region
         # with scratch needs the space its Views are placed in, and the
@@ -258,6 +259,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             f"{views}\n\n"
             f"{launch}"
             "  Kokkos::fence();\n"
+            f"{staging_epilogue(region)}"
             "}\n")
         return f"{self._includes(unit)}{unit}"
 
@@ -278,6 +280,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         for byte, since a header emitted unconditionally would rewrite every
         capture already in the model for a call it does not make.
 
+        The staging header joins them on the same terms, and on the same
+        evidence: a region that obtains its Views through it names it in the
+        text, once, however many Views it has.
+
         :param str unit: the generated translation unit, without its
             includes.
 
@@ -289,7 +295,10 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         if any(f"{call}(" in unit
                for call in INTEGER_INTRINSIC_ALTERNATIVES.values()):
             headers.append("<algorithm>")
-        return "".join(f"#include {header}\n" for header in headers) + "\n"
+        lines = [f"#include {header}\n" for header in headers]
+        if "lfric_kokkos::" in unit:
+            lines.append(f"{include_line()}\n")
+        return "".join(lines) + "\n"
 
     def assignment_node(self, node) -> str:
         """Emit a pointer assignment as a View handle copy.
@@ -966,25 +975,6 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         return (
             f"Kokkos::View<{const}{target.c_type}{rank}, Kokkos::LayoutLeft, "
             f"Kokkos::AnonymousSpace, {traits}> {alias.name};")
-
-    @staticmethod
-    def _view_declaration(view):
-        """Return an unmanaged View declaration.
-
-        :param view: the View to declare over storage the caller owns.
-        :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
-
-        :returns: the declaration, indented for the region body.
-        :rtype: str
-        """
-        const = "const " if view.read_only else ""
-        rank = "*" * len(view.extents)
-        traits = "ReadOnly" if view.random_access else "Unmanaged"
-        extents = ", ".join(view.extents)
-        return (
-            f"  Kokkos::View<{const}{view.c_type}{rank}, "
-            f"Kokkos::LayoutLeft, MemorySpace, {traits}> {view.name}("
-            f"{view.data_name}, {extents});")
 
 
 __all__ = ["KokkosAlias", "KokkosColourMap", "KokkosConstant",

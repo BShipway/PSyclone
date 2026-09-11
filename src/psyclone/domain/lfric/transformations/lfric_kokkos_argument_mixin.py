@@ -127,6 +127,168 @@ from psyclone.psyir.symbols import ArgumentInterface, ScalarType
 from psyclone.psyir.transformations import TransformationError
 
 
+class _ArgumentRoles(KernCallArgList):
+    """A ``KernCallArgList`` that remembers what each actual is.
+
+    Every array a region takes has to be placed somewhere the device can
+    reach it, and where that is depends on what the array *is*: LFRic
+    allocates field data in a space a device shares, and allocates a dofmap,
+    a basis table, a quadrature weight, a map or an operator's local stencil
+    in one it does not. The generated C++ cannot tell them apart -- they all
+    arrive as pointers -- so the answer has to be taken here, where the
+    kernel's metadata still says what each argument means, and carried down
+    on the View as its
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosView.role`.
+
+    ``ArgOrdering`` already visits each argument through a callback named for
+    its kind, so a handful of callbacks are the whole question. Each records
+    the stretch of the argument list its call added -- one entry for a field,
+    one per component for a field vector, the count and the stencil for an
+    operator -- against the role that stretch carries.
+
+    Three kinds are named here rather than left to be read off the access the
+    kernel declares. A *field* is named because its storage is in a space the
+    device shares. An *operator* is named because its storage is not, and
+    because it is the one non-field array a model rewrites between region
+    calls: a kernel assembles it and a later kernel applies it, reading it.
+    Read off the access alone it would look like a dofmap -- read-only, so
+    immutable, so cacheable -- and the apply would go on reading the copy the
+    first call took while the assembly wrote new values to the storage behind
+    it. That is not a compile error and not a crash; it is a solver that
+    stops converging, which is what the whole-model gate saw before the role
+    was taken from the metadata rather than from the access.
+
+    A *basis* or *differential basis* table and a rule's *quadrature weights*
+    are named for the opposite reason. They are read-only for the call, and by
+    the access alone they look exactly like a dofmap, but the PSy layer
+    allocates them at the head of an invoke, fills them from the rule and
+    deallocates them at its foot. The storage is therefore recycled between
+    invokes: an address that held one space's table holds another's a moment
+    later, so nothing keyed by the address stays good. They are ``transient``,
+    which is the role that says read-only for the call and not cacheable
+    across calls.
+
+    :param kern: the kernel whose call is being built.
+    :type kern: :py:class:`psyclone.domain.lfric.LFRicKern`
+
+    """
+    def __init__(self, kern):
+        super().__init__(kern)
+        #: The role of each position in the argument list a callback named,
+        #: keyed by position. A position no callback here named is absent,
+        #: and is placed by what the kernel reads or writes it as.
+        self.roles = {}
+
+    def _record(self, before, role):
+        """Record everything the call just added under one role.
+
+        :param int before: the length of the argument list before the call.
+        :param str role: the role the added arguments carry.
+
+        """
+        self.roles.update(
+            (position, role)
+            for position in range(before, len(self._psyir_arglist)))
+
+    def field(self, arg, var_accesses=None):
+        """Add a field, and record where it landed.
+
+        :param arg: the field to add.
+        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().field(arg, var_accesses)
+        self._record(before, "field")
+
+    def field_vector(self, argvect, var_accesses=None):
+        """Add a field vector, and record where its components landed.
+
+        :param argvect: the field vector to add.
+        :type argvect: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().field_vector(argvect, var_accesses)
+        self._record(before, "field")
+
+    def operator(self, arg, var_accesses=None):
+        """Add an LMA operator, and record it as rewritten between calls.
+
+        :param arg: the operator to add.
+        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().operator(arg, var_accesses)
+        self._record(before, "readwrite")
+
+    def cma_operator(self, arg, var_accesses=None):
+        """Add a columnwise operator, and record it the same way.
+
+        :param arg: the operator to add.
+        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().cma_operator(arg, var_accesses)
+        self._record(before, "readwrite")
+
+    def basis(self, function_space, var_accesses=None):
+        """Add a basis table, and record it as living only for the invoke.
+
+        :param function_space: the space the table is for.
+        :type function_space: \
+            :py:class:`psyclone.domain.lfric.FunctionSpace`
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().basis(function_space, var_accesses)
+        self._record(before, "transient")
+
+    def diff_basis(self, function_space, var_accesses=None):
+        """Add a differential basis table, and record it the same way.
+
+        :param function_space: the space the table is for.
+        :type function_space: \
+            :py:class:`psyclone.domain.lfric.FunctionSpace`
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().diff_basis(function_space, var_accesses)
+        self._record(before, "transient")
+
+    def quad_rule(self, var_accesses=None):
+        """Add the quadrature rule, and record its weights the same way.
+
+        :param var_accesses: optional store for variable accesses.
+        :type var_accesses: Optional[
+            :py:class:`psyclone.core.VariablesAccessMap`]
+
+        """
+        before = len(self._psyir_arglist)
+        super().quad_rule(var_accesses)
+        self._record(before, "transient")
+
+
 class LFRicKokkosArgumentMixin:
     """Build the region's argument list and the actuals the PSy layer passes.
 
@@ -283,7 +445,8 @@ class LFRicKokkosArgumentMixin:
 
     @classmethod
     def _region_arguments(cls, formals, per_cell, cell_index, renames,
-                          count, start, shared=frozenset(), colour=()):
+                          count, start, shared=frozenset(), colour=(),
+                          roles=None):
         # Seven descriptions of one argument list, which is what describing
         # an argument list takes; grouping them into an object would only
         # move the count into its constructor. The locals are one per
@@ -358,6 +521,18 @@ class LFRicKokkosArgumentMixin:
         :type colour: tuple[Union[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
+        :param roles: the role of each formal the kernel's metadata names,
+            as :py:meth:`_argument_lists` reports them: ``field`` for field
+            data, which LFRic allocates in a space a device shares and which
+            the staging header therefore leaves over the caller's pointer,
+            and ``readwrite`` for an operator, whose storage is not in that
+            space and which a model rewrites between calls. A formal absent
+            from the mapping is placed by what the kernel reads or writes it
+            as. ``None`` is a legitimate answer -- a kernel may take neither
+            kind -- but a field missing from it is only copied when it need
+            not be, while an operator missing from it is read from a copy
+            taken before the last kernel that assembled it.
+        :type roles: Optional[Mapping[str, str]]
 
         :returns: one description per generated C argument, in call order, up
             to and including the count and, where there is one, the first
@@ -382,6 +557,13 @@ class LFRicKokkosArgumentMixin:
             if not extents and not sliced:
                 arguments.append(KokkosScalar(symbol.name, c_type))
                 continue
+            # Field data is in a space the device shares; everything
+            # else -- a dofmap, a basis table, a weight, a map, an operator's
+            # local stencil -- is not, and is placed by whether the kernel
+            # writes it. The distinction is the whole of what the role says.
+            role = (roles or {}).get(symbol.name)
+            if role is None:
+                role = "readonly" if read_only else "readwrite"
             arguments.append(KokkosView(
                 symbol.name, f"{symbol.name}_data", c_type,
                 extents + ((count,) if sliced else ()),
@@ -390,7 +572,8 @@ class LFRicKokkosArgumentMixin:
                 extra_indices=(cell_index,) if sliced else (),
                 read_only=read_only, random_access=read_only,
                 atomic=symbol.name in shared,
-                atomic_store=bool(shared.get(symbol.name))))
+                atomic_store=bool(shared.get(symbol.name)),
+                role=role))
         for renamed in renames.values():
             arguments.append(KokkosScalar(renamed, "int"))
         arguments.extend(colour)
@@ -428,7 +611,7 @@ class LFRicKokkosArgumentMixin:
             arguments.append(KokkosView(
                 name, f"{name}_data", c_type, extents,
                 index_offsets=cls._origins(symbol),
-                read_only=True, random_access=True))
+                read_only=True, random_access=True, role="readonly"))
         return tuple(arguments)
 
     @classmethod
@@ -454,13 +637,16 @@ LFRicKokkosTrans.apply` makes.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
 
         :returns: the kernel's own formals, the actuals the PSy layer passes
-            for them, and the name of the cell-position formal the region
-            declares instead of taking, or ``None``. Any measured extent is
-            left out of both, for
+            for them, the name of the cell-position formal the region
+            declares instead of taking, or ``None``, and the names of the
+            formals carrying field data. Any measured extent is left out of
+            the first two, for
             :py:meth:`LFRicKokkosBoundsMixin._implicit_extent_actuals` to add
-            back to the two together.
+            back to the two together; a measured extent is a scalar and so is
+            never a field.
         :rtype: tuple[list[:py:class:`psyclone.psyir.symbols.DataSymbol`],
-            list[:py:class:`psyclone.psyir.nodes.DataNode`], Optional[str]]
+            list[:py:class:`psyclone.psyir.nodes.DataNode`], Optional[str],
+            frozenset[str]]
 
         :raises TransformationError: if the PSy layer supplies a different
             number of actual arguments than the kernel has formals.
@@ -468,7 +654,7 @@ LFRicKokkosTrans.apply` makes.
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.
         node.ancestor(InvokeSchedule).invoke.setup_psy_layer_symbols()
-        argument_builder = KernCallArgList(kernel)
+        argument_builder = _ArgumentRoles(kernel)
         argument_builder.generate()
         # An extent :py:meth:`LFRicKokkosBoundsMixin._resolve_assumed_shapes`
         # measured is a formal the region declares and the kernel never wrote,
@@ -487,6 +673,14 @@ LFRicKokkosTrans.apply` makes.
                 f"for '{kernel.name}' but the PSy layer supplies "
                 f"{len(actuals)}.")
 
+        # Converted to names here, while the two lists are still aligned
+        # with the argument list the positions index: the cell-position drop
+        # below renumbers everything after it, and a role attached to the
+        # wrong argument is a region that copies the wrong array.
+        roles = {
+            formals[position].name: role
+            for position, role in argument_builder.roles.items()
+            if position < len(formals)}
         cell_position = cls._cell_position(kernel, node, formals, actuals)
         if cell_position is not None:
             # Both lists, together. They are walked in step below -- and
@@ -497,7 +691,7 @@ LFRicKokkosTrans.apply` makes.
             # dimension that makes them per-cell.
             formals = formals[1:]
             del actuals[0]
-        return formals, actuals, cell_position
+        return formals, actuals, cell_position, roles
 
     @staticmethod
     def _per_cell(formals, actuals):
@@ -568,7 +762,7 @@ LFRicKokkosTrans.apply` makes.
         # the argument list from the actuals that must match it position for
         # position, which is the one property this routine exists to keep.
         # pylint: disable=too-many-locals
-        formals, actuals, cell_position = cls._argument_lists(
+        formals, actuals, cell_position, roles = cls._argument_lists(
             kernel, node, schedule)
         per_cell = cls._per_cell(formals, actuals)
         storage = cls._storage_extents(
@@ -614,7 +808,7 @@ LFRicKokkosTrans.apply` makes.
                 cls._shared_formals(kernel, schedule,
                                     cls._asserts_disjoint(options))
                 if cls._uses_atomics(node, options) else {},
-                colour_arguments)
+                colour_arguments, roles)
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),

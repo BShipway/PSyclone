@@ -44,7 +44,8 @@ def test_lfric_kokkos_trans_splices_one_loop(target):
     assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
     assert "map_wtheta((df - 1), cell)" in cpp
     assert "const int *map_wtheta_data" in cpp
-    assert "map_wtheta(map_wtheta_data, ndf_wtheta, ncells)" in cpp
+    assert ("map_wtheta_data, lfric_kokkos::Role::readonly, "
+            "ndf_wtheta, ncells)") in cpp
     assert "const double recip_epsilon" in cpp
 
     assert "subroutine moist_dyn_gas_kokkos(" in fortran
@@ -87,8 +88,10 @@ def test_lfric_kokkos_trans_derives_a_second_kernel_contract(second_target):
 
     # Two function spaces, so two dofmaps, each given the cell extent the
     # PSy layer would otherwise have sliced away.
-    assert "map_w3(map_w3_data, ndf_w3, ncells)" in cpp
-    assert "map_wtheta(map_wtheta_data, ndf_wtheta, ncells)" in cpp
+    assert ("map_w3_data, lfric_kokkos::Role::readonly, "
+            "ndf_w3, ncells)") in cpp
+    assert ("map_wtheta_data, lfric_kokkos::Role::readonly, "
+            "ndf_wtheta, ncells)") in cpp
     assert "field_out(((map_w3((df - 1), cell) + k) - 1)) = " in cpp
     assert "(scaling * field_in(((map_wtheta((df - 1), cell) + k) - 1)))" \
         in cpp

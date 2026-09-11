@@ -195,10 +195,16 @@ def test_lfric_kokkos_trans_accepts_a_cross2d_stencil(stencil_target):
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> smap_sizes(smap_sizes_data, 4, ncells);" in cpp)
-    assert ("Kokkos::View<const int****, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> smap(smap_data, ndf_w3, max_length, 4, ncells);" in cpp)
+    assert (("auto smap_sizes = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      smap_sizes_data, lfric_kokkos::Role::readonly, 4, "
+             "ncells);") in cpp)
+    assert (("auto smap = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int****, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      smap_data, lfric_kokkos::Role::readonly, ndf_w3, "
+             "max_length, 4, ncells);") in cpp)
     assert "const int max_length" in cpp
     assert "max_length_data" not in cpp
     assert "smap((df - 1), (step - 1), (branch - 1), cell)" in cpp
@@ -238,15 +244,18 @@ def test_lfric_kokkos_trans_stencil_size_is_indexed_by_cell(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> smap_size(smap_size_data, ncells);" in cpp)
+    assert (("auto smap_size = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      smap_size_data, lfric_kokkos::Role::readonly, "
+             "ncells);") in cpp)
     assert "const int *smap_size_data" in cpp
     # '\b' stops either pattern reaching 'smap_size_data' or 'smap_size_max',
     # so what is left is the size itself: never bare, and subscripted by the
     # cell everywhere but the View construction.
-    assert not re.findall(r"\bsmap_size\b(?!\()", cpp)
-    assert set(re.findall(r"\bsmap_size\(([^)]*)\)", cpp)) == {
-        "smap_size_data, ncells", "cell"}
+    body = cpp.replace("auto smap_size = ", "")
+    assert not re.findall(r"\bsmap_size\b(?!\()", body)
+    assert set(re.findall(r"\bsmap_size\(([^)]*)\)", cpp)) == {"cell"}
 
     fortran = str(psy.gen)
     assert "integer(c_int), dimension(*), intent(in) :: smap_size" in fortran
@@ -269,8 +278,11 @@ def test_lfric_kokkos_trans_accepts_a_region_stencil(stencil_region_target):
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<const int***, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> smap(smap_data, ndf_w3, smap_size_max, ncells);"
+    assert (("auto smap = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int***, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      smap_data, lfric_kokkos::Role::readonly, ndf_w3, "
+             "smap_size_max, ncells);")
             in cpp)
     assert "const int smap_size_max" in cpp
     assert "smap((df - 1), (step - 1), cell)" in cpp
@@ -299,10 +311,16 @@ def test_lfric_kokkos_trans_accepts_a_cross_stencil_with_a_variable_extent(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert ("Kokkos::View<const int*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> smap_size(smap_size_data, ncells);" in cpp)
-    assert ("Kokkos::View<const int***, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> smap(smap_data, ndf_w3, smap_size_max, ncells);"
+    assert (("auto smap_size = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      smap_size_data, lfric_kokkos::Role::readonly, "
+             "ncells);") in cpp)
+    assert (("auto smap = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int***, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      smap_data, lfric_kokkos::Role::readonly, ndf_w3, "
+             "smap_size_max, ncells);")
             in cpp)
     assert "for(step=1; step<=smap_size(cell); step+=1)" in cpp
 

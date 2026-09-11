@@ -106,12 +106,21 @@ def test_kokkos_writer_translation_unit():
     assert "const double recip_epsilon" in code
 
     assert "using Unmanaged = Kokkos::MemoryTraits<Kokkos::Unmanaged>;" in code
-    assert "Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "Unmanaged> moist_dyn_gas(moist_dyn_gas_data, undf_wtheta);" in code
-    assert "Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> mr_v(mr_v_data, undf_wtheta);" in code
-    assert "Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> map_wtheta(map_wtheta_data, ndf_wtheta, ncells);" in code
+    assert ("auto moist_dyn_gas = lfric_kokkos::stage<\n"
+            "      Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged>>(\n"
+            "      moist_dyn_gas_data, lfric_kokkos::Role::readwrite, "
+            "undf_wtheta);") in code
+    assert ("auto mr_v = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double*, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      mr_v_data, lfric_kokkos::Role::readonly, "
+            "undf_wtheta);") in code
+    assert ("auto map_wtheta = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      map_wtheta_data, lfric_kokkos::Role::readonly, "
+            "ndf_wtheta, ncells);") in code
     assert 'Kokkos::parallel_for("moist_dyn_gas_kokkos"' in code
     assert "Kokkos::RangePolicy<>(0, ncells)" in code
     assert "KOKKOS_LAMBDA(const int cell)" in code
@@ -145,8 +154,11 @@ def test_kokkos_launch_takes_an_upper_bound_formal():
 
     assert f"const int {bound}" in code
     assert f"Kokkos::RangePolicy<>(0, {bound})" in code
-    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
-            f"ReadOnly> map_wtheta(map_wtheta_data, ndf_wtheta, {bound});"
+    assert ("auto map_wtheta = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      map_wtheta_data, lfric_kokkos::Role::readonly, "
+            f"ndf_wtheta, {bound});"
             in code)
     assert "ncells" not in code
 
@@ -480,9 +492,15 @@ def test_kokkos_writer_places_locals_in_team_scratch():
     assert code.index("const int team_size") < code.index(
         'Kokkos::parallel_for("tri_solve_kokkos"')
 
-    # The runtime guard and the fence belong to both shapes.
+    # The runtime guard and the fence belong to both shapes, and the
+    # staging epilogue follows the fence: the write-back of a View the
+    # launch wrote cannot read it before the launch has finished.
     assert "if (!Kokkos::is_initialized()) {" in code
-    assert code.rstrip().endswith("Kokkos::fence();\n}")
+    assert code.rstrip().endswith(
+        "Kokkos::fence();\n"
+        "  lfric_kokkos::unstage(y, y_data);\n"
+        "  lfric_kokkos::release();\n"
+        "}")
 
 
 def _renamed(region):
@@ -1463,7 +1481,8 @@ def test_kokkos_writer_declares_a_constant_inside_the_body():
     generated = KokkosWriter()(region)
 
     assert generated.startswith(
-        "#include <Kokkos_Core.hpp>\n\n"
+        "#include <Kokkos_Core.hpp>\n"
+        '#include "lfric_kokkos_staging.hpp"\n\n'
         'extern "C" void moist_dyn_gas_kokkos(')
     assert "static const" not in generated
     assert "    const int x_dofs[2] = {1, 3};\n" in generated
@@ -1582,12 +1601,14 @@ def test_kokkos_writer_includes_algorithm_for_an_integer_maximum():
     code = KokkosWriter()(_scratch_region(scratch=scratch))
 
     assert code.startswith("#include <Kokkos_Core.hpp>\n"
-                           "#include <algorithm>\n\n")
+                           "#include <algorithm>\n"
+                           '#include "lfric_kokkos_staging.hpp"\n\n')
     assert code.count("#include <algorithm>") == 1
     assert code.count(extent) == 2
 
     plain = KokkosWriter()(_scratch_region())
-    assert plain.startswith("#include <Kokkos_Core.hpp>\n\n")
+    assert plain.startswith("#include <Kokkos_Core.hpp>\n"
+                            '#include "lfric_kokkos_staging.hpp"\n\n')
     assert "algorithm" not in plain
 
 
@@ -1604,7 +1625,8 @@ def test_kokkos_view_takes_an_expression_extent():
         for argument in _scratch_region().arguments)
     code = KokkosWriter()(_scratch_region(arguments=arguments))
 
-    assert "map(map_data, 4, ncells);" in code
+    assert ("      map_data, lfric_kokkos::Role::readonly, 4, "
+            "ncells);") in code
     # Still rank 2: a literal extent must not change how the View is typed.
     assert "Kokkos::View<const int**, Kokkos::LayoutLeft, " in code
 
@@ -3205,8 +3227,11 @@ def test_kokkos_coloured_region_declares_its_map_and_colour():
     assert "const int ncolours" in code
     # The first extent is the one that has to be exact: under LayoutLeft
     # it is the stride, and it is the number of colours.
-    assert ("Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> cmap(cmap_data, ncolours, ncells_in_colour);") in code
+    assert (("auto cmap = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      cmap_data, lfric_kokkos::Role::readonly, ncolours, "
+             "ncells_in_colour);")) in code
 
 
 def test_kokkos_uncoloured_region_declares_no_cell():
@@ -3658,8 +3683,11 @@ def test_kokkos_dof_launch_has_no_dofmap():
     # No rank-2 View, which is the shape every sliced dofmap has.
     assert "**" not in code
     assert "map_" not in code
-    assert "Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "Unmanaged> out_dof(out_dof_data, ndofs);" in code
+    assert ("auto out_dof = lfric_kokkos::stage<\n"
+            "      Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+            "Unmanaged>>(\n"
+            "      out_dof_data, lfric_kokkos::Role::readwrite, "
+            "ndofs);") in code
     assert "out_dof(df) = (scale * in_dof(df));" in code
 
 
