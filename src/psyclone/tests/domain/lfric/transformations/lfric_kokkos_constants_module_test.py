@@ -217,8 +217,11 @@ def test_lfric_kokkos_trans_accepts_a_module_array_variable(
     fortran = str(psy.gen)
 
     assert "const double *profile_heights_data" in cpp
-    assert ("Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, "
-            "ReadOnly> profile_heights(profile_heights_data, 100);" in cpp)
+    assert (("auto profile_heights = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const double*, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      profile_heights_data, lfric_kokkos::Role::readonly, "
+             "100);") in cpp)
     assert "profile_heights((profile_size - 1))" in cpp
     assert ("real(c_double), dimension(*), intent(in) :: profile_heights"
             in fortran)

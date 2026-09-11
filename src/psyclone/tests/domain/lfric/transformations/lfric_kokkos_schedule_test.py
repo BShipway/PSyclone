@@ -599,8 +599,11 @@ def test_lfric_kokkos_trans_accepts_a_polymorphic_kernel(
     assert "eval_scale_r_single_kokkos" in cpp
     assert "eval_scale_kokkos" not in cpp
     assert "Kokkos::View<float*" in cpp
-    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> basis_w1_on_w3(basis_w1_on_w3_data, 3, ndf_w1, ndf_w3);" \
+    assert ("auto basis_w1_on_w3 = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double***, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      basis_w1_on_w3_data, lfric_kokkos::Role::transient, 3, "
+            "ndf_w1, ndf_w3);") \
         in cpp
     assert "weights" not in cpp
 

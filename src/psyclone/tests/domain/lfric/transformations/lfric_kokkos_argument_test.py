@@ -259,8 +259,16 @@ def test_lfric_kokkos_trans_accepts_an_operator(operator_target):
     _, loop, _ = operator_target
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> matrix(matrix_data, ncell_3d, ndf1, ndf2);" in code
+    # The kernel only reads the operator, and its element type is const to
+    # say so, but its role is readwrite: the role says where the storage is
+    # and how long a copy of it stays good, not what this kernel does with
+    # it. An operator is assembled by one kernel and applied by another, so
+    # a copy taken on the first apply is wrong on the next timestep.
+    assert ("auto matrix = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double***, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      matrix_data, lfric_kokkos::Role::readwrite, ncell_3d, "
+            "ndf1, ndf2);") in code
     assert "const double *matrix_data" in code
     assert "const int ncell_3d" in code
 
@@ -278,10 +286,14 @@ def test_lfric_kokkos_trans_operator_dofmaps_keep_their_cell_index(
     code = LFRicKokkosTrans().apply(loop)
 
     for dofmap in ("map1", "map2"):
-        assert f"Kokkos::View<const int**, Kokkos::LayoutLeft, MemorySpace, " \
-            f"ReadOnly> {dofmap}({dofmap}_data, ndf" in code
-        assert f"{dofmap}_data, ndf1, ncells)" in code or \
-            f"{dofmap}_data, ndf2, ncells)" in code
+        assert (f"auto {dofmap} = lfric_kokkos::stage<\n"
+                "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+                "MemorySpace, ReadOnly>>(\n"
+                f"      {dofmap}_data, lfric_kokkos::Role::readonly, "
+                "ndf") in code
+        role = "lfric_kokkos::Role::readonly"
+        assert f"{dofmap}_data, {role}, ndf1, ncells)" in code or \
+            f"{dofmap}_data, {role}, ndf2, ncells)" in code
         assert f"{dofmap}(" in code
     assert ", cell_1)" in code
 
@@ -310,8 +322,10 @@ def test_lfric_kokkos_trans_accepts_two_operators(two_operator_target):
     _, loop, _ = two_operator_target
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "matrix(matrix_data, ncell_3d, ndf1, ndf2);" in code
-    assert "matrix2(matrix2_data, ncell_3d_2, ndf1, ndf2);" in code
+    assert ("matrix_data, lfric_kokkos::Role::readwrite, "
+            "ncell_3d, ndf1, ndf2);") in code
+    assert ("matrix2_data, lfric_kokkos::Role::readwrite, "
+            "ncell_3d_2, ndf1, ndf2);") in code
     assert code.count("const int cell = cell_1 + 1;") == 1
 
 

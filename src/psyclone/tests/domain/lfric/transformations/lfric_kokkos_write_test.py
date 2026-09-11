@@ -206,8 +206,10 @@ def test_lfric_kokkos_trans_atomics_reach_a_continuous_gh_inc(
     # used: it would make every access to the field atomic, including the
     # plain reads a 'gh_readinc' kernel makes, and it would change the type
     # the region declares rather than the statement that needed changing.
-    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
-            "Unmanaged> acc(acc_data, undf_w2);" in cpp)
+    assert (("auto acc = lfric_kokkos::stage<\n"
+             "      Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+             "Unmanaged>>(\n"
+             "      acc_data, lfric_kokkos::Role::field, undf_w2);") in cpp)
     assert "Kokkos::Atomic" not in cpp
 
     fortran = str(psy.gen)
@@ -267,8 +269,10 @@ def test_lfric_kokkos_trans_treats_a_continuous_gh_write_as_shared(
     # The View is declared as any other written field's is, for the reason
     # the 'gh_inc' one is: the atomic is a property of the statement, not of
     # the interface.
-    assert ("Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
-            "Unmanaged> flux(flux_data, undf_w2);" in cpp)
+    assert (("auto flux = lfric_kokkos::stage<\n"
+             "      Kokkos::View<double*, Kokkos::LayoutLeft, MemorySpace, "
+             "Unmanaged>>(\n"
+             "      flux_data, lfric_kokkos::Role::field, undf_w2);") in cpp)
     assert "Kokkos::Atomic" not in cpp
 
 

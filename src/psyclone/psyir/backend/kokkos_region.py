@@ -306,6 +306,25 @@ class KokkosView:
     #: description setting this for a field cells accumulate into would
     #: generate a store that kept one contribution and lost the rest.
     atomic_store: bool = False
+    #: What kind of thing this array is, for the staging header the region
+    #: obtains its Views through: ``"field"`` for field data, which LFRic
+    #: allocates in a space a device shares; ``"readonly"`` for a dofmap, a
+    #: stencil, colour, intergrid or reference-element array, or a module
+    #: array, none of which moves or changes for the run; ``"readwrite"`` for
+    #: an operator's local stencil or scratch the caller supplies; and
+    #: ``"transient"`` for a basis or differential-basis table or a rule's
+    #: quadrature weights, which are read-only for the call but allocated and
+    #: freed around the invoke, so their address outlives nothing. It is the
+    #: one question about
+    #: an argument the C++ writer cannot answer -- a ``double *`` says
+    #: nothing about where it was allocated -- so it is answered by the
+    #: transformation that knows what the argument means and carried here.
+    #:
+    #: ``None`` means unstated, which a description built by hand may be.
+    #: The writer then reads a conservative role from :py:attr:`read_only`;
+    #: what it will not do is assume ``field``, because that is the one
+    #: answer asserting something about the caller's allocation.
+    role: Optional[str] = None
 
 
 @dataclass(frozen=True)

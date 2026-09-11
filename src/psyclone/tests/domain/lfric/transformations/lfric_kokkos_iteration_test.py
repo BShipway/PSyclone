@@ -56,7 +56,7 @@ def test_lfric_kokkos_trans_accepts_a_literal_halo_depth(halo_operator_target):
     # The bound is a formal of the region, and the per-cell dofmap View is
     # sized by that same formal rather than by any owned-cell count.
     assert "const int ncells" in cpp
-    assert "map1(map1_data, ndf1, ncells)" in cpp
+    assert "map1_data, lfric_kokkos::Role::readonly, ndf1, ncells)" in cpp
     assert "get_last_halo_cell" not in cpp
     assert "loop0_stop = mesh%get_last_halo_cell(1)" in fortran
     assert "loop0_stop)" in fortran.split(

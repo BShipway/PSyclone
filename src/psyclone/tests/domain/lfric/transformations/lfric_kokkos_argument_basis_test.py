@@ -339,12 +339,21 @@ def test_lfric_kokkos_trans_accepts_a_quadrature_kernel(quadrature_target):
 
     assert "const int np_xy" in code
     assert "const int np_z" in code
-    assert "Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> weights_xy(weights_xy_data, np_xy);" in code
-    assert "Kokkos::View<const double*, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> weights_z(weights_z_data, np_z);" in code
-    assert "Kokkos::View<const double****, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> basis_w3(basis_w3_data, 1, ndf_w3, np_xy, np_z);" in code
+    assert ("auto weights_xy = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double*, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      weights_xy_data, lfric_kokkos::Role::transient, "
+            "np_xy);") in code
+    assert ("auto weights_z = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double*, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      weights_z_data, lfric_kokkos::Role::transient, "
+            "np_z);") in code
+    assert ("auto basis_w3 = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double****, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      basis_w3_data, lfric_kokkos::Role::transient, 1, ndf_w3, "
+            "np_xy, np_z);") in code
 
     signature = code.split(") {\n")[0]
     parameters = [
@@ -392,12 +401,17 @@ def test_lfric_kokkos_trans_accepts_an_evaluator_kernel(evaluator_target):
     assert not kernel.qr_required
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> basis_w3_on_w3(basis_w3_on_w3_data, 1, ndf_w3, ndf_w3);" \
+    assert ("auto basis_w3_on_w3 = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double***, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      basis_w3_on_w3_data, lfric_kokkos::Role::transient, 1, "
+            "ndf_w3, ndf_w3);") \
         in code
-    assert "Kokkos::View<const double***, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> diff_basis_w1_on_w3(diff_basis_w1_on_w3_data, 3, ndf_w1, " \
-        "ndf_w3);" in code
+    assert ("auto diff_basis_w1_on_w3 = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double***, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      diff_basis_w1_on_w3_data, lfric_kokkos::Role::transient, "
+            "3, ndf_w1, ndf_w3);") in code
     assert "weights" not in code
     assert "np_xy" not in code
     assert "np_z" not in code
@@ -414,10 +428,14 @@ def test_lfric_kokkos_trans_accepts_a_kernel_with_both_shapes(
     assert kernel.eval_shapes == ["gh_quadrature_xyoz", "gh_evaluator"]
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "basis_w3_qr(basis_w3_qr_data, 1, ndf_w3, np_xy, np_z);" in code
-    assert "basis_w3_on_w3(basis_w3_on_w3_data, 1, ndf_w3, ndf_w3);" in code
-    assert "basis_w1_qr(basis_w1_qr_data, 3, ndf_w1, np_xy, np_z);" in code
-    assert "basis_w1_on_w3(basis_w1_on_w3_data, 3, ndf_w1, ndf_w3);" in code
+    assert ("basis_w3_qr_data, lfric_kokkos::Role::transient, "
+            "1, ndf_w3, np_xy, np_z);") in code
+    assert ("basis_w3_on_w3_data, lfric_kokkos::Role::transient, "
+            "1, ndf_w3, ndf_w3);") in code
+    assert ("basis_w1_qr_data, lfric_kokkos::Role::transient, "
+            "3, ndf_w1, np_xy, np_z);") in code
+    assert ("basis_w1_on_w3_data, lfric_kokkos::Role::transient, "
+            "3, ndf_w1, ndf_w3);") in code
     assert code.count("const int np_xy") == 1
 
 
@@ -432,8 +450,10 @@ def test_lfric_kokkos_trans_accepts_a_diff_basis(diff_basis_target):
     _, loop, _ = diff_basis_target
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "basis_w3(basis_w3_data, 1, ndf_w3, np_xy, np_z);" in code
-    assert "diff_basis_w3(diff_basis_w3_data, 3, ndf_w3, np_xy, np_z);" in code
+    assert ("basis_w3_data, lfric_kokkos::Role::transient, "
+            "1, ndf_w3, np_xy, np_z);") in code
+    assert ("diff_basis_w3_data, lfric_kokkos::Role::transient, "
+            "3, ndf_w3, np_xy, np_z);") in code
 
 
 def test_lfric_kokkos_trans_basis_indexing_matches_the_kernel(
@@ -578,10 +598,16 @@ def test_face_quadrature_arguments_are_declared(face_quadrature_target):
 
     assert "const int nfaces" in code
     assert "const int np_xyz" in code
-    assert "Kokkos::View<const double**, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> weights_xyz(weights_xyz_data, np_xyz, nfaces);" in code
-    assert "Kokkos::View<const double****, Kokkos::LayoutLeft, MemorySpace, " \
-        "ReadOnly> basis_w3(basis_w3_data, 1, ndf_w3, np_xyz, nfaces);" in code
+    assert ("auto weights_xyz = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double**, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      weights_xyz_data, lfric_kokkos::Role::transient, np_xyz, "
+            "nfaces);") in code
+    assert ("auto basis_w3 = lfric_kokkos::stage<\n"
+            "      Kokkos::View<const double****, Kokkos::LayoutLeft, "
+            "MemorySpace, ReadOnly>>(\n"
+            "      basis_w3_data, lfric_kokkos::Role::transient, 1, ndf_w3, "
+            "np_xyz, nfaces);") in code
     assert "weights_xyz((qp - 1), (face - 1))" in code
     assert "basis_w3((1 - 1), (df - 1), (qp - 1), (face - 1))" in code
 
@@ -641,12 +667,16 @@ def test_face_and_xyoz_together(face_and_xyoz_target):
     assert kernel.eval_shapes == ["gh_quadrature_xyoz", "gh_quadrature_face"]
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "basis_w3_qr(basis_w3_qr_data, 1, ndf_w3, np_xy, np_z);" in code
-    assert "basis_w3_faces(basis_w3_faces_data, 1, ndf_w3, nqp_faces, " \
-        "nfaces);" in code
-    assert "weights_xy(weights_xy_data, np_xy);" in code
-    assert "weights_z(weights_z_data, np_z);" in code
-    assert "wqp_faces(wqp_faces_data, nqp_faces, nfaces);" in code
+    assert ("basis_w3_qr_data, lfric_kokkos::Role::transient, "
+            "1, ndf_w3, np_xy, np_z);") in code
+    assert ("basis_w3_faces_data, lfric_kokkos::Role::transient, "
+            "1, ndf_w3, nqp_faces, nfaces);") in code
+    assert ("weights_xy_data, lfric_kokkos::Role::transient, "
+            "np_xy);") in code
+    assert ("weights_z_data, lfric_kokkos::Role::transient, "
+            "np_z);") in code
+    assert ("wqp_faces_data, lfric_kokkos::Role::transient, "
+            "nqp_faces, nfaces);") in code
 
     signature = code.split(") {\n")[0]
     parameters = [
