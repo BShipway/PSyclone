@@ -569,3 +569,38 @@ def test_match_argument_an_array_actual_is_not_a_scalar_dummy():
     with pytest.raises(CallMatchingArgumentsNotFound) as err:
         match_argument(actual, dummy, interface_call=False)
     assert "Argument type mismatch of call argument 'chi'" in str(err.value)
+
+
+def test_imported_initial_value_is_read_once_per_constant(
+        monkeypatch, clear_module_manager_instance):
+    '''A module is asked for a constant once per ModuleManager; misses too.
+
+    A fresh ModuleManager -- what the fixture gives every test -- empties the
+    table, so no test reads a constant another test's module defined.
+    '''
+    # pylint: disable=unused-argument
+    from psyclone.parse.module_manager import ModuleManager
+    from psyclone.psyir.nodes import argument_matching
+    from psyclone.psyir.symbols import (
+        ContainerSymbol, DataSymbol, ImportInterface)
+    from psyclone.psyir.symbols import ScalarType
+    INTEGER_TYPE = ScalarType(ScalarType.Intrinsic.INTEGER, 4)
+    calls = []
+
+    def missing(self, local_node=None):
+        calls.append(self.name)
+        return None
+    monkeypatch.setattr(ContainerSymbol, "find_container_psyir", missing)
+    module = ContainerSymbol("constants_mod")
+    r_def = DataSymbol("r_def", INTEGER_TYPE,
+                       interface=ImportInterface(module))
+    r_tran = DataSymbol("r_tran", INTEGER_TYPE,
+                        interface=ImportInterface(module))
+    for _ in range(3):
+        assert argument_matching._imported_initial_value(r_def, None) is None
+    assert argument_matching._imported_initial_value(r_tran, None) is None
+    assert calls == ["constants_mod", "constants_mod"]
+    # A new ModuleManager is a new run: the constant is read again.
+    ModuleManager._instance = None
+    assert argument_matching._imported_initial_value(r_def, None) is None
+    assert calls == ["constants_mod", "constants_mod", "constants_mod"]
