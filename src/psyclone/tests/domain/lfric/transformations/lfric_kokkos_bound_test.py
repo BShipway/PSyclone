@@ -431,3 +431,28 @@ def test_a_detached_call_is_not_local():
     """A call with no Container has no local callee to find."""
     call = Call.create(RoutineSymbol("orphan"))
     assert not LFRicKokkosTrans._already_local(call)
+
+
+def test_only_a_written_argument_refusal_is_deferred(
+        loop_mates_target, monkeypatch):
+    """A refusal of any other kind ends the inlining at once.
+
+    The first call is made to fail for a reason inlining the second could
+    never clear; the second is then not tried, which the count of attempts
+    shows, and the refusal is the first call's own.
+    """
+    _, loop, _ = loop_mates_target
+    attempts = []
+    original = LFRicKokkosTrans._inline_one
+
+    def counting(schedule, call, table):
+        attempts.append(call.routine.name)
+        if len(attempts) == 1:
+            raise TransformationError("the callee reads its module state")
+        return original(schedule, call, table)
+    monkeypatch.setattr(LFRicKokkosTrans, "_inline_one", counting)
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "reads its module state" in str(err.value)
+    assert len(attempts) == 1

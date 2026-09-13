@@ -124,6 +124,14 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` passes; and,
     #: by the symbol table as any new symbol's is.
     _BOUND_SUFFIX = "_bound"
 
+    #: The words of the one refusal another inlining can clear:
+    #: :py:class:`~psyclone.psyir.transformations.InlineTrans`'s rule that a
+    #: declaration depends on an argument "which is passed by argument and"
+    #: is or may be written before the call. A call refused for anything
+    #: else is refused for good, and trying the other calls first would only
+    #: repeat the inliner's work; it is raised at once, as it always was.
+    _DEFERRABLE_REFUSAL = "is passed by argument and"
+
     @classmethod
     def _bounded_locals(cls, options):
         """Read and check the ``bounded_locals`` option.
@@ -313,10 +321,13 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, relaxed
         given a bound for a local a written argument would size, by
         :py:meth:`_bound_locals`.
 
-        A call that is refused is not final while another is pending: the
-        refusal is kept, the next pending call is tried, and a pass in which
-        none inlines raises the refusal the pass began with. See the module
-        docstring for why two helpers in one loop need this.
+        A call refused for a declaration depending on a written argument is
+        not final while another is pending: the refusal is kept, the next
+        pending call is tried, and a pass in which none inlines raises the
+        refusal the pass began with. Every other refusal is final and is
+        raised at once. See the module docstring for why two helpers in one
+        loop need the deferral, and :py:attr:`_DEFERRABLE_REFUSAL` for why
+        only that refusal earns it.
 
         :param schedule: the kernel schedule to rewrite in place.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
@@ -349,6 +360,8 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` of them have
                 try:
                     cls._inline_one(schedule, call, table)
                 except TransformationError as err:
+                    if cls._DEFERRABLE_REFUSAL not in str(err):
+                        raise
                     refusals.append(err)
                     continue
                 break
