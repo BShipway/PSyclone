@@ -136,10 +136,15 @@ class LFRicKokkosInlineMixin:
     #: The most calls this will inline into one kernel body. A budget rather
     #: than a nesting depth, because the calls are inlined one at a time: a
     #: chain of helpers spends one of these per link, and a routine that calls
-    #: itself spends them all and is then refused by name. Eight is chosen to
-    #: be past any hand-written LFRic kernel's call chain and far short of
-    #: what would take a runaway rewrite out of memory.
-    _INLINE_LIMIT = 8
+    #: itself spends them all and is then refused by name. Eight was past any
+    #: hand-written LFRic kernel's call chain until the horizontal FFSL
+    #: transport could be inlined at all (phase 7, 2026-09-13): its kernel
+    #: calls three helpers at each of two sites and each of those calls four
+    #: to six more, some thirty inlinings in one body. Sixty-four is past
+    #: that with room, and still far short of what would take a runaway
+    #: rewrite out of memory; a callee that names itself is in any case
+    #: refused earlier, by KernelModuleInlineTrans, before the budget is spent.
+    _INLINE_LIMIT = 64
 
     #: The attributes a formal may carry and still be given its partial
     #: datatype by :py:meth:`_relax_target_arguments`. ``TARGET`` is the one

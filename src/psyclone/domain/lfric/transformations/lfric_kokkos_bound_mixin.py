@@ -85,7 +85,9 @@ therefore validated for its shape here, refused by name where a callee or
 dummy it names is not found, and left to the capture profile to state with
 its reason beside it.
 """
-from psyclone.psyir.nodes import Container, Reference, Routine
+from psyclone.psyir.nodes import (
+    ArrayReference, Container, IntrinsicCall, Literal, Range, Reference,
+    Routine)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ArrayType, DataSymbol)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
@@ -209,6 +211,63 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` passes; and,
                    for reference in extent.walk(Reference))
 
     @classmethod
+    def _section_uses(cls, routine, symbol):
+        """Make every whole-array use of ``symbol`` an explicit section.
+
+        A whole-array reference to a local -- ``cp`` in ``cp = a + b``, or
+        ``cp(:)`` -- means the local's declared extent, and once the local
+        is re-declared by the caller's bound that extent is the caller's.
+        The callee wrote ``cp`` meaning its own ``n`` elements, so each such
+        use is pinned before the declaration moves: it becomes ``cp(1:n)``
+        with the bounds the callee declared, which the inliner then rewrites
+        in terms of the actual as it does every other use of the dummy.
+        Skipped, this rewrite left the vertical FFSL helper's whole-array
+        statements running over the kernel's ``nlayers`` elements while their
+        operands had the column's ``array_length`` (phase 7, 2026-09-13).
+
+        An inquiry -- ``SIZE(cp)``, ``UBOUND(cp)`` -- reads the section's
+        bounds instead of the array's, which is the same answer when the
+        lower bound is one and a different one otherwise; the latter is
+        refused rather than answered wrongly.
+
+        :param routine: the callee, whose body is rewritten in place.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param symbol: the automatic array about to be re-declared.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :raises TransformationError: if the local is the subject of an
+            inquiry intrinsic and a lower bound of its is not one.
+        """
+        shape = symbol.datatype.shape
+        unit_lower = all(
+            isinstance(dimension.lower, Literal)
+            and dimension.lower.value == "1" for dimension in shape)
+        uses = [reference for reference in routine.walk(Reference)
+                if reference.symbol is symbol]
+        for reference in uses:
+            parent = reference.parent
+            if (not unit_lower and isinstance(parent, IntrinsicCall)
+                    and parent.is_inquiry):
+                raise TransformationError(
+                    f"LFRicKokkosTrans cannot bound the local '{symbol.name}' "
+                    f"of '{routine.name}': it is the subject of "
+                    f"{parent.intrinsic.name} and its lower bound is not 1, "
+                    f"so a section would answer that inquiry differently.")
+            if type(reference) is Reference:  # pylint: disable=C0123
+                reference.replace_with(ArrayReference.create(symbol, [
+                    Range.create(dimension.lower.copy(),
+                                 dimension.upper.copy())
+                    for dimension in shape]))
+                continue
+            # An array symbol is otherwise referenced with indices; a full
+            # range among them is spelt with the array's own bounds, which
+            # are about to move.
+            for index, child in enumerate(getattr(reference, "indices", ())):
+                if isinstance(child, Range) and reference.is_full_range(index):
+                    child.children[0].replace_with(shape[index].lower.copy())
+                    child.children[1].replace_with(shape[index].upper.copy())
+
+    @classmethod
     def _rebind_shape(cls, symbol, dummy, bound):
         """Give ``symbol`` its shape with ``dummy`` replaced by ``bound``.
 
@@ -295,6 +354,7 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, so that
                     routine_table.specify_argument_list(arguments + [bound])
                     for symbol in routine_table.automatic_datasymbols:
                         if cls._sized_by(symbol, dummy):
+                            cls._section_uses(routine, symbol)
                             cls._rebind_shape(symbol, dummy, bound)
                 # The actual, once per call: a second call to a callee
                 # already widened finds the dummy there and adds only this.

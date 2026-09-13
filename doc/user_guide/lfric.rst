@@ -4301,8 +4301,12 @@ genuinely assigns before the call -- a sub-column length it computed -- can
 be inlined under the ``bounded_locals`` option, which names, per callee and
 dummy, a variable in the kernel's scope that bounds every value the dummy
 takes: the callee gains a dummy carrying that bound, its locals are sized by
-it, the call passes it, and the body is untouched. The option is an
-assertion the script makes about the kernel, not one PSyclone proves. A formal declared ``TARGET`` is none of those: the attribute
+it, and the call passes it. A whole-array use of such a local -- ``work =
+...``, ``work(:)`` -- meant the callee's extent, and goes on meaning it: it
+becomes a section of the bounds the callee declared, which the inliner then
+rewrites in terms of the actual like any other use of the dummy. Otherwise
+the body is untouched. The option is an assertion the script makes about the
+kernel, not one PSyclone proves. A formal declared ``TARGET`` is none of those: the attribute
 constrains what a pointer elsewhere may be aimed at, which substituting a
 body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like

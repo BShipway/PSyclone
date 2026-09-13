@@ -40,6 +40,7 @@ import pytest
 
 from lfric_kokkos_sources import _LOCAL_ALGORITHM, _LOCAL_KERNEL, _invoke
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
+from psyclone.psyir.backend.fortran import FortranWriter
 from psyclone.psyir.nodes import Call, IntrinsicCall
 from psyclone.psyir.symbols import RoutineSymbol
 from psyclone.psyir.transformations import TransformationError
@@ -195,6 +196,65 @@ _TWICE_WRITTEN_BOUND_KERNEL = _WRITTEN_BOUND_KERNEL.replace(
     "    call recon(length, swept(1:length), partial(1:length))\n")
 
 
+# The helper written with whole-array statements, as the real vertical FFSL
+# helper is: 'slope = ...' means the helper's n elements, and must go on
+# meaning them once slope is declared with the kernel's nlayers. The inquiry
+# is the one case where a section answers differently from the array, when
+# the lower bound is not one; here it is, so SIZE reads the same n.
+_WHOLE_ARRAY_RECON_MODULE = _RECON_MODULE.replace(
+    "    do j = 1, n\n"
+    "      slope(j) = source(j) * 0.5_r_def\n"
+    "      curve(j) = slope(j) * slope(j)\n"
+    "      result(j) = source(j) - curve(j)\n"
+    "    end do\n",
+    "    slope = source * 0.5_r_def\n"
+    "    curve(:) = slope(:) * slope(:)\n"
+    "    result = source - curve\n"
+    "    j = SIZE(curve)\n")
+
+# A local declared from zero, used whole and asked its size: the section's
+# size is one short of the array's, so the bound is refused.
+_OFFSET_RECON_MODULE = _RECON_MODULE.replace(
+    "    real(kind=r_def) :: curve(n)\n",
+    "    real(kind=r_def) :: curve(n)\n"
+    "    real(kind=r_def) :: offset(0:n)\n").replace(
+    "    do j = 1, n\n",
+    "    offset = 0.0_r_def\n"
+    "    j = SIZE(offset)\n"
+    "    do j = 1, n\n")
+
+# The same local without the inquiry: the section keeps its lower bound.
+_OFFSET_NO_INQUIRY_MODULE = _OFFSET_RECON_MODULE.replace(
+    "    j = SIZE(offset)\n", "")
+
+
+@pytest.fixture(name="whole_array_target")
+# pylint: disable-next=unused-argument
+def whole_array_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose helper uses its locals as whole arrays."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _WRITTEN_BOUND_KERNEL,
+        extra={"recon_mod": _WHOLE_ARRAY_RECON_MODULE})
+
+
+@pytest.fixture(name="offset_target")
+# pylint: disable-next=unused-argument
+def offset_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose helper asks the size of a zero-based local."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _WRITTEN_BOUND_KERNEL,
+        extra={"recon_mod": _OFFSET_RECON_MODULE})
+
+
+@pytest.fixture(name="offset_no_inquiry_target")
+# pylint: disable-next=unused-argument
+def offset_no_inquiry_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose helper uses a zero-based local whole."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _WRITTEN_BOUND_KERNEL,
+        extra={"recon_mod": _OFFSET_NO_INQUIRY_MODULE})
+
+
 @pytest.fixture(name="written_bound_target")
 # pylint: disable-next=unused-argument
 def written_bound_target_fixture(tmp_path, clear_module_manager_instance):
@@ -281,6 +341,64 @@ def test_written_bound_is_inlined_with_a_bound(written_bound_target):
     assert "<= length" in cpp or "< length + 1" in cpp or "length" in cpp
 
 
+def test_whole_array_uses_of_a_bounded_local_keep_their_extent(
+        whole_array_target):
+    """A whole-array statement on a widened local runs to the helper's n.
+
+    Widening 'slope(n)' to 'slope(nlayers)' would have 'slope = ...' and
+    'slope(:)' run over nlayers elements against operands of length n, which
+    is what the vertical FFSL helper's statements did before this (phase 7,
+    2026-09-13). Each becomes an explicit section of the declared bounds, so
+    that after inlining it reads 'slope(:length)', and SIZE of the local
+    reads the section's length, which is the helper's n.
+    """
+    _, loop, _ = whole_array_target
+    options = {"bounded_locals": {"recon": {"n": "nlayers"}}}
+
+    # pylint: disable=protected-access
+    routine = LFRicKokkosTrans._inlined_copy(
+        LFRicKokkosTrans._schedule(loop.kernels()[0]), options)
+    code = FortranWriter()(routine)
+
+    assert "slope(:length) = partial(:length) * 0.5_r_def" in code
+    assert "curve(:length) = slope(:length) * slope(:length)" in code
+    assert "SIZE(curve(:length))" in code
+    # The declarations are the widened ones all the same.
+    assert "dimension(nlayers) :: slope" in code
+    assert "dimension(nlayers) :: curve" in code
+
+
+def test_an_inquiry_on_a_zero_based_bounded_local_is_refused(offset_target):
+    """SIZE of 'offset(0:n)' is n + 1, of 'offset(0:n)' the section is n.
+
+    Rather than let the two disagree the bound is refused, and the refusal
+    names the local and the intrinsic.
+    """
+    _, loop, _ = offset_target
+    options = {"bounded_locals": {"recon": {"n": "nlayers"}}}
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop, options=options)
+    assert ("cannot bound the local 'offset' of 'recon': it is the subject "
+            "of SIZE and its lower bound is not 1" in str(err.value))
+
+
+def test_a_zero_based_bounded_local_used_whole_keeps_its_lower_bound(
+        offset_no_inquiry_target):
+    """Without an inquiry a zero-based local is sectioned from zero."""
+    _, loop, _ = offset_no_inquiry_target
+    options = {"bounded_locals": {"recon": {"n": "nlayers"}}}
+
+    # pylint: disable=protected-access
+    routine = LFRicKokkosTrans._inlined_copy(
+        LFRicKokkosTrans._schedule(loop.kernels()[0]), options)
+    code = FortranWriter()(routine)
+
+    # The writer leaves out a lower bound that is the array's own.
+    assert "offset(:length) = 0.0_r_def" in code
+    assert "dimension(0:nlayers) :: offset" in code
+
+
 def test_bound_option_shape_is_validated(written_bound_target):
     """An option that is not callee -> dummy -> bound is refused by shape."""
     _, loop, _ = written_bound_target
@@ -364,7 +482,8 @@ def test_self_calling_bounded_helper_reaches_the_limit(self_calling_target):
     with pytest.raises(TransformationError) as err:
         LFRicKokkosTrans().validate(
             loop, options={"bounded_locals": {"recon": {"n": "nlayers"}}})
-    assert "inlined 8 calls into 'column_solve_code'" in str(err.value)
+    assert (f"inlined {LFRicKokkosTrans._INLINE_LIMIT} calls into "
+            "'column_solve_code'") in str(err.value)
     assert "call to recon still there" in str(err.value)
 
 
