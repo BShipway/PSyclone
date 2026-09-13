@@ -1180,15 +1180,20 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
                         # Skip the Call itself and any other arguments to
                         # the call.
                         continue
+                    # The statement is written out only for the message
+                    # that names it: a debug string of an array access
+                    # compares its bounds symbolically, and taking one for
+                    # every prior access of every sized dummy was nine
+                    # tenths of the time inlining a kernel with thirty
+                    # helper calls took (2026-09-13).
                     exprn = prev.ancestor(Statement, include_self=True)
-                    stmt = exprn.debug_string().strip()
                     if isinstance(prev, (CodeBlock, Call, Kern, Loop)):
                         raise TransformationError(
                             f"Cannot inline routine '{routine.name}' "
                             f"because one or more of its declarations "
                             f"depends on '{sym.name}' which is passed by "
                             f"argument and may be written to before the "
-                            f"call ('{stmt}').")
+                            f"call ('{exprn.debug_string().strip()}').")
                     if isinstance(prev, Reference):
                         if prev.is_write:
                             raise TransformationError(
@@ -1196,7 +1201,8 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
                                 f"because one or more of its declarations "
                                 f"depends on '{sym.name}' which is passed "
                                 f"by argument and is assigned to before "
-                                f"the call ('{stmt}').")
+                                f"the call "
+                                f"('{exprn.debug_string().strip()}').")
                         continue
 
                     raise InternalError(
