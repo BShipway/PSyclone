@@ -41,6 +41,7 @@ import pytest
 from lfric_kokkos_sources import _LOCAL_ALGORITHM, _LOCAL_KERNEL, _invoke
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.psyir.nodes import Call, IntrinsicCall
+from psyclone.psyir.symbols import RoutineSymbol
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -185,6 +186,15 @@ _SELF_CALLING_KERNEL = _WRITTEN_BOUND_KERNEL.replace(
     "end module column_solve_kernel_mod")
 
 
+# The helper called twice with the written length: both calls are refused,
+# the first is deferred, and the second must not try to bring the callee in
+# again -- the retry the survey of rhs_alg_mod crashed on (2026-09-13).
+_TWICE_WRITTEN_BOUND_KERNEL = _WRITTEN_BOUND_KERNEL.replace(
+    "    call recon(length, partial(1:length), swept(1:length))\n",
+    "    call recon(length, partial(1:length), swept(1:length))\n"
+    "    call recon(length, swept(1:length), partial(1:length))\n")
+
+
 @pytest.fixture(name="written_bound_target")
 # pylint: disable-next=unused-argument
 def written_bound_target_fixture(tmp_path, clear_module_manager_instance):
@@ -209,6 +219,16 @@ def self_calling_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose bounded helper calls itself."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _SELF_CALLING_KERNEL)
+
+
+@pytest.fixture(name="twice_target")
+# pylint: disable-next=unused-argument
+def twice_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke calling the helper twice with a written size."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _TWICE_WRITTEN_BOUND_KERNEL,
+        extra={"recon_mod": _RECON_MODULE})
 
 
 @pytest.fixture(name="loop_mates_target")
@@ -346,3 +366,68 @@ def test_self_calling_bounded_helper_reaches_the_limit(self_calling_target):
             loop, options={"bounded_locals": {"recon": {"n": "nlayers"}}})
     assert "inlined 8 calls into 'column_solve_code'" in str(err.value)
     assert "call to recon still there" in str(err.value)
+
+
+def test_a_deferred_call_is_refused_not_crashed(twice_target):
+    """Two refused calls: the retry meets its callee already in the Container.
+
+    Without the bound both calls are refused for the written length. The
+    first is deferred, the second is tried, and its callee -- brought in by
+    the first attempt -- is not brought in again. The result is the first
+    call's refusal, in the inliner's words.
+    """
+    _, loop, _ = twice_target
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "assigned to before the call" in str(err.value)
+    assert "KeyError" not in str(err.value)
+
+
+def test_a_helper_called_twice_is_bounded_at_both_calls(twice_target):
+    """With the bound both calls are inlined, each passing the bound."""
+    _, loop, kernel = twice_target
+    options = {"bounded_locals": {"recon": {"n": "nlayers"}}}
+    cpp = LFRicKokkosTrans().apply(loop, options=options)
+    assert _no_calls_left(kernel)
+    assert cpp.count("shmem_size(nlayers)") >= 4
+
+
+def test_a_failure_to_bring_the_callee_in_is_kept_as_the_reason(
+        written_bound_target, monkeypatch):
+    """Whatever bringing the callee in raises is reported, not propagated.
+
+    KernelModuleInlineTrans reports a name already present with a KeyError;
+    the mixin keeps it as the reason the inlining then fails for, so a
+    deferred retry can never turn the capture into a crash.
+    """
+    _, loop, _ = written_bound_target
+
+    def explode(_call):
+        raise KeyError("Symbol table already contains a symbol")
+    monkeypatch.setattr(LFRicKokkosTrans, "_module_inline", explode)
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "bringing it into the container was refused first: KeyError" in str(
+        err.value)
+
+
+def test_a_failing_preparation_step_is_a_refusal(
+        written_bound_target, monkeypatch):
+    """A preparation step failing in a class of its own is still a refusal."""
+    _, loop, _ = written_bound_target
+
+    def explode(_call):
+        raise ValueError("a shape the frontend never gave")
+    monkeypatch.setattr(LFRicKokkosTrans, "_alias_locals", explode)
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(loop)
+    assert "cannot prepare the call to 'recon'" in str(err.value)
+    assert "ValueError: a shape the frontend never gave" in str(err.value)
+
+
+def test_a_detached_call_is_not_local():
+    """A call with no Container has no local callee to find."""
+    call = Call.create(RoutineSymbol("orphan"))
+    assert not LFRicKokkosTrans._already_local(call)

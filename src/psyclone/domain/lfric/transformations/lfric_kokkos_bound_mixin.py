@@ -85,7 +85,7 @@ therefore validated for its shape here, refused by name where a callee or
 dummy it names is not found, and left to the capture profile to state with
 its reason beside it.
 """
-from psyclone.psyir.nodes import Reference, Routine
+from psyclone.psyir.nodes import Container, Reference, Routine
 from psyclone.psyir.symbols import (
     ArgumentInterface, ArrayType, DataSymbol)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
@@ -364,6 +364,31 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` of them have
             f"kernel this is meant for calls that deeply.")
 
     @classmethod
+    def _already_local(cls, call):
+        """Whether the callee of ``call`` is already declared in its Container.
+
+        True once :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline` has brought
+        the callee in -- as a routine, or as a generic interface whose
+        specifics travelled with it -- and for a callee the kernel's own
+        module declares. False for a callee the Container still only imports,
+        or names without declaring.
+
+        :param call: the call whose callee is looked for.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: True if the Container declares the callee's name itself.
+        :rtype: bool
+        """
+        # pylint: disable=no-member
+        container = call.ancestor(Container)
+        if container is None:
+            return False
+        symbol = container.symbol_table.lookup(
+            cls._callee_name(call), otherwise=None)
+        return symbol is not None and not symbol.is_import
+
+    @classmethod
     def _inline_one(cls, schedule, call, table):
         """Prepare ``call``'s callee and inline the call, or refuse.
 
@@ -376,16 +401,39 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` of them have
 
         :raises TransformationError: if the call cannot be inlined, with the
             inliner's reason and, where the callee could not be brought into
-            the Container first, that reason after it.
+            the Container first, that reason after it; or if a preparation
+            step fails, in that step's own words.
         """
         # pylint: disable=no-member
         name = cls._callee_name(call)
-        refusal = cls._module_inline(call)
-        cls._relax_target_arguments(call)
-        cls._alias_locals(call)
-        cls._agree_on_imports(call)
-        cls._read_declarations(call)
-        cls._bound_locals(call, table)
+        # A call tried once and deferred has already had its callee brought
+        # in; asking again would add the callee's symbol a second time, which
+        # KernelModuleInlineTrans reports with a KeyError rather than a
+        # refusal (a generic interface's name, in the survey of rhs_alg_mod).
+        # Bringing the callee in is attempted, never required: whatever it
+        # raises is kept as the reason to report if the inlining then fails.
+        refusal = None
+        if not cls._already_local(call):
+            try:
+                refusal = cls._module_inline(call)
+            except Exception as err:  # pylint: disable=broad-except
+                refusal = f"{type(err).__name__}: {err}"
+        try:
+            cls._relax_target_arguments(call)
+            cls._alias_locals(call)
+            cls._agree_on_imports(call)
+            cls._read_declarations(call)
+            cls._bound_locals(call, table)
+        except TransformationError:
+            raise
+        # A preparation step that fails in any other way is a refusal too, in
+        # its own class's name, rather than a crash a deferred retry turns the
+        # whole capture into.
+        except Exception as err:  # pylint: disable=broad-except
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot prepare the call to '{name}' in "
+                f"'{schedule.name}' for inlining: {type(err).__name__}: "
+                f"{err}") from err
         try:
             InlineTrans().apply(call)
         # Every failure to inline is a refusal, whatever its class: a name
