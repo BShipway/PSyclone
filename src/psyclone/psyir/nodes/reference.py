@@ -153,13 +153,25 @@ class Reference(DataNode):
         :param call: the Call node this reference is a direct argument of.
         :type call: :py:class:`psyclone.psyir.nodes.Call`
 
-        :returns: False if the callee is found and declares the matching
-            formal intent(in); True otherwise.
+        :returns: False if the callee is declared in this scope or its
+            module, is found, and declares the matching formal intent(in);
+            True otherwise.
         :rtype: bool
 
         '''
         # pylint: disable=import-outside-toplevel
-        from psyclone.psyir.symbols import ArgumentInterface
+        from psyclone.psyir.symbols import (
+            ArgumentInterface, AutomaticInterface, DefaultModuleInterface,
+            RoutineSymbol)
+        # Only a callee declared in this scope or its module is asked, so
+        # that this property never has a module read and parsed on its
+        # behalf: an imported or unresolved routine keeps the conservative
+        # answer, as every call did before intents were consulted.
+        symbol = call.routine.symbol if call.routine else None
+        local = (AutomaticInterface, DefaultModuleInterface)
+        if (not isinstance(symbol, RoutineSymbol)
+                or not isinstance(symbol.interface, local)):
+            return True
         try:
             routine, formal_indices = call.get_callee()
         # get_callee() reports an unfound or unmatched callee with several
