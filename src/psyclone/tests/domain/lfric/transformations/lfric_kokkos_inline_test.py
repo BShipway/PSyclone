@@ -18,8 +18,9 @@ from lfric_kokkos_sources import (
     _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
-from psyclone.psyir.nodes import Call, IntrinsicCall
-from psyclone.psyir.symbols import RoutineSymbol
+from psyclone.psyir.nodes import Call, Container, IntrinsicCall
+from psyclone.psyir.symbols import (
+    RoutineSymbol, Symbol, UnresolvedInterface)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -218,6 +219,28 @@ _SHARED_IMPORT_KERNEL = _MODULE_PROCEDURE_KERNEL.replace(
     "    use shared_edge_mod, only : shared_edge\n")
 
 
+# A module-level import the kernel's module-local helper reads and the kernel
+# itself does not: reference_element_mod's face indices as the FFSL kernels
+# read them. The kernel schedule's copy holds the name unresolved and so does
+# the helper's, and the merge refuses a name unresolved on both sides; the
+# Container names the module.
+_FACES_MODULE = """
+module faces_mod
+  use constants_mod, only : i_def
+  implicit none
+  private
+  integer(kind=i_def), parameter, public :: south = 3_i_def
+end module faces_mod
+"""
+
+_CONTAINER_IMPORT_KERNEL = _MODULE_PROCEDURE_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use faces_mod, only : south").replace(
+    "    result(n) = source(n)\n",
+    "    result(n) = source(n) + real(south, r_def)\n")
+
+
 # A callee that calls itself. Inlining it once leaves a call to it behind, so
 # a rewrite run to a fixed point would never reach one; the depth limit is
 # what turns that into a refusal naming the routine.
@@ -310,6 +333,15 @@ def shared_import_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _SHARED_IMPORT_KERNEL,
         extra={"shared_edge_mod": _SHARED_EDGE_MODULE,
                "sibling_step_mod": _SIBLING_STEP_MODULE})
+
+
+@pytest.fixture(name="container_import_target")
+# pylint: disable-next=unused-argument
+def container_import_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel and helper read one module import."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _CONTAINER_IMPORT_KERNEL,
+        extra={"faces_mod": _FACES_MODULE})
 
 
 @pytest.fixture(name="recursive_procedure_target")
@@ -438,6 +470,63 @@ def test_lfric_kokkos_trans_prefers_a_routine_the_container_holds(
     # The shared routine's one statement is in the body twice, once from
     # each helper.
     assert cpp.count("* 0.5") == 2
+
+
+def test_lfric_kokkos_trans_settles_a_name_from_the_container_import(
+        container_import_target):
+    """A name unresolved in both scopes takes the Container's import.
+
+    The kernel and its helper both read ``south`` through their module's
+    ``use faces_mod, only : south``; neither routine's table resolves it,
+    and the merge refused the pair as "present but unresolved in both
+    tables" (``hori_dep_dist_ffsl``, 2026-09-13). Each side is given the
+    module the Container names, and the helper inlines.
+    """
+    _, loop, kernel = container_import_target
+    # The kernel schedule PSyclone makes of the FFSL kernels holds the face
+    # indices their helpers read as unresolved symbols of its own; the
+    # fixture's schedule is given the same.
+    kernel.get_callees()[0].symbol_table.add(
+        Symbol("south", interface=UnresolvedInterface()))
+
+    LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "sweep_column" not in cpp
+    assert "south" in cpp
+
+
+def test_resolve_from_container_imports_an_unresolved_name(
+        container_import_target):
+    """An unresolved name the Container imports becomes that import.
+
+    The mechanism on its own, on the rooted copy the inlining works on:
+    the routine's table is given the name unresolved, as the FFSL kernel
+    schedules hold the face indices, and afterwards holds it as an import
+    of the module the Container names.
+    """
+    _, _, kernel = container_import_target
+    # pylint: disable=protected-access
+    routine = LFRicKokkosTrans._rooted_copy(LFRicKokkosTrans._schedule(kernel))
+    container = routine.ancestor(Container)
+    routine.symbol_table.add(
+        Symbol("south", interface=UnresolvedInterface()))
+    assert routine.symbol_table.lookup(
+        "south", scope_limit=routine).is_unresolved
+
+    LFRicKokkosTrans._resolve_from_container(routine, container)
+
+    symbol = routine.symbol_table.lookup("south", scope_limit=routine)
+    assert symbol.is_import
+    assert symbol.interface.container_symbol.name == "faces_mod"
+    # A routine with no Container, and a name the Container does not
+    # import, are left as they are.
+    LFRicKokkosTrans._resolve_from_container(routine, None)
+    routine.symbol_table.add(
+        Symbol("nowhere", interface=UnresolvedInterface()))
+    LFRicKokkosTrans._resolve_from_container(routine, container)
+    assert routine.symbol_table.lookup(
+        "nowhere", scope_limit=routine).is_unresolved
 
 
 def test_lfric_kokkos_trans_inlines_a_module_procedure(

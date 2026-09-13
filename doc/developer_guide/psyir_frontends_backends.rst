@@ -930,7 +930,12 @@ rather than `TeamThreadRange` because the two are the same loop on a host and
 the former spreads over the whole team on a device whatever shape the team
 has. The barrier is unconditional because a statement after the loop may read
 what the loop wrote, and deciding whether one does is a second dependence
-analysis the back-end does not perform.
+analysis the back-end does not perform. One thing after the loop is decided:
+Fortran leaves the `DO` variable defined at the value the next iteration
+would have taken, and where a statement after the loop reads it -- the
+liveness `kokkos_team_scalars.live_after` answers -- the variable is
+assigned `Kokkos::max(start, stop + 1)` after the barrier, the lambda's
+parameter having left the region-scope variable untouched.
 
 Every member of the team executes the rest of the body on its own copy of the
 locals, which is right for a scalar and wrong for an array: an element

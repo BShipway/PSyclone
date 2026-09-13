@@ -586,10 +586,43 @@ class LFRicKokkosInlineMixin:
         site = call.ancestor(Routine)
         if site is None:
             return
+        container = site.ancestor(Container)
+        cls._resolve_from_container(site, container)
         for callee in cls._local_callees(call):
+            cls._resolve_from_container(callee, container)
             cls._resolve_shared_names(site, callee.symbol_table)
             cls._resolve_shared_names(callee, site.symbol_table)
-            cls._prefer_local_routines(callee, site.ancestor(Container))
+            cls._prefer_local_routines(callee, container)
+
+    @classmethod
+    def _resolve_from_container(cls, routine, container):
+        """Give ``routine``'s unresolved names the Container's import of them.
+
+        A kernel and its module-local helper both read ``S`` through their
+        module's ``use reference_element_mod, only : ..., S``, and each
+        routine's own table holds the name unresolved; the merge refuses a
+        name "present but unresolved in both tables" (``hori_dep_dist_ffsl``,
+        2026-09-13). The Container the two sit in names the module, so the
+        name is imported from it in the routine's own table, which is the
+        ``use ..., only`` the copy the inliner takes will need anyway.
+
+        :param routine: the routine whose unresolved names are settled.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param container: the Container the routine sits in.
+        :type container: Optional[:py:class:`psyclone.psyir.nodes.Container`]
+        """
+        if container is None:
+            return
+        table = routine.symbol_table
+        for symbol in list(table.symbols):
+            if not symbol.is_unresolved:
+                continue
+            outer = container.symbol_table.lookup(
+                symbol.name, scope_limit=container, otherwise=None)
+            if outer is None or not outer.is_import:
+                continue
+            cls._import_by_name(
+                table, symbol, outer.interface.container_symbol.name)
 
     @staticmethod
     def _prefer_local_routines(callee, container):

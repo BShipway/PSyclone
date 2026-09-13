@@ -140,6 +140,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             for alias in region.aliases})
         self._kind_types = dict(region.kind_types)
         self._parallel_loops = region.parallel_loops
+        self._schedule = region.schedule
 
         signature = ",\n    ".join(
             self._argument_declaration(argument)

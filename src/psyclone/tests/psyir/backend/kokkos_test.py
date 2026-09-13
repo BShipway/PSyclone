@@ -460,6 +460,61 @@ def _level_region(**overrides):
     return replace(region, **overrides) if overrides else region
 
 
+def _exit_value_schedule():
+    """Create a body that reads a level loop's counter after the loop.
+
+    Fortran leaves the ``DO`` variable one past the stop, and the horizontal
+    FFSL kernels index the central cell of a stencil with a counter their
+    loop over the left-hand cells left at zero (2026-09-13).
+    """
+    source = """
+subroutine inject_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  do k = 1, nlayers - 1
+    y(map(1) + k - 1) = x(map(1) + k - 1)
+  end do
+  y(map(1) + k - 1) = x(map(1) + nlayers)
+end subroutine inject_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inject_code", symbol_table=symbol_table, children=children)
+
+
+def test_kokkos_writer_gives_a_spread_loop_its_exit_value_where_read():
+    """A counter read after its spread loop is set to what Fortran leaves.
+
+    The lambda's parameter is the members' own and the region-scope
+    variable is never written by the loop, so a statement after it would
+    read an uninitialised integer and index with it -- which segfaulted the
+    panel-remap region on 2026-09-13. After the barrier the variable is
+    assigned one past the stop, or the start where the loop ran no
+    iteration, which is what Fortran defines it as.
+    """
+    schedule = _exit_value_schedule()
+    code = KokkosWriter()(_level_region(
+        schedule=schedule, parallel_loops=(schedule.walk(Loop)[0],)))
+
+    assert "team.team_barrier();\n" in code
+    assert "k = Kokkos::max(1, (nlayers - 1) + 1);" in code
+    assert code.index("team.team_barrier();") < code.index("k = Kokkos::max(")
+
+
+def test_kokkos_writer_gives_no_exit_value_where_the_counter_is_dead():
+    """A counter nothing reads after the loop is left alone."""
+    code = KokkosWriter()(_level_region())
+
+    assert "Kokkos::max(1, nlayers + 1)" not in code
+    assert "k = Kokkos::max(" not in code
+
+
 def test_kokkos_writer_places_locals_in_team_scratch():
     """A region with kernel-local arrays launches over teams, not a range."""
     code = KokkosWriter()(_scratch_region())
