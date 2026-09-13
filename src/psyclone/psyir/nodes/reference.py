@@ -132,19 +132,49 @@ class Reference(DataNode):
         from psyclone.psyir.nodes.call import Call
         from psyclone.psyir.nodes.intrinsic_call import IntrinsicCall
         parent = self.parent
-        # pure or inquiry IntrinsicCall nodes do not write to their arguments.
-        if (isinstance(parent, IntrinsicCall) and (parent.is_inquiry or
-                                                   parent.is_pure)):
-            return False
-        # All other arguments of all other Calls are assumed to write to their
-        # arguments. This could be improved in the future by looking at
-        # intents where available.
+        if isinstance(parent, IntrinsicCall):
+            # pure or inquiry IntrinsicCall nodes do not write to their
+            # arguments; every other intrinsic may.
+            return not (parent.is_inquiry or parent.is_pure)
         if isinstance(parent, Call):
-            return True
+            # An argument of any other Call is written unless the callee can
+            # be found and its interface declares the corresponding formal
+            # intent(in). Where the callee cannot be found -- an external
+            # routine, an unresolved import, an interface the arguments do
+            # not match -- the conservative answer stands.
+            return self._is_written_by_call(parent)
         # The reference that is the LHS of an assignment is a write.
-        if isinstance(parent, Assignment) and parent.lhs is self:
+        return isinstance(parent, Assignment) and parent.lhs is self
+
+    def _is_written_by_call(self, call):
+        '''
+        Whether ``call``, whose argument this reference is, may write it.
+
+        :param call: the Call node this reference is a direct argument of.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: False if the callee is found and declares the matching
+            formal intent(in); True otherwise.
+        :rtype: bool
+
+        '''
+        # pylint: disable=import-outside-toplevel
+        from psyclone.psyir.symbols import ArgumentInterface
+        try:
+            routine, formal_indices = call.get_callee()
+        # get_callee() reports an unfound or unmatched callee with several
+        # exception types (NotImplementedError, SymbolError,
+        # CallMatchingArgumentsNotFound among them), and every one of them
+        # means the same thing here: the intent is unknown.
+        except Exception:  # pylint: disable=broad-except
             return True
-        return False
+        position = next((index for index, argument in enumerate(call.arguments)
+                         if argument is self), None)
+        if position is None or position >= len(formal_indices):
+            return True
+        formals = routine.symbol_table.argument_list
+        formal = formals[formal_indices[position]]
+        return formal.interface.access != ArgumentInterface.Access.READ
 
     @property
     def symbol(self):

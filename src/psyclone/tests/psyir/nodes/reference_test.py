@@ -44,7 +44,7 @@ import pytest
 
 from psyclone.psyGen import GenerationError
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, CodeBlock, colored,
+    ArrayReference, Assignment, Call, CodeBlock, colored, IntrinsicCall,
     KernelSchedule, Literal, Reference, Loop)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
 from psyclone.psyir.symbols import (ArrayType, ContainerSymbol, DataSymbol,
@@ -575,6 +575,40 @@ def test_reference_is_read(fortran_reader):
     assert not references[6].is_read
     assert references[7].symbol.name == "x"
     assert references[7].is_read
+
+
+def test_reference_is_write_reads_call_intent(fortran_reader):
+    '''A call argument is written unless the callee is found and declares
+    the formal intent(in). An unfound callee keeps the conservative answer.
+    '''
+    code = """module m
+    contains
+      subroutine helper(x, y)
+        integer, intent(in) :: x
+        integer, intent(inout) :: y
+        y = y + x
+      end subroutine helper
+      subroutine caller(a, b, c)
+        integer, intent(inout) :: a, b, c
+        call helper(a, b)
+        call helper(y=c, x=a)
+        call somewhere_else(a)
+      end subroutine caller
+    end module m"""
+    psyir = fortran_reader.psyir_from_source(code)
+    calls = psyir.walk(Call)
+    calls = [call for call in calls if not isinstance(call, IntrinsicCall)]
+    # call helper(a, b): a is intent(in), b intent(inout).
+    assert calls[0].arguments[0].symbol.name == "a"
+    assert not calls[0].arguments[0].is_write
+    assert calls[0].arguments[1].is_write
+    # Named arguments are matched by name: y=c is written, x=a is not.
+    assert calls[1].arguments[0].symbol.name == "c"
+    assert calls[1].arguments[0].is_write
+    assert calls[1].arguments[1].symbol.name == "a"
+    assert not calls[1].arguments[1].is_write
+    # An unresolvable callee writes every argument.
+    assert calls[2].arguments[0].is_write
 
 
 def test_reference_is_write(fortran_reader):

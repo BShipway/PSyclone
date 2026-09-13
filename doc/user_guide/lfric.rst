@@ -4291,7 +4291,18 @@ module, one whose declarations depend on an argument the call site writes to
 before calling, and one whose actual and formal types do not agree are each
 refused in ``InlineTrans``'s own words with the call named, followed by
 ``KernelModuleInlineTrans``'s own where the callee could not be brought in
-either. A formal declared ``TARGET`` is none of those: the attribute
+either. Two things are done before that judgement is final. Every callee
+is brought into the container before any call is judged, and a call that
+is refused is tried again after every other pending call has been tried,
+because two helpers called inside one loop each see the other's call as a
+possible write to the extent they share until that call has become
+statements. And a callee whose local array is sized by a dummy the caller
+genuinely assigns before the call -- a sub-column length it computed -- can
+be inlined under the ``bounded_locals`` option, which names, per callee and
+dummy, a variable in the kernel's scope that bounds every value the dummy
+takes: the callee gains a dummy carrying that bound, its locals are sized by
+it, the call passes it, and the body is untouched. The option is an
+assertion the script makes about the kernel, not one PSyclone proves. A formal declared ``TARGET`` is none of those: the attribute
 constrains what a pointer elsewhere may be aimed at, which substituting a
 body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like
@@ -4858,6 +4869,27 @@ eight calls into one kernel body, and the bound is load-bearing rather
 than defensive: ``InlineTrans`` has no recursion check, so a routine that
 calls itself is substituted into itself for as long as it is asked.
 Reaching the bound is a refusal naming the routine still to be inlined.
+
+**A callee is judged after every callee is in scope, and in whatever order
+succeeds.** Every pending call's callee is brought into the container
+before any call is inlined, so that the inliner can read the intents of
+the calls it has not reached; a call it refuses is tried again once every
+other pending call has been tried, and only a pass in which nothing inlines
+is a refusal, in the words the first call was refused with.
+
+**A local the caller sizes is bounded, not refused, where the script says
+how.** ``InlineTrans`` refuses a callee whose local array is sized by a
+dummy whose actual the caller assigned before the call, because the
+inlined declaration would stand at the top of the caller with a size not
+yet computed. The ``bounded_locals`` option -- ``{"callee": {"dummy":
+"bound"}}``, every name a plain identifier -- gives such a callee a further
+dummy carrying an upper bound the kernel's scope holds, sizes those locals
+by it, and passes it at every call; the callee's loops still run to the
+exact size. The region then sizes the scratch those locals become from the
+bound, which is a region scalar, as it must. A bound too small is an
+out-of-bounds write nothing here would catch, which is why the option is
+an assertion the script states with its reason, refused by name where the
+callee, the dummy or the bound does not exist, and never inferred.
 
 **A callee out of scope is refused rather than guessed at.** In scope are
 a procedure of the kernel's own module, and a procedure of a module the
