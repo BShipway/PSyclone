@@ -15,8 +15,9 @@ from lfric_kokkos_sources import _LOCAL_ALGORITHM, _LOCAL_KERNEL, _invoke
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Literal, Routine)
-from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
+    ArrayReference, Assignment, Literal, Range, Reference, Routine)
+from psyclone.psyir.symbols import (
+    ArrayType, DataSymbol, ScalarType, SymbolTable)
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -225,6 +226,26 @@ def alias_target_fixture(tmp_path, clear_module_manager_instance):
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _ALIAS_KERNEL)
 
 
+# The helper called on sections of the kernel's arrays, which is how the
+# vertical FFSL kernels call theirs. The pointer is aimed at a whole dummy
+# as the helper is written and passes the alias contract; inlined, it is
+# aimed at a section of the kernel's array, and the region has to say so.
+_SECTION_ACTUAL_ALIAS_KERNEL = _ALIAS_KERNEL.replace(
+    "    call sweep_column(nlayers, partial, spare, pick_spare, swept)\n",
+    "    call sweep_column(nlayers - 1, partial(1:nlayers - 1), "
+    "spare(1:nlayers - 1), pick_spare, swept(1:nlayers - 1))\n")
+
+
+@pytest.fixture(name="section_actual_alias_target")
+# pylint: disable-next=unused-argument
+def section_actual_alias_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose aliasing helper is called on sections."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM,
+        _SECTION_ACTUAL_ALIAS_KERNEL)
+
+
 @pytest.fixture(name="section_alias_target")
 # pylint: disable-next=unused-argument
 def section_alias_target_fixture(tmp_path, clear_module_manager_instance):
@@ -400,6 +421,115 @@ def test_alias_pointer_to_a_section_is_refused(section_alias_target):
     message = str(error.value)
     assert "cannot capture the pointer 'chosen' of 'sweep_column'" in message
     assert "a section or an expression rather than at a whole array" in message
+
+
+def test_alias_pointer_aimed_at_a_section_by_inlining_is_a_subview(
+        section_actual_alias_target):
+    """A pointer inlining aims at a column section becomes a subview.
+
+    The helper aims its pointer at a whole dummy and is accepted for it; the
+    kernel passes a section of its array for that dummy, and after inlining
+    the pointer is aimed at the section. A handle copy of the whole array
+    would read the first column for every column -- which the vertical FFSL
+    regions did (2026-09-13) -- so the assignment is a ``Kokkos::subview``
+    of the section's bounds, zero-based and exclusive at the end, and the
+    reads through the handle are unchanged.
+    """
+    _, loop, _ = section_actual_alias_target
+
+    LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert ("chosen = Kokkos::subview(spare, Kokkos::pair<int, int>((1 - 1), "
+            "((nlayers - 1) - 1) + 1));") in cpp
+    assert ("chosen = Kokkos::subview(partial, Kokkos::pair<int, int>((1 - 1),"
+            " ((nlayers - 1) - 1) + 1));") in cpp
+    assert "chosen = spare;" not in cpp
+    assert "chosen = partial;" not in cpp
+    assert "= chosen(" in cpp
+
+
+_INTEGER = ScalarType(ScalarType.Intrinsic.INTEGER,
+                      ScalarType.Precision.UNDEFINED)
+_REAL = ScalarType(ScalarType.Intrinsic.REAL, 8)
+
+
+def _pointer_at(target):
+    """Return a routine holding one pointer assignment aimed at ``target``.
+
+    :param target: the right-hand side of the pointer assignment.
+    :type target: :py:class:`psyclone.psyir.nodes.DataNode`
+
+    :returns: a routine whose only statement is that assignment.
+    :rtype: :py:class:`psyclone.psyir.nodes.Routine`
+    """
+    pointer = DataSymbol(
+        "chosen", ArrayType(_REAL, [ArrayType.Extent.DEFERRED]))
+    table = SymbolTable()
+    table.add(pointer)
+    return Routine.create("body", table, [
+        Assignment.create(Reference(pointer), target, is_pointer=True)])
+
+
+def _literal(value):
+    """Return an integer literal.
+
+    :param str value: the digits.
+
+    :returns: the literal.
+    :rtype: :py:class:`psyclone.psyir.nodes.Literal`
+    """
+    return Literal(value, _INTEGER)
+
+
+def test_alias_section_of_two_ranks_is_refused_after_inlining():
+    """A pointer aimed at a rank-2 section has no one origin to keep."""
+    grid = DataSymbol("grid", ArrayType(_REAL, [10, 3]))
+    body = _pointer_at(ArrayReference.create(
+        grid, [Range.create(_literal("1"), _literal("5")), _literal("2")]))
+
+    # pylint: disable=protected-access
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_aliases(body)
+    message = str(error.value)
+    assert "cannot capture the pointer 'chosen'" in message
+    assert "inlining aimed it at 'grid(:5,2)'" in message
+    assert "not a section of one rank" in message
+
+
+def test_alias_strided_section_is_refused_after_inlining():
+    """A pointer aimed at every other element is not a subview."""
+    column = DataSymbol("column", ArrayType(_REAL, [10]))
+    body = _pointer_at(ArrayReference.create(column, [
+        Range.create(_literal("1"), _literal("9"), _literal("2"))]))
+
+    # pylint: disable=protected-access
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_aliases(body)
+    assert "a strided section" in str(error.value)
+
+
+def test_alias_section_of_a_zero_based_array_is_refused_after_inlining():
+    """The handle copies its target's origin, which a subview would not."""
+    edge = DataSymbol("edge", ArrayType(_REAL, [
+        ArrayType.ArrayBounds(_literal("0"), _literal("9"))]))
+    body = _pointer_at(ArrayReference.create(
+        edge, [Range.create(_literal("0"), _literal("4"))]))
+
+    # pylint: disable=protected-access
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans._validate_aliases(body)
+    assert "not declared from one" in str(error.value)
+
+
+def test_declared_from_one_reads_every_dimension():
+    """Assumed-shape dimensions start from one; explicit ones say."""
+    # pylint: disable=protected-access
+    assert LFRicKokkosTrans._declared_from_one(DataSymbol(
+        "shape", ArrayType(_REAL, [ArrayType.Extent.ATTRIBUTE,
+                                   ArrayType.Extent.ATTRIBUTE])))
+    assert not LFRicKokkosTrans._declared_from_one(
+        DataSymbol("scalar", _REAL))
 
 
 def test_alias_pointer_to_an_expression_is_refused(expression_alias_target):

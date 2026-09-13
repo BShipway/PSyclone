@@ -23,8 +23,8 @@ from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
-    Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Literal, Loop,
-    Reference, Routine)
+    ArrayReference, Assignment, CodeBlock, IntrinsicCall, KernelSchedule,
+    Literal, Loop, Range, Reference, Routine)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ArrayType, DataSymbol, ScalarType)
 
@@ -3944,13 +3944,17 @@ def test_kokkos_writer_rejects_a_first_cell_that_is_not_an_argument():
             in str(error.value))
 
 
-def _alias_schedule(write_through=False):
+def _alias_schedule(write_through=False, aim=None):
     """Create a scratch body choosing between its two arrays by a pointer.
 
     :param bool write_through: whether the body's last sweep writes through
         the pointer rather than reading through it. The Fortran is a program
         error where a target is read-only, and is what the writer's refusal
         of that pairing is checked against.
+    :param aim: what to aim the pointer at in the first branch instead of
+        the whole ``tri_plus_new``: a section, once a callee is inlined
+        against a section actual.
+    :type aim: Optional[str]
 
     ``_scratch_schedule``'s two sweeps with a choice between them, which is
     the shape LFRic's vertical-support helpers have once inlined: the columns
@@ -3987,6 +3991,9 @@ end subroutine tri_solve_code
         source = source.replace(
             "    y(map(1) + k - 1) = chosen(k)\n",
             "    chosen(k) = y(map(1) + k - 1)\n")
+    if aim is not None:
+        source = source.replace(
+            "    chosen => tri_plus_new\n", f"    chosen => {aim}\n")
     routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
     symbol_table = routine.symbol_table.detach()
     children = [child.detach() for child in routine.children[:]]
@@ -4040,6 +4047,75 @@ def test_kokkos_alias_is_declared_and_assigned_as_a_handle():
     # scratch arrays it may name are the only ones counted for.
     assert "chosen_scratch_t" not in code
     assert code.count("shmem_size") == 2
+
+
+def test_kokkos_alias_aimed_at_a_section_is_a_subview():
+    """A pointer aimed at a rank-1 section becomes a ``Kokkos::subview``.
+
+    A handle copy of the whole array would say nothing of the section and
+    read from its first element -- the first column, in the vertical FFSL
+    regions that met this (2026-09-13). The subview takes the section's
+    bounds with the target's origin removed and its end made exclusive, so
+    that element ``0`` of the handle is the section's first and the reads
+    through it keep the origin the alias copied from its target.
+    """
+    code = KokkosWriter()(_alias_region(
+        schedule=_alias_schedule(aim="tri_plus_new(2:nlayers)")))
+
+    assert ("chosen = Kokkos::subview(tri_plus_new, "
+            "Kokkos::pair<int, int>((2 - 1), (nlayers - 1) + 1));") in code
+    assert "chosen = x_new;" in code
+    assert ("y((((map((1 - 1), cell) + k) - 1) - 1)) = chosen((k - 1));"
+            in code)
+
+
+def test_kokkos_writer_rejects_a_strided_section_alias():
+    """Every other element of a View is not a subview of it."""
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()(_alias_region(
+            schedule=_alias_schedule(aim="tri_plus_new(1:nlayers:2)")))
+    assert ("cannot aim the handle 'chosen' at 'tri_plus_new(::2)': "
+            "a strided section cannot be a subview") in str(error.value)
+
+
+def test_kokkos_writer_rejects_a_section_alias_of_two_ranks():
+    """A section of more than one rank is refused by the writer too."""
+    schedule = _alias_schedule()
+    plane = schedule.symbol_table.new_symbol(
+        "plane", symbol_type=DataSymbol,
+        datatype=ArrayType(ScalarType(ScalarType.Intrinsic.REAL, 8), [3, 3]))
+    assignment = [node for node in schedule.walk(Assignment)
+                  if node.is_pointer][0]
+    integer = ScalarType(ScalarType.Intrinsic.INTEGER,
+                         ScalarType.Precision.UNDEFINED)
+    one, two = Literal("1", integer), Literal("2", integer)
+    assignment.rhs.replace_with(ArrayReference.create(
+        plane, [Range.create(one.copy(), two.copy()),
+                Range.create(one.copy(), two.copy())]))
+
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()(_alias_region(schedule=schedule))
+    assert ("cannot aim the handle 'chosen' at 'plane(:2,:2)': "
+            "only a rank-1 section of the target can be a subview"
+            in str(error.value))
+
+
+def test_kokkos_writer_rejects_a_section_alias_of_an_undescribed_array():
+    """A section of an array the region did not describe has no View."""
+    schedule = _alias_schedule()
+    ghost = schedule.symbol_table.new_symbol(
+        "ghost", symbol_type=DataSymbol,
+        datatype=ArrayType(ScalarType(ScalarType.Intrinsic.REAL, 8), [3]))
+    assignment = [node for node in schedule.walk(Assignment)
+                  if node.is_pointer][0]
+    one = Literal("1", ScalarType(ScalarType.Intrinsic.INTEGER, 4))
+    two = Literal("2", ScalarType(ScalarType.Intrinsic.INTEGER, 4))
+    assignment.rhs.replace_with(ArrayReference.create(
+        ghost, [Range.create(one, two)]))
+
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()(_alias_region(schedule=schedule))
+    assert "Array 'ghost' has no Kokkos View description" in str(error.value)
 
 
 def test_kokkos_alias_is_declared_after_the_scratch_it_names():

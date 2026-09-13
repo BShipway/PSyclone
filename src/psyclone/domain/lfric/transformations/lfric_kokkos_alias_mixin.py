@@ -57,7 +57,8 @@ pointer a ``View`` handle does not reproduce.
 """
 
 from psyclone.psyir.nodes import (
-    Assignment, Call, CodeBlock, IntrinsicCall, Reference)
+    ArrayReference, Assignment, Call, CodeBlock, IntrinsicCall, Literal,
+    Range, Reference)
 from psyclone.psyir.symbols import (
     ArrayType, AutomaticInterface, UnsupportedFortranType)
 from psyclone.psyir.transformations import TransformationError
@@ -306,6 +307,72 @@ class LFRicKokkosAliasMixin:
                 symbol.interface = AutomaticInterface()
                 for assignment in assignments:
                     cls._relax_alias_target(assignment.rhs.symbol)
+
+    @classmethod
+    def _validate_aliases(cls, schedule):
+        """Refuse a pointer that inlining aimed at a section it cannot hold.
+
+        :py:meth:`_alias_locals` judges the callee as written, where the
+        pointer is aimed at a whole dummy. Inlined against a section actual
+        -- ``call edge(field(w3_idx:w3_idx + nlayers - 1), ...)``, the
+        vertical FFSL kernels' shape -- the same pointer is aimed at a
+        section of the kernel's array, which the backend can say as a
+        ``subview`` when the section is rank-1, contiguous and of an array
+        declared from one, so that the reads through the handle keep the
+        origin they copied from the target. Anything else compiles as a
+        wrong answer or not at all, and is refused here, after the inlining
+        and before the body is judged.
+
+        :param schedule: the inlined kernel schedule to be captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if a pointer is aimed at a section of
+            more than one rank, a strided one, or one of an array whose
+            lower bound is not one.
+        """
+        for assignment in schedule.walk(Assignment):
+            if (not assignment.is_pointer
+                    or not isinstance(assignment.rhs, ArrayReference)):
+                continue
+            target = assignment.rhs
+            preamble = (
+                f"LFRicKokkosTrans cannot capture the pointer "
+                f"'{assignment.lhs.name}' as a Kokkos View handle because "
+                f"inlining aimed it at '{target.debug_string()}', which is ")
+            indices = target.indices
+            if len(indices) != 1 or not isinstance(indices[0], Range):
+                raise TransformationError(
+                    preamble + "not a section of one rank.")
+            step = indices[0].step
+            if not (isinstance(step, Literal) and step.value == "1"):
+                raise TransformationError(preamble + "a strided section.")
+            if not cls._declared_from_one(target.symbol):
+                raise TransformationError(
+                    preamble + "a section of an array not declared from "
+                    "one, so a subview's first element would not be the "
+                    "handle's.")
+
+    @staticmethod
+    def _declared_from_one(symbol):
+        """Whether every dimension of an array has a lower bound of one.
+
+        An assumed-shape dimension has, by Fortran's rule; an explicit one
+        has when its declaration says so.
+
+        :param symbol: the array symbol.
+        :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
+
+        :returns: True if no dimension starts anywhere but one.
+        :rtype: bool
+        """
+        datatype = getattr(symbol, "datatype", None)
+        if not isinstance(datatype, ArrayType):
+            return False
+        return all(
+            not isinstance(dimension, ArrayType.ArrayBounds)
+            or (isinstance(dimension.lower, Literal)
+                and dimension.lower.value == "1")
+            for dimension in datatype.shape)
 
     @classmethod
     def _relax_alias_target(cls, symbol):

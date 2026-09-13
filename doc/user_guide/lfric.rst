@@ -4314,7 +4314,13 @@ any other. A formal carrying any other attribute PSyclone does not model --
 ``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
 ``InlineTrans``'s words. A callee's own ``POINTER`` local is relaxed too
 where it only ever aims at a whole array, and becomes a ``View`` handle in
-the generated region; every other use of such a pointer is refused by name. A name the two
+the generated region; every other use of such a pointer is refused by name.
+Inlined against a section actual -- ``call edge(field(w3_idx:w3_idx +
+nlayers - 1), ...)`` -- that pointer is aimed at the section, and the
+handle is a ``Kokkos::subview`` of it where the section is rank-1,
+contiguous and of an array declared from one; any other section is refused
+after the inlining, since a handle copy of the whole array would read its
+first elements for every cell. A name the two
 scopes hold differently -- an import in one and, in the other, a name that
 scope cannot say the origin of, which is how LFRic's FFSL kernels and their
 support routines reach ``reference_element_mod``'s ``S`` -- is given the

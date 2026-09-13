@@ -151,6 +151,7 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
         # validate() must leave the schedule as it found it and because a
         # detached schedule has no Container for the callee to be found in.
         schedule = self._inlined_copy(self._schedule(kernel), options)
+        self._validate_aliases(schedule)
         self._validate_body(schedule)
         self._validate_sections(schedule)
         # The formals are judged with every assumed shape already measured,
