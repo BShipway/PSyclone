@@ -159,6 +159,65 @@ _CHAINED_PROCEDURE_KERNEL = _MODULE_PROCEDURE_KERNEL.replace(
     "  end subroutine seed_column\n")
 
 
+# A routine of a third module that two helpers call: one helper of the
+# kernel's own module, one of a sibling module. Inlining the first brings the
+# shared routine into the kernel's Container; the second then arrives with
+# an import of the name the Container now holds as a routine of its own,
+# which is the horizontal FFSL kernels' shape (fourth_order_horizontal_edge
+# under ffsl_flux_xy_panel_remap_1d and ffsl_flux_xy_1d).
+_SHARED_EDGE_MODULE = """
+module shared_edge_mod
+  use constants_mod, only : i_def, r_def
+  implicit none
+  private
+  public :: shared_edge
+contains
+  subroutine shared_edge(n, source, result)
+    integer(kind=i_def), intent(in) :: n
+    real(kind=r_def), dimension(n), intent(in) :: source
+    real(kind=r_def), dimension(n), intent(inout) :: result
+    result(n) = source(n) * 0.5_r_def
+  end subroutine shared_edge
+end module shared_edge_mod
+"""
+
+_SIBLING_STEP_MODULE = """
+module sibling_step_mod
+  use constants_mod, only : i_def, r_def
+  implicit none
+  private
+  public :: sibling_step
+contains
+  subroutine sibling_step(n, source, result)
+    use shared_edge_mod, only : shared_edge
+    integer(kind=i_def), intent(in) :: n
+    real(kind=r_def), dimension(n), intent(in) :: source
+    real(kind=r_def), dimension(n), intent(inout) :: result
+    integer(kind=i_def) :: j
+    call shared_edge(n, source, result)
+    do j = n - 1, 1, -1
+      result(j) = result(j + 1) + source(j)
+    end do
+  end subroutine sibling_step
+end module sibling_step_mod
+"""
+
+_SHARED_IMPORT_KERNEL = _MODULE_PROCEDURE_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use sibling_step_mod, only : sibling_step").replace(
+    "    call sweep_column(nlayers, partial, swept)\n",
+    "    call sweep_column(nlayers, partial, swept)\n"
+    "    call sibling_step(nlayers, partial, swept)\n").replace(
+    "    integer(kind=i_def) :: j\n"
+    "    result(n) = source(n)\n",
+    "    integer(kind=i_def) :: j\n"
+    "    call shared_edge(n, source, result)\n").replace(
+    "  subroutine sweep_column(n, source, result)\n",
+    "  subroutine sweep_column(n, source, result)\n"
+    "    use shared_edge_mod, only : shared_edge\n")
+
+
 # A callee that calls itself. Inlining it once leaves a call to it behind, so
 # a rewrite run to a fixed point would never reach one; the depth limit is
 # what turns that into a refusal naming the routine.
@@ -241,6 +300,16 @@ def chained_procedure_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel's callee itself calls."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _CHAINED_PROCEDURE_KERNEL)
+
+
+@pytest.fixture(name="shared_import_target")
+# pylint: disable-next=unused-argument
+def shared_import_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose two helpers import one third routine."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _SHARED_IMPORT_KERNEL,
+        extra={"shared_edge_mod": _SHARED_EDGE_MODULE,
+               "sibling_step_mod": _SIBLING_STEP_MODULE})
 
 
 @pytest.fixture(name="recursive_procedure_target")
@@ -345,6 +414,30 @@ def test_lfric_kokkos_trans_names_a_called_routine_as_a_call(
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
     assert "cannot inline the call to 'helper'" in str(error.value)
+
+
+def test_lfric_kokkos_trans_prefers_a_routine_the_container_holds(
+        shared_import_target):
+    """A callee's import of a routine already brought in is aimed at it.
+
+    Inlining the kernel's own helper brings ``shared_edge`` into the
+    Container; the sibling module's helper then arrives importing the same
+    name, and the merge would rename the Container's routine through the
+    caller's table and raise ``ValueError`` -- the refusal the survey of
+    2026-09-13 gave every horizontal FFSL kernel. The import is aimed at
+    the routine the Container holds instead, and both helpers inline.
+    """
+    _, loop, _ = shared_import_target
+
+    LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "sweep_column" not in cpp
+    assert "sibling_step" not in cpp
+    assert "shared_edge" not in cpp
+    # The shared routine's one statement is in the body twice, once from
+    # each helper.
+    assert cpp.count("* 0.5") == 2
 
 
 def test_lfric_kokkos_trans_inlines_a_module_procedure(

@@ -567,6 +567,19 @@ class LFRicKokkosInlineMixin:
         module the ``ModuleManager`` caches is left as its file declares it
         and a later capture of another kernel meets it unchanged.
 
+        A third disagreement is between an import and a routine already
+        brought in. The horizontal FFSL kernels call a module-local helper
+        and a sibling module's helper in one body, and both call
+        ``fourth_order_horizontal_edge`` from
+        ``subgrid_horizontal_support_mod``: inlining the first brings that
+        routine into the kernel's Container,
+        and the second then arrives importing the same name, which the merge
+        answers by renaming the Container's routine through the wrong table
+        and raising ``ValueError`` (the survey of 2026-09-13). The callee's
+        calls are aimed at the routine the Container holds and the import
+        is taken out of its table, which is what the merge would have done
+        had it been able to: the two are one routine of one module.
+
         :param call: the call about to be inlined.
         :type call: :py:class:`psyclone.psyir.nodes.Call`
         """
@@ -576,6 +589,45 @@ class LFRicKokkosInlineMixin:
         for callee in cls._local_callees(call):
             cls._resolve_shared_names(site, callee.symbol_table)
             cls._resolve_shared_names(callee, site.symbol_table)
+            cls._prefer_local_routines(callee, site.ancestor(Container))
+
+    @staticmethod
+    def _prefer_local_routines(callee, container):
+        """Aim ``callee``'s calls at routines ``container`` already holds.
+
+        Each name ``callee`` imports that ``container`` holds as a routine
+        of its own -- one an earlier inlining brought in -- has its calls
+        re-aimed at that routine and its import removed. An import the
+        callee uses in any other way is left, and the merge says what it
+        makes of it.
+
+        :param callee: the routine about to be inlined, as the call site
+            sees it.
+        :type callee: :py:class:`psyclone.psyir.nodes.Routine`
+        :param container: the Container the call is made from.
+        :type container: Optional[:py:class:`psyclone.psyir.nodes.Container`]
+        """
+        if container is None:
+            return
+        local_routines = {routine.name.lower()
+                          for routine in container.walk(Routine)}
+        table = callee.symbol_table
+        for imported in list(table.imported_symbols):
+            if imported.name.lower() not in local_routines:
+                continue
+            local = container.symbol_table.lookup(
+                imported.name, scope_limit=container, otherwise=None)
+            if local is None or local.is_import:
+                continue
+            for made in callee.walk(Call):
+                if (made.routine is not None
+                        and made.routine.symbol is imported):
+                    made.routine.symbol = local
+            try:
+                table.remove(imported)
+            except (NotImplementedError, ValueError, KeyError):
+                # A use the merge will have to judge for itself.
+                continue
 
     @classmethod
     def _resolve_shared_names(cls, routine, other):

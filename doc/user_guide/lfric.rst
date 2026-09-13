@@ -4325,7 +4325,11 @@ scopes hold differently -- an import in one and, in the other, a name that
 scope cannot say the origin of, which is how LFRic's FFSL kernels and their
 support routines reach ``reference_element_mod``'s ``S`` -- is given the
 module both name before the two tables are merged, and refused as it was
-where that module cannot be read. An imported name a later pass needs the
+where that module cannot be read. A name a callee imports that the kernel's
+module already holds as a routine -- one an earlier inlining brought in, as
+the horizontal FFSL kernels' two helpers both bring in
+``fourth_order_horizontal_edge`` -- has the callee's calls aimed at that
+routine and its import taken out, the two being one routine of one module. An imported name a later pass needs the
 type of is read from its module too, so an array section bounded by a
 module's parameter is lowered by that parameter's value. Types agreeing is a scored judgement rather than
 an identity: a literal actual stating no kind, an actual whose type PSyclone cannot
