@@ -4497,7 +4497,19 @@ operator it carries, and a replacement as ``Kokkos::atomic_store``, on the
 View element. It is decided per argument rather than per region, so a
 ``gh_write`` to a *discontinuous* space in the same kernel stays a plain
 assignment; and it is the update and not the read that is made atomic, so a
-``gh_readinc`` reads its element plainly. Each component of a field vector
+``gh_readinc`` reads its element plainly. On the atomic arm the body may
+read a shared field only as the target of its own read-modify-write, which
+the atomic performs indivisibly with the store; a read of it anywhere else
+is refused, because it is a read of an element another cell of the launch
+may be storing to at the same moment and no atomic orders the two. The
+shape refused is the claim -- read a flag on a shared face, select the face
+if it is unclaimed, store the flag -- which is ``sci_face_selector_kernel_mod``'s,
+and whose claims raced on a device so that neighbouring cells both computed
+the same FFSL flux face. LFRic's own rule for ``gh_write`` on a continuous
+space (:ref:`lfric-kernel-valid-access`) is that every cell stores the same
+value **and the first access to a shared dof is a write**; a body reading
+first breaks the second half and is right in serial Fortran and under
+colouring only because those order the cells. Each component of a field vector
 is a field of its own and is made safe separately. The question is asked of
 cell iteration alone: a dof-iterating kernel writes each dof once, so its
 stores stay plain assignments whatever their function space, and the

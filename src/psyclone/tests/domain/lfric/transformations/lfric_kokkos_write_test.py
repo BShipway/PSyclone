@@ -152,6 +152,31 @@ def test_lfric_kokkos_trans_refuses_a_continuous_write_reading_its_target(
             "the loop instead." in str(error.value))
 
 
+def test_lfric_kokkos_trans_refuses_a_claim_of_a_shared_dof(
+        continuous_claim_target):
+    """A body that reads a shared field it stores to is refused.
+
+    The claim: read a flag on a shared face, select the face if it is
+    unclaimed, store the flag. The store is a constant an atomic store
+    carries, so the store rules pass it; what races is the read, which
+    sees the neighbour's store or not depending on who ran first. This is
+    ``sci_face_selector_kernel_mod``'s shape, met on a device on
+    2026-09-14: both cells claimed the face and the FFSL flux was then
+    computed from both sides. LFRic's own rule for a ``gh_write`` on a
+    continuous space is that the first access to a shared dof is a write.
+    """
+    _, loop, _ = continuous_claim_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert ("reads the shared field 'flux' at an element another cell of "
+            "the launch may store to, and no atomic orders that read against "
+            "the other cell's store. LFRic's rule for a write to a "
+            "continuous space is that the first access to a shared dof is a "
+            "write. Colour the loop instead." in str(error.value))
+
+
 def test_lfric_kokkos_trans_permits_a_continuous_read(target):
     """Only the written spaces decide whether cells may run in parallel."""
     _, loop, kernel = target

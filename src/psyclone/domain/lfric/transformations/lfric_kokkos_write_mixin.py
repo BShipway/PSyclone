@@ -601,6 +601,70 @@ LFRicKokkosTrans.apply`
                     f"replaces an element of the shared field "
                     f"'{target.name}' with a value that reads it, which is a "
                     "race no atomic store answers. Colour the loop instead.")
+        cls._refuse_reads_of_shared(kernel, schedule, shared)
+
+    @staticmethod
+    def _refuse_reads_of_shared(kernel, schedule, shared):
+        """Refuse a body that reads a shared field outside its own update.
+
+        Every statement writing a shared field has by now been found to be
+        one an atomic carries: a store, or a read-modify-write of the
+        element it stores. That leaves the reads. A read of a shared field
+        anywhere else in the body is a read of an element another cell of
+        the launch may be storing to at the same moment, and no atomic
+        orders the two: the read may see the value before or after the
+        other cell's store, so the body computes from a value that differs
+        between runs.
+
+        The shape this refuses is the claim: ``if (flag(face) == 0) then
+        select the face; flag(face) = 1``, where ``flag`` is a field on a
+        continuous space and the face is shared with the neighbour. Both
+        cells read ``0`` and both claim the face, and everything computed
+        from the selection afterwards differs from a serial run. LFRic's
+        own rule for ``gh_write`` on a continuous space -- the LFRic user
+        guide, *Valid Access Modes* -- is that every cell stores the same
+        value to a shared dof **and the first access to it is a write**;
+        the body this refuses breaks the second half, and the serial
+        Fortran and the coloured OpenMP build were only ever right because
+        they ordered the cells. Found on 2026-09-14 in
+        ``sci_face_selector_kernel_mod``, whose selection decides which
+        cells compute each FFSL flux face: on a device the claims raced,
+        neighbouring cells both computed the same face, and the flux column
+        was written from both sides.
+
+        The one read that is not refused is the read an accepted
+        read-modify-write makes of its own target -- ``lhs(i) = lhs(i) +
+        x`` -- which the atomic performs indivisibly with the store.
+
+        :param kernel: the kernel the loop holds.
+        :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
+        :param schedule: the kernel schedule, with every rewrite applied.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param shared: the shared formals, as
+            :py:meth:`_shared_formals` returns them.
+        :type shared: Dict[str, bool]
+
+        :raises TransformationError: if a shared field is read other than
+            as the target of its own read-modify-write.
+        """
+        for reference in schedule.walk(Reference):
+            if reference.name not in shared:
+                continue
+            assignment = reference.ancestor(Assignment)
+            if assignment is not None:
+                if reference is assignment.lhs:
+                    continue
+                if (assignment.lhs.name == reference.name
+                        and atomic_update_operands(assignment) is not None
+                        and reference == assignment.lhs):
+                    continue
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture '{kernel.name}': it reads "
+                f"the shared field '{reference.name}' at an element another "
+                "cell of the launch may store to, and no atomic orders that "
+                "read against the other cell's store. LFRic's rule for a "
+                "write to a continuous space is that the first access to a "
+                "shared dof is a write. Colour the loop instead.")
 
     @staticmethod
     def _is_lowered(assignment):
