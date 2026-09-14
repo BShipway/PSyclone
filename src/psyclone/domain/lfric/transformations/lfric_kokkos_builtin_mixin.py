@@ -91,8 +91,8 @@ from psyclone.domain.lfric import LFRicConstants
 from psyclone.domain.lfric.lfric_builtins import LFRicBuiltIn
 from psyclone.psyGen import BuiltIn, InvokeSchedule
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Container, FileContainer, KernelSchedule,
-    Literal, Reference)
+    ArrayReference, Assignment, Container, DataNode, FileContainer,
+    KernelSchedule, Reference)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ContainerSymbol, DataSymbol, ImportInterface,
     ScalarType, SymbolTable)
@@ -310,11 +310,12 @@ ContainerSymbol`
         array reference to the field's data symbol subscripted by the dof
         index; every such reference becomes a reference to the formal, and
         the dof index leaves the body with them. A scalar argument reaches
-        it as the algorithm's own expression -- a reference to a variable
-        or a literal -- and is replaced by matching that expression: every
-        reference to the variable, or the literals equal to the literal,
-        one per occurrence in the order they appear so that two scalar
-        arguments passed the same literal each claim one.
+        it as copies of the algorithm's own expression -- a variable, a
+        literal, a negated literal -- and every node equal to that
+        expression becomes the formal, so a scalar the body reads twice
+        (``a * x + a * y``) reads the formal twice. Two scalar arguments
+        passed one expression are the one value: the first claims every
+        occurrence and the second is a formal the body does not read.
 
         :param assignment: the lowered body, rewritten in place.
         :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
@@ -332,20 +333,13 @@ ContainerSymbol`
                     reference.replace_with(Reference(formal))
             return
         actual = argument.psyir_expression()
-        if isinstance(actual, Literal):
-            matches = [literal for literal in assignment.walk(Literal)
-                       if literal == actual]
-            if matches:
-                matches[0].replace_with(Reference(formal))
-            return
-        for reference in assignment.walk(Reference):
-            # The exact type: an ArrayReference is a Reference too, and a
-            # field's data reference must not be mistaken for the scalar.
-            # pylint: disable-next=unidiomatic-typecheck
-            if (type(reference) is Reference
-                    and reference.symbol.name.lower()
-                    == actual.symbol.name.lower()):
-                reference.replace_with(Reference(formal))
+        # The exact type as well as equality: an ArrayReference is a
+        # Reference too, and a field's data reference must not be mistaken
+        # for a scalar of the same name.
+        # pylint: disable-next=unidiomatic-typecheck
+        for node in [node for node in assignment.walk(DataNode)
+                     if type(node) is type(actual) and node == actual]:
+            node.replace_with(Reference(formal))
 
     @classmethod
     def _builtin_schedule_name(cls, kernel, kinds):

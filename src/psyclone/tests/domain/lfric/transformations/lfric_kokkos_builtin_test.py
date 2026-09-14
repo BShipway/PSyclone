@@ -84,6 +84,16 @@ _SAME_LITERAL_ALGORITHM = _AXPBY_ALGORITHM.replace(
     "aX_plus_bY(f3, 0.5_r_def, f1, 0.5_r_def, f2)")
 
 
+# One scalar read twice by the body.
+_TWICE_ALGORITHM = _AXPBY_ALGORITHM.replace(
+    "aX_plus_bY(f3, a, f1, 0.5_r_def, f2)", "aX_plus_aY(f3, a, f1, f2)")
+
+
+# A negated literal, which is an expression rather than a literal.
+_NEGATED_ALGORITHM = _AXPBY_ALGORITHM.replace(
+    "aX_plus_bY(f3, a, f1, 0.5_r_def, f2)", "a_times_X(f3, -1.0_r_def, f1)")
+
+
 # A precision conversion between two kinds of different width.
 _CONVERT_ALGORITHM = """
 program kokkos_builtin_convert_test
@@ -185,19 +195,46 @@ def test_builtin_scalars_by_variable_and_by_literal(
             "0.5_r_def, f2_data, loop0_stop)" in fortran)
 
 
-def test_builtin_two_scalars_passed_one_literal_each_claim_one(
+def test_builtin_two_scalars_passed_one_literal_share_the_first_formal(
         tmp_path, clear_module_manager_instance):
-    """Two scalar arguments given the same literal each take a formal.
+    """Two scalar arguments given one literal are one value.
 
-    The literals are matched one per occurrence in order, so the second
-    argument is not left as a formal the body never reads.
+    Every occurrence of the literal becomes the first argument's formal;
+    the second is declared, passed, and never read. Nothing in the body is
+    left as the literal, which would otherwise be a value the algorithm
+    could not change.
     """
     _, loop, _ = _invoke(tmp_path, "same", _SAME_LITERAL_ALGORITHM, _KERNEL)
 
     code = LFRicKokkosTrans().apply(loop)
 
-    assert ("arg1(df) = ((arg2 * arg3(df)) + (arg4 * arg5(df)));"
+    assert "const double arg2,\n" in code
+    assert "const double arg4,\n" in code
+    assert ("arg1(df) = ((arg2 * arg3(df)) + (arg2 * arg5(df)));"
             in _strip(code))
+    assert "0.5" not in code
+
+
+def test_builtin_scalar_read_twice_and_negated_literal(
+        tmp_path, clear_module_manager_instance):
+    """A scalar the body reads twice reads the formal twice, and a negated
+    literal is matched as the expression it is."""
+    _, loop, _ = _invoke(tmp_path, "twice", _TWICE_ALGORITHM, _KERNEL)
+
+    code = LFRicKokkosTrans().apply(loop)
+
+    # PSyclone lowers aX_plus_aY as a * (X + Y); the point is that the one
+    # scalar the algorithm passed is the one formal the body reads.
+    assert "arg1(df) = (arg2 * (arg3(df) + arg4(df)));" in _strip(code)
+    assert "const double arg2,\n" in code
+    assert "arg5" not in code
+
+    _, loop, _ = _invoke(tmp_path, "negated", _NEGATED_ALGORITHM, _KERNEL)
+
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "arg1(df) = (arg2 * arg3(df));" in _strip(code)
+    assert "-1.0" not in _strip(code)
 
 
 def test_builtin_of_two_kinds_names_both_and_casts(
@@ -247,6 +284,14 @@ def test_builtin_validate_leaves_the_invoke_as_found(
     fortran = str(psy.gen)
     assert "! Built-in: inc_X_plus_Y" in fortran
     assert "_kokkos(" not in fortran
+
+
+def test_builtin_rule_passes_over_a_coded_kernel(target):
+    """The built-in rule has nothing to say about a coded kernel."""
+    _, loop, kernel = target
+    assert not LFRicKokkosTrans._is_builtin(kernel)
+
+    LFRicKokkosTrans._validate_builtin(loop)
 
 
 def test_builtin_reduction_is_refused(
