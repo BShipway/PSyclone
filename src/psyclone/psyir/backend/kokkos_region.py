@@ -472,12 +472,17 @@ class KokkosRegion:
     #: launches over the mesh cells themselves and generates exactly the
     #: source it generated before colouring was accepted.
     colour_map: Optional[KokkosColourMap] = None
-    #: The team size the hierarchical launch asks for. ``None`` renders
-    #: ``Kokkos::AUTO`` and lets the backend choose; a positive integer
+    #: The team size the hierarchical launch asks for. A positive integer
     #: renders itself, which is how a host build reaches the team-level
-    #: concurrency that ``AUTO`` sizes to one member. The flat shapes ignore
-    #: it: the range launch has no team, and the flat team launch takes the
-    #: size the backend recommends for its own functor.
+    #: concurrency that ``Kokkos::AUTO`` sizes to one member, and how an
+    #: application profile forces a team it has measured. ``None`` leaves
+    #: the choice to the launch, which on a GPU backend computes it from the
+    #: extent of the loops the region spreads and elsewhere renders
+    #: ``Kokkos::AUTO``; see
+    #: :py:func:`~psyclone.psyir.backend.kokkos_launch.computed_team_size`.
+    #: The flat shapes ignore it: the range launch has no team, and the flat
+    #: team launch takes the size the backend recommends for its own
+    #: functor.
     team_size: Optional[int] = None
     #: One :py:class:`KokkosConstant` per ``parameter`` array the body reads.
     #: Declared among the body's locals and taking no place on the ABI, so a

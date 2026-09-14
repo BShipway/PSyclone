@@ -459,7 +459,9 @@ def test_apply_builds_a_hierarchical_region_for_a_level_loop(level_target):
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "TeamPolicy(ncells, Kokkos::AUTO)," in cpp
+    # The team is sized from the extent of the loop the region spreads.
+    assert "const int spread_extent = ((nlayers - 1)) + 1 - (1);" in cpp
+    assert "TeamPolicy(ncells, team_size)," in cpp
     assert "KOKKOS_LAMBDA(const TeamMember &team) {" in cpp
     assert "const int cell = team.league_rank();" in cpp
     assert ("Kokkos::parallel_for(Kokkos::TeamVectorRange"

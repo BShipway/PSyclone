@@ -407,9 +407,12 @@ Additionally, there are three partially-implemented back-ends
   one of per region -- a sixth, and `team_private_scalars` in
   `psyclone.psyir.backend.kokkos_team_scalars` -- which decides, before any
   code is generated, which of the body's scalars belong to one member of a
-  team -- a seventh, and `psyclone.psyir.backend.kokkos_staging` -- which
+  team -- a seventh, `psyclone.psyir.backend.kokkos_staging` -- which
   holds the C++ header a region obtains its Views from, and the Python that
-  writes the three statements naming it -- an eighth; all are described
+  writes the three statements naming it -- an eighth, and `spread_extents`
+  in `psyclone.psyir.backend.kokkos_spread_extent` -- which reads how far
+  the loops a region spreads actually run, so that the hierarchical launch
+  can size its team from them -- a ninth; all are described
   below. The
   description is built by the LFRic transformation `LFRicKokkosTrans` (see
   the Transformations section of the LFRic chapter in the User Guide), which
@@ -1023,10 +1026,68 @@ by `LFRicKokkosTrans` rather than here: the back-end renders the loops it is
 given, and judges only what they do to the body's scalars. It does check what it is given, since none of
 the four mistakes announces itself downstream -- an entry must be a `Loop` of
 the region's own schedule, not nested inside another chosen loop, and of unit
-step, `TeamVectorRange` having no stride. `team_size` renders as a literal in
-the policy, `Kokkos::AUTO` when it is `None`; the two flat shapes ignore it,
-the range launch having no team and the flat team launch taking the size its
-own probe recommends.
+step, `TeamVectorRange` having no stride. The two flat shapes ignore
+`team_size`, the range launch having no team and the flat team launch taking
+the size its own probe recommends.
+
+How wide the hierarchical launch's team is, is one of three answers in this
+order. A `team_size` the region carries renders as a literal in the policy,
+which is how a host build reaches team-level concurrency and how an
+application profile forces a team it has measured. Failing that, the launch
+sizes the team itself from how far the loops it spreads run, which is what
+`spread_extents` in `psyclone.psyir.backend.kokkos_spread_extent` reads off
+those loops' bounds: the Fortran bounds are inclusive, so one loop's extent
+is `(stop) + 1 - (start)`, repeats are dropped, and `computed_team_size` in
+`psyclone.psyir.backend.kokkos_launch` emits the largest of them as
+
+.. code-block:: c++
+
+    #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+    #if defined(KOKKOS_ENABLE_HIP)
+      constexpr int warp_width = 64;
+    #else
+      constexpr int warp_width = 32;
+    #endif
+      const int spread_extent = (nlayers) + 1 - (1);
+      TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO);
+      const int team_max = probe.team_size_max(body, Kokkos::ParallelForTag());
+      const int team_size = std::max(1,
+          std::min(((spread_extent + warp_width - 1) / warp_width)
+                       * warp_width, team_max));
+    #else
+      const auto team_size = Kokkos::AUTO;
+    #endif
+
+Failing both, the team is `Kokkos::AUTO`, which is what every region got
+before the extent was computed.
+
+`Kokkos::AUTO` cannot be the first answer, because it knows the policy and
+not the loop the region will spread inside it: on CUDA it is 128 members
+while an LFRic spread is a column of levels, of which a GungHo mesh has 30,
+so 98 members idle through the body and all 128 rendezvous at every barrier
+it carries. Measured on an H100 the horizontal FFSL flux region fell from
+22.6 ms a launch to 12.1 ms with a team of 32. The extent is rounded **up**
+to a warp because a GPU schedules a whole warp whether or not its lanes have
+work, and clamped to `team_size_max` -- a team wider than the backend will
+launch is refused at run time -- and clamped below at one member.
+`team_size_max` is asked of the launch's own functor, which is why the
+computed shape is the one shape here that names its lambda rather than
+writing it into the `parallel_for`: `auto body = KOKKOS_LAMBDA(...)`,
+defined once, asked about once and launched once. The other two shapes keep
+the lambda inline, so a region reaching either generates the text it did
+before.
+
+**Only a GPU backend computes anything**, which is what the `#if` is for. On
+OpenMP `Kokkos::AUTO` is one member a team, the leagues carry this shape's
+parallelism, and a `TeamPolicy` asking for more members than the thread pool
+holds is refused at launch -- so a host build keeps `AUTO` and behaves as it
+did. A bound the generated function cannot evaluate where it sizes the team
+contributes no extent: only the region's scalar formals are in scope there,
+while the body's own locals are declared inside the functor, so a loop over
+`TeamVectorRange(team, b, t + 1)` is passed over and a region none of whose
+loops has readable bounds keeps `Kokkos::AUTO`. That costs a wide team and
+never a wrong answer, since a `TeamVectorRange` divides its iterations among
+however many members the team has.
 
 A `KokkosScratch` is described separately from the region's arguments, and
 deliberately so. It crosses no interface, so it must not appear in the C ABI
