@@ -398,7 +398,125 @@ def team_launch(region, local_declarations, body):
         "      body);\n")
 
 
-def hierarchical_launch(region, local_declarations, body):
+def _team_scratch(region):
+    """Return the three pieces of scratch text the hierarchical launch needs.
+
+    The launch's own policy and the probe that clamps its team both carry
+    the scratch request, and the request has to be the same text in both:
+    a probe asking for no scratch answers for a policy that is not the one
+    being launched.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the type aliases, guard and size computation that precede the
+        launch; the ``.set_scratch_size`` text a policy carries; and the
+        View constructions that open the functor. The first two are empty
+        for a region with no scratch, which is what such a region generated
+        before scratch existed.
+    :rtype: Tuple[str, str, str]
+    """
+    aliases, sizes, sizes_global, constructions = _scratch_text(
+        region, "team.team_scratch(0)", "    ")
+    if not region.scratch:
+        return "", "", constructions
+    return (
+        f"{aliases}\n{scratch_guard(region)}"
+        f"  const size_t scratch_bytes = {sizes};\n"
+        f"{global_scratch_size(sizes_global)}\n",
+        "\n          .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))"
+        + global_scratch_policy(sizes_global, "PerTeam"),
+        constructions)
+
+
+def _largest_extent(extents):
+    """Return the C++ for the largest of a region's spread extents.
+
+    :param extents: the extent expressions, from
+        :py:func:`~psyclone.psyir.backend.kokkos_spread_extent.spread_extents`
+        and never empty.
+    :type extents: Tuple[str, ...]
+
+    :returns: the single extent, or a nest of ``std::max`` over all of them.
+    :rtype: str
+    """
+    largest = extents[-1]
+    for extent in reversed(extents[:-1]):
+        largest = f"std::max({extent}, {largest})"
+    return largest
+
+
+def computed_team_size(extents, scratch_request):
+    """Return the run-time team size the hierarchical launch is given.
+
+    ``Kokkos::AUTO`` is 128 members on CUDA whatever the region does with
+    them, and an LFRic region's members are the levels of one column: a
+    GungHo mesh has 30, so 98 of the 128 idle through the body and all 128
+    rendezvous at each ``team_barrier`` it carries. Measured on an H100
+    (phase 7, task B7) the horizontal FFSL flux region fell from 22.6 ms a
+    launch to 12.1 ms when its team was cut to 32. This computes that
+    answer instead of taking it from a table: the spread extent, rounded up
+    to a whole warp, clamped to the largest team the backend will run this
+    functor with, and clamped below at one member.
+
+    Rounded **up** to a warp because a GPU schedules a warp whether or not
+    its lanes have work, so a team of 30 idles the same two lanes a team of
+    32 does and buys nothing; and clamped to ``team_size_max`` rather than
+    to ``team_size_recommended`` because the recommendation answers a
+    different question -- the occupancy the backend would like -- while what
+    is wanted here is only that a team the spread asked for is one the
+    backend will actually launch.
+
+    **Only a GPU backend computes anything.** On OpenMP ``Kokkos::AUTO`` is
+    one member per team, the leagues carry the parallelism, and a
+    ``TeamPolicy`` asking for more members than the thread pool holds is
+    refused at launch -- so a host build, which the whole-model checksum
+    gates run on one thread, keeps ``AUTO`` and the behaviour it had before
+    this was written. The guard is on the backend rather than on anything
+    the region says, because that is where the difference is.
+
+    :param extents: the extent expressions of the loops this region spreads,
+        never empty; see
+        :py:func:`~psyclone.psyir.backend.kokkos_spread_extent.spread_extents`.
+    :type extents: Tuple[str, ...]
+    :param scratch_request: the ``.set_scratch_size`` text the launch's own
+        policy carries, empty for a region with no scratch. The probe
+        carries it too, or it answers for a policy asking for no scratch and
+        the clamp is taken against a team the real launch could not run.
+    :type scratch_request: str
+
+    :returns: the guarded declaration of ``team_size``.
+    :rtype: str
+    """
+    return (
+        "  // The team is sized from the loops this region spreads rather\n"
+        "  // than left to Kokkos::AUTO, which knows the policy and not the\n"
+        "  // loop: AUTO is 128 members on CUDA, while the spread below is\n"
+        "  // typically one column of levels. Rounded up to a warp, since a\n"
+        "  // partial warp idles its remaining lanes anyway, and clamped to\n"
+        "  // the widest team this functor can be launched with.\n"
+        "#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)\n"
+        "#if defined(KOKKOS_ENABLE_HIP)\n"
+        "  constexpr int warp_width = 64;\n"
+        "#else\n"
+        "  constexpr int warp_width = 32;\n"
+        "#endif\n"
+        f"  const int spread_extent = {_largest_extent(extents)};\n"
+        f"  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO){scratch_request};\n"
+        "  const int team_max = probe.team_size_max(body, "
+        "Kokkos::ParallelForTag());\n"
+        "  const int team_size = std::max(1,\n"
+        "      std::min(((spread_extent + warp_width - 1) / warp_width)\n"
+        "                   * warp_width, team_max));\n"
+        "#else\n"
+        "  // On a host backend AUTO is one member a team, which is what the\n"
+        "  // leagues of this shape are sized for; a team wider than the\n"
+        "  // thread pool is refused at launch.\n"
+        "  const auto team_size = Kokkos::AUTO;\n"
+        "#endif\n")
+
+
+def hierarchical_launch(region, local_declarations, body, extents=()):
     """Return the ``TeamPolicy`` launch, one team per cell.
 
     The league carries the cells and the team carries the levels: each team
@@ -420,11 +538,25 @@ def hierarchical_launch(region, local_declarations, body):
     not, so it sits in the functor rather than in a range over the league.
     Every member runs it redundantly on its own copy of the locals.
 
+    The team's width is one of three things, in this order.
     :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.team_size` renders
     as a literal in the policy rather than as anything the generated code
     computes, so a run may be given a different team by regenerating nothing
     but this line -- which is what the forced-team build does to reach the
-    team-level concurrency ``Kokkos::AUTO`` sizes to one member on a host.
+    team-level concurrency ``Kokkos::AUTO`` sizes to one member on a host,
+    and what an application profile does to force a measured answer.
+    Failing that, a region whose spread extent the generated function can
+    evaluate sizes its own team from it on a GPU backend; see
+    :py:func:`computed_team_size`. Failing both, the team is
+    ``Kokkos::AUTO``, as every region's was before the extent was computed.
+
+    Only the computed shape names its functor. The other two keep the
+    lambda where it always was, inline in the ``parallel_for``, so that a
+    region reaching either of them generates exactly the text it did before
+    this: the captures already in the model are gated on assertions over
+    that text. The computed shape has to name it, because the clamp asks
+    the backend how wide a team it will run *this functor* with, and a
+    functor cannot be asked about before it exists.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -433,33 +565,40 @@ def hierarchical_launch(region, local_declarations, body):
     :type local_declarations: str
     :param body: the generated kernel body, already indented.
     :type body: str
+    :param extents: the extents of the loops the region spreads, as C++ the
+        generated function can evaluate; empty where none of them can be,
+        which is the fall back to ``Kokkos::AUTO``. See
+        :py:func:`~psyclone.psyir.backend.kokkos_spread_extent.spread_extents`.
+    :type extents: Tuple[str, ...]
 
     :returns: the scratch type aliases, :py:func:`scratch_guard` and the
-        size computation where the region has scratch, and the
-        ``parallel_for`` over one team per cell.
+        size computation where the region has scratch, the team size where
+        it is computed, and the ``parallel_for`` over one team per cell.
     :rtype: str
     """
-    aliases, sizes, sizes_global, constructions = _scratch_text(
-        region, "team.team_scratch(0)", "    ")
-    preamble = (
-        f"{aliases}\n{scratch_guard(region)}"
-        f"  const size_t scratch_bytes = {sizes};\n"
-        f"{global_scratch_size(sizes_global)}\n"
-        if region.scratch else "")
-    team_size = (
-        "Kokkos::AUTO" if region.team_size is None
-        else str(region.team_size))
+    preamble, scratch_request, constructions = _team_scratch(region)
+    computed = region.team_size is None and bool(extents)
     _, offset, span = launch_offsets(region)
-    policy = f"TeamPolicy({span}, {team_size})" + (
-        "\n          .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))"
-        + global_scratch_policy(sizes_global, "PerTeam")
-        if region.scratch else "")
-    return (
-        f"{preamble}"
-        f'  Kokkos::parallel_for("{region.name}",\n'
-        f"      {policy},\n"
-        "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
+    width = "team_size" if computed else (
+        "Kokkos::AUTO" if region.team_size is None else region.team_size)
+    policy = f"TeamPolicy({span}, {width}){scratch_request}"
+    functor = (
         f"    const int {launch_index(region)} = "
         f"{offset}team.league_rank();\n"
-        f"{constructions}{local_declarations}{body}"
-        "  });\n")
+        f"{constructions}{local_declarations}{body}")
+    launch = (f'  Kokkos::parallel_for("{region.name}",\n'
+              f"      {policy},\n")
+    if not computed:
+        return (
+            f"{preamble}{launch}"
+            "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
+            f"{functor}"
+            "  });\n")
+    return (
+        f"{preamble}"
+        "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
+        f"{functor}"
+        "  };\n\n"
+        f"{computed_team_size(extents, scratch_request)}"
+        f"{launch}"
+        "      body);\n")

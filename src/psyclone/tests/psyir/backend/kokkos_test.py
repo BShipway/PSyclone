@@ -725,7 +725,7 @@ def test_kokkos_hierarchical_region_launches_one_team_per_cell():
     """
     code = KokkosWriter()(_level_region())
 
-    assert "TeamPolicy(ncells, Kokkos::AUTO)," in code
+    assert "TeamPolicy(ncells, team_size)," in code
     assert "KOKKOS_LAMBDA(const TeamMember &team) {" in code
     assert "const int cell = team.league_rank();" in code
     assert "using TeamPolicy = Kokkos::TeamPolicy<>;" in code
@@ -792,6 +792,186 @@ def test_kokkos_hierarchical_region_takes_a_team_size():
 
     assert "TeamPolicy(ncells, 4)," in code
     assert "Kokkos::AUTO" not in code
+
+
+def _extent_schedule(loops):
+    """Create a body whose spread loops run between the given bounds.
+
+    ``loops`` is one ``(variable, start, stop)`` per loop, written into the
+    Fortran verbatim, so that a test can ask for a bound the generated
+    function can evaluate where it sizes the team and one it cannot. ``b``
+    and ``t`` are body locals assigned before the loops and are the bounds
+    no launch can read: they are declared inside the functor.
+    """
+    body = "".join(
+        f"  do {variable} = {start}, {stop}\n"
+        f"    y(map(1) + {variable} - 1) = x(map(1) + {variable} - 1)\n"
+        "  end do\n"
+        for variable, start, stop in loops)
+    source = f"""
+subroutine inject_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k, df, b, t
+  b = 1
+  t = nlayers
+{body}end subroutine inject_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inject_code", symbol_table=symbol_table, children=children)
+
+
+def _extent_region(loops, **overrides):
+    """Return a region spreading every loop of :py:func:`_extent_schedule`."""
+    schedule = _extent_schedule(loops)
+    return _level_region(
+        schedule=schedule, parallel_loops=tuple(schedule.walk(Loop)),
+        **overrides)
+
+
+def test_kokkos_hierarchical_region_sizes_the_team_from_its_spread():
+    """The team is the loop's extent rounded to a warp, not Kokkos::AUTO.
+
+    ``Kokkos::AUTO`` is 128 members on CUDA and the spread is one column of
+    levels, so 98 members idle through the body and all 128 rendezvous at
+    every barrier. Measured on an H100 the horizontal FFSL flux region fell
+    from 22.6 ms a launch to 12.1 ms with a team of 32 (phase 7, task B7),
+    which is the number this arithmetic reaches for a 30-level column
+    without anybody measuring it.
+    """
+    code = KokkosWriter()(_level_region())
+
+    # The Fortran bound is inclusive and the Kokkos range half-open, so the
+    # extent is the count of iterations the TeamVectorRange is given.
+    assert "const int spread_extent = (nlayers) + 1 - (1);" in code
+    assert "  const int team_size = std::max(1,\n" \
+        "      std::min(((spread_extent + warp_width - 1) / warp_width)\n" \
+        "                   * warp_width, team_max));\n" in code
+    assert "TeamPolicy(ncells, team_size)," in code
+    assert "Kokkos::AUTO" in code  # the probe's, and the host fall back's
+
+    # Rounding up to a warp needs the warp, which differs between the two
+    # GPU back-ends and is asked of neither: nothing portable reports it.
+    assert "  constexpr int warp_width = 32;\n" in code
+    assert "  constexpr int warp_width = 64;\n" in code
+
+    # <algorithm> comes with the clamp, from the same reading of the text
+    # that brings it for an integer MAX in a bound.
+    assert "#include <algorithm>" in code
+
+
+def test_kokkos_hierarchical_region_clamps_the_team_to_its_own_functor():
+    """The clamp asks the backend about the lambda the launch will run.
+
+    A team wider than the backend will launch is refused at run time, so
+    the rounded extent is clamped to ``team_size_max``. That is a question
+    about a functor, which is why the computed shape is the one shape here
+    that names its lambda instead of writing it into the ``parallel_for``:
+    it is defined once, asked about once, and launched once.
+    """
+    code = KokkosWriter()(_level_region())
+
+    assert "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n" in code
+    assert "  const int team_max = probe.team_size_max(body, " \
+        "Kokkos::ParallelForTag());\n" in code
+    assert code.count("KOKKOS_LAMBDA(const TeamMember &team)") == 1
+    assert code.count("Kokkos::parallel_for(\"inject_kokkos\"") == 1
+    assert "      body);\n" in code
+
+    # team_size_recommended is the flat shape's question -- the occupancy
+    # the backend would like -- and is not asked here, where the extent has
+    # already said what the team is for.
+    assert "team_size_recommended" not in code
+
+
+def test_kokkos_hierarchical_region_leaves_a_host_team_to_auto():
+    """A host build keeps the one member a team ``AUTO`` gives it.
+
+    ``Kokkos::AUTO`` is one member on OpenMP, the leagues carry this
+    shape's parallelism there, and a ``TeamPolicy`` asking for more members
+    than the thread pool holds is refused at launch -- which would abort
+    the whole-model host gates, since they run on one thread. So the
+    computation is guarded on the backend and the host branch declares
+    exactly what the launch had before.
+    """
+    code = KokkosWriter()(_level_region())
+
+    assert "#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)\n" \
+        in code
+    assert "#else\n" in code
+    assert "  const auto team_size = Kokkos::AUTO;\n" in code
+    assert code.count("#endif\n") == 2
+
+
+def test_kokkos_hierarchical_region_takes_the_largest_spread():
+    """Several spread loops give the team the widest of them.
+
+    A team narrower than the widest loop is correct -- a
+    ``TeamVectorRange`` divides its iterations among whatever members
+    there are -- but it makes that loop take two passes, which is what the
+    sweep showed a team of 16 paying over a 30-level column.
+    """
+    code = KokkosWriter()(_extent_region(
+        (("k", "1", "nlayers"), ("df", "1", "ndf"))))
+
+    assert "const int spread_extent = std::max((nlayers) + 1 - (1), " \
+        "(ndf) + 1 - (1));" in code
+
+
+def test_kokkos_hierarchical_region_names_a_repeated_spread_once():
+    """The level loop is spread a dozen times in one body, and is one extent.
+
+    Dropping the repeats is not cosmetic: a GungHo region spreads its level
+    loop at every sweep of the column, and a ``std::max`` nest of a dozen
+    copies of one expression would be the generated source's account of a
+    team width that has one term.
+    """
+    code = KokkosWriter()(_extent_region(
+        (("k", "1", "nlayers"), ("df", "1", "nlayers"))))
+
+    assert "const int spread_extent = (nlayers) + 1 - (1);" in code
+    assert "std::max((nlayers)" not in code
+
+
+@pytest.mark.parametrize("stop, reason", [
+    ("t", "a body local, declared inside the functor"),
+    ("map(1)", "a View, which the functor holds and the launch does not"),
+    ("max(nlayers, ndf)", "a call, which this grammar does not admit"),
+])
+def test_kokkos_hierarchical_region_falls_back_to_auto(stop, reason):
+    """A bound the launch cannot evaluate leaves the team to ``AUTO``.
+
+    Only the region's scalar formals are in scope where the team is sized;
+    the body's own locals are declared inside the functor and a View is
+    staged for it. A loop bounded by one of those contributes no extent,
+    and a region none of whose loops contributes one is generated exactly
+    as it was before the extent was computed. The cost is a wide team, not
+    a wrong answer: the loop still runs, in more passes.
+    """
+    code = KokkosWriter()(_extent_region((("k", "1", stop),)))
+
+    assert "TeamPolicy(ncells, Kokkos::AUTO)," in code
+    assert "spread_extent" not in code, reason
+    assert "team_size" not in code
+    assert "auto body = " not in code
+
+
+def test_kokkos_hierarchical_region_takes_one_spread_of_several():
+    """One unreadable bound does not throw away the ones that are readable.
+
+    The team is sized from the loops whose extent the launch can evaluate,
+    and the rest are run by that team in as many passes as they need.
+    """
+    code = KokkosWriter()(_extent_region(
+        (("k", "b", "t"), ("df", "1", "ndf"))))
+
+    assert "const int spread_extent = (ndf) + 1 - (1);" in code
 
 
 def test_kokkos_flat_shapes_ignore_team_size():
@@ -3813,8 +3993,12 @@ def test_kokkos_hierarchical_launch_takes_a_lower_bound():
     """The one-team-per-cell shape offsets its cell and shortens its league."""
     code = KokkosWriter()(_with_first_cell(_level_region()))
 
-    assert "TeamPolicy((ncells - first_cell), Kokkos::AUTO)," in code
+    assert "TeamPolicy((ncells - first_cell), team_size)," in code
     assert "const int cell = first_cell + team.league_rank();" in code
+
+    # The league is the only thing the first cell shortens. The team is the
+    # levels of one column, which no offset into the cells changes.
+    assert "const int spread_extent = (nlayers) + 1 - (1);" in code
 
 
 # The two capabilities the tests above describe were written apart and answer

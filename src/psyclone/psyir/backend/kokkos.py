@@ -28,6 +28,7 @@ from psyclone.psyir.backend.kokkos_staging import (
 from psyclone.psyir.backend.kokkos_region import (
     KokkosAlias, KokkosColourMap, KokkosRegion, KokkosScalar, KokkosView,
     extent_names, is_extent, is_identifier, is_offset)
+from psyclone.psyir.backend.kokkos_spread_extent import spread_extents
 from psyclone.psyir.backend.kokkos_team_scalars import (
     team_private_scalars)
 from psyclone.psyir.backend.kokkos_launch import (
@@ -210,13 +211,15 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             # establishes, and prepended here for the same reason: all three
             # launch shapes want it immediately after their own index, and
             # each of them has just declared that.
-            colours = region.colour_map
             local_declarations = (
                 f"{self._nindent}const int {region.cell_index} = "
-                f"{colours.name}({colours.colour} - 1, {colours.index}) "
-                "- 1;\n") + local_declarations
+                f"{region.colour_map.name}({region.colour_map.colour} - 1, "
+                f"{region.colour_map.index}) - 1;\n") + local_declarations
         body = "".join(
             self._visit(child) for child in region.schedule.children)
+        # Rendered here, while this writer's kinds and Views are in force,
+        # because the launch that consumes it visits no PSyIR.
+        extents = spread_extents(region, self._visit)
         constant_indent, self._depth = self._nindent, 0
         self._views, self._kind_types = {}, {}
         self._parallel_loops = ()
@@ -233,7 +236,8 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
         if region.dof:
             launch = dof_launch(region, local_declarations, body)
         elif region.parallel_loops:
-            launch = hierarchical_launch(region, local_declarations, body)
+            launch = hierarchical_launch(
+                region, local_declarations, body, extents)
         elif region.scratch:
             launch = team_launch(region, local_declarations, body)
         else:

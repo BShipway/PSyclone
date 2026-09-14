@@ -407,10 +407,14 @@ def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
     assert "swept_scratch_t swept(team.team_scratch(0), nlayers);" in cpp
     assert "PerTeam(scratch_bytes)" in cpp
 
-    # The launch is the hierarchical shape. It has no team-size probe and no
-    # bounds guard, because the league is one team per cell rather than a
-    # flat range of ranks that has to be folded onto cells.
-    assert "TeamPolicy(ncells, Kokkos::AUTO)" in cpp
+    # The launch is the hierarchical shape. It has no bounds guard, because
+    # the league is one team per cell rather than a flat range of ranks that
+    # has to be folded onto cells. Its team is sized from the extent of the
+    # loop it spreads rather than left to ``Kokkos::AUTO``, and the probe that
+    # clamps that size is the launch's own functor.
+    assert "TeamPolicy(ncells, team_size)" in cpp
+    assert "const int spread_extent = (nlayers) + 1 - (1);" in cpp
+    assert "probe.team_size_max(body, Kokkos::ParallelForTag());" in cpp
     assert "Kokkos::RangePolicy" not in cpp
     assert "team_size_recommended" not in cpp
     assert "if (cell >= ncells)" not in cpp
