@@ -634,35 +634,48 @@ staging existed, which is why no existing result moves. `all` allocates a
 View in the execution space, `deep_copy`s the caller's storage into it on
 entry and copies a written one back on exit; it is a correctness mode and the
 header says on stderr, once, that timings taken in it mean nothing. `non-field`
-mirrors only what needs mirroring: an LFRic field is already in a space the
-device can reach, so a `field` role is left unmanaged over its pointer, while
-a `readonly` role is a device mirror cached by `(pointer, bytes)` and a
-`readwrite` or `transient` one is staged in and out per call. `LFRIC_KOKKOS_STAGING_CACHE=0`
+mirrors only what needs mirroring: an LFRic field, and an LMA operator's
+local stencil, are already in a space the device can reach, so a `field` role
+is left unmanaged over its pointer, while a `readonly` role is a device
+mirror cached by `(pointer, bytes)` and a `readwrite` or `transient` one is
+staged in and out per call. `LFRIC_KOKKOS_STAGING_CACHE=0`
 copies every call instead of consulting that cache. An unrecognised value is
 `Kokkos::abort`ed rather than treated as `none`: a misspelt mode that fell
 back silently would be reported as a run in the mode it names.
 
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that
-knows what an argument *is*: `field` for a field or field vector, `readonly`
-for a dofmap, a stencil map or size, a colour map, an inter-grid cell map, a
-reference-element array or a module array, `readwrite` for an operator's
-local stencil and for caller-supplied scratch, and `transient` for a basis or
-differential-basis array and for a rule's quadrature weights. A description
-that states no role falls back to `readonly` or `readwrite` from the View's
-own constness -- never to `field`, which is a claim about where the storage
-lives and cannot be guessed.
+knows what an argument *is*: `field` for a field or field vector and for an
+LMA operator's local stencil, `readonly` for a dofmap, a stencil map or size,
+a colour map, an inter-grid cell map, a reference-element array or a module
+array, `readwrite` for a columnwise operator and for caller-supplied scratch,
+and `transient` for a basis or differential-basis array and for a rule's
+quadrature weights. A description that states no role falls back to
+`readonly` or `readwrite` from the View's own constness -- never to `field`,
+which is a claim about where the storage lives and cannot be guessed.
 
-An operator is `readwrite` even where the kernel only reads it, and that is
-the point of taking the role from the metadata rather than from the access.
-The role says how long a copy of the storage stays good, not what one kernel
-does with it: an operator is assembled by one kernel and applied by another,
-so a mirror cached on the first apply is stale on the next assembly. Read
-off the access it would look like a dofmap -- read-only, so immutable, so
-cacheable -- and the whole model's solver stops converging in `non-field`
-mode while every unit test and every extracted region still passes. The
-arrays that remain `readonly` are the ones LFRic fills once at
-initialisation.
+An LMA operator takes a field's role because LFRic gives it a field's
+storage. `lfric_core` claims a field's `data` and an operator's
+`local_stencil` from one shared-space registry, on one default and behind one
+switch, so a region reads and writes an operator's stencil where it lies and
+nothing is copied around the call. The saving is larger than a field's would
+be: a stencil is `ncell_3d * ndf_to * ndf_from` doubles, tens of megabytes
+against a field's hundreds of kilobytes, and a per-call staging copies it in
+and back out on every region entry.
+
+What the role must not be read off is the access. An operator is `field` even
+where the kernel only reads it, and taking the role from the metadata rather
+than from the access is what allows that. The role says where the storage is
+and how long a copy of it stays good, not what one kernel does with it: an
+operator is assembled by one kernel and applied by another, so a mirror
+cached on the first apply is stale on the next assembly. Read off the access
+it would look like a dofmap -- read-only, so immutable, so cacheable -- and
+the whole model's solver stops converging in `non-field` mode while every
+unit test and every extracted region still passes. The arrays that remain
+`readonly` are the ones LFRic fills once at initialisation. A columnwise
+operator keeps `readwrite`: `columnwise_operator_mod` allocates its banded
+matrix the ordinary way, and the transformation refuses a CMA kernel in any
+case.
 
 A basis table is `transient` for the mirror image of that reason. It *is*
 read-only, and stays so for the whole life of the storage; what it does not

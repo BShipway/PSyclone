@@ -14,6 +14,9 @@ from lfric_kokkos_sources import (
     _ALGORITHM, _KERNEL, _OPERATOR_ALGORITHM, _OPERATOR_KERNEL, _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
+from psyclone.domain.lfric.transformations.lfric_kokkos_argument_mixin import (
+    _ArgumentRoles)
+from psyclone.tests.utilities import get_invoke
 
 
 # The production kernel with 'cell' declared as one of its own locals and
@@ -260,17 +263,60 @@ def test_lfric_kokkos_trans_accepts_an_operator(operator_target):
     code = LFRicKokkosTrans().apply(loop)
 
     # The kernel only reads the operator, and its element type is const to
-    # say so, but its role is readwrite: the role says where the storage is
-    # and how long a copy of it stays good, not what this kernel does with
-    # it. An operator is assembled by one kernel and applied by another, so
-    # a copy taken on the first apply is wrong on the next timestep.
+    # say so, but its role is the field role: the role says where the storage
+    # is, not what this kernel does with it, and LFRic claims an operator's
+    # local stencil from the shared space it claims a field's data from.
     assert ("auto matrix = lfric_kokkos::stage<\n"
             "      Kokkos::View<const double***, Kokkos::LayoutLeft, "
             "MemorySpace, ReadOnly>>(\n"
-            "      matrix_data, lfric_kokkos::Role::readwrite, ncell_3d, "
+            "      matrix_data, lfric_kokkos::Role::field, ncell_3d, "
             "ndf1, ndf2);") in code
     assert "const double *matrix_data" in code
     assert "const int ncell_3d" in code
+
+
+def test_lfric_kokkos_trans_operator_is_never_staged(operator_target):
+    """The stencil takes a field's role, and nothing else in the region does.
+
+    The role is the whole of what stops an operator being copied into the
+    execution space and back on every region entry: in ``non-field`` staging
+    a ``field`` View is left unmanaged over the caller's pointer, and a
+    stencil is the largest array a region takes -- ``ncell_3d * ndf_to *
+    ndf_from`` doubles, tens of megabytes at C48. The dofmaps beside it are
+    ``readonly``, cached once by address, and are asserted here so that a
+    change that gave everything the field role would fail rather than pass.
+    """
+    _, loop, _ = operator_target
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert "matrix_data, lfric_kokkos::Role::field," in code
+    assert "lfric_kokkos::Role::readwrite" not in code
+    for dofmap in ("map1", "map2"):
+        assert f"{dofmap}_data, lfric_kokkos::Role::readonly," in code
+
+
+def test_argument_roles_stage_a_columnwise_operator_per_call():
+    """A CMA operator's banded matrix keeps ``readwrite``; a field keeps
+    ``field``.
+
+    An LMA operator takes the field role because ``lfric_core`` claims its
+    local stencil from shared space. ``columnwise_operator_mod`` was not
+    changed with it: the banded matrix and its indexing dofmaps are ordinary
+    allocatables, so nothing may assume a device can reach them and each has
+    to be staged per call. ``LFRicKokkosTrans`` refuses a CMA kernel outright,
+    which is why the callback is exercised here directly rather than through a
+    capture.
+    """
+    psy, _ = get_invoke("20.1_cma_apply.f90", "lfric", dist_mem=False, idx=0)
+    invoke = psy.invokes.invoke_list[0]
+    invoke.setup_psy_layer_symbols()
+    builder = _ArgumentRoles(invoke.schedule.kernels()[0])
+    builder.generate()
+
+    roles = {builder._arglist[position]: role
+             for position, role in builder.roles.items()}
+    assert roles["cma_op1_cma_matrix"] == "readwrite"
+    assert roles["field_a_data"] == "field"
 
 
 def test_lfric_kokkos_trans_operator_dofmaps_keep_their_cell_index(
@@ -322,9 +368,9 @@ def test_lfric_kokkos_trans_accepts_two_operators(two_operator_target):
     _, loop, _ = two_operator_target
     code = LFRicKokkosTrans().apply(loop)
 
-    assert ("matrix_data, lfric_kokkos::Role::readwrite, "
+    assert ("matrix_data, lfric_kokkos::Role::field, "
             "ncell_3d, ndf1, ndf2);") in code
-    assert ("matrix2_data, lfric_kokkos::Role::readwrite, "
+    assert ("matrix2_data, lfric_kokkos::Role::field, "
             "ncell_3d_2, ndf1, ndf2);") in code
     assert code.count("const int cell = cell_1 + 1;") == 1
 

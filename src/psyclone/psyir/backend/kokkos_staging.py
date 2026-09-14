@@ -38,9 +38,10 @@ A generated region is handed raw pointers by the Fortran that calls it, and
 until now it wrapped each of them in an unmanaged ``Kokkos::View`` and ran.
 That is correct exactly when the storage behind the pointer is reachable from
 the execution space -- true on a CPU build, true on a GPU only for storage
-allocated in a space the device can read. LFRic field data is allocated in
-``SharedSpace``; a dofmap, a basis table, a quadrature weight, a stencil or
-colour map and an operator's local stencil are not.
+allocated in a space the device can read. LFRic field data and an LMA
+operator's local stencil are allocated in ``SharedSpace``; a dofmap, a basis
+table, a quadrature weight, a stencil or colour map and a columnwise
+operator's banded matrix are not.
 
 This module holds the text of the header the generated regions use to close
 that gap, ``lfric_kokkos_staging.hpp``, and the spellings the writer emits to
@@ -60,7 +61,8 @@ offers three modes:
 
 ``non-field``
     A ``field`` view is left unmanaged over the caller's pointer, because
-    LFRic field data is in ``SharedSpace``. A ``readonly`` array is copied
+    LFRic claims field data and an LMA operator's local stencil from
+    ``SharedSpace``. A ``readonly`` array is copied
     once and cached by ``(pointer, bytes)``, because a dofmap or a map is
     allocated once and immutable for the run. A ``readwrite`` array, and a
     ``transient`` one whose storage the PSy layer allocates and frees around
@@ -103,9 +105,9 @@ _HEADER_TEXT = r'''
 //
 //   none       an unmanaged View over the caller's pointer (the default)
 //   all        every array copied into and out of the execution space
-//   non-field  fields unmanaged (LFRic allocates them in SharedSpace),
-//              every other read-only array copied once and cached,
-//              a written non-field array staged per call
+//   non-field  fields and LMA operator stencils unmanaged (LFRic claims
+//              both from SharedSpace), every other read-only array copied
+//              once and cached, every other written array staged per call
 //
 // LFRIC_KOKKOS_STAGING_CACHE=0 disables the cache in non-field mode.
 //
@@ -134,11 +136,14 @@ namespace lfric_kokkos {
 // knows it. A C++ writer cannot tell these apart; the role is the answer
 // carried down from where the question could be answered.
 enum class Role {
-  field,      // field data: LFRic allocates it in SharedSpace
+  field,      // field data, and an LMA operator's local stencil: LFRic
+              // claims both from SharedSpace through one registry, so the
+              // caller's storage is what the region reads and writes
   readonly,   // dofmap, stencil or colour map, mesh property, module array:
               // read-only storage a long-lived LFRic object owns, so a copy
               // of it keyed by its address stays good for the run
-  readwrite,  // an operator's local stencil, caller-supplied scratch
+  readwrite,  // a columnwise operator's banded matrix, caller-supplied
+              // scratch: storage a region writes that is not in SharedSpace
   transient   // a basis or differential-basis table, quadrature weights:
               // read-only for the call and gone after the invoke that made
               // it, so its address says nothing about its contents and a
