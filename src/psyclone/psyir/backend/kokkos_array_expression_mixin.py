@@ -77,6 +77,7 @@ keeping its own account of it would keep a second list to hold in step.
 from psyclone.psyir.backend.kokkos_array_expression import (
     KokkosArrayExpression, KokkosScratch)
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.backend.kokkos_team_scalars import live_after
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, BinaryOperation, Range,
@@ -386,6 +387,15 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
         parameter is legal C++, and the generated code is not compiled with
         ``-Wshadow``.
 
+        Fortran leaves a ``DO`` variable defined after the loop, at the
+        value the next iteration would have taken -- one past the stop, or
+        the start where the loop ran no iteration -- and a kernel may read
+        it there: the horizontal FFSL kernels index the central cell of a
+        stencil with the counter their loop over the left-hand cells left at
+        zero (2026-09-13). The lambda's parameter leaves the region-scope
+        variable untouched, so where the loop's exit value is live the
+        variable is assigned it after the barrier, by every member alike.
+
         :param node: the loop in the captured body.
         :type node: :py:class:`psyclone.psyir.nodes.Loop`
 
@@ -406,12 +416,17 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
         body = "".join(self._visit(child) for child in node.loop_body)
         self._depth -= 1
         self._parallel_depth -= 1
+        exit_value = ""
+        if node.variable.name in live_after(node, self._schedule):
+            exit_value = (
+                f"{self._nindent}{node.variable.name} = "
+                f"Kokkos::max({start}, {stop} + 1);\n")
         return (
             f"{self._nindent}Kokkos::parallel_for("
             f"Kokkos::TeamVectorRange(team, {start}, {stop} + 1),\n"
             f"{self._nindent}    [&](const int {node.variable.name}) {{\n"
             f"{declarations}{body}{self._nindent}}});\n"
-            f"{self._nindent}team.team_barrier();\n")
+            f"{self._nindent}team.team_barrier();\n{exit_value}")
 
     def _atomic_update(self, node, lowered):
         """Return the atomic call this assignment needs, if it needs one.

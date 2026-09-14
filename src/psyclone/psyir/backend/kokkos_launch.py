@@ -113,8 +113,55 @@ def launch_offsets(region):
             f"({region.cell_count} - {region.cell_start})")
 
 
+def global_scratch_names(region):
+    """Return the names of the scratch arrays an alias handle may be aimed at.
+
+    These are placed in level-1 team scratch -- global memory -- rather than
+    in level 0, which the CUDA backend puts in shared memory. The reason is
+    a code-generation defect met on 2026-09-14 (phase 7, task B6b): an
+    ``AnonymousSpace`` handle aimed at a shared-memory scratch array in one
+    branch and at a global argument View in the other is a pointer the
+    compiler has to keep generic, and ``nvcc`` 13.3 does not. It infers
+    "shared" for the merged pointer, converts the global pointer with
+    ``cvta.to.shared`` and reads through ``ld.shared``, so the branch that
+    aims the handle at the argument reads a garbage shared-memory offset
+    (``ffsl_flux_z_nirvana``, ``field_ptr`` under ``log_space``; a
+    sixty-line Kokkos kernel reproduces it). With every target of a handle
+    in global memory the merged pointer is generic on both sides and the
+    defect has nothing to specialise. The cost is one column of global
+    memory per team for those arrays alone; every other scratch array stays
+    in shared memory.
+
+    Only scratch arrays are returned: an alias target that is an argument
+    View is already in global memory and needs no moving.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the names of the scratch arrays some alias names as a target.
+    :rtype: Set[str]
+    """
+    targets = {name for alias in region.aliases for name in alias.targets}
+    return {item.name for item in region.scratch if item.name in targets}
+
+
+def _scratch_level(region, item):
+    """Return the scratch level a scratch array is placed in, as text.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    :param item: the scratch array.
+    :type item: :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`
+
+    :returns: ``"1"`` for an alias target (see
+        :py:func:`global_scratch_names`), ``"0"`` otherwise.
+    :rtype: str
+    """
+    return "1" if item.name in global_scratch_names(region) else "0"
+
+
 def _scratch_text(region, allocation, indent):
-    """Return the three pieces of C++ a region's scratch arrays generate.
+    """Return the four pieces of C++ a region's scratch arrays generate.
 
     The two team launches place scratch differently -- one array per rank in
     the flat shape, one per team in the hierarchical one -- but the aliases
@@ -125,29 +172,69 @@ def _scratch_text(region, allocation, indent):
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     :param allocation: the member function the Views are constructed over,
-        ``team.thread_scratch(0)`` or ``team.team_scratch(0)``.
+        ``team.thread_scratch(0)`` or ``team.team_scratch(0)``; the level in
+        it is rewritten to ``1`` for the arrays
+        :py:func:`global_scratch_names` places in global memory.
     :type allocation: str
     :param indent: the leading whitespace of each construction, which differs
         because the flat shape nests its body one level deeper.
     :type indent: str
 
-    :returns: the type aliases, the ``shmem_size`` sum, and the View
-        constructions.
-    :rtype: Tuple[str, str, str]
+    :returns: the type aliases, the level-0 ``shmem_size`` sum (``0`` where
+        every array moved to level 1), the level-1 sum (empty where none
+        did), and the View constructions.
+    :rtype: Tuple[str, str, str, str]
     """
     aliases = "".join(
         f"  using {item.name}_scratch_t = Kokkos::View<{item.c_type}"
         f"{'*' * len(item.extents)}, Kokkos::LayoutLeft, ScratchSpace, "
         "Unmanaged>;\n"
         for item in region.scratch)
-    sizes = "\n      + ".join(
-        f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})"
-        for item in region.scratch)
+    by_level = {"0": [], "1": []}
+    for item in region.scratch:
+        by_level[_scratch_level(region, item)].append(
+            f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})")
+    sizes = "\n      + ".join(by_level["0"]) or "0"
+    sizes_global = "\n      + ".join(by_level["1"])
     constructions = "".join(
         f"{indent}{item.name}_scratch_t {item.name}("
-        f"{allocation}, {', '.join(item.extents)});\n"
+        f"{allocation.replace('(0)', f'({_scratch_level(region, item)})')}, "
+        f"{', '.join(item.extents)});\n"
         for item in region.scratch)
-    return aliases, sizes, constructions
+    return aliases, sizes, sizes_global, constructions
+
+
+def global_scratch_size(sizes_global):
+    """Return the level-1 size computation, or nothing where none is needed.
+
+    :param str sizes_global: the level-1 ``shmem_size`` sum from
+        :py:func:`_scratch_text`, empty where no array moved.
+
+    :returns: the comment and the ``scratch_bytes_1`` computation.
+    :rtype: str
+    """
+    if not sizes_global:
+        return ""
+    return (
+        "  // The arrays below are targets of an alias handle and live in\n"
+        "  // level-1 (global) team scratch: a handle aimed at shared memory\n"
+        "  // in one branch and at a global View in the other is a pointer\n"
+        "  // nvcc 13.3 wrongly specialises to shared memory.\n"
+        f"  const size_t scratch_bytes_1 = {sizes_global};\n")
+
+
+def global_scratch_policy(sizes_global, per):
+    """Return the level-1 request to append to a ``TeamPolicy``.
+
+    :param str sizes_global: the level-1 sum, empty where no array moved.
+    :param str per: ``PerThread`` or ``PerTeam``, matching the launch.
+
+    :returns: the ``.set_scratch_size(1, ...)`` text, or nothing.
+    :rtype: str
+    """
+    if not sizes_global:
+        return ""
+    return f"\n          .set_scratch_size(1, Kokkos::{per}(scratch_bytes_1))"
 
 
 def scratch_guard(region):
@@ -272,13 +359,15 @@ def team_launch(region, local_declarations, body):
         ``parallel_for``.
     :rtype: str
     """
-    aliases, sizes, constructions = _scratch_text(
+    aliases, sizes, sizes_global, constructions = _scratch_text(
         region, "team.thread_scratch(0)", "      ")
     _, offset, span = launch_offsets(region)
+    level_one = global_scratch_policy(sizes_global, "PerThread")
     return (
         f"{aliases}\n"
         f"{scratch_guard(region)}"
-        f"  const size_t scratch_bytes = {sizes};\n\n"
+        f"  const size_t scratch_bytes = {sizes};\n"
+        f"{global_scratch_size(sizes_global)}\n"
         "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
         "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
         "team.team_size()),\n"
@@ -296,7 +385,8 @@ def team_launch(region, local_declarations, body):
         "    });\n"
         "  };\n\n"
         "  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)\n"
-        "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes));\n"
+        "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes))"
+        f"{level_one};\n"
         "  const int team_size = probe.team_size_recommended(body, "
         "Kokkos::ParallelForTag());\n"
         f"  const int league_size = ({span} + team_size - 1)"
@@ -304,7 +394,7 @@ def team_launch(region, local_declarations, body):
         f'  Kokkos::parallel_for("{region.name}",\n'
         "      TeamPolicy(league_size, team_size)\n"
         "          .set_scratch_size(0, "
-        "Kokkos::PerThread(scratch_bytes)),\n"
+        f"Kokkos::PerThread(scratch_bytes)){level_one},\n"
         "      body);\n")
 
 
@@ -349,11 +439,12 @@ def hierarchical_launch(region, local_declarations, body):
         ``parallel_for`` over one team per cell.
     :rtype: str
     """
-    aliases, sizes, constructions = _scratch_text(
+    aliases, sizes, sizes_global, constructions = _scratch_text(
         region, "team.team_scratch(0)", "    ")
     preamble = (
         f"{aliases}\n{scratch_guard(region)}"
-        f"  const size_t scratch_bytes = {sizes};\n\n"
+        f"  const size_t scratch_bytes = {sizes};\n"
+        f"{global_scratch_size(sizes_global)}\n"
         if region.scratch else "")
     team_size = (
         "Kokkos::AUTO" if region.team_size is None
@@ -361,6 +452,7 @@ def hierarchical_launch(region, local_declarations, body):
     _, offset, span = launch_offsets(region)
     policy = f"TeamPolicy({span}, {team_size})" + (
         "\n          .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))"
+        + global_scratch_policy(sizes_global, "PerTeam")
         if region.scratch else "")
     return (
         f"{preamble}"

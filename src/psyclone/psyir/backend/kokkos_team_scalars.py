@@ -202,7 +202,7 @@ def _flow(statements) -> tuple:
     return written, exposed
 
 
-def _live_after(loop, schedule) -> set:
+def live_after(loop, schedule) -> set:
     """Return the names read after a loop before anything writes them.
 
     Everything that runs once the loop is over, walked outwards from the loop
@@ -336,7 +336,7 @@ def team_private_scalars(region) -> tuple:
     for loop in region.parallel_loops:
         body = loop.loop_body.children
         exposed = _flow(body)[1]
-        live = _live_after(loop, region.schedule)
+        live = live_after(loop, region.schedule)
         # Only what this loop writes. A name it merely reads belongs to
         # whatever wrote it -- the team body, or a loop this one is nested
         # inside -- and declaring it here would shadow that with an

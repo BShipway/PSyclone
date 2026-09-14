@@ -455,7 +455,18 @@ class ArrayMixin(metaclass=abc.ABCMeta):
         else:
             declaration_bound = datatype.shape[index].lower
 
-        # Do the bounds match?
+        # Do the bounds match? Two integer literals are compared as the
+        # integers they are: the symbolic comparison below writes both
+        # sides out for SymPy and parses them back, and an access such as
+        # `map(1)` against a declaration from one was half of the time
+        # inlining a kernel with thirty helper calls took (2026-09-13).
+        if (isinstance(declaration_bound, Literal)
+                and isinstance(access_bound, Literal)
+                and declaration_bound.datatype.intrinsic
+                == ScalarType.Intrinsic.INTEGER
+                and access_bound.datatype.intrinsic
+                == ScalarType.Intrinsic.INTEGER):
+            return int(declaration_bound.value) == int(access_bound.value)
         sym_maths = SymbolicMaths.get()
         return sym_maths.equal(declaration_bound, access_bound)
 

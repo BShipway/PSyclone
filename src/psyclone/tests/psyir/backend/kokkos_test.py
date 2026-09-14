@@ -23,8 +23,8 @@ from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
-    Assignment, CodeBlock, IntrinsicCall, KernelSchedule, Literal, Loop,
-    Reference, Routine)
+    ArrayReference, Assignment, CodeBlock, IntrinsicCall, KernelSchedule,
+    Literal, Loop, Range, Reference, Routine)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ArrayType, DataSymbol, ScalarType)
 
@@ -458,6 +458,61 @@ def _level_region(**overrides):
         scratch=(),
         parallel_loops=(schedule.walk(Loop)[0],))
     return replace(region, **overrides) if overrides else region
+
+
+def _exit_value_schedule():
+    """Create a body that reads a level loop's counter after the loop.
+
+    Fortran leaves the ``DO`` variable one past the stop, and the horizontal
+    FFSL kernels index the central cell of a stencil with a counter their
+    loop over the left-hand cells left at zero (2026-09-13).
+    """
+    source = """
+subroutine inject_code(nlayers, y, x, ndf, undf, map)
+  use constants_mod, only: r_double, i_def
+  integer(kind=i_def), intent(in) :: nlayers, ndf, undf
+  real(kind=r_double), dimension(undf), intent(inout) :: y
+  real(kind=r_double), dimension(undf), intent(in) :: x
+  integer(kind=i_def), dimension(ndf), intent(in) :: map
+  integer(kind=i_def) :: k
+  do k = 1, nlayers - 1
+    y(map(1) + k - 1) = x(map(1) + k - 1)
+  end do
+  y(map(1) + k - 1) = x(map(1) + nlayers)
+end subroutine inject_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "inject_code", symbol_table=symbol_table, children=children)
+
+
+def test_kokkos_writer_gives_a_spread_loop_its_exit_value_where_read():
+    """A counter read after its spread loop is set to what Fortran leaves.
+
+    The lambda's parameter is the members' own and the region-scope
+    variable is never written by the loop, so a statement after it would
+    read an uninitialised integer and index with it -- which segfaulted the
+    panel-remap region on 2026-09-13. After the barrier the variable is
+    assigned one past the stop, or the start where the loop ran no
+    iteration, which is what Fortran defines it as.
+    """
+    schedule = _exit_value_schedule()
+    code = KokkosWriter()(_level_region(
+        schedule=schedule, parallel_loops=(schedule.walk(Loop)[0],)))
+
+    assert "team.team_barrier();\n" in code
+    assert "k = Kokkos::max(1, (nlayers - 1) + 1);" in code
+    assert code.index("team.team_barrier();") < code.index("k = Kokkos::max(")
+
+
+def test_kokkos_writer_gives_no_exit_value_where_the_counter_is_dead():
+    """A counter nothing reads after the loop is left alone."""
+    code = KokkosWriter()(_level_region())
+
+    assert "Kokkos::max(1, nlayers + 1)" not in code
+    assert "k = Kokkos::max(" not in code
 
 
 def test_kokkos_writer_places_locals_in_team_scratch():
@@ -3944,13 +3999,17 @@ def test_kokkos_writer_rejects_a_first_cell_that_is_not_an_argument():
             in str(error.value))
 
 
-def _alias_schedule(write_through=False):
+def _alias_schedule(write_through=False, aim=None):
     """Create a scratch body choosing between its two arrays by a pointer.
 
     :param bool write_through: whether the body's last sweep writes through
         the pointer rather than reading through it. The Fortran is a program
         error where a target is read-only, and is what the writer's refusal
         of that pairing is checked against.
+    :param aim: what to aim the pointer at in the first branch instead of
+        the whole ``tri_plus_new``: a section, once a callee is inlined
+        against a section actual.
+    :type aim: Optional[str]
 
     ``_scratch_schedule``'s two sweeps with a choice between them, which is
     the shape LFRic's vertical-support helpers have once inlined: the columns
@@ -3987,6 +4046,9 @@ end subroutine tri_solve_code
         source = source.replace(
             "    y(map(1) + k - 1) = chosen(k)\n",
             "    chosen(k) = y(map(1) + k - 1)\n")
+    if aim is not None:
+        source = source.replace(
+            "    chosen => tri_plus_new\n", f"    chosen => {aim}\n")
     routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
     symbol_table = routine.symbol_table.detach()
     children = [child.detach() for child in routine.children[:]]
@@ -4042,6 +4104,75 @@ def test_kokkos_alias_is_declared_and_assigned_as_a_handle():
     assert code.count("shmem_size") == 2
 
 
+def test_kokkos_alias_aimed_at_a_section_is_a_subview():
+    """A pointer aimed at a rank-1 section becomes a ``Kokkos::subview``.
+
+    A handle copy of the whole array would say nothing of the section and
+    read from its first element -- the first column, in the vertical FFSL
+    regions that met this (2026-09-13). The subview takes the section's
+    bounds with the target's origin removed and its end made exclusive, so
+    that element ``0`` of the handle is the section's first and the reads
+    through it keep the origin the alias copied from its target.
+    """
+    code = KokkosWriter()(_alias_region(
+        schedule=_alias_schedule(aim="tri_plus_new(2:nlayers)")))
+
+    assert ("chosen = Kokkos::subview(tri_plus_new, "
+            "Kokkos::pair<int, int>((2 - 1), (nlayers - 1) + 1));") in code
+    assert "chosen = x_new;" in code
+    assert ("y((((map((1 - 1), cell) + k) - 1) - 1)) = chosen((k - 1));"
+            in code)
+
+
+def test_kokkos_writer_rejects_a_strided_section_alias():
+    """Every other element of a View is not a subview of it."""
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()(_alias_region(
+            schedule=_alias_schedule(aim="tri_plus_new(1:nlayers:2)")))
+    assert ("cannot aim the handle 'chosen' at 'tri_plus_new(::2)': "
+            "a strided section cannot be a subview") in str(error.value)
+
+
+def test_kokkos_writer_rejects_a_section_alias_of_two_ranks():
+    """A section of more than one rank is refused by the writer too."""
+    schedule = _alias_schedule()
+    plane = schedule.symbol_table.new_symbol(
+        "plane", symbol_type=DataSymbol,
+        datatype=ArrayType(ScalarType(ScalarType.Intrinsic.REAL, 8), [3, 3]))
+    assignment = [node for node in schedule.walk(Assignment)
+                  if node.is_pointer][0]
+    integer = ScalarType(ScalarType.Intrinsic.INTEGER,
+                         ScalarType.Precision.UNDEFINED)
+    one, two = Literal("1", integer), Literal("2", integer)
+    assignment.rhs.replace_with(ArrayReference.create(
+        plane, [Range.create(one.copy(), two.copy()),
+                Range.create(one.copy(), two.copy())]))
+
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()(_alias_region(schedule=schedule))
+    assert ("cannot aim the handle 'chosen' at 'plane(:2,:2)': "
+            "only a rank-1 section of the target can be a subview"
+            in str(error.value))
+
+
+def test_kokkos_writer_rejects_a_section_alias_of_an_undescribed_array():
+    """A section of an array the region did not describe has no View."""
+    schedule = _alias_schedule()
+    ghost = schedule.symbol_table.new_symbol(
+        "ghost", symbol_type=DataSymbol,
+        datatype=ArrayType(ScalarType(ScalarType.Intrinsic.REAL, 8), [3]))
+    assignment = [node for node in schedule.walk(Assignment)
+                  if node.is_pointer][0]
+    one = Literal("1", ScalarType(ScalarType.Intrinsic.INTEGER, 4))
+    two = Literal("2", ScalarType(ScalarType.Intrinsic.INTEGER, 4))
+    assignment.rhs.replace_with(ArrayReference.create(
+        ghost, [Range.create(one, two)]))
+
+    with pytest.raises(VisitorError) as error:
+        KokkosWriter()(_alias_region(schedule=schedule))
+    assert "Array 'ghost' has no Kokkos View description" in str(error.value)
+
+
 def test_kokkos_alias_is_declared_after_the_scratch_it_names():
     """The alias' declaration still follows the scratch constructions.
 
@@ -4079,6 +4210,85 @@ def test_kokkos_alias_spans_two_memory_spaces():
     assert ("Kokkos::View<double*, Kokkos::LayoutLeft, "
             "Kokkos::AnonymousSpace, Unmanaged> chosen;") in code
     assert "decltype" not in code
+
+
+def test_kokkos_alias_target_scratch_lives_in_global_level():
+    """A scratch array an alias may name is placed in level-1 scratch.
+
+    The workaround for the nvcc 13.3 defect met on 2026-09-14: a handle
+    aimed at a shared-memory scratch array in one branch and at a global
+    argument View in the other had its global pointer converted with
+    ``cvta.to.shared`` and read through ``ld.shared``. With the target in
+    level-1 (global) team scratch both branches hand the handle a generic
+    pointer and there is nothing to specialise. Here ``x_new`` is the only
+    scratch target of the alias -- ``y`` is an argument -- so ``x_new`` moves
+    and ``tri_plus_new`` stays in level 0, each with its own size sum, and
+    both the probe and the launch policy carry the second request.
+    """
+    code = KokkosWriter()(_alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("y", "x_new")),)))
+
+    assert "x_new_scratch_t x_new(team.thread_scratch(1), nlayers);" in code
+    assert ("tri_plus_new_scratch_t tri_plus_new(team.thread_scratch(0), "
+            "nlayers);") in code
+    assert ("const size_t scratch_bytes = "
+            "tri_plus_new_scratch_t::shmem_size(nlayers);") in code
+    assert ("const size_t scratch_bytes_1 = "
+            "x_new_scratch_t::shmem_size(nlayers);") in code
+    assert code.count(
+        ".set_scratch_size(1, Kokkos::PerThread(scratch_bytes_1))") == 2
+    # The type alias and the subscripts do not change with the level.
+    assert ("using x_new_scratch_t = Kokkos::View<double*, "
+            "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;") in code
+
+
+def test_kokkos_alias_with_every_scratch_targeted_leaves_level_zero_empty():
+    """Level 0 asks for nothing when every scratch array moved to level 1.
+
+    ``_alias_region`` aims its handle at both scratch arrays, so both move;
+    the level-0 sum is then written as ``0`` rather than as an empty
+    expression, and the level-1 sum carries both.
+    """
+    code = KokkosWriter()(_alias_region())
+
+    assert "const size_t scratch_bytes = 0;" in code
+    assert ("const size_t scratch_bytes_1 = "
+            "x_new_scratch_t::shmem_size(nlayers)\n"
+            "      + tri_plus_new_scratch_t::shmem_size(nlayers);") in code
+    assert "thread_scratch(0)" not in code
+    assert code.count("thread_scratch(1)") == 2
+
+
+def test_kokkos_region_without_alias_requests_no_global_scratch():
+    """No alias, no level-1 request: the text generated before is kept."""
+    code = KokkosWriter()(_scratch_region())
+
+    assert "scratch_bytes_1" not in code
+    assert "set_scratch_size(1" not in code
+    assert "thread_scratch(1)" not in code
+
+
+def test_kokkos_hierarchical_alias_target_uses_team_scratch_level_one():
+    """The per-team shape moves an alias target the same way, with PerTeam.
+
+    The same region as the flat test, with its first sweep spread over the
+    team so that the hierarchical launch is taken: the moved array is
+    constructed over ``team.team_scratch(1)`` and the policy carries a
+    ``PerTeam`` request for it beside the level-0 one.
+    """
+    region = _alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("y", "x_new")),))
+    region = replace(
+        region, parallel_loops=(region.schedule.walk(Loop)[0],))
+    code = KokkosWriter()(region)
+
+    assert "x_new_scratch_t x_new(team.team_scratch(1), nlayers);" in code
+    assert ("tri_plus_new_scratch_t tri_plus_new(team.team_scratch(0), "
+            "nlayers);") in code
+    assert (".set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))\n"
+            "          .set_scratch_size(1, Kokkos::PerTeam(scratch_bytes_1))"
+            ) in code
+    assert "thread_scratch" not in code
 
 
 def test_kokkos_alias_takes_the_constness_of_its_first_target():

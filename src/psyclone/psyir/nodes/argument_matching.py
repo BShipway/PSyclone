@@ -63,6 +63,20 @@ from psyclone.psyir.symbols import (
 )
 from psyclone.psyir.symbols.datatypes import ArrayType
 
+#: What :py:func:`_imported_initial_value` found, by (module name, constant
+#: name), a miss included. It is asked once per reference the inliner
+#: rewrites, and a miss is expensive: ``ModuleManager.get_module_info``
+#: compares the module's name against every file name it knows with
+#: ``difflib`` before giving up, and LFRic's kinds come from ``constants_mod``,
+#: which a build passes to ``--modman-file-ignore``. Inlining the FFSL
+#: transport helpers asked that question tens of thousands of times and the
+#: capture of one module ran for the better part of an hour (2026-09-13).
+#: A module's contents do not change within a run, so the answer is kept for
+#: as long as the run's ``ModuleManager`` is: the ``owner`` is that instance,
+#: and a new one -- which is how the test suite starts a fresh set of
+#: modules -- empties the table.
+_INITIAL_VALUES = {"owner": None, "values": {}}
+
 #: The score of a match that needed none of the relaxations below.
 EXACT_MATCH = 0
 #: The score of a match that needed one of them.
@@ -220,8 +234,52 @@ def _imported_initial_value(symbol: DataSymbol,
     '''
     if not symbol.is_import:
         return None
+    container_symbol = symbol.interface.container_symbol
+    values = _initial_values()
+    key = (container_symbol.name.lower(), symbol.name.lower())
+    if key in values:
+        return values[key]
+    value = _read_imported_initial_value(container_symbol, symbol, local_node)
+    values[key] = value
+    return value
+
+
+def _initial_values():
+    '''
+    :returns: the table of imported constants' values for the current
+        :py:class:`~psyclone.parse.module_manager.ModuleManager`, emptied
+        when that instance has changed since the table was last used.
+    :rtype: dict[tuple[str, str], Optional[DataNode]]
+
+    '''
+    # pylint: disable-next=import-outside-toplevel
+    from psyclone.parse.module_manager import ModuleManager
+    manager = ModuleManager.get()
+    if _INITIAL_VALUES["owner"] is not manager:
+        _INITIAL_VALUES["owner"] = manager
+        _INITIAL_VALUES["values"] = {}
+    return _INITIAL_VALUES["values"]
+
+
+def _read_imported_initial_value(container_symbol, symbol, local_node):
+    '''
+    Reads what a module defines a named constant as, through the frontend.
+
+    :param container_symbol: the module the constant is imported from.
+    :type container_symbol: :py:class:`psyclone.psyir.symbols.ContainerSymbol`
+    :param symbol: the named constant.
+    :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+    :param local_node: a node of the tree the call is in, whose file is
+        searched for the module before the search path is.
+    :type local_node: :py:class:`psyclone.psyir.nodes.Node`
+
+    :returns: the constant's initial value, or None if the module cannot be
+        read or does not define it.
+    :rtype: Optional[:py:class:`psyclone.psyir.nodes.DataNode`]
+
+    '''
     try:
-        container = symbol.interface.container_symbol.find_container_psyir(
+        container = container_symbol.find_container_psyir(
             local_node=local_node)
     # pylint: disable-next=broad-except
     except Exception:

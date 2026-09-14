@@ -11,6 +11,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_alias_mixin \
     import LFRicKokkosAliasMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_argument_mixin \
     import LFRicKokkosArgumentMixin
+from psyclone.domain.lfric.transformations.lfric_kokkos_bound_mixin import (
+    LFRicKokkosBoundMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_bounds_mixin import (
     LFRicKokkosBoundsMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
@@ -39,11 +41,11 @@ from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Thirteen mixins and Transformation, which is one contract split by subject
-# rather than fourteen layers of behaviour: every base but the last holds only
+# Fourteen mixins and Transformation, which is one contract split by subject
+# rather than fifteen layers of behaviour: every base but the last holds only
 # private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
-class LFRicKokkosTrans(LFRicKokkosAliasMixin,
+class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
                        LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
                        LFRicKokkosArgumentMixin, LFRicKokkosBoundsMixin,
                        LFRicKokkosCallMixin,
@@ -93,8 +95,9 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin,
         :param node: the loop that is to be captured as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
         :param options: a dictionary with options for transformations. The
-            three read here are ``"team_size"``, ``"atomics"`` and
-            ``"disjoint_writes"``; see :py:meth:`apply`.
+            four read here are ``"team_size"``, ``"atomics"``,
+            ``"disjoint_writes"`` and ``"bounded_locals"``; see
+            :py:meth:`apply`.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.validate`.
@@ -113,6 +116,10 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin,
         :raises TransformationError: if the ``"disjoint_writes"`` option
             contradicts the loop, the other option or the metadata, as
             ``LFRicKokkosWriteMixin._validate_disjoint_option`` states.
+        :raises TransformationError: if the ``"bounded_locals"`` option is
+            not a mapping of callee name to a mapping of dummy name to bound
+            name, or names a dummy or a bound that does not exist, as
+            ``LFRicKokkosBoundMixin`` states.
         """
         if not isinstance(node, LFRicLoop):
             raise TransformationError(
@@ -124,6 +131,7 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin,
         # consequence it had for the other option.
         self._validate_disjoint_option(node, options)
         self._validate_atomics_option(node, options)
+        self._bounded_locals(options)
         team_size = (options or {}).get(self._TEAM_SIZE_OPTION)
         if team_size is not None and (
                 isinstance(team_size, bool) or not isinstance(team_size, int)
@@ -142,7 +150,8 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin,
         # backend. The rewrite is made over a copy of the whole file, because
         # validate() must leave the schedule as it found it and because a
         # detached schedule has no Container for the callee to be found in.
-        schedule = self._inlined_copy(self._schedule(kernel))
+        schedule = self._inlined_copy(self._schedule(kernel), options)
+        self._validate_aliases(schedule)
         self._validate_body(schedule)
         self._validate_sections(schedule)
         # The formals are judged with every assumed shape already measured,
@@ -202,6 +211,13 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin,
         :param options: a dictionary with options for transformations.
             ``"team_size"`` sets the team the hierarchical launch asks for, as
             a positive integer; absent, the launch writes ``Kokkos::AUTO``.
+            ``"bounded_locals"`` maps a callee name to a mapping of dummy
+            name to the name, in the kernel's scope, of an upper bound for
+            every actual that dummy takes; the callee's locals that dummy
+            sizes are sized by the bound instead, which is what lets a helper
+            whose size the caller computes be inlined and its locals placed
+            in scratch. An assertion the caller makes, not one PSyclone
+            checks; see ``LFRicKokkosBoundMixin``.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.apply`.
@@ -218,7 +234,7 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin,
         self.validate(node, options=options, **kwargs)
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
-        self._inline_calls(schedule)
+        self._inline_calls(schedule, options)
         self._lower_allocations(schedule)
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)

@@ -177,6 +177,20 @@ _CONTINUOUS_READ_BACK_KERNEL = _CONTINUOUS_WRITE_KERNEL.replace(
     "*src(map_w3(1) + k)")
 
 
+# The claim: read a flag on a shared face, select the face if it is unclaimed,
+# store the flag. The store is a constant an atomic store carries, so the
+# store rules pass it; what races is the read, which sees the neighbour's
+# store or not depending on who ran first. 'sci_face_selector_kernel_mod'
+# has this shape, and its selection decides which cells compute each FFSL
+# flux face (2026-09-14).
+_CONTINUOUS_CLAIM_KERNEL = _CONTINUOUS_WRITE_KERNEL.replace(
+    "        flux(map_w2(df) + k) = 2.0_r_def*src(map_w3(1) + k)\n",
+    "        if (flux(map_w2(df) + k) == 0.0_r_def) then\n"
+    "          out(map_w3(1) + k) = src(map_w3(1) + k)\n"
+    "          flux(map_w2(df) + k) = 1.0_r_def\n"
+    "        end if\n")
+
+
 # The shared write in the shape GungHo writes it most often: 'matrix_vector',
 # an operator applied to a field and accumulated onto a continuous space. The
 # operator is what makes this different from 'inc_probe_kernel_mod' -- LFRic
@@ -462,6 +476,16 @@ def continuous_read_back_target_fixture(
     return _invoke(
         tmp_path, "flux_probe", _CONTINUOUS_WRITE_ALGORITHM,
         _CONTINUOUS_READ_BACK_KERNEL)
+
+
+@pytest.fixture(name="continuous_claim_target")
+# pylint: disable-next=unused-argument
+def continuous_claim_target_fixture(
+        tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel claims a shared dof by reading a flag."""
+    return _invoke(
+        tmp_path, "flux_probe", _CONTINUOUS_WRITE_ALGORITHM,
+        _CONTINUOUS_CLAIM_KERNEL)
 
 
 @pytest.fixture(name="shared_write_operator_target")

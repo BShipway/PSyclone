@@ -136,10 +136,15 @@ class LFRicKokkosInlineMixin:
     #: The most calls this will inline into one kernel body. A budget rather
     #: than a nesting depth, because the calls are inlined one at a time: a
     #: chain of helpers spends one of these per link, and a routine that calls
-    #: itself spends them all and is then refused by name. Eight is chosen to
-    #: be past any hand-written LFRic kernel's call chain and far short of
-    #: what would take a runaway rewrite out of memory.
-    _INLINE_LIMIT = 8
+    #: itself spends them all and is then refused by name. Eight was past any
+    #: hand-written LFRic kernel's call chain until the horizontal FFSL
+    #: transport could be inlined at all (phase 7, 2026-09-13): its kernel
+    #: calls three helpers at each of two sites and each of those calls four
+    #: to six more, some thirty inlinings in one body. Sixty-four is past
+    #: that with room, and still far short of what would take a runaway
+    #: rewrite out of memory; a callee that names itself is in any case
+    #: refused earlier, by KernelModuleInlineTrans, before the budget is spent.
+    _INLINE_LIMIT = 64
 
     #: The attributes a formal may carry and still be given its partial
     #: datatype by :py:meth:`_relax_target_arguments`. ``TARGET`` is the one
@@ -180,90 +185,6 @@ class LFRicKokkosInlineMixin:
         """
         return [call for call in schedule.walk(Call)
                 if not isinstance(call, IntrinsicCall)]
-
-    @classmethod
-    def _inline_calls(cls, schedule):
-        """Replace every call in ``schedule`` with the callee's statements.
-
-        The body is re-walked after each inlining rather than the calls being
-        collected once, because inlining rewrites the tree the collection was
-        taken from: a call the callee itself makes did not exist when the walk
-        ran, and a call sharing a statement with the one just inlined may have
-        been moved out of it.
-
-        Each callee is prepared before it is inlined: brought into the
-        Container the call is made from by :py:meth:`_module_inline`, then
-        relaxed by :py:meth:`_relax_target_arguments`, which gives a formal
-        declared ``TARGET`` the type the frontend parsed out of that
-        declaration, and then by
-        :py:meth:`~psyclone.domain.lfric.transformations.\
-lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`, which does the
-        same for a local ``POINTER`` that only ever aliases a whole array.
-        Then :py:meth:`_agree_on_imports` settles a name the two scopes
-        disagree about the origin of, one holding it as an import and the
-        other as a name some wildcard ``use`` was to supply. Last,
-        :py:meth:`_read_declarations` reads the declaration of an imported
-        name the frontend recorded the origin of and nothing else, so a later
-        pass that needs its type or its value has one.
-
-        :param schedule: the kernel schedule to rewrite in place.
-        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
-
-        :raises TransformationError: if a call cannot be inlined, in which
-            case the reason is the one PSyclone gives for it, followed by the
-            reason the callee was not brought into the Container first where
-            there is one. Anything
-            :py:class:`~psyclone.psyir.transformations.InlineTrans` raises is
-            a reason, not only what it refuses with: a name the frontend read
-            as a call may resolve to a datum, which PSyclone reports with a
-            :py:exc:`TypeError` from failing to specialise the symbol, and an
-            expression its machinery cannot handle surfaces as whatever that
-            machinery raises. A class other than ``TransformationError`` is
-            named in the message. This is what keeps ``validate`` raising only
-            ``TransformationError``, so a kernel the inliner cannot handle is
-            declined rather than aborting the caller.
-        :raises TransformationError: if a callee declares a pointer local
-            that is not an alias of whole arrays, by
-            :py:meth:`~psyclone.domain.lfric.transformations.\
-lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
-        :raises TransformationError: if calls are still left after
-            :py:attr:`_INLINE_LIMIT` of them have been inlined, which is what
-            a self-recursive callee looks like from here.
-        """
-        for _ in range(cls._INLINE_LIMIT):
-            pending = cls._pending_calls(schedule)
-            if not pending:
-                return
-            call = pending[0]
-            name = cls._callee_name(call)
-            refusal = cls._module_inline(call)
-            cls._relax_target_arguments(call)
-            cls._alias_locals(call)
-            cls._agree_on_imports(call)
-            cls._read_declarations(call)
-            try:
-                InlineTrans().apply(call)
-            # Every failure to inline is a refusal, whatever its class: see
-            # the docstring above.
-            except Exception as err:  # pylint: disable=broad-except
-                first = (f"; bringing it into the container was refused "
-                         f"first: {refusal}") if refusal else ""
-                # A TransformationError names itself in its own text; any
-                # other class is named here, so a reader is told what the
-                # inliner raised as well as what it said.
-                kind = ("" if isinstance(err, TransformationError)
-                        else f"{type(err).__name__}: ")
-                raise TransformationError(
-                    f"LFRicKokkosTrans cannot inline the call to '{name}' in "
-                    f"'{schedule.name}': {kind}{err}{first}") from err
-        names = ", ".join(sorted(
-            {cls._callee_name(call)
-             for call in cls._pending_calls(schedule)}))
-        raise TransformationError(
-            f"LFRicKokkosTrans inlined {cls._INLINE_LIMIT} calls into "
-            f"'{schedule.name}' and found the call to {names} still there: "
-            f"a routine that calls itself is never inlined away, and no "
-            f"kernel this is meant for calls that deeply.")
 
     @classmethod
     def _module_inline(cls, call):
@@ -646,15 +567,100 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
         module the ``ModuleManager`` caches is left as its file declares it
         and a later capture of another kernel meets it unchanged.
 
+        A third disagreement is between an import and a routine already
+        brought in. The horizontal FFSL kernels call a module-local helper
+        and a sibling module's helper in one body, and both call
+        ``fourth_order_horizontal_edge`` from
+        ``subgrid_horizontal_support_mod``: inlining the first brings that
+        routine into the kernel's Container,
+        and the second then arrives importing the same name, which the merge
+        answers by renaming the Container's routine through the wrong table
+        and raising ``ValueError`` (the survey of 2026-09-13). The callee's
+        calls are aimed at the routine the Container holds and the import
+        is taken out of its table, which is what the merge would have done
+        had it been able to: the two are one routine of one module.
+
         :param call: the call about to be inlined.
         :type call: :py:class:`psyclone.psyir.nodes.Call`
         """
         site = call.ancestor(Routine)
         if site is None:
             return
+        container = site.ancestor(Container)
+        cls._resolve_from_container(site, container)
         for callee in cls._local_callees(call):
+            cls._resolve_from_container(callee, container)
             cls._resolve_shared_names(site, callee.symbol_table)
             cls._resolve_shared_names(callee, site.symbol_table)
+            cls._prefer_local_routines(callee, container)
+
+    @classmethod
+    def _resolve_from_container(cls, routine, container):
+        """Give ``routine``'s unresolved names the Container's import of them.
+
+        A kernel and its module-local helper both read ``S`` through their
+        module's ``use reference_element_mod, only : ..., S``, and each
+        routine's own table holds the name unresolved; the merge refuses a
+        name "present but unresolved in both tables" (``hori_dep_dist_ffsl``,
+        2026-09-13). The Container the two sit in names the module, so the
+        name is imported from it in the routine's own table, which is the
+        ``use ..., only`` the copy the inliner takes will need anyway.
+
+        :param routine: the routine whose unresolved names are settled.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param container: the Container the routine sits in.
+        :type container: Optional[:py:class:`psyclone.psyir.nodes.Container`]
+        """
+        if container is None:
+            return
+        table = routine.symbol_table
+        for symbol in list(table.symbols):
+            if not symbol.is_unresolved:
+                continue
+            outer = container.symbol_table.lookup(
+                symbol.name, scope_limit=container, otherwise=None)
+            if outer is None or not outer.is_import:
+                continue
+            cls._import_by_name(
+                table, symbol, outer.interface.container_symbol.name)
+
+    @staticmethod
+    def _prefer_local_routines(callee, container):
+        """Aim ``callee``'s calls at routines ``container`` already holds.
+
+        Each name ``callee`` imports that ``container`` holds as a routine
+        of its own -- one an earlier inlining brought in -- has its calls
+        re-aimed at that routine and its import removed. An import the
+        callee uses in any other way is left, and the merge says what it
+        makes of it.
+
+        :param callee: the routine about to be inlined, as the call site
+            sees it.
+        :type callee: :py:class:`psyclone.psyir.nodes.Routine`
+        :param container: the Container the call is made from.
+        :type container: Optional[:py:class:`psyclone.psyir.nodes.Container`]
+        """
+        if container is None:
+            return
+        local_routines = {routine.name.lower()
+                          for routine in container.walk(Routine)}
+        table = callee.symbol_table
+        for imported in list(table.imported_symbols):
+            if imported.name.lower() not in local_routines:
+                continue
+            local = container.symbol_table.lookup(
+                imported.name, scope_limit=container, otherwise=None)
+            if local is None or local.is_import:
+                continue
+            for made in callee.walk(Call):
+                if (made.routine is not None
+                        and made.routine.symbol is imported):
+                    made.routine.symbol = local
+            try:
+                table.remove(imported)
+            except (NotImplementedError, ValueError, KeyError):
+                # A use the merge will have to judge for itself.
+                continue
 
     @classmethod
     def _resolve_shared_names(cls, routine, other):
@@ -973,7 +979,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
         return root.copy().walk(Routine)[index]
 
     @classmethod
-    def _inlined_copy(cls, schedule):
+    def _inlined_copy(cls, schedule, options=None):
         """Return a copy of ``schedule`` with its calls inlined.
 
         The copy is of the whole file the kernel was read from, not of the
@@ -984,6 +990,10 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
 
         :param schedule: the kernel schedule to predict the rewrite for.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param options: the transformation's options, handed to
+            :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin._inline_calls`.
+        :type options: Optional[Dict[str, Any]]
 
         :returns: the copied schedule, with every call inlined.
         :rtype: :py:class:`psyclone.psyir.nodes.Routine`
@@ -992,7 +1002,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals`.
             :py:meth:`_inline_calls`.
         """
         copy = cls._rooted_copy(schedule)
-        cls._inline_calls(copy)
+        cls._inline_calls(copy, options)
         return copy
 
 

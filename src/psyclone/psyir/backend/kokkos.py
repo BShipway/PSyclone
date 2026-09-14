@@ -33,8 +33,10 @@ from psyclone.psyir.backend.kokkos_team_scalars import (
 from psyclone.psyir.backend.kokkos_launch import (
     hierarchical_launch, range_launch, team_launch)
 from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
+from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
-    Assignment, CodeBlock, KernelSchedule, Literal, Loop, Reference)
+    ArrayReference, Assignment, CodeBlock, KernelSchedule, Literal, Loop,
+    Range, Reference)
 
 
 class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
@@ -138,6 +140,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             for alias in region.aliases})
         self._kind_types = dict(region.kind_types)
         self._parallel_loops = region.parallel_loops
+        self._schedule = region.schedule
 
         signature = ",\n    ".join(
             self._argument_declaration(argument)
@@ -330,8 +333,65 @@ KokkosArrayExpressionMixin.assignment_node` would first lower it into the
         :rtype: str
         """
         if node.is_pointer:
+            if isinstance(node.rhs, ArrayReference):
+                return self._alias_section_node(node)
             return f"{self._nindent}{node.lhs.name} = {node.rhs.name};\n"
         return super().assignment_node(node)
+
+    def _alias_section_node(self, node: Assignment) -> str:
+        """Aim a handle at a contiguous rank-1 section: a ``subview``.
+
+        A pointer that the callee aimed at a whole dummy is aimed, once the
+        callee is inlined against a section actual, at ``field(w3_idx:w3_idx
+        + nlayers - 1)``. Written as a handle copy of ``field`` that would
+        read the first column for every column and compile without a word
+        -- which is what the vertical FFSL regions did until 2026-09-13.
+        The section is a ``Kokkos::subview`` instead, whose element ``0`` is
+        the section's first, so the reads through the handle keep the
+        origin the alias copied from its target: one.
+
+        Only a rank-1 section with unit stride can be said this way; a
+        strided section is not a ``subview`` of a ``LayoutLeft`` View and a
+        higher rank one has no one origin to keep. Either is refused here
+        as the last line, the transformation having refused it first.
+
+        :param node: the pointer assignment whose right-hand side is a
+            section.
+
+        :returns: the subview assignment, indented for the body.
+
+        :raises VisitorError: if the section is not rank-1 with unit stride,
+            or its array has no View description.
+        """
+        target = node.rhs
+        indices = target.indices
+        if len(indices) != 1 or not isinstance(indices[0], Range):
+            raise VisitorError(
+                f"KokkosWriter cannot aim the handle '{node.lhs.name}' at "
+                f"'{target.debug_string()}': only a rank-1 section of the "
+                f"target can be a subview.")
+        section = indices[0]
+        if not (isinstance(section.step, Literal)
+                and section.step.value == "1"):
+            raise VisitorError(
+                f"KokkosWriter cannot aim the handle '{node.lhs.name}' at "
+                f"'{target.debug_string()}': a strided section cannot be a "
+                f"subview.")
+        try:
+            view = self._views[target.name]
+        except KeyError as err:
+            raise VisitorError(
+                f"Array '{target.name}' has no Kokkos View "
+                f"description.") from err
+        start = self._visit(section.start)
+        stop = self._visit(section.stop)
+        offset = view.index_offsets[0] if view.index_offsets else ""
+        if offset:
+            start = f"({start} - {offset})"
+            stop = f"({stop} - {offset})"
+        return (f"{self._nindent}{node.lhs.name} = Kokkos::subview("
+                f"{target.name}, Kokkos::pair<int, int>({start}, {stop} + 1));"
+                f"\n")
 
     def reference_node(self, node: Reference) -> str:
         """Emit a name, subscripting it where the region made it per-cell.
