@@ -4798,11 +4798,29 @@ shape that would silently drop it. That refusal is asked after the rules
 a cell-column launch would apply, so a body a cell launch could not take
 either is still refused for the reason it always was.
 
-**An LFRic builtin is refused by name.** ``setval_c`` and its kind are
-dof loops PSyclone generates the body of rather than reads from a kernel
-file, so there is no source to capture and none of the metadata this
-transformation reads from a kernel. Refusing them by name is what keeps
-the dof space open for the kernels that do have a file.
+**An LFRic built-in is captured as the dof kernel it is.** ``setval_c``,
+``inc_X_plus_Y``, ``real_to_real_X`` and the rest of
+:ref:`the built-ins <lfric-built-ins>` are dof loops PSyclone generates the
+body of rather than reads from a kernel file, so the transformation writes
+the kernel file LFRic never did: a schedule with one scalar formal per
+argument, at the kind the argument carries, whose single statement is the
+built-in's own lowering with each ``field_data(df)`` replaced by the formal
+standing for it (:py:class:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_builtin_mixin.LFRicKokkosBuiltinMixin`). From there the dof
+launch, the ABI, the staging roles and every rule above apply unchanged.
+The region is named for the built-in *and* the kinds of its arguments --
+``builtin_real_to_real_x_r_def_r_solver_kokkos`` -- because one built-in
+name covers every precision LFRic instantiates it at, and the generated
+types differ between them exactly as a kind-polymorphic kernel's specific
+procedures do. The formals are positional, ``arg1`` to ``argN``, so that
+every call site of one built-in at one set of kinds generates the same
+translation unit.
+
+A **reduction** built-in -- ``sum_X``, ``X_innerproduct_Y``, ``inc_max_aX``
+and their kind -- is still refused by name: it lowers to an accumulation
+into a scalar, for which the flat dof launch has no shape. The lowering is
+taken on a copy of the invoke, so validation leaves the PSy layer holding
+the built-in until the loop is replaced by the launch.
 
 **The kernel's cell argument is declared rather than passed.** LFRic gives
 a leading ``cell`` formal to exactly the kernels that take an operator,

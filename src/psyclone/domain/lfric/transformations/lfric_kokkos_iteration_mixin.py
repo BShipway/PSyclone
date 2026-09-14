@@ -74,7 +74,6 @@ is what lets a sibling ask for a launch bound without importing this module.
 """
 
 from psyclone.domain.lfric import LFRicConstants
-from psyclone.psyGen import BuiltIn
 from psyclone.psyir.transformations import TransformationError
 
 
@@ -287,35 +286,6 @@ class LFRicKokkosIterationMixin:
                 f"LFRicKokkosTrans does not support the "
                 f"'{node.upper_bound_name}' loop bound.")
 
-    @staticmethod
-    def _validate_builtin(node):
-        """Refuse a loop holding an LFRic builtin, by the builtin's name.
-
-        LFRic writes a builtin as a loop over dofs, so admitting the dof
-        iteration space reaches them and this rule is what stops it. A
-        builtin has no kernel file and no
-        :py:class:`~psyclone.psyir.nodes.KernelSchedule`: PSyclone lowers it
-        into the PSy layer itself. Every rule after this one asks a question
-        of that schedule, so without this the capture fails with an
-        ``AttributeError`` from inside the metadata checks rather than with a
-        refusal -- which the coverage survey would record as an error row and
-        a whole-model capture build would stop on.
-
-        Capturing a builtin is a capability of its own: what would be
-        generated is not a translation of a kernel file but of PSyclone's own
-        model of the operation.
-
-        :param node: the loop that is to be captured.
-        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
-
-        :raises TransformationError: if any kernel in the loop is a builtin.
-        """
-        for kernel in node.kernels():
-            if isinstance(kernel, BuiltIn):
-                raise TransformationError(
-                    f"LFRicKokkosTrans does not support the LFRic builtin "
-                    f"'{kernel.name}'.")
-
     @classmethod
     def _validate_dof_body(cls, node, schedule, parallel_loops):
         """Refuse a dof kernel asking for anything only a team can give.
@@ -378,8 +348,9 @@ class LFRicKokkosIterationMixin:
         :py:meth:`_validate_halo_depth`, called here in the order they have
         always been checked so that a loop failing more than one of them
         reports the same refusal as before.
-        :py:meth:`_validate_builtin` precedes both, because a builtin has no
-        kernel schedule for the rules after it to be asked of.
+        :py:meth:`LFRicKokkosBuiltinMixin._validate_builtin` precedes both,
+        because a reduction built-in has no body the rules after it could be
+        asked of.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`

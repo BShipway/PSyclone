@@ -885,7 +885,13 @@ it replaces iterated over the degrees of freedom of a function space rather
 than over cell columns, so the index is a position in each of the Views the
 region carries and reaches no dofmap. The shape has no team, so a dof region
 naming `scratch` or `parallel_loops` is rejected by `_validate` rather than
-launched over a shape that would drop them.
+launched over a shape that would drop them. An LFRic built-in reaches this
+shape as any coded dof kernel does: `LFRicKokkosBuiltinMixin`, in
+`domain/lfric/transformations/lfric_kokkos_builtin_mixin.py`, gives the
+built-in the kernel schedule it never had -- one positional scalar formal per
+argument and PSyclone's own lowering of the built-in as the body -- before
+the region is described, and nothing the back-end sees says which of the two
+a dof region came from.
 
 A region naming `cell_start` begins at that formal instead of at zero, which
 is what a Fortran loop over the halo cells alone needs. `launch_offsets` in

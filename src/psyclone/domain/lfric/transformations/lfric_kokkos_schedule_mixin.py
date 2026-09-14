@@ -104,7 +104,9 @@ class LFRicKokkosScheduleMixin:
         procedure of its generic interface, and the one to capture is the one
         Fortran would have resolved the call to. That question is
         :py:meth:`~psyclone.domain.lfric.LFRicKern.validate_kernel_code_args`'s
-        rather than this transformation's; see :py:meth:`_matches`.
+        rather than this transformation's; see :py:meth:`_matches`. A
+        built-in has no file and so no callee: its schedule is synthesised
+        by :py:meth:`LFRicKokkosBuiltinMixin._builtin_schedule`.
 
         :param kernel: the kernel the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.LFRicKern`
@@ -118,6 +120,10 @@ class LFRicKokkosScheduleMixin:
             algorithm layer passes, if more than one does, or if the matcher
             cannot model the kernel's metadata and so cannot answer at all.
         """
+        if cls._is_builtin(kernel):
+            # A built-in has no file for get_callees() to read; its schedule
+            # is written for it, see LFRicKokkosBuiltinMixin.
+            return cls._builtin_schedule(kernel)
         schedules = kernel.get_callees()
         if len(schedules) == 1:
             return schedules[0]
