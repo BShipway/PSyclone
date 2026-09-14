@@ -70,6 +70,14 @@ offers three modes:
     ``LFRIC_KOKKOS_STAGING_CACHE=0`` turns the cache off and copies on every
     call.
 
+What the header did is reported to stderr at ``Kokkos::finalize``: a line of
+totals, and then a line per role carrying that role's arrays, copies, bytes
+copied each way and allocations made and released. The split is the
+measurement any decision about staging rests on -- a total cannot say whether
+a run's copying is a dofmap copied once or a basis table copied on every
+call -- and ``psy-ir-aidev``'s ``bin/measure-timestep`` reads both lines into
+one row per run.
+
 The *role* -- which of those kinds an argument is -- is decided by the
 LFRic transformation that knows what the argument means, never here and never
 by the writer: a C++ writer sees a ``double *`` and cannot tell a field from a
@@ -111,6 +119,12 @@ _HEADER_TEXT = r'''
 //
 // LFRIC_KOKKOS_STAGING_CACHE=0 disables the cache in non-field mode.
 //
+// At Kokkos::finalize the header reports what it did on stderr: one line of
+// totals, then one line per role (staging_role=field, readonly, readwrite,
+// transient) carrying that role's arrays, copies, bytes each way and
+// allocations. A total cannot say which kind of argument the copying was
+// for, and the four roles are copied on entirely different schedules.
+//
 // stage() returns the View type it is given, so a launch body compiled
 // against one mode is the text it is compiled against in every other: only
 // the memory the View covers changes.
@@ -120,6 +134,7 @@ _HEADER_TEXT = r'''
 
 #include <Kokkos_Core.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -129,6 +144,7 @@ _HEADER_TEXT = r'''
 #include <mutex>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace lfric_kokkos {
 
@@ -149,6 +165,23 @@ enum class Role {
               // it, so its address says nothing about its contents and a
               // copy of it is taken afresh every call
 };
+
+// The roles in the order they are declared, so that a report reads in that
+// order however it is gathered.
+constexpr int role_count = 4;
+
+inline const char *role_name(Role role) {
+  switch (role) {
+  case Role::field:
+    return "field";
+  case Role::readonly:
+    return "readonly";
+  case Role::readwrite:
+    return "readwrite";
+  default:
+    return "transient";
+  }
+}
 
 enum class Mode { none, all, non_field };
 
@@ -204,31 +237,130 @@ inline bool caching() {
   return setting;
 }
 
+// The buffer pool, on unless LFRIC_KOKKOS_STAGING_POOL=0. A transient array
+// is copied afresh on every region call, so its buffer is allocated and
+// released on every call too: at C48 that is 136 allocations and 136
+// releases a timestep, nine tenths of every allocation the staging header
+// makes. The contents cannot be reused -- the address says nothing about
+// them -- but the *storage* can, so a released buffer is kept and handed to
+// the next argument of the same size instead of being given back to the
+// driver. Nothing about what is copied changes; only who owns the bytes.
+inline bool pooling() {
+  static const bool setting = []() {
+    const char *value = std::getenv("LFRIC_KOKKOS_STAGING_POOL");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+  }();
+  return setting;
+}
+
+// How much unused storage the pool may hold, in megabytes. A bound rather
+// than none because the pool keys on an exact byte count: a run meeting many
+// distinct sizes would otherwise keep a spare of each for ever. Past the
+// bound a released buffer goes back to the driver as it did before.
+inline std::size_t pool_limit() {
+  static const std::size_t bytes = []() {
+    const char *value = std::getenv("LFRIC_KOKKOS_STAGING_POOL_MB");
+    const long megabytes = value == nullptr ? 256 : std::atol(value);
+    return megabytes <= 0 ? std::size_t(0)
+                          : std::size_t(megabytes) * 1024 * 1024;
+  }();
+  return bytes;
+}
+
 // A device allocation and the handle that owns it. The owner is a
 // shared_ptr to a managed Kokkos::View: holding the View is what keeps the
 // allocation alive, and dropping the last owner is what frees it.
+struct State;
+
 struct Block {
   std::shared_ptr<void> owner;
   void *data = nullptr;
   std::size_t bytes = 0;
   int references = 0;
+  Role role = Role::readonly;
+  // Which memory space's pool this block belongs to, as the one thing about
+  // the space that survives the template it was allocated in: the release
+  // happens in release() or at finalise, where the value type and the space
+  // are no longer in hand.
+  void (*recycle)(State &, Block &) = nullptr;
 };
+
+// An allocation nobody is using: the owner whose lifetime is the
+// allocation's, and the address it covers. Held by exact byte count, so the
+// next argument of that size takes it instead of asking the driver.
+struct Spare {
+  std::shared_ptr<void> owner;
+  void *data = nullptr;
+};
+
+// Keyed by byte count alone, and not by element type: a Kokkos allocation is
+// aligned to at least the alignment of any scalar in every space this header
+// stages into -- CudaSpace goes through cudaMalloc, which gives 256 bytes;
+// HostSpace aligns to 64 -- so a buffer taken for doubles serves ints and the
+// other way about. What it may not do is serve a different *size*, which is
+// why the key is exact rather than a best fit.
+using Spares = std::map<std::size_t, std::vector<Spare>>;
 
 // Host pointer and byte count. The byte count is in the key so that two
 // arguments over the same base pointer with different lengths -- a field
 // vector's components, say -- are not mistaken for one another.
 using Key = std::pair<const void *, std::size_t>;
 
+// What staging did, kept once per role. Totals say how much copying a run
+// does; only the split by role says which kind of argument it is for, and
+// the four kinds are copied on entirely different schedules -- a field never,
+// a dofmap once for the run, a transient table on every call. Bytes are
+// counted beside calls because a call count says nothing about the bus, and
+// allocations beside bytes because an allocator call costs whatever its size.
+struct Counters {
+  std::size_t staged = 0;      // arrays staged for the duration of one call
+  std::size_t cached = 0;      // arrays copied once and kept for the run
+  std::size_t hits = 0;        // calls served from the cache
+  std::size_t shared = 0;      // calls served by another argument's staging
+  std::size_t copies_in = 0;
+  std::size_t copies_out = 0;
+  std::size_t bytes_in = 0;
+  std::size_t bytes_out = 0;
+  std::size_t allocations = 0;  // allocations made in the execution space
+  std::size_t frees = 0;        // those allocations given back to the driver
+  std::size_t reuses = 0;       // buffers taken from the pool instead
+  std::size_t recycled = 0;     // buffers returned to the pool instead
+};
+
 struct State {
   std::mutex lock;
   std::map<Key, Block> cache;  // read-only non-field, kept for the run
   std::map<Key, Block> live;   // staged for this region call
-  std::size_t staged = 0;
-  std::size_t cached = 0;
-  std::size_t hits = 0;
-  std::size_t shared = 0;
-  std::size_t copied_in = 0;
-  std::size_t copied_out = 0;
+  Counters role[role_count];
+  // One pool per memory space met, registered here when it is first used so
+  // that the finalize hook can empty every one of them before Kokkos goes.
+  std::vector<Spares *> pools;
+  std::size_t pool_bytes = 0;     // held unused in the pools
+  std::size_t pool_peak = 0;      // the most ever held
+  std::size_t pool_released = 0;  // pooled buffers given back at finalise
+
+  Counters &of(Role which) { return role[static_cast<int>(which)]; }
+
+  // The totals are the sum of the roles rather than a second set of
+  // counters: two tallies of one quantity can disagree, and one cannot.
+  Counters total() const {
+    Counters sum;
+    for (int index = 0; index < role_count; ++index) {
+      sum.staged += role[index].staged;
+      sum.cached += role[index].cached;
+      sum.hits += role[index].hits;
+      sum.shared += role[index].shared;
+      sum.copies_in += role[index].copies_in;
+      sum.copies_out += role[index].copies_out;
+      sum.bytes_in += role[index].bytes_in;
+      sum.bytes_out += role[index].bytes_out;
+      sum.allocations += role[index].allocations;
+      sum.frees += role[index].frees;
+      sum.reuses += role[index].reuses;
+      sum.recycled += role[index].recycled;
+    }
+    return sum;
+  }
 };
 
 inline void finish();
@@ -246,32 +378,140 @@ inline State &state() {
   return *singleton;
 }
 
+// The pool for one memory space. A function-local static, so a space that
+// is never staged into never has one, and registered with the State on
+// first use so that the finalize hook empties it while Kokkos is still up.
+template <typename Space>
+inline Spares &pool_of(State &current) {
+  static Spares *spares = [&current]() {
+    Spares *created = new Spares();
+    current.pools.push_back(created);
+    return created;
+  }();
+  return *spares;
+}
+
+// Put a block's allocation into its space's pool rather than give it back.
+// Bound to the space at allocation time and reached through Block::recycle.
+template <typename Space>
+inline void recycle_into(State &current, Block &block) {
+  Spares &spares = pool_of<Space>(current);
+  spares[block.bytes].push_back(Spare{block.owner, block.data});
+  current.pool_bytes += block.bytes;
+  current.pool_peak = std::max(current.pool_peak, current.pool_bytes);
+}
+
+// Release one block, counting it against the role that took it. With the
+// pool on, and room in it, "release" means putting the storage where the
+// next argument of that size will find it; otherwise the driver gets it
+// back. Every allocation this header makes leaves through here, so
+// allocations plus reuses equals frees plus recycles once nothing is live.
+inline void drop(State &current, Block &block, bool recycle = true) {
+  if (recycle && pooling() && block.owner && block.recycle != nullptr &&
+      current.pool_bytes + block.bytes <= pool_limit()) {
+    block.recycle(current, block);
+    current.of(block.role).recycled += 1;
+  } else {
+    current.of(block.role).frees += 1;
+  }
+  block.owner.reset();
+  block.data = nullptr;
+}
+
+inline void drop_all(State &current, std::map<Key, Block> &blocks,
+                     bool recycle = true) {
+  for (auto &entry : blocks) {
+    drop(current, entry.second, recycle);
+  }
+  blocks.clear();
+}
+
+// Give every pooled buffer back to the driver. Called from the finalize
+// hook, before Kokkos::finalize, because a View released after it is an
+// error Kokkos reports.
+inline void empty_pools(State &current) {
+  for (Spares *spares : current.pools) {
+    for (auto &entry : *spares) {
+      current.pool_released += entry.second.size();
+    }
+    spares->clear();
+  }
+  current.pool_bytes = 0;
+}
+
 inline void finish() {
   State &current = state();
   std::lock_guard<std::mutex> guard(current.lock);
-  if (current.staged + current.cached > 0) {
+  // Before the report, so that the frees it prints are all of them: what is
+  // still held at finalise was allocated and is about to be released. Not
+  // recycled -- there is nothing left to hand it to, and a buffer put in the
+  // pool here would only have to come out again below.
+  drop_all(current, current.cache, false);
+  drop_all(current, current.live, false);
+  empty_pools(current);
+  const Counters sum = current.total();
+  if (sum.staged + sum.cached > 0) {
     std::fprintf(stderr,
                  "lfric_kokkos: staging=%s staged=%zu cached=%zu hits=%zu "
                  "shared=%zu copies_in=%zu copies_out=%zu\n",
-                 mode_name(mode()), current.staged, current.cached,
-                 current.hits, current.shared, current.copied_in,
-                 current.copied_out);
+                 mode_name(mode()), sum.staged, sum.cached, sum.hits,
+                 sum.shared, sum.copies_in, sum.copies_out);
+    // One line per role, whether or not that role was met, so that a reader
+    // and a parser both find the same four rows in every run.
+    for (int index = 0; index < role_count; ++index) {
+      const Counters &counted = current.role[index];
+      std::fprintf(stderr,
+                   "lfric_kokkos: staging_role=%s staged=%zu cached=%zu "
+                   "hits=%zu shared=%zu copies_in=%zu copies_out=%zu "
+                   "bytes_in=%zu bytes_out=%zu allocs=%zu frees=%zu "
+                   "reuses=%zu recycled=%zu\n",
+                   role_name(static_cast<Role>(index)), counted.staged,
+                   counted.cached, counted.hits, counted.shared,
+                   counted.copies_in, counted.copies_out, counted.bytes_in,
+                   counted.bytes_out, counted.allocations, counted.frees,
+                   counted.reuses, counted.recycled);
+    }
+    // What the pool did, in one line: how often storage was handed on
+    // rather than allocated, and the most it held at once, which is what a
+    // reader worried about device memory wants to see.
+    std::fprintf(stderr,
+                 "lfric_kokkos: staging_pool=%s reuses=%zu recycled=%zu "
+                 "released=%zu peak_bytes=%zu\n",
+                 pooling() ? "on" : "off", sum.reuses, sum.recycled,
+                 current.pool_released, current.pool_peak);
   }
-  current.cache.clear();
-  current.live.clear();
 }
 
+// Storage for one staged array: a spare of exactly the right size if the
+// pool has one, and otherwise an allocation. The two are indistinguishable
+// afterwards -- the same bytes in the same space, uninitialised either way,
+// and about to be written by the copy-in that follows every call of this.
 template <typename Value, typename Space>
-inline Block allocate(std::size_t count) {
+inline Block allocate(State &current, std::size_t count, Role role) {
+  Block block;
+  block.bytes = count * sizeof(Value);
+  block.references = 1;
+  block.role = role;
+  block.recycle = &recycle_into<Space>;
+  if (pooling()) {
+    Spares &spares = pool_of<Space>(current);
+    auto found = spares.find(block.bytes);
+    if (found != spares.end() && !found->second.empty()) {
+      block.owner = found->second.back().owner;
+      block.data = found->second.back().data;
+      found->second.pop_back();
+      current.pool_bytes -= block.bytes;
+      current.of(role).reuses += 1;
+      return block;
+    }
+  }
   using Owner = Kokkos::View<Value *, Kokkos::LayoutLeft, Space>;
   auto owner = std::make_shared<Owner>(
       Kokkos::view_alloc(Kokkos::WithoutInitializing, "lfric_kokkos_staging"),
       count);
-  Block block;
   block.owner = owner;
   block.data = owner->data();
-  block.bytes = count * sizeof(Value);
-  block.references = 1;
+  current.of(role).allocations += 1;
   return block;
 }
 
@@ -320,16 +560,18 @@ inline ViewType stage(typename ViewType::value_type *pointer, Role role,
       mode() == Mode::non_field && role == Role::readonly && caching();
   State &current = state();
   std::lock_guard<std::mutex> guard(current.lock);
+  Counters &counted = current.of(role);
   if (cacheable) {
     auto found = current.cache.find(key);
     if (found == current.cache.end()) {
-      Block block = allocate<Value, Space>(count);
+      Block block = allocate<Value, Space>(current, count, role);
       copy_in<Value, Space>(block.data, pointer, count);
-      current.cached += 1;
-      current.copied_in += 1;
+      counted.cached += 1;
+      counted.copies_in += 1;
+      counted.bytes_in += block.bytes;
       found = current.cache.emplace(key, block).first;
     } else {
-      current.hits += 1;
+      counted.hits += 1;
     }
     return ViewType(static_cast<Pointer>(found->second.data), extents...);
   }
@@ -340,13 +582,14 @@ inline ViewType stage(typename ViewType::value_type *pointer, Role role,
   auto found = current.live.find(key);
   if (found != current.live.end()) {
     found->second.references += 1;
-    current.shared += 1;
+    counted.shared += 1;
     return ViewType(static_cast<Pointer>(found->second.data), extents...);
   }
-  Block block = allocate<Value, Space>(count);
+  Block block = allocate<Value, Space>(current, count, role);
   copy_in<Value, Space>(block.data, pointer, count);
-  current.staged += 1;
-  current.copied_in += 1;
+  counted.staged += 1;
+  counted.copies_in += 1;
+  counted.bytes_in += block.bytes;
   current.live.emplace(key, block);
   return ViewType(static_cast<Pointer>(block.data), extents...);
 }
@@ -377,7 +620,10 @@ inline void unstage(const ViewType &view,
   }
   copy_out<Value, Space>(const_cast<Value *>(pointer), found->second.data,
                          count);
-  current.copied_out += 1;
+  Counters &counted = current.of(found->second.role);
+  counted.copies_out += 1;
+  counted.bytes_out += found->second.bytes;
+  drop(current, found->second);
   current.live.erase(found);
 }
 
@@ -391,7 +637,7 @@ inline void release() {
   }
   State &current = state();
   std::lock_guard<std::mutex> guard(current.lock);
-  current.live.clear();
+  drop_all(current, current.live);
 }
 
 }  // namespace lfric_kokkos

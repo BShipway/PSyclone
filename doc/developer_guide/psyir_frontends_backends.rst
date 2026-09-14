@@ -646,6 +646,59 @@ copies every call instead of consulting that cache. An unrecognised value is
 `Kokkos::abort`ed rather than treated as `none`: a misspelt mode that fell
 back silently would be reported as a run in the mode it names.
 
+At `Kokkos::finalize` the header reports what it did on stderr. One line of
+totals::
+
+  lfric_kokkos: staging=non-field staged=… cached=… hits=… shared=…
+                copies_in=… copies_out=…
+
+and then one line per role, printed whether or not that role was met so that
+a reader and a parser find the same four rows in every run::
+
+  lfric_kokkos: staging_role=transient staged=… cached=… hits=… shared=…
+                copies_in=… copies_out=… bytes_in=… bytes_out=…
+                allocs=… frees=… reuses=… recycled=…
+
+and last one line for the buffer pool::
+
+  lfric_kokkos: staging_pool=on reuses=… recycled=… released=… peak_bytes=…
+
+The totals are summed from the four roles rather than counted a second time,
+so the two kinds of line cannot disagree. The split is what a decision about
+staging is made from: a total says how much copying a run does and cannot say
+which kind of argument it is for, and the four roles are copied on entirely
+different schedules -- a field never, a dofmap once for the run, a basis
+table on every call. `bytes_in` and `bytes_out` are counted beside the call
+counts because a count says nothing about the bus, and `allocs` and `frees`
+beside the bytes because an allocator call costs what it costs whatever its
+size: a role that copies few bytes may still dominate a run's allocator
+traffic. Every allocation the header makes is counted where it is made and
+released through one `drop`, so `allocs` plus `reuses` minus `frees` minus
+`recycled` is what the header still holds.
+
+That last distinction is what the pool is for. A `transient` array -- a basis
+table, a quadrature weight -- is copied afresh on every region call because
+its address says nothing about its contents, so its buffer is allocated and
+released on every call too. Measured on the LFRic gungho C48 configuration
+that is about nine allocations in ten that the header makes, for storage it
+released moments earlier, and `cudaFree` is not cheap: the driver
+synchronises on it. The contents cannot be reused, but the *storage* can, so
+`drop` puts a released buffer in a free list keyed by its exact byte count
+and `allocate` takes one from there in preference to asking the driver.
+Nothing about what is copied changes; only who owns the bytes between one
+call and the next. The key is exact rather than a best fit, and does not
+include the element type: a Kokkos allocation is aligned to at least the
+alignment of any scalar in every space the header stages into. There is one
+free list per memory space, and the finalize hook empties them all before
+`Kokkos::finalize`, for the same reason it empties the cache.
+
+`LFRIC_KOKKOS_STAGING_POOL=0` turns the pool off, which is how a run is timed
+both ways in one binary, and `LFRIC_KOKKOS_STAGING_POOL_MB` bounds what it may
+hold unused (256 MB by default). The bound matters because the key is exact:
+a run meeting many distinct sizes would otherwise keep a spare of every one
+of them for ever. Past the bound a released buffer goes back to the driver as
+it did before.
+
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that
 knows what an argument *is*: `field` for a field or field vector and for an

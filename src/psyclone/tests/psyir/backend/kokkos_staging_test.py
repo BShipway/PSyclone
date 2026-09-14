@@ -19,9 +19,9 @@ against.
 
 """
 
-import pytest
-
 from types import SimpleNamespace
+
+import pytest
 
 from psyclone.psyir.backend.kokkos import KokkosView
 from psyclone.psyir.backend.kokkos_staging import (
@@ -105,7 +105,88 @@ def test_kokkos_staging_header_releases_before_kokkos_finalises():
     text = header_text()
 
     assert "Kokkos::push_finalize_hook(" in text
-    assert "current.cache.clear();" in text
+    assert "drop_all(current, current.cache, false);" in text
+    assert "empty_pools(current);" in text
+
+
+def test_kokkos_staging_header_counts_every_role_separately():
+    """The finalise report splits what staging did by role.
+
+    Totals say how much copying a run did; only the split says which kind of
+    argument it was for, and that is the measurement any decision about
+    staging rests on. One line per role, printed whether or not the role was
+    met, so that a reader and a parser find the same four rows in every run.
+    """
+    text = header_text()
+
+    assert "struct Counters {" in text
+    assert "Counters role[role_count];" in text
+    assert "constexpr int role_count = 4;" in text
+    assert "staging_role=%s staged=%zu" in text
+    assert "bytes_in=%zu bytes_out=%zu allocs=%zu frees=%zu" in text
+    for role in ROLES:
+        assert f'return "{role}";' in text
+    # The totals are summed from the roles rather than counted a second
+    # time, so the two lines of the report cannot disagree.
+    assert "Counters total() const {" in text
+    assert "for (int index = 0; index < role_count; ++index) {" in text
+
+
+def test_kokkos_staging_header_counts_an_allocation_where_it_is_made():
+    """Every allocation and every release is counted against its role.
+
+    A block carries the role that took it so that the release -- which
+    happens in ``release()`` and at finalise, far from the ``stage()`` call
+    that asked for it -- is charged to the same role as the allocation.
+    Allocations minus frees is then what the header still holds.
+    """
+    text = header_text()
+
+    assert "Role role = Role::readonly;" in text
+    assert "current.of(role).allocations += 1;" in text
+    assert "current.of(block.role).frees += 1;" in text
+
+
+def test_kokkos_staging_header_pools_released_buffers():
+    """A released buffer is kept for the next argument of its size.
+
+    The measurement this answers is that a transient table is allocated and
+    released on every region call, so nine allocations in ten the header
+    makes are for storage it released moments earlier. The pool hands that
+    storage on instead. It is keyed by exact byte count, bounded, and can be
+    turned off from the environment so that a run can be timed either way.
+    """
+    text = header_text()
+
+    assert 'std::getenv("LFRIC_KOKKOS_STAGING_POOL")' in text
+    assert 'std::getenv("LFRIC_KOKKOS_STAGING_POOL_MB")' in text
+    assert "using Spares = std::map<std::size_t, std::vector<Spare>>;" in text
+    assert "current.of(role).reuses += 1;" in text
+    assert "current.of(block.role).recycled += 1;" in text
+    assert "staging_pool=%s reuses=%zu recycled=%zu" in text
+    # The bound is what stops a run meeting many distinct sizes from keeping
+    # a spare of every one of them for ever.
+    assert "current.pool_bytes + block.bytes <= pool_limit()" in text
+
+
+def test_kokkos_staging_header_empties_the_pool_before_kokkos_goes():
+    """Pooled buffers are released from the finalize hook, like the cache.
+
+    A pooled buffer is a live Kokkos allocation that no region is using: it
+    is held by the pool's ``shared_ptr``, and if that outlives
+    ``Kokkos::finalize`` the run ends with the error Kokkos reports for a
+    View released too late. The hook empties the pool for that reason, and
+    counts what it released so the report balances.
+    """
+    text = header_text()
+
+    assert "inline void empty_pools(State &current) {" in text
+    assert "current.pool_released += entry.second.size();" in text
+    # Finalise releases for real rather than recycling: there is nothing
+    # left for a recycled buffer to be handed to.
+    assert "inline void drop(State &current, Block &block, " \
+        "bool recycle = true) {" in text
+    assert "drop_all(current, current.live, false);" in text
 
 
 def test_kokkos_staging_role_of_reads_a_stated_role():
