@@ -148,15 +148,19 @@ class _ArgumentRoles(KernCallArgList):
 
     Three kinds are named here rather than left to be read off the access the
     kernel declares. A *field* is named because its storage is in a space the
-    device shares. An *operator* is named because its storage is not, and
-    because it is the one non-field array a model rewrites between region
-    calls: a kernel assembles it and a later kernel applies it, reading it.
-    Read off the access alone it would look like a dofmap -- read-only, so
-    immutable, so cacheable -- and the apply would go on reading the copy the
-    first call took while the assembly wrote new values to the storage behind
-    it. That is not a compile error and not a crash; it is a solver that
-    stops converging, which is what the whole-model gate saw before the role
-    was taken from the metadata rather than from the access.
+    device shares. An *LMA operator* is named for the same reason and carries
+    the same role: ``lfric_core`` claims a field's ``data`` and an operator's
+    ``local_stencil`` from one registry, on one default and behind one switch,
+    so an operator's stencil is in the space a field's data is in and a region
+    reads and writes it where it lies. Read off the access alone it would look
+    like a dofmap -- read-only, so immutable, so cacheable -- and an apply
+    would go on reading the copy the first call took while a later assembly
+    wrote new values to the storage behind it. That is not a compile error and
+    not a crash; it is a solver that stops converging, which is what the
+    whole-model gate saw before the role was taken from the metadata rather
+    than from the access. A *columnwise* operator is the exception: its matrix
+    and its dofmaps are ordinary allocatables, nothing may assume they are
+    device-reachable, and it keeps ``readwrite``.
 
     A *basis* or *differential basis* table and a rule's *quadrature weights*
     are named for the opposite reason. They are read-only for the call, and by
@@ -219,7 +223,13 @@ class _ArgumentRoles(KernCallArgList):
         self._record(before, "field")
 
     def operator(self, arg, var_accesses=None):
-        """Add an LMA operator, and record it as rewritten between calls.
+        """Add an LMA operator, and record where its stencil landed.
+
+        The ``field`` role, because an LMA operator's local stencil is in the
+        space a field's data is in: one registry claims both, on one default.
+        A region therefore works on the caller's storage and nothing is
+        copied around the call. The count the call also adds is a scalar,
+        which carries no View and so no role.
 
         :param arg: the operator to add.
         :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
@@ -230,10 +240,16 @@ class _ArgumentRoles(KernCallArgList):
         """
         before = len(self._psyir_arglist)
         super().operator(arg, var_accesses)
-        self._record(before, "readwrite")
+        self._record(before, "field")
 
     def cma_operator(self, arg, var_accesses=None):
-        """Add a columnwise operator, and record it the same way.
+        """Add a columnwise operator, and record it as staged per call.
+
+        Not the ``field`` role an LMA operator takes.
+        ``columnwise_operator_mod`` allocates the banded matrix and its
+        dofmaps the ordinary way, so none of them is device-reachable and
+        each has to be staged. The transformation refuses a CMA kernel
+        outright today; this keeps the answer right for the day it does not.
 
         :param arg: the operator to add.
         :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
@@ -523,15 +539,16 @@ class LFRicKokkosArgumentMixin:
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
         :param roles: the role of each formal the kernel's metadata names,
             as :py:meth:`_argument_lists` reports them: ``field`` for field
-            data, which LFRic allocates in a space a device shares and which
-            the staging header therefore leaves over the caller's pointer,
-            and ``readwrite`` for an operator, whose storage is not in that
-            space and which a model rewrites between calls. A formal absent
-            from the mapping is placed by what the kernel reads or writes it
-            as. ``None`` is a legitimate answer -- a kernel may take neither
-            kind -- but a field missing from it is only copied when it need
-            not be, while an operator missing from it is read from a copy
-            taken before the last kernel that assembled it.
+            data and for an LMA operator's local stencil, both of which LFRic
+            claims from a space a device shares and which the staging header
+            therefore leaves over the caller's pointer, and ``readwrite`` for
+            a columnwise operator, whose storage is allocated the ordinary
+            way. A formal absent from the mapping is placed by what the kernel
+            reads or writes it as. ``None`` is a legitimate answer -- a kernel
+            may take neither kind -- but a formal missing from it is staged
+            per call where it need not be, and an operator missing from it is
+            placed by its access: read-only, therefore cacheable, therefore
+            read from a copy taken before the last kernel that assembled it.
         :type roles: Optional[Mapping[str, str]]
 
         :returns: one description per generated C argument, in call order, up
@@ -557,10 +574,11 @@ class LFRicKokkosArgumentMixin:
             if not extents and not sliced:
                 arguments.append(KokkosScalar(symbol.name, c_type))
                 continue
-            # Field data is in a space the device shares; everything
-            # else -- a dofmap, a basis table, a weight, a map, an operator's
-            # local stencil -- is not, and is placed by whether the kernel
-            # writes it. The distinction is the whole of what the role says.
+            # Field data and an LMA operator's local stencil are in a space
+            # the device shares; everything else -- a dofmap, a basis table,
+            # a weight, a map, a columnwise operator's matrix -- is not, and
+            # is placed by whether the kernel writes it. The distinction is
+            # the whole of what the role says.
             role = (roles or {}).get(symbol.name)
             if role is None:
                 role = "readonly" if read_only else "readwrite"
