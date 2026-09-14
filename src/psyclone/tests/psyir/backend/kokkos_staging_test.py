@@ -19,9 +19,9 @@ against.
 
 """
 
-import pytest
-
 from types import SimpleNamespace
+
+import pytest
 
 from psyclone.psyir.backend.kokkos import KokkosView
 from psyclone.psyir.backend.kokkos_staging import (
@@ -105,7 +105,45 @@ def test_kokkos_staging_header_releases_before_kokkos_finalises():
     text = header_text()
 
     assert "Kokkos::push_finalize_hook(" in text
-    assert "current.cache.clear();" in text
+    assert "drop_all(current, current.cache);" in text
+
+
+def test_kokkos_staging_header_counts_every_role_separately():
+    """The finalise report splits what staging did by role.
+
+    Totals say how much copying a run did; only the split says which kind of
+    argument it was for, and that is the measurement any decision about
+    staging rests on. One line per role, printed whether or not the role was
+    met, so that a reader and a parser find the same four rows in every run.
+    """
+    text = header_text()
+
+    assert "struct Counters {" in text
+    assert "Counters role[role_count];" in text
+    assert "constexpr int role_count = 4;" in text
+    assert "staging_role=%s staged=%zu" in text
+    assert "bytes_in=%zu bytes_out=%zu allocs=%zu frees=%zu" in text
+    for role in ROLES:
+        assert f'return "{role}";' in text
+    # The totals are summed from the roles rather than counted a second
+    # time, so the two lines of the report cannot disagree.
+    assert "Counters total() const {" in text
+    assert "for (int index = 0; index < role_count; ++index) {" in text
+
+
+def test_kokkos_staging_header_counts_an_allocation_where_it_is_made():
+    """Every allocation and every release is counted against its role.
+
+    A block carries the role that took it so that the release -- which
+    happens in ``release()`` and at finalise, far from the ``stage()`` call
+    that asked for it -- is charged to the same role as the allocation.
+    Allocations minus frees is then what the header still holds.
+    """
+    text = header_text()
+
+    assert "Role role = Role::readonly;" in text
+    assert "current.of(role).allocations += 1;" in text
+    assert "current.of(block.role).frees += 1;" in text
 
 
 def test_kokkos_staging_role_of_reads_a_stated_role():

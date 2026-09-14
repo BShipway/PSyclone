@@ -70,6 +70,14 @@ offers three modes:
     ``LFRIC_KOKKOS_STAGING_CACHE=0`` turns the cache off and copies on every
     call.
 
+What the header did is reported to stderr at ``Kokkos::finalize``: a line of
+totals, and then a line per role carrying that role's arrays, copies, bytes
+copied each way and allocations made and released. The split is the
+measurement any decision about staging rests on -- a total cannot say whether
+a run's copying is a dofmap copied once or a basis table copied on every
+call -- and ``psy-ir-aidev``'s ``bin/measure-timestep`` reads both lines into
+one row per run.
+
 The *role* -- which of those kinds an argument is -- is decided by the
 LFRic transformation that knows what the argument means, never here and never
 by the writer: a C++ writer sees a ``double *`` and cannot tell a field from a
@@ -111,6 +119,12 @@ _HEADER_TEXT = r'''
 //
 // LFRIC_KOKKOS_STAGING_CACHE=0 disables the cache in non-field mode.
 //
+// At Kokkos::finalize the header reports what it did on stderr: one line of
+// totals, then one line per role (staging_role=field, readonly, readwrite,
+// transient) carrying that role's arrays, copies, bytes each way and
+// allocations. A total cannot say which kind of argument the copying was
+// for, and the four roles are copied on entirely different schedules.
+//
 // stage() returns the View type it is given, so a launch body compiled
 // against one mode is the text it is compiled against in every other: only
 // the memory the View covers changes.
@@ -149,6 +163,23 @@ enum class Role {
               // it, so its address says nothing about its contents and a
               // copy of it is taken afresh every call
 };
+
+// The roles in the order they are declared, so that a report reads in that
+// order however it is gathered.
+constexpr int role_count = 4;
+
+inline const char *role_name(Role role) {
+  switch (role) {
+  case Role::field:
+    return "field";
+  case Role::readonly:
+    return "readonly";
+  case Role::readwrite:
+    return "readwrite";
+  default:
+    return "transient";
+  }
+}
 
 enum class Mode { none, all, non_field };
 
@@ -212,6 +243,7 @@ struct Block {
   void *data = nullptr;
   std::size_t bytes = 0;
   int references = 0;
+  Role role = Role::readonly;
 };
 
 // Host pointer and byte count. The byte count is in the key so that two
@@ -219,16 +251,51 @@ struct Block {
 // vector's components, say -- are not mistaken for one another.
 using Key = std::pair<const void *, std::size_t>;
 
+// What staging did, kept once per role. Totals say how much copying a run
+// does; only the split by role says which kind of argument it is for, and
+// the four kinds are copied on entirely different schedules -- a field never,
+// a dofmap once for the run, a transient table on every call. Bytes are
+// counted beside calls because a call count says nothing about the bus, and
+// allocations beside bytes because an allocator call costs whatever its size.
+struct Counters {
+  std::size_t staged = 0;      // arrays staged for the duration of one call
+  std::size_t cached = 0;      // arrays copied once and kept for the run
+  std::size_t hits = 0;        // calls served from the cache
+  std::size_t shared = 0;      // calls served by another argument's staging
+  std::size_t copies_in = 0;
+  std::size_t copies_out = 0;
+  std::size_t bytes_in = 0;
+  std::size_t bytes_out = 0;
+  std::size_t allocations = 0;  // allocations made in the execution space
+  std::size_t frees = 0;        // those allocations released again
+};
+
 struct State {
   std::mutex lock;
   std::map<Key, Block> cache;  // read-only non-field, kept for the run
   std::map<Key, Block> live;   // staged for this region call
-  std::size_t staged = 0;
-  std::size_t cached = 0;
-  std::size_t hits = 0;
-  std::size_t shared = 0;
-  std::size_t copied_in = 0;
-  std::size_t copied_out = 0;
+  Counters role[role_count];
+
+  Counters &of(Role which) { return role[static_cast<int>(which)]; }
+
+  // The totals are the sum of the roles rather than a second set of
+  // counters: two tallies of one quantity can disagree, and one cannot.
+  Counters total() const {
+    Counters sum;
+    for (int index = 0; index < role_count; ++index) {
+      sum.staged += role[index].staged;
+      sum.cached += role[index].cached;
+      sum.hits += role[index].hits;
+      sum.shared += role[index].shared;
+      sum.copies_in += role[index].copies_in;
+      sum.copies_out += role[index].copies_out;
+      sum.bytes_in += role[index].bytes_in;
+      sum.bytes_out += role[index].bytes_out;
+      sum.allocations += role[index].allocations;
+      sum.frees += role[index].frees;
+    }
+    return sum;
+  }
 };
 
 inline void finish();
@@ -246,23 +313,54 @@ inline State &state() {
   return *singleton;
 }
 
+// Release one block's allocation, counting it against the role that took
+// it. Every allocation this header makes leaves through here, so allocations
+// minus frees is what it still holds.
+inline void drop(State &current, Block &block) {
+  current.of(block.role).frees += 1;
+  block.owner.reset();
+  block.data = nullptr;
+}
+
+inline void drop_all(State &current, std::map<Key, Block> &blocks) {
+  for (auto &entry : blocks) {
+    drop(current, entry.second);
+  }
+  blocks.clear();
+}
+
 inline void finish() {
   State &current = state();
   std::lock_guard<std::mutex> guard(current.lock);
-  if (current.staged + current.cached > 0) {
+  // Before the report, so that the frees it prints are all of them: what is
+  // still held at finalise was allocated and is about to be released.
+  drop_all(current, current.cache);
+  drop_all(current, current.live);
+  const Counters sum = current.total();
+  if (sum.staged + sum.cached > 0) {
     std::fprintf(stderr,
                  "lfric_kokkos: staging=%s staged=%zu cached=%zu hits=%zu "
                  "shared=%zu copies_in=%zu copies_out=%zu\n",
-                 mode_name(mode()), current.staged, current.cached,
-                 current.hits, current.shared, current.copied_in,
-                 current.copied_out);
+                 mode_name(mode()), sum.staged, sum.cached, sum.hits,
+                 sum.shared, sum.copies_in, sum.copies_out);
+    // One line per role, whether or not that role was met, so that a reader
+    // and a parser both find the same four rows in every run.
+    for (int index = 0; index < role_count; ++index) {
+      const Counters &counted = current.role[index];
+      std::fprintf(stderr,
+                   "lfric_kokkos: staging_role=%s staged=%zu cached=%zu "
+                   "hits=%zu shared=%zu copies_in=%zu copies_out=%zu "
+                   "bytes_in=%zu bytes_out=%zu allocs=%zu frees=%zu\n",
+                   role_name(static_cast<Role>(index)), counted.staged,
+                   counted.cached, counted.hits, counted.shared,
+                   counted.copies_in, counted.copies_out, counted.bytes_in,
+                   counted.bytes_out, counted.allocations, counted.frees);
+    }
   }
-  current.cache.clear();
-  current.live.clear();
 }
 
 template <typename Value, typename Space>
-inline Block allocate(std::size_t count) {
+inline Block allocate(State &current, std::size_t count, Role role) {
   using Owner = Kokkos::View<Value *, Kokkos::LayoutLeft, Space>;
   auto owner = std::make_shared<Owner>(
       Kokkos::view_alloc(Kokkos::WithoutInitializing, "lfric_kokkos_staging"),
@@ -272,6 +370,8 @@ inline Block allocate(std::size_t count) {
   block.data = owner->data();
   block.bytes = count * sizeof(Value);
   block.references = 1;
+  block.role = role;
+  current.of(role).allocations += 1;
   return block;
 }
 
@@ -320,16 +420,18 @@ inline ViewType stage(typename ViewType::value_type *pointer, Role role,
       mode() == Mode::non_field && role == Role::readonly && caching();
   State &current = state();
   std::lock_guard<std::mutex> guard(current.lock);
+  Counters &counted = current.of(role);
   if (cacheable) {
     auto found = current.cache.find(key);
     if (found == current.cache.end()) {
-      Block block = allocate<Value, Space>(count);
+      Block block = allocate<Value, Space>(current, count, role);
       copy_in<Value, Space>(block.data, pointer, count);
-      current.cached += 1;
-      current.copied_in += 1;
+      counted.cached += 1;
+      counted.copies_in += 1;
+      counted.bytes_in += block.bytes;
       found = current.cache.emplace(key, block).first;
     } else {
-      current.hits += 1;
+      counted.hits += 1;
     }
     return ViewType(static_cast<Pointer>(found->second.data), extents...);
   }
@@ -340,13 +442,14 @@ inline ViewType stage(typename ViewType::value_type *pointer, Role role,
   auto found = current.live.find(key);
   if (found != current.live.end()) {
     found->second.references += 1;
-    current.shared += 1;
+    counted.shared += 1;
     return ViewType(static_cast<Pointer>(found->second.data), extents...);
   }
-  Block block = allocate<Value, Space>(count);
+  Block block = allocate<Value, Space>(current, count, role);
   copy_in<Value, Space>(block.data, pointer, count);
-  current.staged += 1;
-  current.copied_in += 1;
+  counted.staged += 1;
+  counted.copies_in += 1;
+  counted.bytes_in += block.bytes;
   current.live.emplace(key, block);
   return ViewType(static_cast<Pointer>(block.data), extents...);
 }
@@ -377,7 +480,10 @@ inline void unstage(const ViewType &view,
   }
   copy_out<Value, Space>(const_cast<Value *>(pointer), found->second.data,
                          count);
-  current.copied_out += 1;
+  Counters &counted = current.of(found->second.role);
+  counted.copies_out += 1;
+  counted.bytes_out += found->second.bytes;
+  drop(current, found->second);
   current.live.erase(found);
 }
 
@@ -391,7 +497,7 @@ inline void release() {
   }
   State &current = state();
   std::lock_guard<std::mutex> guard(current.lock);
-  current.live.clear();
+  drop_all(current, current.live);
 }
 
 }  // namespace lfric_kokkos

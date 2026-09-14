@@ -643,6 +643,32 @@ copies every call instead of consulting that cache. An unrecognised value is
 `Kokkos::abort`ed rather than treated as `none`: a misspelt mode that fell
 back silently would be reported as a run in the mode it names.
 
+At `Kokkos::finalize` the header reports what it did on stderr. One line of
+totals::
+
+  lfric_kokkos: staging=non-field staged=… cached=… hits=… shared=…
+                copies_in=… copies_out=…
+
+and then one line per role, printed whether or not that role was met so that
+a reader and a parser find the same four rows in every run::
+
+  lfric_kokkos: staging_role=transient staged=… cached=… hits=… shared=…
+                copies_in=… copies_out=… bytes_in=… bytes_out=…
+                allocs=… frees=…
+
+The totals are summed from the four roles rather than counted a second time,
+so the two kinds of line cannot disagree. The split is what a decision about
+staging is made from: a total says how much copying a run does and cannot say
+which kind of argument it is for, and the four roles are copied on entirely
+different schedules -- a field never, a dofmap once for the run, a basis
+table on every call. `bytes_in` and `bytes_out` are counted beside the call
+counts because a count says nothing about the bus, and `allocs` and `frees`
+beside the bytes because an allocator call costs what it costs whatever its
+size: a role that copies few bytes may still dominate a run's allocator
+traffic. Every allocation the header makes is counted where it is made and
+released through one `drop`, so `allocs` minus `frees` is what the header
+still holds.
+
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that
 knows what an argument *is*: `field` for a field or field vector and for an
