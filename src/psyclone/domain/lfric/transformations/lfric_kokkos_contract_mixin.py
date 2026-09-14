@@ -244,6 +244,10 @@ class LFRicKokkosContractMixin:
         :raises TransformationError: if the kernel asks for a basis shape
             outside :py:attr:`_SUPPORTED_SHAPES`.
         """
+        if cls._is_builtin(kernel):
+            # A built-in takes fields and scalars and no basis, and has no
+            # metadata attribute to say so.
+            return
         for shape in kernel.eval_shapes:
             if shape not in cls._SUPPORTED_SHAPES:
                 raise TransformationError(

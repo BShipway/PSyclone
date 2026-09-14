@@ -15,6 +15,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_bound_mixin import (
     LFRicKokkosBoundMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_bounds_mixin import (
     LFRicKokkosBoundsMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_builtin_mixin import (
+    LFRicKokkosBuiltinMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_call_mixin import (
     LFRicKokkosCallMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_constants_mixin \
@@ -41,13 +43,14 @@ from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Fourteen mixins and Transformation, which is one contract split by subject
-# rather than fifteen layers of behaviour: every base but the last holds only
+# Fifteen mixins and Transformation, which is one contract split by subject
+# rather than sixteen layers of behaviour: every base but the last holds only
 # private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
 class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
-                       LFRicKokkosContractMixin, LFRicKokkosTypesMixin,
-                       LFRicKokkosArgumentMixin, LFRicKokkosBoundsMixin,
+                       LFRicKokkosBuiltinMixin, LFRicKokkosContractMixin,
+                       LFRicKokkosTypesMixin, LFRicKokkosArgumentMixin,
+                       LFRicKokkosBoundsMixin,
                        LFRicKokkosCallMixin,
                        LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,
                        LFRicKokkosInterfaceMixin,

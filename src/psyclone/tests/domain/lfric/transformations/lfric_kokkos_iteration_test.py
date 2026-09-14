@@ -75,10 +75,10 @@ def test_lfric_kokkos_trans_accepts_an_annexed_bound(
     launch's formal from a different member than a halo bound uses -- the
     field's function space rather than the mesh.
 
-    The loop this is asked of holds a builtin, which is refused by name and
-    for a reason of its own: it has no kernel file to capture. That is a rule
-    of its own and this test is about the bound, so the separation is
-    asserted rather than assumed.
+    The loop this is asked of holds a builtin, which since the builtin
+    capture is given a schedule of its own and captured as the dof kernel
+    it is; the bound reaches the launch as the count, as it does for a
+    coded dof kernel.
 
     Whether annexed dofs are computed is a configuration option, and the test
     configuration has it off; the model this prototype targets has it on, so
@@ -91,14 +91,15 @@ def test_lfric_kokkos_trans_accepts_an_annexed_bound(
     assert loop.upper_bound_name == "nannexed"
 
     LFRicKokkosTrans._validate_halo_depth(loop)
+    code = LFRicKokkosTrans().apply(loop)
 
+    assert "Kokkos::RangePolicy<>(0, ndofs)" in code
     fortran = str(psy.gen)
     assert ("loop0_stop = out_field_proxy%vspace%get_last_dof_annexed()"
             in fortran)
     assert "get_last_halo_cell" not in fortran
-
-    with pytest.raises(TransformationError, match="LFRic builtin"):
-        LFRicKokkosTrans().validate(loop)
+    assert ("call builtin_setval_x_r_def_kokkos(out_field_data, "
+            "in_field_data, loop0_stop)" in fortran)
 
 
 def test_lfric_kokkos_trans_accepts_a_runtime_halo_depth(
@@ -400,32 +401,6 @@ def test_lfric_kokkos_trans_accepts_a_halo_cell_column(
     assert "loop0_start = mesh%get_last_edge_cell() + 1" in fortran
     assert "loop0_stop = mesh%get_last_halo_cell(hdepth)" in fortran
     assert "loop0_stop, loop0_start - 1)" in fortran
-
-
-# pylint: disable-next=unused-argument
-def test_lfric_kokkos_trans_refuses_a_builtin(
-        tmp_path, clear_module_manager_instance):
-    """A builtin is refused by name, not by its iteration space.
-
-    LFRic writes a builtin as a loop over dofs, so widening the
-    iteration-space rule to admit dof loops reaches them. It must not: a
-    builtin has no kernel file and no kernel schedule to capture -- PSyclone
-    lowers it into the PSy layer itself -- so every rule below this one is
-    asked of something that is not there. Refusing it by name is what keeps
-    that from surfacing as an AttributeError, which the coverage survey would
-    record as an error row and a whole-model capture would crash on.
-
-    The survey excludes builtins from the catalogue by design, so no
-    catalogue row turns on this refusal.
-    """
-    _, loop, _ = _invoke(
-        tmp_path, "moist_dyn_gas", _BUILTIN_ALGORITHM, _KERNEL)
-
-    with pytest.raises(TransformationError) as error:
-        LFRicKokkosTrans().validate(loop)
-
-    assert ("LFRicKokkosTrans does not support the LFRic builtin "
-            "'setval_x'." in str(error.value))
 
 
 def test_lfric_kokkos_trans_refuses_an_unmodelled_iteration_space(target):
