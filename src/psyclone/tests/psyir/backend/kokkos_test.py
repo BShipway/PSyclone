@@ -4212,6 +4212,85 @@ def test_kokkos_alias_spans_two_memory_spaces():
     assert "decltype" not in code
 
 
+def test_kokkos_alias_target_scratch_lives_in_global_level():
+    """A scratch array an alias may name is placed in level-1 scratch.
+
+    The workaround for the nvcc 13.3 defect met on 2026-09-14: a handle
+    aimed at a shared-memory scratch array in one branch and at a global
+    argument View in the other had its global pointer converted with
+    ``cvta.to.shared`` and read through ``ld.shared``. With the target in
+    level-1 (global) team scratch both branches hand the handle a generic
+    pointer and there is nothing to specialise. Here ``x_new`` is the only
+    scratch target of the alias -- ``y`` is an argument -- so ``x_new`` moves
+    and ``tri_plus_new`` stays in level 0, each with its own size sum, and
+    both the probe and the launch policy carry the second request.
+    """
+    code = KokkosWriter()(_alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("y", "x_new")),)))
+
+    assert "x_new_scratch_t x_new(team.thread_scratch(1), nlayers);" in code
+    assert ("tri_plus_new_scratch_t tri_plus_new(team.thread_scratch(0), "
+            "nlayers);") in code
+    assert ("const size_t scratch_bytes = "
+            "tri_plus_new_scratch_t::shmem_size(nlayers);") in code
+    assert ("const size_t scratch_bytes_1 = "
+            "x_new_scratch_t::shmem_size(nlayers);") in code
+    assert code.count(
+        ".set_scratch_size(1, Kokkos::PerThread(scratch_bytes_1))") == 2
+    # The type alias and the subscripts do not change with the level.
+    assert ("using x_new_scratch_t = Kokkos::View<double*, "
+            "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;") in code
+
+
+def test_kokkos_alias_with_every_scratch_targeted_leaves_level_zero_empty():
+    """Level 0 asks for nothing when every scratch array moved to level 1.
+
+    ``_alias_region`` aims its handle at both scratch arrays, so both move;
+    the level-0 sum is then written as ``0`` rather than as an empty
+    expression, and the level-1 sum carries both.
+    """
+    code = KokkosWriter()(_alias_region())
+
+    assert "const size_t scratch_bytes = 0;" in code
+    assert ("const size_t scratch_bytes_1 = "
+            "x_new_scratch_t::shmem_size(nlayers)\n"
+            "      + tri_plus_new_scratch_t::shmem_size(nlayers);") in code
+    assert "thread_scratch(0)" not in code
+    assert code.count("thread_scratch(1)") == 2
+
+
+def test_kokkos_region_without_alias_requests_no_global_scratch():
+    """No alias, no level-1 request: the text generated before is kept."""
+    code = KokkosWriter()(_scratch_region())
+
+    assert "scratch_bytes_1" not in code
+    assert "set_scratch_size(1" not in code
+    assert "thread_scratch(1)" not in code
+
+
+def test_kokkos_hierarchical_alias_target_uses_team_scratch_level_one():
+    """The per-team shape moves an alias target the same way, with PerTeam.
+
+    The same region as the flat test, with its first sweep spread over the
+    team so that the hierarchical launch is taken: the moved array is
+    constructed over ``team.team_scratch(1)`` and the policy carries a
+    ``PerTeam`` request for it beside the level-0 one.
+    """
+    region = _alias_region(
+        aliases=(KokkosAlias(name="chosen", targets=("y", "x_new")),))
+    region = replace(
+        region, parallel_loops=(region.schedule.walk(Loop)[0],))
+    code = KokkosWriter()(region)
+
+    assert "x_new_scratch_t x_new(team.team_scratch(1), nlayers);" in code
+    assert ("tri_plus_new_scratch_t tri_plus_new(team.team_scratch(0), "
+            "nlayers);") in code
+    assert (".set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))\n"
+            "          .set_scratch_size(1, Kokkos::PerTeam(scratch_bytes_1))"
+            ) in code
+    assert "thread_scratch" not in code
+
+
 def test_kokkos_alias_takes_the_constness_of_its_first_target():
     """A read-only first target gives a const handle with its traits.
 

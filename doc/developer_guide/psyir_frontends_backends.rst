@@ -1071,6 +1071,24 @@ assign to. The traits need no widening with it: `ReadOnly` -- `Unmanaged |
 RandomAccess` -- is carried only by a read-only argument, whose element type
 is already `const`.
 
+A scratch array that is the target of an alias is placed in **level-1** team
+scratch -- `team.team_scratch(1)`, requested with
+`.set_scratch_size(1, Kokkos::PerTeam(scratch_bytes_1))` -- which the CUDA
+backend keeps in global memory, while every other scratch array stays in
+level 0, shared memory. That is a workaround for a code-generation defect
+rather than a design preference: a handle aimed at a shared-memory array in
+one branch and at a global argument View in the other is a pointer the
+compiler must keep generic, and `nvcc` 13.3 does not. It infers "shared" for
+the merged pointer, converts the global pointer with `cvta.to.shared` and
+reads through it with `ld.shared`, so the branch that aims the handle at the
+argument reads a garbage shared-memory offset and the kernel faults
+(`ffsl_flux_z_nirvana`'s `field_ptr`, 2026-09-14; a sixty-line Kokkos
+kernel reproduces it). With every target of a handle in global memory the
+merged pointer is generic on both sides and there is nothing to
+specialise. `kokkos_launch.global_scratch_names` says which arrays move; the
+type alias, the `shmem_size` arithmetic and the subscripts are unchanged,
+because a `ScratchSpace` View is the same View at either level.
+
 The writer validates an alias as it validates the rest: the name must not
 collide with a described array or a local, there must be at least one
 target, every target must be a described array, and the targets must agree
