@@ -4804,9 +4804,11 @@ either is still refused for the reason it always was.
 body of rather than reads from a kernel file, so the transformation writes
 the kernel file LFRic never did: a schedule with one scalar formal per
 argument, at the kind the argument carries, whose single statement is the
-built-in's own lowering with each ``field_data(df)`` replaced by the formal
-standing for it (:py:class:`~psyclone.domain.lfric.transformations.\
-lfric_kokkos_builtin_mixin.LFRicKokkosBuiltinMixin`). From there the dof
+built-in's own lowering written over those formals -- the lowering reads
+``arg3`` where the PSy layer's would read ``f1_data(df)`` or the
+algorithm's ``0.5_r_def`` (:py:class:`~psyclone.domain.lfric.\
+transformations.lfric_kokkos_builtin_mixin.LFRicKokkosBuiltinMixin`).
+From there the dof
 launch, the ABI, the staging roles and every rule above apply unchanged.
 The region is named for the built-in *and* the kinds of its arguments --
 ``builtin_real_to_real_x_r_def_r_solver_kokkos`` -- because one built-in

@@ -61,8 +61,10 @@ uses, which already hands a dof kernel one dof of each field. So the
 schedule synthesised here is the kernel file LFRic would have written for
 the built-in had it written one: a routine with one scalar formal per
 argument, at the kind the argument carries, whose single statement is the
-built-in's own assignment with each per-dof reference replaced by the
-formal it stands for. From there the dof launch, the ABI, the staging roles
+built-in's own assignment written over those formals -- the lowering is
+asked to read the formals where it would have read the PSy layer's
+per-dof field references and the algorithm's scalar expressions. From
+there the dof launch, the ABI, the staging roles
 and every rule of the contract apply unchanged, because nothing about the
 loop that reaches them says "built-in" any more.
 
@@ -87,12 +89,10 @@ sites of one region symbol to agree on its text.
 """
 
 from psyclone.core import AccessType
-from psyclone.domain.lfric import LFRicConstants
 from psyclone.domain.lfric.lfric_builtins import LFRicBuiltIn
 from psyclone.psyGen import BuiltIn, InvokeSchedule
 from psyclone.psyir.nodes import (
-    ArrayReference, Assignment, Container, DataNode, FileContainer,
-    KernelSchedule, Reference)
+    Assignment, Container, FileContainer, KernelSchedule, Reference)
 from psyclone.psyir.symbols import (
     ArgumentInterface, ContainerSymbol, DataSymbol, ImportInterface,
     ScalarType, SymbolTable)
@@ -166,11 +166,14 @@ class LFRicKokkosBuiltinMixin:
     def _builtin_schedule(cls, kernel):
         """Return the kernel schedule LFRic would have written for a built-in.
 
-        The body is taken from PSyclone's own lowering of the built-in, on a
-        copy of the invoke so that the invoke itself is left as it was: the
-        lowering replaces the built-in with the assignment it generates,
-        and the PSy layer must still hold the built-in when the loop is
-        later replaced by the launch call.
+        The formals are declared first, one per argument in the built-in's
+        order, and the body is then taken from PSyclone's own lowering of
+        the built-in with those formals standing where the lowering would
+        have put the PSy layer's actuals. The lowering runs on a copy of the
+        invoke so that the invoke itself is left as it was: it replaces the
+        built-in with the assignment it generates, and the PSy layer must
+        still hold the built-in when the loop is later replaced by the
+        launch call.
 
         :param kernel: the built-in the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.lfric_builtins.\
@@ -187,7 +190,6 @@ LFRicBuiltIn`
         :raises TransformationError: if the built-in's lowering is not a
             single assignment.
         """
-        assignment = cls._builtin_lowering(kernel)
         table = SymbolTable()
         kinds_module = ContainerSymbol(cls._BUILTIN_KINDS_MODULE)
         table.add(kinds_module)
@@ -206,8 +208,8 @@ LFRicBuiltIn`
                 interface=ArgumentInterface(access))
             table.add(formal)
             formals.append(formal)
-            cls._substitute_argument(assignment, argument, formal)
         table.specify_argument_list(formals)
+        assignment = cls._builtin_lowering(kernel, formals)
         name = cls._builtin_schedule_name(kernel, kinds)
         schedule = KernelSchedule.create(name, table, [assignment])
         container = Container.create(f"{name[:-len('_code')]}_mod",
@@ -216,19 +218,31 @@ LFRicBuiltIn`
         return schedule
 
     @staticmethod
-    def _builtin_lowering(kernel):
-        """Return the assignment PSyclone lowers ``kernel`` to, detached.
+    def _builtin_lowering(kernel, formals):
+        """Return the assignment PSyclone lowers ``kernel`` to, over formals.
+
+        Every LFRic built-in writes its body from two lists its base class
+        supplies -- one indexed reference per field argument and one
+        expression per scalar argument, each in argument order. On the copy
+        that is lowered, both are answered with references to the formals
+        instead, so the body reads ``arg3`` where the PSy layer's would have
+        read ``f1_data(df)`` or the algorithm's ``0.5_r_def``. That is what
+        makes the body a function of the built-in and its kinds alone: two
+        call sites passing different scalars, or the same scalar twice,
+        generate one text, which the whole-model capture requires of the
+        sites of one region symbol.
 
         Lowered on a copy of the whole invoke schedule rather than on the
-        built-in, because the lowering resolves the field-data symbols and
-        the dof index through the invoke's symbol table and replaces the
-        built-in in its loop: neither may happen to the invoke being
-        captured. The built-in is found again in the copy by its position
-        among the invoke's built-ins.
+        built-in, because the lowering replaces the built-in in its loop and
+        the invoke being captured must keep it. The built-in is found again
+        in the copy by its position among the invoke's built-ins.
 
         :param kernel: the built-in the loop holds.
         :type kernel: :py:class:`psyclone.domain.lfric.lfric_builtins.\
 LFRicBuiltIn`
+        :param formals: the schedule's formals, one per argument in the
+            built-in's argument order.
+        :type formals: list[:py:class:`psyclone.psyir.symbols.DataSymbol`]
 
         :returns: the built-in's own assignment, with no parent.
         :rtype: :py:class:`psyclone.psyir.nodes.Assignment`
@@ -237,13 +251,15 @@ LFRicBuiltIn`
             which is the shape every non-reduction built-in has.
         """
         invoke_schedule = kernel.ancestor(InvokeSchedule)
-        # The field-data symbols the lowering looks up by tag are created
-        # when the invoke prepares its PSy-layer symbols, which the code
-        # generation does before it lowers anything; a capture may reach
-        # the built-in first.
-        invoke_schedule.invoke.setup_psy_layer_symbols()
         index = invoke_schedule.walk(LFRicBuiltIn).index(kernel)
         copy = invoke_schedule.copy().walk(LFRicBuiltIn)[index]
+        by_argument = list(zip(kernel.arguments.args, formals))
+        copy.get_indexed_field_argument_references = lambda: [
+            Reference(formal) for argument, formal in by_argument
+            if argument.is_field]
+        copy.get_scalar_argument_references = lambda: [
+            Reference(formal) for argument, formal in by_argument
+            if argument.is_scalar]
         lowered = copy.lower_to_language_level()
         if not isinstance(lowered, Assignment):
             raise TransformationError(
@@ -301,45 +317,6 @@ ContainerSymbol`
             "integer": ScalarType.Intrinsic.INTEGER,
             "logical": ScalarType.Intrinsic.BOOLEAN,
         }[intrinsic_type]
-
-    @staticmethod
-    def _substitute_argument(assignment, argument, formal):
-        """Replace one argument's references in the lowered body by a formal.
-
-        A field argument reaches the lowering as ``<name>_data(df)``, an
-        array reference to the field's data symbol subscripted by the dof
-        index; every such reference becomes a reference to the formal, and
-        the dof index leaves the body with them. A scalar argument reaches
-        it as copies of the algorithm's own expression -- a variable, a
-        literal, a negated literal -- and every node equal to that
-        expression becomes the formal, so a scalar the body reads twice
-        (``a * x + a * y``) reads the formal twice. Two scalar arguments
-        passed one expression are the one value: the first claims every
-        occurrence and the second is a formal the body does not read.
-
-        :param assignment: the lowered body, rewritten in place.
-        :type assignment: :py:class:`psyclone.psyir.nodes.Assignment`
-        :param argument: the built-in argument being replaced.
-        :type argument: :py:class:`psyclone.domain.lfric.LFRicKernelArgument`
-        :param formal: the formal standing for it in the schedule.
-        :type formal: :py:class:`psyclone.psyir.symbols.DataSymbol`
-        """
-        if argument.is_field:
-            suffix = LFRicConstants().ARG_TYPE_SUFFIX_MAPPING[
-                argument.argument_type]
-            data_name = f"{argument.name}_{suffix}".lower()
-            for reference in assignment.walk(ArrayReference):
-                if reference.symbol.name.lower() == data_name:
-                    reference.replace_with(Reference(formal))
-            return
-        actual = argument.psyir_expression()
-        # The exact type as well as equality: an ArrayReference is a
-        # Reference too, and a field's data reference must not be mistaken
-        # for a scalar of the same name.
-        # pylint: disable-next=unidiomatic-typecheck
-        for node in [node for node in assignment.walk(DataNode)
-                     if type(node) is type(actual) and node == actual]:
-            node.replace_with(Reference(formal))
 
     @classmethod
     def _builtin_schedule_name(cls, kernel, kinds):

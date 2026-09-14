@@ -195,22 +195,21 @@ def test_builtin_scalars_by_variable_and_by_literal(
             "0.5_r_def, f2_data, loop0_stop)" in fortran)
 
 
-def test_builtin_two_scalars_passed_one_literal_share_the_first_formal(
+def test_builtin_two_scalars_passed_one_literal_each_take_a_formal(
         tmp_path, clear_module_manager_instance):
-    """Two scalar arguments given one literal are one value.
+    """Two scalar arguments given one literal are still two formals.
 
-    Every occurrence of the literal becomes the first argument's formal;
-    the second is declared, passed, and never read. Nothing in the body is
-    left as the literal, which would otherwise be a value the algorithm
-    could not change.
+    The body is written over the formals rather than matched against the
+    actuals, so what the algorithm passed cannot change the text: a site
+    passing the same literal twice generates the region a site passing two
+    variables does, which the whole-model capture requires of the sites of
+    one region symbol.
     """
     _, loop, _ = _invoke(tmp_path, "same", _SAME_LITERAL_ALGORITHM, _KERNEL)
 
     code = LFRicKokkosTrans().apply(loop)
 
-    assert "const double arg2,\n" in code
-    assert "const double arg4,\n" in code
-    assert ("arg1(df) = ((arg2 * arg3(df)) + (arg2 * arg5(df)));"
+    assert ("arg1(df) = ((arg2 * arg3(df)) + (arg4 * arg5(df)));"
             in _strip(code))
     assert "0.5" not in code
 
@@ -218,13 +217,12 @@ def test_builtin_two_scalars_passed_one_literal_share_the_first_formal(
 def test_builtin_scalar_read_twice_and_negated_literal(
         tmp_path, clear_module_manager_instance):
     """A scalar the body reads twice reads the formal twice, and a negated
-    literal is matched as the expression it is."""
+    literal never reaches the body at all."""
     _, loop, _ = _invoke(tmp_path, "twice", _TWICE_ALGORITHM, _KERNEL)
 
     code = LFRicKokkosTrans().apply(loop)
 
-    # PSyclone lowers aX_plus_aY as a * (X + Y); the point is that the one
-    # scalar the algorithm passed is the one formal the body reads.
+    # PSyclone lowers aX_plus_aY as a * (X + Y).
     assert "arg1(df) = (arg2 * (arg3(df) + arg4(df)));" in _strip(code)
     assert "const double arg2,\n" in code
     assert "arg5" not in code
