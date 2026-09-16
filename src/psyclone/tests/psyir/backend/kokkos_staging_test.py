@@ -300,14 +300,18 @@ def test_kokkos_staging_header_dedupes_a_repeated_field_in_one_call():
 
     assert 'std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH_DEDUPE")' in text
     assert "const Key range(pointer, bytes);" in text
-    assert "const bool repeat_in_call = holds(current.call_prefetched, " \
-        "range);" in text
-    assert "    if (dedupe_prefetch()) {\n" \
+    assert "    if (holds(current.call_prefetched, range)) {\n" \
+        "      current.prefetch_repeat_call += 1;\n" \
         "      current.prefetch_deduped += 1;\n      return;" in text
-    # Counted whether or not the knob is on: the count is what the knob was
-    # built from, and a run with it off is the run that reports it.
-    assert "current.prefetch_repeat_call += 1;" in text
-    assert "current.prefetch_repeat_prev += 1;" in text
+    # The census is inside the knob's own test, so a run with the knob off
+    # pays nothing for it: keeping it on the default path measured at +0.3 to
+    # +0.6% of the C48 step, more than the repeats are worth.
+    census = text.index("if (dedupe_prefetch()) {", text.index(
+        "inline void prefetch(State &current"))
+    for counter in ("current.prefetch_repeat_call += 1;",
+                    "current.prefetch_repeat_prev += 1;",
+                    "current.call_prefetched.push_back(range);"):
+        assert text.index(counter) > census
 
 
 def test_kokkos_staging_header_drops_the_dedupe_at_the_end_of_a_call():
@@ -326,6 +330,7 @@ def test_kokkos_staging_header_drops_the_dedupe_at_the_end_of_a_call():
     assert "current.previous_prefetched.swap(current.call_prefetched);\n" \
         "  current.call_prefetched.clear();" in text
     release = text.index("inline void release() {")
+    assert "if (prefetching() && dedupe_prefetch()) {" in text[release:]
     assert text.index("end_prefetch_call();", release) < \
         text.index("if (mode() == Mode::none) {", release)
 

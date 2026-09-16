@@ -758,10 +758,12 @@ pages on the host to begin with. The header cannot see that host code, so
 `prefetch_repeat_prev` -- ranges the *previous* call prefetched -- is counted
 and reported but never skipped; it is an upper bound on what a cross-call
 dedupe could remove rather than a saving available to one. Both counts are
-taken whether or not the knob is on, because a run with it off is the run
-that says what there was to take. Nothing about what any launch reads
-changes either way: a prefetch is a hint, and a page the driver did not move
-is faulted in by the launch that reads it.
+taken only while the knob is on, and read zero with it off: keeping the
+census on the default path cost more than the repeats it counts are worth,
+so the census and the dedupe are one knob and a run that wants the numbers
+asks for them. Nothing about what any launch reads changes either way: a
+prefetch is a hint, and a page the driver did not move is faulted in by the
+launch that reads it.
 
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that

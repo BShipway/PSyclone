@@ -381,6 +381,8 @@ struct State {
   // an upper bound on what a cross-call dedupe could save rather than a
   // saving: this header cannot see the host code that ran in between, and
   // host code between two regions is what puts a page back on the host.
+  // Both are counted only while the dedupe knob is on, which is what the
+  // knob's own report field says of them.
   std::size_t prefetch_repeat_call = 0;
   std::size_t prefetch_repeat_prev = 0;
   std::size_t prefetch_deduped = 0;   // repeats the dedupe did not issue
@@ -476,7 +478,7 @@ inline bool managed_pointer(State &current, const void *pointer) {
 #endif  // KOKKOS_ENABLE_CUDA
 
 // Is this range in a list of them? The lists are a call's worth of ranges,
-// so a linear scan is the whole of the search.
+// so a linear scan is the whole of the search. Only the dedupe fills them.
 inline bool holds(const std::vector<Key> &keys, const Key &key) {
   return std::find(keys.begin(), keys.end(), key) != keys.end();
 }
@@ -493,18 +495,19 @@ inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
     current.prefetch_refused += 1;
     return;
   }
-  // Counted whether or not the dedupe is on, because the count is the
-  // measurement the dedupe was built from and a run with it off is the one
-  // that reports what there was to take.
-  const Key range(pointer, bytes);
-  const bool repeat_in_call = holds(current.call_prefetched, range);
-  if (repeat_in_call) {
-    current.prefetch_repeat_call += 1;
-    if (dedupe_prefetch()) {
+  // The census and the dedupe are one knob, so a run with the knob off pays
+  // for neither and reports zeroes, and a run with it on reports the whole
+  // census: a repeat is counted before it is dropped. They are not separate
+  // because keeping the census alone on the default path measured at +0.3 to
+  // +0.6% of the C48 step, which is more than the repeats it counts are
+  // worth (2026-09-16, Task W3).
+  if (dedupe_prefetch()) {
+    const Key range(pointer, bytes);
+    if (holds(current.call_prefetched, range)) {
+      current.prefetch_repeat_call += 1;
       current.prefetch_deduped += 1;
       return;
     }
-  } else {
     if (holds(current.previous_prefetched, range)) {
       current.prefetch_repeat_prev += 1;
     }
@@ -847,7 +850,7 @@ inline void unstage(const ViewType &view,
 // back -- and without this they would accumulate one allocation per call.
 // The cache is untouched.
 inline void release() {
-  if (prefetching()) {
+  if (prefetching() && dedupe_prefetch()) {
     end_prefetch_call();
   }
   if (mode() == Mode::none) {
