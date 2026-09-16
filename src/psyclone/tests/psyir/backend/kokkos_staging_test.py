@@ -189,6 +189,97 @@ def test_kokkos_staging_header_empties_the_pool_before_kokkos_goes():
     assert "drop_all(current, current.live, false);" in text
 
 
+def test_kokkos_staging_header_prefetches_a_field_behind_a_knob():
+    """A field's pages are asked for before the launch, if the knob says so.
+
+    A ``field`` role is the one role left over the caller's storage, which on
+    a CUDA build is managed memory faulted onto the card 64 KB at a time by
+    the launch that reads it. The prefetch turns those faults into one bulk
+    copy on the stream the launch will use, so the region's existing fence is
+    what orders it and nothing new is waited for. Off unless asked for: a
+    prefetch of a field that is already resident costs the call and moves
+    nothing, and which way that goes is a measurement.
+    """
+    text = header_text()
+
+    assert 'std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH")' in text
+    assert 'std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH_STRIDE")' in text
+    # Unset is off, so a build that has not asked for it is the build it was.
+    assert "return value != nullptr && value[0] != '\\0' &&\n" \
+        "           std::strcmp(value, \"0\") != 0;" in text
+    assert "cudaMemPrefetchAsync(const_cast<void *>(pointer), bytes, " \
+        "on_device, 0," in text
+    assert "stream_of(Kokkos::DefaultExecutionSpace())" in text
+    assert "inline cudaStream_t stream_of(const Kokkos::Cuda &space) {" in text
+    # Only the role whose storage stays where the caller put it, and only
+    # when asked: every other role in every other mode is untouched.
+    assert "if (role == Role::field && prefetching()) {" in text
+
+
+def test_kokkos_staging_header_prefetch_is_cuda_only_and_include_ordered():
+    """The prefetch is compiled only where there is a card to prefetch to.
+
+    ``KOKKOS_ENABLE_CUDA`` is defined by ``Kokkos_Core.hpp``, which this
+    header includes itself rather than relying on a region to have included
+    it first: a knob switched off by an include order is exactly the silent
+    null lever the measurement protocol exists to catch. On a host build the
+    calls are not compiled at all, and a run that asked for the knob there
+    says so by counting every staging as refused.
+    """
+    text = header_text()
+
+    kokkos = text.index("#include <Kokkos_Core.hpp>")
+    guard = text.index("#if defined(KOKKOS_ENABLE_CUDA)")
+    assert kokkos < guard
+    assert "#include <cuda_runtime_api.h>" in text
+    assert text.index("#include <cuda_runtime_api.h>") > guard
+    assert "#endif  // KOKKOS_ENABLE_CUDA" in text
+    # The host arm of the prefetch itself: nothing to do, and it says so.
+    assert "  (void)bytes;\n  current.prefetch_refused += 1;\n#endif" in text
+
+
+def test_kokkos_staging_header_tolerates_a_pointer_it_cannot_prefetch():
+    """A pointer that is not managed memory is refused, not fatal.
+
+    A host-only build has no managed memory, and on a device build a field
+    whose SharedSpace claim was refused falls back to a Fortran ALLOCATE, so
+    a region may be handed a pointer the driver will not take. The call is
+    counted, the sticky error it leaves is cleared so the next CUDA call is
+    not blamed for it, and the answer is remembered per pointer so that such
+    a run does not pay a driver query on every staging.
+    """
+    text = header_text()
+
+    assert "cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess &&" \
+        in text
+    assert "attributes.type == cudaMemoryTypeManaged" in text
+    assert "std::map<const void *, bool> managed;" in text
+    assert text.count("(void)cudaGetLastError();") >= 3
+    assert "current.prefetch_refused += 1;" in text
+    # The stride's state: which staging a pointer was last prefetched at.
+    assert "std::map<const void *, std::size_t> prefetched_at;" in text
+    assert "current.prefetch_skipped += 1;" in text
+
+
+def test_kokkos_staging_header_announces_what_the_prefetch_did():
+    """The knob announces itself on the totals line, on or off.
+
+    A knob that does nothing passes every correctness gate and reports a null
+    lever, so the line is printed whenever the knob is on even in a mode that
+    stages nothing at all, and it carries the counters a reader needs to tell
+    "prefetching did not pay" from "prefetching did not happen": the calls
+    issued, the bytes they covered, the calls the driver would not take, the
+    calls the stride held back and the stagings they are read against.
+    """
+    text = header_text()
+
+    assert "prefetch=%s prefetches=%zu prefetch_bytes=%zu " in text
+    assert "prefetch_refused=%zu prefetch_skipped=%zu " in text
+    assert "prefetch_stride=%zu field_stages=%zu\\n" in text
+    assert 'prefetching() ? "on" : "off"' in text
+    assert "if (sum.staged + sum.cached > 0 || prefetching()) {" in text
+
+
 def test_kokkos_staging_role_of_reads_a_stated_role():
     """A description that names a role is taken at its word."""
     assert role_of(_view(role="field")) == "field"
