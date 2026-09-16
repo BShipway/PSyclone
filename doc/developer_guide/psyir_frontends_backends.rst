@@ -408,8 +408,9 @@ Additionally, there are three partially-implemented back-ends
   `psyclone.psyir.backend.kokkos_team_scalars` -- which decides, before any
   code is generated, which of the body's scalars belong to one member of a
   team -- a seventh, `psyclone.psyir.backend.kokkos_staging` -- which
-  holds the C++ header a region obtains its Views from, and the Python that
-  writes the three statements naming it -- an eighth, and `spread_extents`
+  writes the three statements naming the C++ header a region obtains its
+  Views from, and hands out that header's text from its sibling
+  `psyclone.psyir.backend.kokkos_staging_header` -- an eighth, and `spread_extents`
   in `psyclone.psyir.backend.kokkos_spread_extent` -- which reads how far
   the loops a region spreads actually run, so that the hierarchical launch
   can size its team from them -- a ninth; all are described
@@ -625,10 +626,15 @@ fixed parameter after a parameter pack.
 The three statements are written by `stage_declaration`, `unstage_statement`
 and `release_statement` in `psyclone.psyir.backend.kokkos_staging`, and
 `view_declaration` there is what `KokkosWriter` calls for each of a region's
-Views. The header itself is `header_text()` in the same module, a single C++
-string; the module imports nothing from PSyclone, so a build script can load
-it from source and write the header out beside the regions it generates
-without a PSyclone environment.
+Views. The header itself is `header_text()` in the same module, which returns
+a single C++ string held in the sibling module
+`psyclone.psyir.backend.kokkos_staging_header`; the header is seven hundred
+lines of C++ and the module that holds the spellings is the one a reader of
+the back-end wants, so the two are kept apart. Neither imports PSyclone at
+import time, so a build script can load `kokkos_staging` from source -- by
+path, with no PSyclone environment at all -- and write the header out beside
+the regions it generates; `header_text()` finds its sibling beside itself when
+it was loaded that way, and imports it normally when it was not.
 
 `LFRIC_KOKKOS_STAGING` is read once, at the first region entry of the
 process, and names one of three modes. `none`, the default, is an unmanaged
