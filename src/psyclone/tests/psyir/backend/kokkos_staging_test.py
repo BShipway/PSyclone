@@ -275,9 +275,90 @@ def test_kokkos_staging_header_announces_what_the_prefetch_did():
 
     assert "prefetch=%s prefetches=%zu prefetch_bytes=%zu " in text
     assert "prefetch_refused=%zu prefetch_skipped=%zu " in text
-    assert "prefetch_stride=%zu field_stages=%zu\\n" in text
+    assert "prefetch_stride=%zu field_stages=%zu " in text
     assert 'prefetching() ? "on" : "off"' in text
     assert "if (sum.staged + sum.cached > 0 || prefetching()) {" in text
+    # The dedupe's own fields, ending the line: what it resolved to, the
+    # repeats there were to take within a call and across the call boundary,
+    # and the calls it did not issue.
+    assert "prefetch_dedupe=%s prefetch_repeat_call=%zu " in text
+    assert "prefetch_repeat_prev=%zu prefetch_deduped=%zu\\n" in text
+    assert 'dedupe_prefetch() ? "on" : "off"' in text
+
+
+def test_kokkos_staging_header_dedupes_a_repeated_field_in_one_call():
+    """A field staged twice by one region call is prefetched once.
+
+    An invoke may pass one field under two of a region's arguments -- a field
+    vector's components, a built-in whose input and output are one field --
+    and the second prefetch asks the driver to move a range it has just been
+    asked to move. The dedupe is keyed by (pointer, bytes), as every other
+    key in this header is, so two arguments over one base pointer with
+    different lengths are still two ranges.
+    """
+    text = header_text()
+
+    assert 'std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH_DEDUPE")' in text
+    assert "const Key range(pointer, bytes);" in text
+    assert "    if (holds(current.call_prefetched, range)) {\n" \
+        "      current.prefetch_repeat_call += 1;\n" \
+        "      current.prefetch_deduped += 1;\n      return;" in text
+    # The census is inside the knob's own test, so a run with the knob off
+    # pays nothing for it: keeping it on the default path measured at +0.3 to
+    # +0.6% of the C48 step, more than the repeats are worth.
+    census = text.index("if (dedupe_prefetch()) {", text.index(
+        "inline void prefetch(State &current"))
+    for counter in ("current.prefetch_repeat_call += 1;",
+                    "current.prefetch_repeat_prev += 1;",
+                    "current.call_prefetched.push_back(range);"):
+        assert text.index(counter) > census
+
+
+def test_kokkos_staging_header_drops_the_dedupe_at_the_end_of_a_call():
+    """Nothing is ever skipped across a region call boundary.
+
+    Between two regions the host writes fields, which is what put the pages
+    back on the host in the first place, and wave 1 measured that skipping a
+    prefetch on that account costs time. So the ranges this call prefetched
+    are dropped at ``release()`` -- ahead of the mode check there, because
+    ``none`` mode returns early from everything else and still prefetches --
+    and the call before's are kept only to be counted against.
+    """
+    text = header_text()
+
+    assert "inline void end_prefetch_call() {" in text
+    assert "current.previous_prefetched.swap(current.call_prefetched);\n" \
+        "  current.call_prefetched.clear();" in text
+    release = text.index("inline void release() {")
+    assert "if (prefetching() && dedupe_prefetch()) {" in text[release:]
+    assert text.index("end_prefetch_call();", release) < \
+        text.index("if (mode() == Mode::none) {", release)
+
+
+def test_kokkos_staging_header_copies_out_before_the_reference_guard():
+    """A written View aliased by a read-only one is still copied out.
+
+    ``references`` counts every argument that landed on one (pointer, bytes)
+    key, and only written arguments call ``unstage()``: a read-only ``const``
+    View of the same field raises the count and never lowers it. With the
+    guard ahead of the copy-out, the one argument that had something to copy
+    returned early and ``release()`` recycled the block, discarding the device
+    write -- 48 suppressed copies-out per C16_MG step in ``all`` mode, 146 of
+    272 regions susceptible (Task W6, 2026-09-16). So the copy-out is
+    unconditional and the count keeps only its other job, releasing the block.
+
+    """
+    text = header_text()
+
+    unstage = text.index("inline void unstage(const ViewType &view,")
+    copy_out = text.index(
+        "copy_out<Value, Space>(const_cast<Value *>(pointer)", unstage)
+    guard = text.index("found->second.references -= 1;", unstage)
+    assert copy_out < guard
+    assert guard < text.index("drop(current, found->second);", unstage)
+    assert "counted.copies_out += 1;" in text[copy_out:guard]
+    # And the comment no longer states the premise the reorder disproved.
+    assert "still held by another argument" not in text
 
 
 def test_kokkos_staging_role_of_reads_a_stated_role():
