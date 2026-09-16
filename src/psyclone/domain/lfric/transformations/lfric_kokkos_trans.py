@@ -156,6 +156,11 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
         schedule = self._inlined_copy(self._schedule(kernel), options)
         self._validate_aliases(schedule)
         self._validate_body(schedule)
+        # Before the sections are judged, because this is what decides
+        # whether a section inside a fold stands outside an assignment: after
+        # the rewrite it is in one, and the rule below has nothing to refuse.
+        # Made on the copy, which is this method's to rewrite.
+        self._lower_reductions(schedule)
         self._validate_sections(schedule)
         # The formals are judged with every assumed shape already measured,
         # because that is the shape apply() describes; on the copy taken
@@ -203,11 +208,15 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
         """Generate C++ and replace ``node`` with the typed launch call.
 
         Unlike :py:meth:`validate`, this alters the kernel schedule: any
-        array section it holds is lowered to an explicit loop, every shape
-        enquiry is replaced by the bound its declaration gives, and every
-        module-level ``parameter`` it reads is replaced by its value, before
-        the region is described. The loops to spread over the team are chosen
-        after all three, because the first two create loops.
+        scalar-valued fold standing where the back-end cannot place the loop
+        that computes it is given an assignment of its own immediately
+        before the statement it stood in, any ``ALLOCATE``\\ d local becomes
+        a declared one, any array section is lowered to an explicit loop,
+        every shape enquiry is replaced by the bound its declaration gives,
+        and every module-level ``parameter`` it reads is replaced by its
+        value, before the region is described. The loops to spread over the
+        team are chosen after all five, because the first three create loops
+        and the fourth settles their bounds.
 
         :param node: the loop to capture as a Kokkos region.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -238,6 +247,7 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
         kernel = node.kernels()[0]
         schedule = self._schedule(kernel)
         self._inline_calls(schedule, options)
+        self._lower_reductions(schedule)
         self._lower_allocations(schedule)
         self._lower_sections(schedule)
         self._substitute_bounds(schedule)

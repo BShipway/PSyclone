@@ -767,6 +767,51 @@ _TINY_KERNEL = _MINVAL_KERNEL.replace(
     "    floor_value = tiny(partial(1))")
 
 
+# The FFSL departure-point shape: a fold standing where no loop can be placed.
+# The MAXVAL is the condition of an IF and reads a section whose bounds are
+# runtime scalars, which is the pair of refusals wave 2 met -- the fold in a
+# position the array tier does not write, and the section that is therefore
+# outside every assignment. A second fold stands beside it in the same
+# condition, so that the move has to be made more than once over one
+# statement; and a third stands inside the branch as an operand of a larger
+# right-hand side, which is a position the tier does write, so that the move
+# is shown to take only what the tier leaves.
+_FOLD_CONDITION_KERNEL = _LOCAL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    integer(kind=i_def) :: k_low, k_high\n").replace(
+    "    swept(nlayers) = partial(nlayers)",
+    "    k_low = 1\n"
+    "    k_high = nlayers\n"
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    if ( maxval(partial(k_low:k_high)) > 0.0_r_def .and. &\n"
+    "         minval(swept) < 1.0_r_def ) then\n"
+    "      swept(nlayers) = swept(nlayers) - minval(partial) * 2.0_r_def\n"
+    "    end if")
+
+
+# The one position the move cannot serve. A DO WHILE re-reads its condition
+# on every trip, and the assignment the fold would be given stands before the
+# loop and is evaluated once, so this is refused rather than moved.
+_FOLD_WHILE_KERNEL = _FOLD_CONDITION_KERNEL.replace(
+    "    if ( maxval(partial(k_low:k_high)) > 0.0_r_def .and. &\n"
+    "         minval(swept) < 1.0_r_def ) then\n"
+    "      swept(nlayers) = swept(nlayers) - minval(partial) * 2.0_r_def\n"
+    "    end if",
+    "    do while ( maxval(partial(k_low:k_high)) > 0.0_r_def )\n"
+    "      k_high = k_high - 1\n"
+    "    end do")
+
+
+# A section outside an assignment that no scalar-valued fold accounts for.
+# ANY is not one of the array tier's intrinsics, so nothing moves and the
+# section refusal stands -- which is what the refusal has to name the
+# statement for.
+_FOLD_UNMOVED_KERNEL = _FOLD_CONDITION_KERNEL.replace(
+    "maxval(partial(k_low:k_high)) > 0.0_r_def",
+    "any(partial(k_low:k_high) > 0.0_r_def)")
+
+
 @pytest.fixture(name="allocate_local_target")
 # pylint: disable-next=unused-argument
 def allocate_local_target_fixture(tmp_path, clear_module_manager_instance):
@@ -805,6 +850,30 @@ def tiny_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel reads an intrinsic no writer has."""
     return _invoke(
         tmp_path, "column_solve", _LOCAL_ALGORITHM, _TINY_KERNEL)
+
+
+@pytest.fixture(name="fold_condition_target")
+# pylint: disable-next=unused-argument
+def fold_condition_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel folds a section in an IF condition."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _FOLD_CONDITION_KERNEL)
+
+
+@pytest.fixture(name="fold_while_target")
+# pylint: disable-next=unused-argument
+def fold_while_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel folds in a DO WHILE condition."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _FOLD_WHILE_KERNEL)
+
+
+@pytest.fixture(name="fold_unmoved_target")
+# pylint: disable-next=unused-argument
+def fold_unmoved_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose section no scalar-valued fold encloses."""
+    return _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _FOLD_UNMOVED_KERNEL)
 
 
 # An allocation carrying an option beside the arrays it names. `mold=` states
