@@ -652,6 +652,18 @@ copies every call instead of consulting that cache. An unrecognised value is
 `Kokkos::abort`ed rather than treated as `none`: a misspelt mode that fell
 back silently would be reported as a run in the mode it names.
 
+`unstage()` copies the device buffer back before it touches the block's
+reference count, and not after. The count records every argument that landed
+on one `(pointer, bytes)` key, and only *written* arguments unstage: a
+read-only `const` View of the same field raises it and never lowers it. A
+region call handed one field as both a written and a read argument therefore
+had its device write discarded while the copy-out sat behind the count -- 48
+suppressed copies-out per `C16_MG` step in `all` mode, 146 of 272 captured
+regions susceptible, and `non-field` and `none` never on the path. The
+copy-out is what the block's data warrants whichever argument is unstaging
+it; the count keeps its other job, which is deciding when the block may be
+released.
+
 At `Kokkos::finalize` the header reports what it did on stderr. One line of
 totals::
 

@@ -335,6 +335,32 @@ def test_kokkos_staging_header_drops_the_dedupe_at_the_end_of_a_call():
         text.index("if (mode() == Mode::none) {", release)
 
 
+def test_kokkos_staging_header_copies_out_before_the_reference_guard():
+    """A written View aliased by a read-only one is still copied out.
+
+    ``references`` counts every argument that landed on one (pointer, bytes)
+    key, and only written arguments call ``unstage()``: a read-only ``const``
+    View of the same field raises the count and never lowers it. With the
+    guard ahead of the copy-out, the one argument that had something to copy
+    returned early and ``release()`` recycled the block, discarding the device
+    write -- 48 suppressed copies-out per C16_MG step in ``all`` mode, 146 of
+    272 regions susceptible (Task W6, 2026-09-16). So the copy-out is
+    unconditional and the count keeps only its other job, releasing the block.
+
+    """
+    text = header_text()
+
+    unstage = text.index("inline void unstage(const ViewType &view,")
+    copy_out = text.index(
+        "copy_out<Value, Space>(const_cast<Value *>(pointer)", unstage)
+    guard = text.index("found->second.references -= 1;", unstage)
+    assert copy_out < guard
+    assert guard < text.index("drop(current, found->second);", unstage)
+    assert "counted.copies_out += 1;" in text[copy_out:guard]
+    # And the comment no longer states the premise the reorder disproved.
+    assert "still held by another argument" not in text
+
+
 def test_kokkos_staging_role_of_reads_a_stated_role():
     """A description that names a role is taken at its word."""
     assert role_of(_view(role="field")) == "field"

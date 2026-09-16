@@ -813,8 +813,17 @@ inline ViewType stage(typename ViewType::value_type *pointer, Role role,
 }
 
 // Copy a written View back to the caller's storage. A no-op in none mode,
-// and for a View this call did not stage -- a field in non-field mode, or
-// an array whose last reference is still held by another argument.
+// and for a View this call did not stage -- a field in non-field mode.
+//
+// The copy-out is unconditional, ahead of the reference count. `references`
+// counts every argument that landed on this key, and only *written* ones
+// unstage: a read-only const View of the same field raises the count and
+// never lowers it, so a guard ahead of the copy-out would discard the device
+// write of the one argument that had something to copy (Task W6, 2026-09-16:
+// 48 suppressed copies-out per C16 step in all mode, 146 of 272 regions
+// susceptible). The device buffer is the current value of that memory
+// whichever argument is unstaging it. The count keeps its other job, which
+// is deciding when the block may be released.
 template <typename ViewType>
 inline void unstage(const ViewType &view,
                     typename ViewType::value_type *pointer) {
@@ -832,15 +841,15 @@ inline void unstage(const ViewType &view,
   if (found == current.live.end()) {
     return;
   }
-  found->second.references -= 1;
-  if (found->second.references > 0) {
-    return;
-  }
   copy_out<Value, Space>(const_cast<Value *>(pointer), found->second.data,
                          count);
   Counters &counted = current.of(found->second.role);
   counted.copies_out += 1;
   counted.bytes_out += found->second.bytes;
+  found->second.references -= 1;
+  if (found->second.references > 0) {
+    return;
+  }
   drop(current, found->second);
   current.live.erase(found);
 }
