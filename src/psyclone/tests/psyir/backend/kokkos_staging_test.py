@@ -275,9 +275,59 @@ def test_kokkos_staging_header_announces_what_the_prefetch_did():
 
     assert "prefetch=%s prefetches=%zu prefetch_bytes=%zu " in text
     assert "prefetch_refused=%zu prefetch_skipped=%zu " in text
-    assert "prefetch_stride=%zu field_stages=%zu\\n" in text
+    assert "prefetch_stride=%zu field_stages=%zu " in text
     assert 'prefetching() ? "on" : "off"' in text
     assert "if (sum.staged + sum.cached > 0 || prefetching()) {" in text
+    # The dedupe's own fields, ending the line: what it resolved to, the
+    # repeats there were to take within a call and across the call boundary,
+    # and the calls it did not issue.
+    assert "prefetch_dedupe=%s prefetch_repeat_call=%zu " in text
+    assert "prefetch_repeat_prev=%zu prefetch_deduped=%zu\\n" in text
+    assert 'dedupe_prefetch() ? "on" : "off"' in text
+
+
+def test_kokkos_staging_header_dedupes_a_repeated_field_in_one_call():
+    """A field staged twice by one region call is prefetched once.
+
+    An invoke may pass one field under two of a region's arguments -- a field
+    vector's components, a built-in whose input and output are one field --
+    and the second prefetch asks the driver to move a range it has just been
+    asked to move. The dedupe is keyed by (pointer, bytes), as every other
+    key in this header is, so two arguments over one base pointer with
+    different lengths are still two ranges.
+    """
+    text = header_text()
+
+    assert 'std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH_DEDUPE")' in text
+    assert "const Key range(pointer, bytes);" in text
+    assert "const bool repeat_in_call = holds(current.call_prefetched, " \
+        "range);" in text
+    assert "    if (dedupe_prefetch()) {\n" \
+        "      current.prefetch_deduped += 1;\n      return;" in text
+    # Counted whether or not the knob is on: the count is what the knob was
+    # built from, and a run with it off is the run that reports it.
+    assert "current.prefetch_repeat_call += 1;" in text
+    assert "current.prefetch_repeat_prev += 1;" in text
+
+
+def test_kokkos_staging_header_drops_the_dedupe_at_the_end_of_a_call():
+    """Nothing is ever skipped across a region call boundary.
+
+    Between two regions the host writes fields, which is what put the pages
+    back on the host in the first place, and wave 1 measured that skipping a
+    prefetch on that account costs time. So the ranges this call prefetched
+    are dropped at ``release()`` -- ahead of the mode check there, because
+    ``none`` mode returns early from everything else and still prefetches --
+    and the call before's are kept only to be counted against.
+    """
+    text = header_text()
+
+    assert "inline void end_prefetch_call() {" in text
+    assert "current.previous_prefetched.swap(current.call_prefetched);\n" \
+        "  current.call_prefetched.clear();" in text
+    release = text.index("inline void release() {")
+    assert text.index("end_prefetch_call();", release) < \
+        text.index("if (mode() == Mode::none) {", release)
 
 
 def test_kokkos_staging_role_of_reads_a_stated_role():

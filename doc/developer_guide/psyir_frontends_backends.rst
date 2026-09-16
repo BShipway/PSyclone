@@ -658,7 +658,9 @@ totals::
   lfric_kokkos: staging=non-field staged=… cached=… hits=… shared=…
                 copies_in=… copies_out=… prefetch=on|off prefetches=…
                 prefetch_bytes=… prefetch_refused=… prefetch_skipped=…
-                prefetch_stride=… field_stages=…
+                prefetch_stride=… field_stages=… prefetch_dedupe=on|off
+                prefetch_repeat_call=… prefetch_repeat_prev=…
+                prefetch_deduped=…
 
 and then one line per role, printed whether or not that role was met so that
 a reader and a parser find the same four rows in every run::
@@ -736,10 +738,30 @@ back to a Fortran `ALLOCATE`, so a region may legitimately be handed a
 pointer no prefetch can take: such a call is counted as `prefetch_refused`,
 the sticky CUDA error it leaves is cleared, and the run carries on. Every
 staging of a field therefore ends in exactly one of `prefetches`,
-`prefetch_refused` and `prefetch_skipped`, and those three sum to
-`field_stages`. The line is printed whenever the knob is on, even in a mode
-that stages nothing, so that a knob which resolved off cannot be read as a
-lever that did not pay.
+`prefetch_refused`, `prefetch_skipped` and `prefetch_deduped`, and those four
+sum to `field_stages`. The line is printed whenever the knob is on, even in a
+mode that stages nothing, so that a knob which resolved off cannot be read as
+a lever that did not pay.
+
+One region call may stage one field twice -- a field vector's component under
+two arguments, an invoke whose actual appears under two formals, a built-in
+whose input and output are one field -- and the second prefetch asks the
+driver to move a range it has just been asked to move.
+`LFRIC_KOKKOS_STAGING_PREFETCH_DEDUPE=1` issues it once instead: the ranges
+prefetched in the current call are kept, keyed by `(pointer, bytes)` like
+every other key here, and a staging that matches one of them is counted in
+`prefetch_deduped` and not issued. The list is dropped at `release()`, ahead
+of the mode check there because `none` mode returns early from the rest of
+that function and still prefetches, so nothing is ever skipped across a call
+boundary: between two regions the host writes fields, which is what put those
+pages on the host to begin with. The header cannot see that host code, so
+`prefetch_repeat_prev` -- ranges the *previous* call prefetched -- is counted
+and reported but never skipped; it is an upper bound on what a cross-call
+dedupe could remove rather than a saving available to one. Both counts are
+taken whether or not the knob is on, because a run with it off is the run
+that says what there was to take. Nothing about what any launch reads
+changes either way: a prefetch is a hint, and a page the driver did not move
+is faulted in by the launch that reads it.
 
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that

@@ -272,6 +272,30 @@ inline std::size_t prefetch_stride() {
   return stride;
 }
 
+// DEDUPE WITHIN A REGION CALL. One region call stages each of its array
+// arguments once, and two of those arguments may be the same field: a field
+// vector's component passed twice, an invoke whose actual appears under two
+// formals, a built-in whose input and output are one field. The second
+// staging asks the driver to move a range it has just been asked to move,
+// which costs the call -- about 12 microseconds -- and moves nothing. Keyed
+// by (pointer, bytes) like everything else here, remembered for the duration
+// of one region call and dropped at release(), so nothing is ever skipped
+// across a call boundary: between two regions the host writes fields, and
+// wave 1 measured that skipping a prefetch there costs time.
+//
+// Byte-identical by construction either way -- a prefetch is a hint, and a
+// page the driver did not move is faulted in by the launch that reads it --
+// so the knob exists to be the A/B's control, not because the answer could
+// be wrong.
+inline bool dedupe_prefetch() {
+  static const bool setting = []() {
+    const char *value = std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH_DEDUPE");
+    return value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0;
+  }();
+  return setting;
+}
+
 // A device allocation and the handle that owns it. The owner is a
 // shared_ptr to a managed Kokkos::View: holding the View is what keeps the
 // allocation alive, and dropping the last owner is what frees it.
@@ -351,6 +375,21 @@ struct State {
   std::size_t prefetch_bytes = 0;     // their total size
   std::size_t prefetch_refused = 0;   // pointers the driver would not take
   std::size_t prefetch_skipped = 0;   // held back by the stride
+  // Repeats, which are what the dedupe is worth. A staging of a range this
+  // region call has already prefetched is the dedupe's own; a staging of a
+  // range the call *before* prefetched is counted but never skipped, and is
+  // an upper bound on what a cross-call dedupe could save rather than a
+  // saving: this header cannot see the host code that ran in between, and
+  // host code between two regions is what puts a page back on the host.
+  std::size_t prefetch_repeat_call = 0;
+  std::size_t prefetch_repeat_prev = 0;
+  std::size_t prefetch_deduped = 0;   // repeats the dedupe did not issue
+  // The ranges prefetched in this region call, and in the one before it.
+  // Vectors rather than a map: a region stages a handful of arrays, a linear
+  // scan over a handful beats a tree, and swap-and-clear at the end of a call
+  // keeps the capacity so that no call allocates.
+  std::vector<Key> call_prefetched;
+  std::vector<Key> previous_prefetched;
   // Whether a pointer's storage is managed memory, asked once per pointer:
   // a run of fallen-back fields would otherwise pay a query per staging.
   std::map<const void *, bool> managed;
@@ -436,9 +475,16 @@ inline bool managed_pointer(State &current, const void *pointer) {
 
 #endif  // KOKKOS_ENABLE_CUDA
 
+// Is this range in a list of them? The lists are a call's worth of ranges,
+// so a linear scan is the whole of the search.
+inline bool holds(const std::vector<Key> &keys, const Key &key) {
+  return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
 // Move one field's range to the card, if the driver will take it. Every
-// staging of a field either issues a prefetch, is refused or is held back
-// by the stride, so those three sum to field_stages. Lock held.
+// staging of a field either issues a prefetch, is refused, is held back by
+// the stride or is a repeat the dedupe dropped, so those four sum to
+// field_stages. Lock held.
 inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
   const std::size_t index = current.field_stages;
   current.field_stages += 1;
@@ -446,6 +492,23 @@ inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
   if (pointer == nullptr || bytes == 0) {
     current.prefetch_refused += 1;
     return;
+  }
+  // Counted whether or not the dedupe is on, because the count is the
+  // measurement the dedupe was built from and a run with it off is the one
+  // that reports what there was to take.
+  const Key range(pointer, bytes);
+  const bool repeat_in_call = holds(current.call_prefetched, range);
+  if (repeat_in_call) {
+    current.prefetch_repeat_call += 1;
+    if (dedupe_prefetch()) {
+      current.prefetch_deduped += 1;
+      return;
+    }
+  } else {
+    if (holds(current.previous_prefetched, range)) {
+      current.prefetch_repeat_prev += 1;
+    }
+    current.call_prefetched.push_back(range);
   }
   const std::size_t stride = prefetch_stride();
   if (stride > 0) {
@@ -483,6 +546,18 @@ inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
   (void)bytes;
   current.prefetch_refused += 1;
 #endif
+}
+
+// The end of a region call, for the dedupe: this call's ranges become the
+// previous call's and the current list is emptied, so that a repeat is only
+// ever skipped inside one call. Called from release(), before the mode check
+// there, because none mode returns early from everything else and still
+// prefetches.
+inline void end_prefetch_call() {
+  State &current = state();
+  std::lock_guard<std::mutex> guard(current.lock);
+  current.previous_prefetched.swap(current.call_prefetched);
+  current.call_prefetched.clear();
 }
 
 // The lock is the only cost a staging pays for this, and only when the knob
@@ -575,13 +650,17 @@ inline void finish() {
                  "shared=%zu copies_in=%zu copies_out=%zu "
                  "prefetch=%s prefetches=%zu prefetch_bytes=%zu "
                  "prefetch_refused=%zu prefetch_skipped=%zu "
-                 "prefetch_stride=%zu field_stages=%zu\n",
+                 "prefetch_stride=%zu field_stages=%zu "
+                 "prefetch_dedupe=%s prefetch_repeat_call=%zu "
+                 "prefetch_repeat_prev=%zu prefetch_deduped=%zu\n",
                  mode_name(mode()), sum.staged, sum.cached, sum.hits,
                  sum.shared, sum.copies_in, sum.copies_out,
                  prefetching() ? "on" : "off", current.prefetches,
                  current.prefetch_bytes, current.prefetch_refused,
                  current.prefetch_skipped, prefetch_stride(),
-                 current.field_stages);
+                 current.field_stages, dedupe_prefetch() ? "on" : "off",
+                 current.prefetch_repeat_call, current.prefetch_repeat_prev,
+                 current.prefetch_deduped);
     // One line per role, whether or not that role was met, so that a reader
     // and a parser both find the same four rows in every run.
     for (int index = 0; index < role_count; ++index) {
@@ -768,6 +847,9 @@ inline void unstage(const ViewType &view,
 // back -- and without this they would accumulate one allocation per call.
 // The cache is untouched.
 inline void release() {
+  if (prefetching()) {
+    end_prefetch_call();
+  }
   if (mode() == Mode::none) {
     return;
   }
