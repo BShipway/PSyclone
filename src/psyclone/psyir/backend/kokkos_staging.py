@@ -119,6 +119,12 @@ _HEADER_TEXT = r'''
 //
 // LFRIC_KOKKOS_STAGING_CACHE=0 disables the cache in non-field mode.
 //
+// LFRIC_KOKKOS_STAGING_PREFETCH=1 asks, on a CUDA build, for a field's pages
+// to be moved to the card before the launch that reads them rather than
+// faulted across one at a time by the launch itself; it is off unless asked
+// for. LFRIC_KOKKOS_STAGING_PREFETCH_STRIDE=N asks for a pointer at most
+// once in every N field stagings, for a field that is already resident.
+//
 // At Kokkos::finalize the header reports what it did on stderr: one line of
 // totals, then one line per role (staging_role=field, readonly, readwrite,
 // transient) carrying that role's arrays, copies, bytes each way and
@@ -133,6 +139,12 @@ _HEADER_TEXT = r'''
 #define LFRIC_KOKKOS_STAGING_HPP
 
 #include <Kokkos_Core.hpp>
+
+// After Kokkos, which is what defines KOKKOS_ENABLE_CUDA, so that this
+// header says the same thing wherever a region includes it.
+#if defined(KOKKOS_ENABLE_CUDA)
+#include <cuda_runtime_api.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -267,6 +279,45 @@ inline std::size_t pool_limit() {
   return bytes;
 }
 
+// PREFETCH ON STAGE. In non-field mode -- and in none mode, which reaches
+// the same line -- a Role::field View is left over the caller's pointer,
+// which on a CUDA build is managed memory whose pages live wherever they
+// were last touched: a launch reading a field the host has just written
+// faults it onto the card 64 KB at a time (at C48, 525 thousand GPU faults
+// in ten steps and 5.5 s of the 12.3 s of kernel time, nearly all of it in
+// the captured built-ins). Asking the driver for the whole range first turns
+// those faults into one bulk copy, issued on the stream the launch that
+// follows will run on, so the region's own fence orders it and nothing new
+// is waited for.
+//
+// Off unless asked for: a prefetch of a field that is already resident costs
+// the call and moves nothing, and which way that goes is a measurement.
+inline bool prefetching() {
+  static const bool setting = []() {
+    const char *value = std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH");
+    return value != nullptr && value[0] != '\0' &&
+           std::strcmp(value, "0") != 0;
+  }();
+  return setting;
+}
+
+// How rarely one pointer may be prefetched again, counted in field stagings
+// of any pointer; zero, the default, prefetches on every staging. This is
+// the honest form of "once a timestep": a header included by regions sees no
+// step boundary -- every region ends in the same fence, and the Fortran that
+// knows the step never calls in here -- so a count of stagings is its only
+// clock. The field set is the same every step, so N stagings is a fixed
+// fraction of a step, and field_stages on the report line divided by the
+// step count is what to set N from.
+inline std::size_t prefetch_stride() {
+  static const std::size_t stride = []() {
+    const char *value = std::getenv("LFRIC_KOKKOS_STAGING_PREFETCH_STRIDE");
+    const long count = value == nullptr ? 0 : std::atol(value);
+    return count <= 0 ? std::size_t(0) : std::size_t(count);
+  }();
+  return stride;
+}
+
 // A device allocation and the handle that owns it. The owner is a
 // shared_ptr to a managed Kokkos::View: holding the View is what keeps the
 // allocation alive, and dropping the last owner is what frees it.
@@ -339,6 +390,19 @@ struct State {
   std::size_t pool_peak = 0;      // the most ever held
   std::size_t pool_released = 0;  // pooled buffers given back at finalise
 
+  // What the prefetch did. Counted here rather than in Counters because
+  // only a field's storage is ever prefetched.
+  std::size_t field_stages = 0;       // Role::field Views left unmanaged
+  std::size_t prefetches = 0;         // ranges handed to the driver
+  std::size_t prefetch_bytes = 0;     // their total size
+  std::size_t prefetch_refused = 0;   // pointers the driver would not take
+  std::size_t prefetch_skipped = 0;   // held back by the stride
+  // Whether a pointer's storage is managed memory, asked once per pointer:
+  // a run of fallen-back fields would otherwise pay a query per staging.
+  std::map<const void *, bool> managed;
+  // The staging at which each pointer was last prefetched, for the stride.
+  std::map<const void *, std::size_t> prefetched_at;
+
   Counters &of(Role which) { return role[static_cast<int>(which)]; }
 
   // The totals are the sum of the roles rather than a second set of
@@ -376,6 +440,103 @@ inline State &state() {
     return created;
   }();
   return *singleton;
+}
+
+#if defined(KOKKOS_ENABLE_CUDA)
+
+// The stream the launch that follows will be issued on: ordering the copy
+// before the launch on one stream is the whole of the synchronisation this
+// needs. Only the Cuda execution space has a stream to name; any other
+// default space takes the template below and gets the default stream.
+inline cudaStream_t stream_of(const Kokkos::Cuda &space) {
+  return space.cuda_stream();
+}
+
+template <typename Space>
+inline cudaStream_t stream_of(const Space &) {
+  return cudaStream_t(0);
+}
+
+// Is the storage behind this pointer managed memory? A host-only build has
+// none, and on a device build a field whose SharedSpace claim was refused
+// falls back to Fortran ALLOCATE (lfric_core's kokkos_memory.cpp), so a
+// region may be handed a pointer no prefetch can take. Asked once per
+// pointer and remembered. Called with the state's lock held.
+inline bool managed_pointer(State &current, const void *pointer) {
+  const auto found = current.managed.find(pointer);
+  if (found != current.managed.end()) {
+    return found->second;
+  }
+  cudaPointerAttributes attributes{};
+  const bool answer =
+      cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess &&
+      attributes.type == cudaMemoryTypeManaged;
+  if (!answer) {
+    // A host pointer is not an error for the next CUDA call to be blamed
+    // for: some toolkits answer one, and a sticky error outlives the call.
+    (void)cudaGetLastError();
+  }
+  current.managed.emplace(pointer, answer);
+  return answer;
+}
+
+#endif  // KOKKOS_ENABLE_CUDA
+
+// Move one field's range to the card, if the driver will take it. Every
+// staging of a field either issues a prefetch, is refused or is held back
+// by the stride, so those three sum to field_stages. Lock held.
+inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
+  const std::size_t index = current.field_stages;
+  current.field_stages += 1;
+#if defined(KOKKOS_ENABLE_CUDA)
+  if (pointer == nullptr || bytes == 0) {
+    current.prefetch_refused += 1;
+    return;
+  }
+  const std::size_t stride = prefetch_stride();
+  if (stride > 0) {
+    const auto seen = current.prefetched_at.find(pointer);
+    if (seen != current.prefetched_at.end() && index - seen->second < stride) {
+      current.prefetch_skipped += 1;
+      return;
+    }
+  }
+  int device = 0;
+  if (!managed_pointer(current, pointer) ||
+      cudaGetDevice(&device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    current.prefetch_refused += 1;
+    return;
+  }
+  cudaMemLocation on_device{};
+  on_device.type = cudaMemLocationTypeDevice;
+  on_device.id = device;
+  if (cudaMemPrefetchAsync(const_cast<void *>(pointer), bytes, on_device, 0,
+                           stream_of(Kokkos::DefaultExecutionSpace())) !=
+      cudaSuccess) {
+    (void)cudaGetLastError();
+    current.prefetch_refused += 1;
+    return;
+  }
+  current.prefetches += 1;
+  current.prefetch_bytes += bytes;
+  if (stride > 0) {
+    current.prefetched_at[pointer] = index;
+  }
+#else
+  // No card and no managed memory: asked for, nothing to do, and said.
+  (void)pointer;
+  (void)bytes;
+  current.prefetch_refused += 1;
+#endif
+}
+
+// The lock is the only cost a staging pays for this, and only when the knob
+// is on: the caller tests prefetching() first.
+inline void prefetch_field(const void *pointer, std::size_t bytes) {
+  State &current = state();
+  std::lock_guard<std::mutex> guard(current.lock);
+  prefetch(current, pointer, bytes);
 }
 
 // The pool for one memory space. A function-local static, so a space that
@@ -450,12 +611,23 @@ inline void finish() {
   drop_all(current, current.live, false);
   empty_pools(current);
   const Counters sum = current.total();
-  if (sum.staged + sum.cached > 0) {
+  // Printed when staging did anything, and whenever the prefetch knob was
+  // asked for, so that a run in none mode -- which stages nothing -- still
+  // says what the knob resolved to: a knob that silently did nothing passes
+  // every correctness gate and reads as a null lever.
+  if (sum.staged + sum.cached > 0 || prefetching()) {
     std::fprintf(stderr,
                  "lfric_kokkos: staging=%s staged=%zu cached=%zu hits=%zu "
-                 "shared=%zu copies_in=%zu copies_out=%zu\n",
+                 "shared=%zu copies_in=%zu copies_out=%zu "
+                 "prefetch=%s prefetches=%zu prefetch_bytes=%zu "
+                 "prefetch_refused=%zu prefetch_skipped=%zu "
+                 "prefetch_stride=%zu field_stages=%zu\n",
                  mode_name(mode()), sum.staged, sum.cached, sum.hits,
-                 sum.shared, sum.copies_in, sum.copies_out);
+                 sum.shared, sum.copies_in, sum.copies_out,
+                 prefetching() ? "on" : "off", current.prefetches,
+                 current.prefetch_bytes, current.prefetch_refused,
+                 current.prefetch_skipped, prefetch_stride(),
+                 current.field_stages);
     // One line per role, whether or not that role was met, so that a reader
     // and a parser both find the same four rows in every run.
     for (int index = 0; index < role_count; ++index) {
@@ -545,12 +717,22 @@ inline void copy_out(Value *host, const void *device, std::size_t count) {
 template <typename ViewType, typename... Extents>
 inline ViewType stage(typename ViewType::value_type *pointer, Role role,
                       Extents... extents) {
-  if (mode() == Mode::none ||
-      (mode() == Mode::non_field && role == Role::field)) {
-    return ViewType(pointer, extents...);
-  }
   using Value =
       typename std::remove_const<typename ViewType::value_type>::type;
+  if (mode() == Mode::none ||
+      (mode() == Mode::non_field && role == Role::field)) {
+    // The one path that leaves a field's storage where the caller put it,
+    // and so the only one where the launch would pay a fault per page.
+    // Nothing is issued for another role: a readonly or transient array in
+    // none mode may be ordinary host memory, which no prefetch can take.
+    if (role == Role::field && prefetching()) {
+      const std::size_t size =
+          (std::size_t(1) * ... * static_cast<std::size_t>(extents));
+      prefetch_field(static_cast<const void *>(pointer),
+                     size * sizeof(Value));
+    }
+    return ViewType(pointer, extents...);
+  }
   using Space = typename ViewType::memory_space;
   using Pointer = typename ViewType::value_type *;
   const std::size_t count =

@@ -650,7 +650,9 @@ At `Kokkos::finalize` the header reports what it did on stderr. One line of
 totals::
 
   lfric_kokkos: staging=non-field staged=… cached=… hits=… shared=…
-                copies_in=… copies_out=…
+                copies_in=… copies_out=… prefetch=on|off prefetches=…
+                prefetch_bytes=… prefetch_refused=… prefetch_skipped=…
+                prefetch_stride=… field_stages=…
 
 and then one line per role, printed whether or not that role was met so that
 a reader and a parser find the same four rows in every run::
@@ -698,6 +700,40 @@ hold unused (256 MB by default). The bound matters because the key is exact:
 a run meeting many distinct sizes would otherwise keep a spare of every one
 of them for ever. Past the bound a released buffer goes back to the driver as
 it did before.
+
+Prefetching a field onto the card
++++++++++++++++++++++++++++++++++
+
+A `field` role is the one role `stage` leaves where the caller put it, and on
+a CUDA build that storage is managed memory: its pages live wherever they
+were last touched, so a launch reading a field the host has just written
+faults it onto the card 64 KB at a time. `LFRIC_KOKKOS_STAGING_PREFETCH=1`
+asks the driver for the whole range instead, with `cudaMemPrefetchAsync` on
+the stream the launch that follows will be issued on, so the region's own
+fence -- which was already there -- is what orders it. Nothing is issued for
+another role, on a host build, or in `all` mode, where the field is copied
+into the execution space anyway.
+
+The knob is off unless asked for, because the gain is a measurement and not
+an argument: a prefetch of a field that is already resident costs the call
+and moves nothing. `LFRIC_KOKKOS_STAGING_PREFETCH_STRIDE=N` is the answer to
+that cost, and prefetches one pointer at most once in every `N` stagings of
+any field. It is spelt in stagings rather than in timesteps because a header
+included by regions sees no step boundary; the field set is the same every
+step, so `field_stages` on the report line divided by the step count is what
+"once a step" is in the units this header has.
+
+Whether a pointer's storage is managed memory is asked of the driver once
+per pointer and remembered. A host-only build has no managed memory at all,
+and on a device build a field whose `SharedSpace` claim was refused falls
+back to a Fortran `ALLOCATE`, so a region may legitimately be handed a
+pointer no prefetch can take: such a call is counted as `prefetch_refused`,
+the sticky CUDA error it leaves is cleared, and the run carries on. Every
+staging of a field therefore ends in exactly one of `prefetches`,
+`prefetch_refused` and `prefetch_skipped`, and those three sum to
+`field_stages`. The line is printed whenever the knob is on, even in a mode
+that stages nothing, so that a knob which resolved off cannot be read as a
+lever that did not pay.
 
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that
