@@ -32,7 +32,8 @@ from psyclone.psyir.backend.kokkos_spread_extent import spread_extents
 from psyclone.psyir.backend.kokkos_team_scalars import (
     team_private_scalars)
 from psyclone.psyir.backend.kokkos_launch import (
-    hierarchical_launch, range_launch, team_launch)
+    hierarchical_launch, member_local_definition, range_launch,
+    team_launch, team_scratch_items)
 from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
@@ -158,7 +159,7 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
                 "using TeamPolicy = Kokkos::TeamPolicy<>;",
                 "using TeamMember = TeamPolicy::member_type;",
             )) if region.scratch or region.parallel_loops else ""
-        if region.scratch:
+        if team_scratch_items(region):
             team_aliases += (
                 "  using ScratchSpace = "
                 "Kokkos::DefaultExecutionSpace::scratch_memory_space;\n")
@@ -244,6 +245,9 @@ class KokkosWriter(KokkosIntrinsicsMixin, KokkosArrayExpressionMixin,
             launch = range_launch(region, local_declarations, body)
 
         unit = (
+            # Ahead of the region, since a member of the team declares one
+            # inside the functor and a template may not be defined there.
+            f"{member_local_definition(region)}"
             f'extern "C" void {region.name}(\n'
             f"    {signature}) {{\n"
             # Kokkos does not treat an uninitialised runtime as an error: the

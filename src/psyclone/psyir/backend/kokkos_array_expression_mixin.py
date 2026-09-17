@@ -530,6 +530,15 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
         assignment in the two flat launch shapes, whose members are cells
         rather than lanes of one.
 
+        A write to a member-local array is left as it is too, for the reason
+        a write to a scalar is: the storage is the writing member's own, so
+        the concurrent writes the wrap exists to stop are not writes to one
+        element. See
+        :py:attr:`~psyclone.psyir.backend.kokkos.KokkosScratch.member_local`.
+        No barrier is lost with the wrap: such an array is one no loop
+        spread over the team touches, so no member ever waits on another's
+        copy of it, and every spread loop emits a barrier of its own.
+
         An array constructor on the right-hand side writes array elements
         too, and names its target without subscripting it -- ``x = [a, b]``
         -- so it is wrapped for the same reason. All of its element
@@ -578,7 +587,8 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
             isinstance(node.rhs, ArrayConstructor)
         atomic = self._atomic_update(node, lowered)
         if (not self._parallel_loops or self._parallel_depth
-                or not writes_an_array):
+                or not writes_an_array
+                or self._writes_member_local(node)):
             if atomic:
                 return self._atomic_statement(node, *atomic)
             if lowered:
@@ -598,6 +608,25 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
             "[&]() {\n"
             f"{inner}{self._nindent}}});\n"
             f"{self._nindent}team.team_barrier();\n")
+
+    def _writes_member_local(self, node) -> bool:
+        """Say whether an assignment's target is a member-local array.
+
+        The name is read from the left-hand side of the statement, which
+        names the array whether it subscripts it -- ``x(1) = w`` -- or not,
+        as the array-constructor form ``x = [a, b]`` does not.
+
+        :param node: the assignment in the captured body.
+        :type node: :py:class:`psyclone.psyir.nodes.Assignment`
+
+        :returns: whether the region described the target as per-member
+            storage. False for a target described as a View, a constant or
+            an alias, none of which carries the field, and for a target the
+            region described not at all.
+        :rtype: bool
+        """
+        target = self._views.get(getattr(node.lhs, "name", None))
+        return bool(getattr(target, "member_local", False))
 
     def arrayreference_node(self, node: ArrayReference) -> str:
         """Emit an indexed View access with Fortran lower bounds removed.

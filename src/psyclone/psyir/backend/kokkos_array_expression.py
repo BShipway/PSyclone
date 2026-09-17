@@ -81,6 +81,15 @@ class KokkosScratch:
     ``index_offsets`` and ``extra_indices`` are carried, and the latter is
     always empty, so that one array-reference table can hold both Views and
     scratch and be read without a type test.
+
+    ``member_local`` turns the scratch View into per-member storage: the
+    array is declared inside the functor, every member of the team holds its
+    own copy, and no team scratch is reserved for it. It is set only where
+    holding a copy each is both cheap and indistinguishable from sharing
+    one, which is decided where the region is described and not here; see
+    :py:func:`~psyclone.psyir.backend.kokkos_launch.member_local_definition`
+    for what is generated. It defaults to false, so a description built
+    before it existed is generated exactly as it was then.
     """
 
     name: str
@@ -89,6 +98,9 @@ class KokkosScratch:
     #: As :py:attr:`KokkosView.index_offsets`.
     index_offsets: Tuple[Union[int, str], ...] = ()
     extra_indices: Tuple[str, ...] = ()
+    #: Whether every member of the team holds its own copy rather than the
+    #: team sharing one in scratch.
+    member_local: bool = False
 
 
 class KokkosArrayExpression:

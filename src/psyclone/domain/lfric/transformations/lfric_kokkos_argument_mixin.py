@@ -812,6 +812,9 @@ LFRicKokkosTrans.apply` makes.
         # fields below composes with the two above.
         colours, colour_arguments, colour_actuals = cls._colouring(
             kernel, node, schedule, cell_index)
+        # Once, and handed to both the region and the scratch below, whose
+        # descriptions turn on the same answer the launch shape does.
+        parallel_loops = cls._parallel_loops(schedule)
         region = KokkosRegion(
             name=cls._region_name(schedule),
             schedule=schedule,
@@ -830,9 +833,9 @@ LFRicKokkosTrans.apply` makes.
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
-            scratch=cls._scratch_arrays(schedule, renames),
+            scratch=cls._scratch_arrays(schedule, renames, parallel_loops),
             aliases=cls._region_aliases(schedule, renames),
-            parallel_loops=cls._parallel_loops(schedule),
+            parallel_loops=parallel_loops,
             team_size=(options or {}).get(cls._TEAM_SIZE_OPTION))
         actuals.extend(actual.copy() for _, actual in storage.values())
         actuals.extend(colour_actuals)
@@ -867,7 +870,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
             for name, targets in cls._alias_targets(schedule).items())
 
     @classmethod
-    def _scratch_arrays(cls, schedule, renames):
+    def _scratch_arrays(cls, schedule, renames, parallel_loops=()):
         """Describe the kernel's automatic arrays, per-cell sizes renamed.
 
         A local sized from a stencil's size -- ``dimension(stencil_size)`` --
@@ -881,6 +884,11 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
         :param schedule: the kernel schedule being captured.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
         :param dict[str, str] renames: the new name of each per-cell size.
+        :param parallel_loops: the loops the launch spreads over the team,
+            passed to ``cls._local_arrays``, which decides from them which
+            arrays a member may hold its own copy of.
+        :type parallel_loops: tuple[
+            :py:class:`psyclone.psyir.nodes.Loop`, ...]
 
         :returns: one description per automatic array, in declaration order.
         :rtype: tuple[
@@ -891,7 +899,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
                     extents=cls._rename_extents(item.extents, renames),
                     index_offsets=cls._rename_extents(
                         item.index_offsets, renames))
-            for item in cls._local_arrays(schedule))
+            for item in cls._local_arrays(schedule, parallel_loops))
 
     @classmethod
     def _call_region(cls, node, region, actuals, constants):
