@@ -678,6 +678,286 @@ def test_cw_loop_step_of_unknown_sign(fortran_reader):
     assert 'for(i=1; i<=n; i+=s)' in CWriter()(module[0])
 
 
+def test_cw_loop_with_bounds_fixed_at_entry_is_unchanged(fortran_reader):
+    '''Tests that a loop whose bounds cannot change keeps the text it had.
+
+    Hoisting a bound that cannot change while the loop runs -- a literal, a
+    scalar the body never assigns, or arithmetic over those, which is the
+    ``nlayers - 1`` almost every captured layer loop ends at -- would buy
+    nothing and would re-shape every generated loop in the prototype's
+    captured regions. The whole text is asserted, not a fragment, because
+    "unchanged" is the claim.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, n, s)
+          integer :: i, a
+          integer, intent(in) :: n, s
+          integer, dimension(:) :: b
+          do i = 1, 20, 2
+            a = (2 * i)
+          enddo
+          do i = 1, n, s
+            a = i
+          enddo
+          do i = n, 1, -1
+            a = i
+          enddo
+          do i = 1, n - 1
+            a = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    cwriter = CWriter()
+    assert cwriter(module[0]) == ("for(i=1; i<=20; i+=2)\n"
+                                  "{\n"
+                                  "  a = (2 * i);\n"
+                                  "}\n")
+    assert cwriter(module[1]) == ("for(i=1; i<=n; i+=s)\n"
+                                  "{\n"
+                                  "  a = i;\n"
+                                  "}\n")
+    assert cwriter(module[2]) == ("for(i=n; i>=1; i+=(-1))\n"
+                                  "{\n"
+                                  "  a = i;\n"
+                                  "}\n")
+    assert cwriter(module[3]) == ("for(i=1; i<=(n - 1); i+=1)\n"
+                                  "{\n"
+                                  "  a = i;\n"
+                                  "}\n")
+
+
+def test_cw_loop_stop_that_reads_memory_is_evaluated_once(fortran_reader):
+    '''Tests that a bound reading memory is evaluated once before the loop.
+
+    Fortran fixes a DO loop's trip count when the loop is entered, so a
+    bound that reads an array is read once however many trips follow. C
+    re-evaluates a for header's test every trip, so the literal translation
+    is not the same program: an iteration that writes what the bound reads,
+    or another thread that does, changes the number of trips still to come.
+    The local is const, is declared immediately before the loop, and is in a
+    block of its own so that it cannot collide with anything around it.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, m)
+          integer :: i, a
+          integer, dimension(:) :: b, m
+          do i = 1, m(1)
+            m(2) = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[0]) == ("{\n"
+                                    "  const int i_stop = m[1];\n"
+                                    "  for(i=1; i<=i_stop; i+=1)\n"
+                                    "  {\n"
+                                    "    m[2] = i;\n"
+                                    "  }\n"
+                                    "}\n")
+
+
+def test_cw_loop_step_that_reads_memory_is_evaluated_once(fortran_reader):
+    '''Tests that a step reading memory is evaluated once, as a stop is.
+
+    A Fortran DO evaluates its step exactly where it evaluates its bounds,
+    and C adds the step on every trip, so the step needs the same treatment
+    and gets a local of its own.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, n, m)
+          integer :: i, a
+          integer, intent(in) :: n
+          integer, dimension(:) :: b, m
+          do i = 1, n, m(1)
+            a = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[0]) == ("{\n"
+                                    "  const int i_step = m[1];\n"
+                                    "  for(i=1; i<=n; i+=i_step)\n"
+                                    "  {\n"
+                                    "    a = i;\n"
+                                    "  }\n"
+                                    "}\n")
+
+
+def test_cw_loop_hoists_stop_and_step_together(fortran_reader):
+    '''Tests a loop whose stop and step both read memory.
+
+    Both locals are declared, in the order the header reads them, and the
+    header reads nothing but the two names.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, m)
+          integer :: i, a
+          integer, dimension(:) :: b, m
+          do i = 1, m(1), m(2)
+            a = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[0]) == ("{\n"
+                                    "  const int i_stop = m[1];\n"
+                                    "  const int i_step = m[2];\n"
+                                    "  for(i=1; i<=i_stop; i+=i_step)\n"
+                                    "  {\n"
+                                    "    a = i;\n"
+                                    "  }\n"
+                                    "}\n")
+
+
+def test_cw_loop_scalar_bound_the_body_assigns_is_hoisted(fortran_reader):
+    '''Tests that a scalar bound the body writes is still evaluated once.
+
+    A scalar reference is left in the header only because nothing can change
+    it. Where the body does change it, Fortran keeps the trip count it
+    worked out at entry and the C loop would not, so this is the one shape
+    of scalar bound that has to be hoisted.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b)
+          integer :: i, n
+          integer, dimension(:) :: b
+          do i = 1, n
+            n = n - 1
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[0]) == ("{\n"
+                                    "  const int i_stop = n;\n"
+                                    "  for(i=1; i<=i_stop; i+=1)\n"
+                                    "  {\n"
+                                    "    n = (n - 1);\n"
+                                    "  }\n"
+                                    "}\n")
+
+
+def test_cw_nested_loops_each_hoist_their_own_bound(fortran_reader):
+    '''Tests that nested loops get a local each, named after their own
+    variable.
+
+    The inner loop's bound is re-read on every trip of the outer loop, which
+    is what Fortran does too -- entering a loop is where its count is fixed
+    -- so the inner declaration sits inside the outer body rather than being
+    lifted out of it.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, m)
+          integer :: i, j, a
+          integer, dimension(:) :: b, m
+          do i = 1, m(1)
+            do j = 1, m(i)
+              a = j
+            enddo
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[0]) == ("{\n"
+                                    "  const int i_stop = m[1];\n"
+                                    "  for(i=1; i<=i_stop; i+=1)\n"
+                                    "  {\n"
+                                    "    {\n"
+                                    "      const int j_stop = m[i];\n"
+                                    "      for(j=1; j<=j_stop; j+=1)\n"
+                                    "      {\n"
+                                    "        a = j;\n"
+                                    "      }\n"
+                                    "    }\n"
+                                    "  }\n"
+                                    "}\n")
+
+
+def test_cw_loop_hoisted_name_avoids_the_expression(fortran_reader):
+    '''Tests that the hoisted local is not named after something the bound
+    reads.
+
+    The declaration is in a block of its own, so a name shared with anything
+    outside it shadows rather than clashes. The name that would break is one
+    the hoisted expression itself writes, because the initialiser would then
+    be reading the variable it is declaring.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(b, m, i_stop)
+          integer :: i, a
+          integer, intent(in) :: i_stop
+          integer, dimension(:) :: b, m
+          do i = 1, m(i_stop)
+            a = i
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[0]) == ("{\n"
+                                    "  const int i_stop_ = m[i_stop];\n"
+                                    "  for(i=1; i<=i_stop_; i+=1)\n"
+                                    "  {\n"
+                                    "    a = i;\n"
+                                    "  }\n"
+                                    "}\n")
+
+
+def test_cw_while_loop_condition_is_not_hoisted(fortran_reader):
+    '''Tests that the while writer is untouched by the counted loop's hoist.
+
+    A Fortran DO WHILE re-evaluates its condition on every trip, exactly as
+    C's while does, so a condition that reads memory is a faithful
+    translation where a counted loop's bound would not be. Evaluating it
+    once would be the bug here.
+
+    '''
+    code = '''
+        module test
+        contains
+        subroutine tmp(m)
+          integer :: i
+          integer, dimension(:) :: m
+          i = 0
+          do while (i < m(1))
+            i = i + 1
+          enddo
+        end subroutine tmp
+        end module test'''
+    module = fortran_reader.psyir_from_source(code).children[0].children[0]
+
+    assert CWriter()(module[1]) == ("while ((i < m[1])) {\n"
+                                    "  i = (i + 1);\n"
+                                    "}\n")
+
+
 def test_cw_unsupported_intrinsiccall():
     ''' Check the CWriter class SIZE intrinsic raises the expected error since
     there is no C equivalent. '''

@@ -53,8 +53,8 @@ from psyclone.psyir.backend.language_writer import LanguageWriter
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, Call, IntrinsicCall,
-    Literal, Operation, Range, Reference, UnaryOperation)
-from psyclone.psyir.symbols import ArrayType, ScalarType
+    Literal, Operation, Range, Reference, StructureReference, UnaryOperation)
+from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
 
 
 # PSyIR datatypes now support precision as well as intrinsics. It is
@@ -470,6 +470,98 @@ class CWriter(CIntrinsicsMixin, LanguageWriter):
             return not step_expr.children[0].value.startswith("-")
         return False
 
+    @staticmethod
+    def _is_fixed_at_entry(expr, node):
+        '''Whether a bound expression has one value for the whole loop.
+
+        Fortran fixes a ``DO`` loop's trip count when the loop is entered;
+        C re-evaluates the expressions in a ``for`` header on every trip.
+        The two say the same thing only where the expression cannot change
+        while the loop runs, and this decides where that is. Fixed at entry
+        are a literal, a reference to a scalar the body does not assign, and
+        an operation over things that are themselves fixed at entry -- so
+        the ``nlayers - 1`` that ends almost every captured layer loop keeps
+        the shape it has always had.
+
+        Not fixed at entry is anything that reads memory: an array element,
+        a structure component, a whole array, or a call, whose result the
+        tree does not rule out the body, another thread or another member of
+        the team writing between one trip and the next.
+
+        :param expr: the bound expression being judged.
+        :type expr: :py:class:`psyclone.psyir.nodes.Node`
+        :param node: the loop the expression is a bound of.
+        :type node: :py:class:`psyclone.psyir.nodes.Loop`
+
+        :returns: whether the expression may be left in the loop header.
+        :rtype: bool
+
+        '''
+        if isinstance(expr, Literal):
+            return True
+        if isinstance(expr, Operation):
+            return all(CWriter._is_fixed_at_entry(child, node)
+                       for child in expr.children)
+        if (not isinstance(expr, Reference)
+                or isinstance(expr, (ArrayReference, StructureReference))
+                or getattr(expr.symbol, "is_array", False)):
+            return False
+        return not any(
+            getattr(assignment.lhs, "symbol", None) is expr.symbol
+            for assignment in node.loop_body.walk(Assignment))
+
+    @staticmethod
+    def _unused_name(stem, texts):
+        '''Return a name built from a stem that appears in none of the texts.
+
+        The hoisted bound is declared in a block of its own, so a name it
+        shares with something outside that block shadows rather than
+        clashes. The one name that would not be safe is a name the hoisted
+        expression itself uses, which its own initialiser would then read
+        before it has a value; underscores are added until the name is not
+        written in any of the expressions the loop header is built from.
+
+        :param str stem: the name to start from.
+        :param texts: the generated expressions the name must not occur in.
+        :type texts: Iterable[str]
+
+        :returns: a name that occurs in none of the texts.
+        :rtype: str
+
+        '''
+        name = stem
+        while any(name in text for text in texts):
+            name = name + "_"
+        return name
+
+    def _hoisted_bounds(self, node, start, stop, step):
+        '''Decide which of a loop's bounds are evaluated before the loop.
+
+        :param node: the loop whose header is being written.
+        :type node: :py:class:`psyclone.psyir.nodes.Loop`
+        :param str start: the generated start expression.
+        :param str stop: the generated stop expression.
+        :param str step: the generated step expression.
+
+        :returns: the ``(name, expression)`` pairs to be declared before the
+            loop, and the stop and step its header should read.
+        :rtype: Tuple[List[Tuple[str, str]], str, str]
+
+        '''
+        hoisted = []
+        taken = [start, stop, step]
+        variable_name = node.variable.name
+        if not self._is_fixed_at_entry(node.stop_expr, node):
+            name = self._unused_name(f"{variable_name}_stop", taken)
+            taken.append(name)
+            hoisted.append((name, stop))
+            stop = name
+        if not self._is_fixed_at_entry(node.step_expr, node):
+            name = self._unused_name(f"{variable_name}_step", taken)
+            hoisted.append((name, step))
+            step = name
+        return hoisted, stop, step
+
     def loop_node(self, node):
         '''This method is called when a Loop instance is found in the
         PSyIR tree.
@@ -479,6 +571,17 @@ class CWriter(CIntrinsicsMixin, LanguageWriter):
         k>=1; k+=-1)`` rather than a loop whose body never runs. Only a step
         whose sign is visible in the tree is followed; see
         :py:meth:`_loop_counts_down`.
+
+        A stop or step expression that reads memory -- and so is not fixed
+        at entry, see :py:meth:`_is_fixed_at_entry` -- is evaluated once into
+        a ``const`` local, declared immediately before the loop in a block of
+        its own, and the header reads the local. Without that the C loop
+        re-evaluates the expression on every trip, which a Fortran ``DO``
+        does not do, so a bound reading something the body or a neighbouring
+        thread writes gives a trip count Fortran would never have taken. A
+        loop whose bounds are fixed at entry, which is all but a few dozen of
+        the prototype's captured loops, is written exactly as it was before
+        this was here.
 
         :param node: a Loop PSyIR node.
         :type node: :py:class:`psyclone.psyir.nodes.Loop`
@@ -493,15 +596,31 @@ class CWriter(CIntrinsicsMixin, LanguageWriter):
         variable_name = node.variable.name
         test = ">=" if self._loop_counts_down(node.step_expr) else "<="
 
+        hoisted, stop, step = self._hoisted_bounds(node, start, stop, step)
+
+        block_indent = self._nindent
+        if hoisted:
+            self._depth += 1
+        loop_indent = self._nindent
+
         self._depth += 1
         body = ""
         for child in node.loop_body:
             body += self._visit(child)
         self._depth -= 1
 
-        return f"{self._nindent}for({variable_name}={start}; "\
+        loop = f"{loop_indent}for({variable_name}={start}; "\
                f"{variable_name}{test}{stop}; {variable_name}+={step})\n"\
-               f"{self._nindent}{{\n{body}{self._nindent}}}\n"
+               f"{loop_indent}{{\n{body}{loop_indent}}}\n"
+        if not hoisted:
+            return loop
+
+        self._depth -= 1
+        declarations = "".join(
+            f"{loop_indent}const "
+            f"{self.gen_declaration(DataSymbol(name, node.variable.datatype))}"
+            f" = {expression};\n" for name, expression in hoisted)
+        return f"{block_indent}{{\n{declarations}{loop}{block_indent}}}\n"
 
     def whileloop_node(self, node):
         '''This method is called when a WhileLoop instance is found in the
