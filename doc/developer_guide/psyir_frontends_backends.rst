@@ -972,11 +972,20 @@ unwritable argument would stand in for the call it sits under. `LBOUND`,
 before the writer sees them -- and neither are the array-valued intrinsics of
 the next section, which no handler writes and which lowering replaces first.
 Where the lowering does *not* replace one, a handler writes it after all and
-it is asked like any other: `_written_by_the_array_tier` steps over such a
+it is asked like any other: `written_by_the_array_tier` steps over such a
 call only on a right-hand side that is not itself an array constructor,
 because `assignment_node` decides which statements are lowered on exactly
 that question and a constructor is spread over its destination element by
 element.
+
+That predicate is public because the LFRic transformation asks it too.
+`LFRicKokkosIntrinsicMixin._lower_reductions` uses it to decide which
+scalar-valued folds it must move into an assignment of their own before the
+writer is reached -- a `MAXVAL` in an `IF` condition being the case that
+arises -- and a second copy of the rule in the transformation would be a
+second copy to keep in step with this one. The writer is therefore the sole
+authority on where the tier writes a call, and both the refusal and the
+rewrite are derived from it.
 
 `unshapeable_expressions(schedule, kind_types)` is the other half of the same
 question, and the half that probe cannot ask. An array-valued intrinsic where
@@ -1670,6 +1679,25 @@ written in -- reaches the writer as it stands and is generated here.
 `LFRicKokkosIntrinsicMixin._written_as_a_nest` is what
 `LFRicKokkosContractMixin._is_array_valued` asks, alongside the array
 constructor it excludes for the same reason.
+
+Because `hoist` places its loops *ahead of the statement*, the positions it
+can serve are on, or within, a right-hand side. A scalar-valued fold anywhere
+else -- `if (MAXVAL(switch(low:high)) > 0)`, the shape the FFSL
+departure-point kernels ask a sweep's result in -- has no statement to be
+placed ahead of, and used to be refused twice: once by
+`unsupported_intrinsics`, the ordinary handler having no spelling for it,
+and once by `LFRicKokkosContractMixin._validate_sections`, its operand being
+a section outside every assignment. `LFRicKokkosIntrinsicMixin
+._lower_reductions` moves such a fold into an assignment of its own,
+inserted in the position of the statement it stood in and no earlier, and
+replaces the call with a reference to the scalar. Both refusals then have
+nothing to refuse, and the statement pair is the one the section lowering
+and this tier already write. The move asks `written_by_the_array_tier`
+rather than restating where the tier writes, takes only folds whose
+`datatype` is a `ScalarType` -- an array-valued result would need a
+temporary of its own shape -- and refuses the condition of a `WhileLoop`,
+where Fortran re-reads the value on every trip and a statement before the
+loop would be evaluated once.
 
 `space` and `consumed` are what `KokkosArrayExpression` asks before it sizes
 a nest. An operand is not a section of the statement it appears in --

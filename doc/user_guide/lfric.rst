@@ -5174,8 +5174,38 @@ instead. One that is an actual argument of a call is left to the call:
 inlining the callee takes the argument away with it, so the section is
 gone before this rule could have refused it, and where the callee cannot
 be inlined that is the refusal worth reporting. One in the bounds of an
-``ALLOCATE`` is read as the shape it states, below. Anywhere else it is
-beyond what lowering can reach and is refused before the backend sees it.
+``ALLOCATE`` is read as the shape it states, below. One inside a
+scalar-valued fold is moved into an assignment by the rule below before
+this one is asked. Anywhere else it is beyond what lowering can reach and
+is refused before the backend sees it, naming the statement it stands in.
+
+**A fold outside an assignment is moved into one.** ``SUM``, ``MINVAL``,
+``MAXVAL`` and ``DOT_PRODUCT`` are written as a bounded loop over an
+accumulator, which has to be placed ahead of the statement that reads the
+result, because a loop is not an expression in C++. The positions that
+offer such a place are on, or within, the right-hand side of an
+assignment. A fold standing anywhere else -- ``if (MAXVAL(switch(low:high))
+> 0)``, which is how the FFSL departure-point kernels ask whether a sweep
+found any cell -- is given an assignment of its own immediately before the
+statement it stood in, and the call is replaced by a reference to the
+scalar that assignment writes. What was refused twice over, once for the
+fold in a position the writer has no spelling for and once for the section
+that was therefore outside every assignment, is then the statement pair
+already lowered above.
+
+Immediately before, and not hoisted any further: the operands of these
+folds are the running arrays of a sweep, so a statement moved past another
+that writes one of them would fold different values. Placing it in the
+statement's own position keeps the order the Fortran states, and with it
+the bit-exactness of a single-threaded host build, since the loop the
+backend generates runs the section's own indices in the section's own
+order. Only a fold whose *value* is a scalar is moved: ``MATMUL``,
+``TRANSPOSE``, ``RESHAPE`` and a ``SUM`` with a ``dim`` produce arrays,
+which would need a temporary of their own shape, and they keep whatever
+refusal they already had. The one position the move cannot serve is the
+condition of a ``DO WHILE``, which Fortran evaluates on every trip where
+an assignment before the loop is evaluated once; that is refused, naming
+the fold and the condition.
 
 **An array constructor fills an array; it is not a value.** A kernel
 writing ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or filling one
