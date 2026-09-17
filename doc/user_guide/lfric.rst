@@ -4298,15 +4298,32 @@ because two helpers called inside one loop each see the other's call as a
 possible write to the extent they share until that call has become
 statements. And a callee whose local array is sized by a dummy the caller
 genuinely assigns before the call -- a sub-column length it computed -- can
-be inlined under the ``bounded_locals`` option, which names, per callee and
-dummy, a variable in the kernel's scope that bounds every value the dummy
-takes: the callee gains a dummy carrying that bound, its locals are sized by
-it, and the call passes it. A whole-array use of such a local -- ``work =
+be inlined under the ``bounded_locals`` option, which gives, per callee and
+dummy, a bound on every value the dummy takes, written in the kernel's scope
+-- a variable it holds, or a Fortran expression over its scalars such as ``3
++ 2 * order`` where the kernel holds no one name for the larger of two
+branches. The callee gains a dummy carrying that bound, its locals are sized
+by it, and the call passes it. A whole-array use of such a local -- ``work =
 ...``, ``work(:)`` -- meant the callee's extent, and goes on meaning it: it
 becomes a section of the bounds the callee declared, which the inliner then
 rewrites in terms of the actual like any other use of the dummy. Otherwise
 the body is untouched. The option is an assertion the script makes about the
-kernel, not one PSyclone proves. A formal declared ``TARGET`` is none of those: the attribute
+kernel, not one PSyclone proves. A call passing **one element where the
+callee declares an array** -- Fortran's sequence association, which LFRic's
+horizontal FFSL transport writes as ``call monotonic_edge(...,
+field_edge_left(k), field_edge_right(k), order+order_offset, 1, 1)`` against
+a callee declaring ``edge_left(nlayers)`` and taking ``nlayers`` as ``1`` --
+matches no routine at all by rank, and would be refused before inlining
+begins. Where the callee's declared extent is **one element** at that call,
+read with the call's own actuals put in place of the dummies its bounds
+name, the actual is rewritten as the one-element section of itself,
+``field_edge_left(k:k)``, which says the same thing to Fortran, to PSyIR and
+to the generated region. Anything the call does not fix to one element -- an
+extent still a variable, a dummy of more than one element, an element of an
+array of rank two or more -- is left as the kernel wrote it and refused in
+``InlineTrans``'s own words with the call named, a narrowing of what the
+callee reads being worse than a refusal. A formal declared ``TARGET`` is
+none of those: the attribute
 constrains what a pointer elsewhere may be aimed at, which substituting a
 body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like
@@ -4928,14 +4945,28 @@ how.** ``InlineTrans`` refuses a callee whose local array is sized by a
 dummy whose actual the caller assigned before the call, because the
 inlined declaration would stand at the top of the caller with a size not
 yet computed. The ``bounded_locals`` option -- ``{"callee": {"dummy":
-"bound"}}``, every name a plain identifier -- gives such a callee a further
-dummy carrying an upper bound the kernel's scope holds, sizes those locals
-by it, and passes it at every call; the callee's loops still run to the
-exact size. The region then sizes the scratch those locals become from the
-bound, which is a region scalar, as it must. A bound too small is an
-out-of-bounds write nothing here would catch, which is why the option is
-an assertion the script states with its reason, refused by name where the
-callee, the dummy or the bound does not exist, and never inferred.
+"bound"}}``, the callee and dummy plain identifiers -- gives such a callee a
+further dummy carrying an upper bound the kernel's scope can supply, sizes
+those locals by it, and passes it at every call; the callee's loops still
+run to the exact size. The region then sizes the scratch those locals
+become from the bound, which is arithmetic over region scalars, as it must.
+
+The bound is a name of that scope, or a Fortran expression over names of it.
+The name is what the vertical FFSL transport needs, where the kernel's own
+``nlayers`` bounds every sub-column length it computes. The expression is
+what the horizontal special-edge transport needs, where the caller assigns
+``recon_size = 3 + 2*order`` or ``1 + 2*order`` by a branch and holds no one
+name for the larger: ``{"ffsl_flux_xy_special_edge_1d": {"recon_size": "3 +
+2 * order"}}`` states it, and ``order`` is a scalar formal of the region, so
+the launch evaluates the bound where it sizes the scratch. An expression is
+read against the kernel's own symbols and admitted only as arithmetic over
+literals and plain scalar names, by the rule the spread extents are chosen
+by: a subscript, an intrinsic or a call is refused by what it holds, and a
+name the kernel's scope does not hold is refused by that name. A bound too
+small is an out-of-bounds write nothing here would catch, which is why the
+option is an assertion the script states with its reason, refused by name
+where the callee, the dummy or a name in the bound does not exist, and never
+inferred.
 
 **A callee out of scope is refused rather than guessed at.** In scope are
 a procedure of the kernel's own module, and a procedure of a module the

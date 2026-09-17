@@ -322,7 +322,11 @@ def test_lfric_kokkos_trans_accepts_a_cross_stencil_with_a_variable_extent(
              "      smap_data, lfric_kokkos::Role::readonly, ndf_w3, "
              "smap_size_max, ncells);")
             in cpp)
-    assert "for(step=1; step<=smap_size(cell); step+=1)" in cpp
+    # The stencil length varies by cell, so the bound is a View read;
+    # it is hoisted out of the loop rather than re-read each pass
+    # (phase 7 lesson 104), which is what this asserts.
+    assert "const int step_stop = smap_size(cell);" in cpp
+    assert "for(step=1; step<=step_stop; step+=1)" in cpp
 
     fortran = str(psy.gen)
     assert "STENCIL_CROSS, extent" in fortran

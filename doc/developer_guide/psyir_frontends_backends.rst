@@ -986,6 +986,20 @@ reference to bind a temporary to. `Kokkos::Experimental::epsilon<T>::value`
 fails the same way; `std::numeric_limits<T>::epsilon()` would compile but is a
 `<limits>` answer where this writer spells everything through Kokkos.
 
+`MERGE(tsource, fsource, mask)` becomes C++'s conditional expression,
+`(mask ? tsource : fsource)`, which is the whole of it: the Fortran chooses
+between two values by a logical and so does the operator, and both operands
+are written whichever way the mask goes, so there is no short-circuit
+difference to preserve. It is written here rather than left to `CWriter`,
+which has no handler for it, because the scalar `MERGE` is how LFRic's
+`subgrid_horizontal_support_mod` selects a special-edge reconstruction --
+`MERGE(1.0_r_tran, 0.0_r_tran, spt_case == n)` summed over the cases -- and
+without it every one of the four `*_special_edge` routines is reported by
+`unsupported_intrinsics` and the horizontal FFSL flux kernel that calls them
+is refused. Only the three-argument form is written; the array-valued form is
+replaced by the array lowering before the writer sees it, and a `MERGE` of any
+other arity falls through to `CWriter` and its refusal.
+
 `**` is not an intrinsic call but an operator, and the only part of it this
 writer touches is the name of the function `CWriter` falls back to when the
 integer-power tree declines. `_POW_FUNCTION` overrides that name with

@@ -33,6 +33,8 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_inline_mixin import (
     LFRicKokkosInlineMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_schedule_mixin \
     import LFRicKokkosScheduleMixin
+from psyclone.domain.lfric.transformations.lfric_kokkos_element_mixin import (
+    LFRicKokkosElementMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_write_mixin import (
@@ -43,16 +45,17 @@ from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Fifteen mixins and Transformation, which is one contract split by subject
-# rather than sixteen layers of behaviour: every base but the last holds only
-# private helpers, and none of them overrides anything.
+# Sixteen mixins and Transformation, which is one contract split by subject
+# rather than seventeen layers of behaviour: every base but the last holds
+# only private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
 class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
                        LFRicKokkosBuiltinMixin, LFRicKokkosContractMixin,
                        LFRicKokkosTypesMixin, LFRicKokkosArgumentMixin,
                        LFRicKokkosBoundsMixin,
                        LFRicKokkosCallMixin,
-                       LFRicKokkosConstantsMixin, LFRicKokkosInlineMixin,
+                       LFRicKokkosConstantsMixin, LFRicKokkosElementMixin,
+                       LFRicKokkosInlineMixin,
                        LFRicKokkosInterfaceMixin,
                        LFRicKokkosIntrinsicMixin, LFRicKokkosIterationMixin,
                        LFRicKokkosScheduleMixin, LFRicKokkosWriteMixin,
@@ -120,8 +123,10 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
             contradicts the loop, the other option or the metadata, as
             ``LFRicKokkosWriteMixin._validate_disjoint_option`` states.
         :raises TransformationError: if the ``"bounded_locals"`` option is
-            not a mapping of callee name to a mapping of dummy name to bound
-            name, or names a dummy or a bound that does not exist, as
+            not a mapping of callee name to a mapping of dummy name to bound,
+            names a dummy that does not exist, or gives a bound the kernel's
+            scope cannot supply -- a name it does not hold, or an expression
+            it cannot read as arithmetic over its own scalars -- as
             ``LFRicKokkosBoundMixin`` states.
         """
         if not isinstance(node, LFRicLoop):
@@ -224,12 +229,13 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
             ``"team_size"`` sets the team the hierarchical launch asks for, as
             a positive integer; absent, the launch writes ``Kokkos::AUTO``.
             ``"bounded_locals"`` maps a callee name to a mapping of dummy
-            name to the name, in the kernel's scope, of an upper bound for
-            every actual that dummy takes; the callee's locals that dummy
-            sizes are sized by the bound instead, which is what lets a helper
-            whose size the caller computes be inlined and its locals placed
-            in scratch. An assertion the caller makes, not one PSyclone
-            checks; see ``LFRicKokkosBoundMixin``.
+            name to an upper bound for every actual that dummy takes, written
+            in the kernel's scope: a name it holds, or a Fortran expression
+            over its scalars such as ``"3 + 2 * order"``. The callee's locals
+            that dummy sizes are sized by the bound instead, which is what
+            lets a helper whose size the caller computes be inlined and its
+            locals placed in scratch. An assertion the caller makes, not one
+            PSyclone checks; see ``LFRicKokkosBoundMixin``.
         :type options: Optional[Dict[str, Any]]
         :param kwargs: additional keyword arguments for the base
             :py:meth:`~psyclone.psyGen.Transformation.apply`.

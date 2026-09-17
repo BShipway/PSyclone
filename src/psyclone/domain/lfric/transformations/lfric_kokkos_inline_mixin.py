@@ -113,9 +113,11 @@ class LFRicKokkosInlineMixin:
     Being in scope is not being inlinable, and the difference is PSyclone's
     to state rather than ours. A callee reading data private to its own
     module, one whose declarations depend on an argument the call site writes
-    to first, one whose actual and formal types do not match: each is refused
-    by ``InlineTrans`` in its own words, and this mixin adds only which call
-    it was.
+    to first and for which the script states no bound (see
+    :py:class:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin`), one whose actual and formal
+    types do not match: each is refused by ``InlineTrans`` in its own words,
+    and this mixin adds only which call it was.
 
     **Not every Call is a call.** ``weights(index)`` is a function reference
     or an element of an array, and where the kernel's own file does not say

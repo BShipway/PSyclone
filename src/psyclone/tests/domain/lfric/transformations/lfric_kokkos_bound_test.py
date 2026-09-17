@@ -41,7 +41,7 @@ import pytest
 from lfric_kokkos_sources import _LOCAL_ALGORITHM, _LOCAL_KERNEL, _invoke
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
 from psyclone.psyir.backend.fortran import FortranWriter
-from psyclone.psyir.nodes import Call, IntrinsicCall
+from psyclone.psyir.nodes import Call, IntrinsicCall, Reference
 from psyclone.psyir.symbols import RoutineSymbol
 from psyclone.psyir.transformations import TransformationError
 
@@ -575,3 +575,80 @@ def test_only_a_written_argument_refusal_is_deferred(
         LFRicKokkosTrans().validate(loop)
     assert "reads its module state" in str(err.value)
     assert len(attempts) == 1
+
+
+def test_an_expression_bound_sizes_the_scratch(written_bound_target):
+    """A bound written as arithmetic sizes the scratch, evaluated in place.
+
+    The horizontal special-edge transport's shape: the size the caller
+    assigns is one of two branches and the bound is the larger of them,
+    written as the arithmetic the kernel's own formals spell it with rather
+    than as a name, because the caller holds no name for it.
+    """
+    _, loop, kernel = written_bound_target
+    options = {"bounded_locals": {"recon": {"n": "1 + 2 * nlayers"}}}
+
+    LFRicKokkosTrans().validate(loop, options=options)
+    cpp = LFRicKokkosTrans().apply(loop, options=options)
+
+    assert _no_calls_left(kernel)
+    assert "shmem_size((1 + (2 * nlayers)))" in cpp
+    assert "shmem_size(length)" not in cpp
+
+
+def test_an_expression_bound_reads_the_caller_s_own_symbols(
+        written_bound_target):
+    """The parsed bound refers to the caller's variables, not to lookalikes.
+
+    Parsing against a throwaway table would be worth nothing if the
+    references it produced pointed at symbols of that table: the generated
+    scratch would size itself from a name the region never declares.
+    """
+    _, _, kernel = written_bound_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    caller = schedule
+    bound = LFRicKokkosTrans._bound_expression(
+        caller, "recon", "n", "1 + 2 * nlayers")
+    names = {reference.symbol.name for reference in bound.walk(Reference)}
+    assert names == {"nlayers"}
+    for reference in bound.walk(Reference):
+        assert reference.symbol is caller.symbol_table.lookup("nlayers")
+
+
+def test_an_expression_bound_naming_the_unknown_is_refused(
+        written_bound_target):
+    """A bound over a name the caller does not hold names it and refuses."""
+    _, loop, _ = written_bound_target
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(
+            loop, options={"bounded_locals": {"recon": {"n": "3 + 2*order"}}})
+    assert ("bounds 'n' of 'recon' by '3 + 2*order', which names order: "
+            "not in scope at the call in" in str(err.value))
+
+
+def test_a_bound_that_is_not_an_expression_is_refused(written_bound_target):
+    """Text the Fortran frontend cannot read as an expression is refused."""
+    _, loop, _ = written_bound_target
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans().validate(
+            loop, options={"bounded_locals": {"recon": {"n": "3 +"}}})
+    assert ("bounds 'n' of 'recon' by '3 +', which is not a Fortran "
+            "expression:" in str(err.value))
+
+
+def test_a_bound_the_launch_could_not_evaluate_is_refused(
+        written_bound_target):
+    """A bound holding a call or a subscript is refused by what it holds.
+
+    The launch sizes the region's scratch before the functor runs, where an
+    array is a View it does not hold and an intrinsic is not available: the
+    same rule the spread extents are chosen by.
+    """
+    _, loop, _ = written_bound_target
+    for bound, held in (("max(nlayers, 2)", "IntrinsicCall"),
+                        ("partial(1)", "ArrayReference")):
+        with pytest.raises(TransformationError) as err:
+            LFRicKokkosTrans().validate(
+                loop, options={"bounded_locals": {"recon": {"n": bound}}})
+        assert "the launch could not evaluate where it sizes" in str(err.value)
+        assert held in str(err.value)
