@@ -357,7 +357,11 @@ Additionally, there are three partially-implemented back-ends
   whole kernel. A loop's continuation test follows the sign of its step
   where that sign is visible in the tree, so a Fortran countdown such as
   `do k = n, 1, -1` becomes `for(k=n; k>=1; k+=-1)`; a step that is a
-  runtime value is taken to be positive. An array constructor is written
+  runtime value is taken to be positive. A stop or step expression that
+  reads memory is evaluated once into a `const` local declared immediately
+  before the loop, because Fortran fixes a `DO` loop's trip count when the
+  loop is entered and C's `for` header does not; the C back-end section
+  below says which expressions that covers. An array constructor is written
   only where it fills an array, and the C back-end section below says why
   that is the only position it can be written in. A power by a small integer
   literal is written as the multiplications gfortran makes rather than as a
@@ -587,6 +591,46 @@ hierarchical launch -- has to keep such a loop out of that shape itself;
 `domain/lfric/transformations/lfric_kokkos_schedule_mixin.py`, which holds the
 steps that choose the kernel implementation to capture and put its body into
 the shape the region is described from.
+
+`CWriter.loop_node` evaluates a loop bound that reads memory once, before
+the loop, rather than leaving it in the `for` header. Fortran fixes a `DO`
+loop's trip count when the loop is entered: the stop and step expressions are
+evaluated there and once, and nothing the body does afterwards changes how
+many trips remain. C re-evaluates the expressions in a `for` header on every
+trip, so the literal translation
+`for(df=1; df<=abs(selector(map(cell))); df+=1)` is a different program from
+the `DO` it came from as soon as anything writes what the bound reads --
+the body itself, another thread, or another member of a Kokkos team running
+the same lambda. What it is written as instead is
+
+.. code-block:: c
+
+    {
+      const int df_stop = Kokkos::abs(selector(map(cell)));
+      for(df=1; df<=df_stop; df+=1)
+      {
+        ...
+      }
+    }
+
+`CWriter._is_fixed_at_entry` decides which expressions need this, and it
+errs towards leaving the header alone: a literal, a reference to a scalar the
+body does not assign, and any operation over those are fixed at entry and
+stay where they are, so the `nlayers - 1` that ends almost every LFRic layer
+loop keeps the text it has always had. What is not fixed at entry is anything
+that reads memory -- an array element, a structure component, a whole array,
+or a call. The local is `const`, carries the loop variable's own type through
+whichever `gen_declaration` the writer has, and sits in a block of its own so
+that it shadows rather than collides; the one name it must not take is a name
+the hoisted expression itself reads, which `CWriter._unused_name` rules out
+by adding underscores. Nested loops each declare their own, inside the body
+of the loop outside them, because entering a loop is where Fortran fixes its
+count and an inner loop is entered once per outer trip.
+
+`CWriter.whileloop_node` does no such thing, and must not. Fortran's
+`DO WHILE` re-evaluates its condition before every trip exactly as C's
+`while` does, so the condition belongs where it is written; evaluating it
+once would be the bug there.
 
 Kokkos back-end
 +++++++++++++++
@@ -1496,6 +1540,20 @@ while the index they are read at is the mesh cell the map returned. Under
 leading one has to be exact and the addresses are the ones the Fortran
 computes; a build with `KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK` would nonetheless
 report the index as out of range.
+
+A second consequence reaches the loop headers. `KokkosWriter.reference_node`
+writes a scalar formal the region describes as a per-cell View --
+`stencil_size`, which LFRic hands the kernel one value per cell -- as
+`stencil_size(cell)`, a read of staged memory. In the kernel's own tree it is
+a name that nothing in the body assigns, so `CWriter._is_fixed_at_entry` would
+leave it in a `for` header and the generated loop would read the View on every
+trip. `KokkosWriter` therefore overrides that predicate: a reference
+`_per_cell_indices` recognises is not fixed at entry here, whatever the tree
+says, and the bound is evaluated once before the loop like any other memory
+read. `_per_cell_indices` is the one place the per-cell shape is recognised,
+and `reference_node` reads it too, so the two cannot disagree. Three of the
+prototype's captured regions -- `monotonic_update`, `poly2d_reconstruction`
+and `propagate_onion_layers` -- have a loop of exactly this shape.
 
 Extents
 ~~~~~~~

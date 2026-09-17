@@ -427,11 +427,56 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
         :returns: the name, subscripted by the region's own indices where the
             region described the scalar as a per-cell View.
         """
+        indices = self._per_cell_indices(node)
+        if indices:
+            return f"{node.name}({', '.join(indices)})"
+        return super().reference_node(node)
+
+    def _per_cell_indices(self, node: Reference):
+        """The region's own indices, where a scalar formal was made per-cell.
+
+        Such a View carries region indices and no kernel indices at all,
+        which is exactly what a scalar formal made per-cell has: no dimension
+        the kernel subscripts and one the region does. Every other View has
+        at least one kernel index and is reached through
+        :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
+KokkosArrayExpressionMixin.arrayreference_node` instead.
+
+        :param node: the reference being written.
+
+        :returns: the indices to subscript the name by, or ``None`` where the
+            reference is not a scalar the region made per-cell.
+        :rtype: Optional[Tuple[str, ...]]
+        """
         view = self._views.get(node.name)
         if (isinstance(view, KokkosView) and view.extra_indices
                 and not view.index_offsets and not node.children):
-            return f"{node.name}({', '.join(view.extra_indices)})"
-        return super().reference_node(node)
+            return view.extra_indices
+        return None
+
+    def _is_fixed_at_entry(self, expr, node) -> bool:
+        """Judge a loop bound knowing which scalars are really View reads.
+
+        :py:class:`~psyclone.psyir.backend.c.CWriter` leaves a reference to a
+        scalar the body does not assign in the loop header, because nothing
+        in the tree can change it. That is true of the kernel's own text and
+        not of this region's: a scalar formal the region describes as a
+        per-cell View is written as ``stencil_size(cell)``, a global read of
+        staged memory, and re-reading that on every trip is the very thing
+        this writer must not do. LFRic gives a stencil's size that way, so
+        three of the prototype's captured regions turn on this.
+
+        :param expr: the bound expression being judged.
+        :type expr: :py:class:`psyclone.psyir.nodes.Node`
+        :param node: the loop the expression is a bound of.
+        :type node: :py:class:`psyclone.psyir.nodes.Loop`
+
+        :returns: whether the expression may be left in the loop header.
+        :rtype: bool
+        """
+        if isinstance(expr, Reference) and self._per_cell_indices(expr):
+            return False
+        return super()._is_fixed_at_entry(expr, node)
 
     def _validate(self, region):
         """Reject incomplete or unsupported region descriptions.
