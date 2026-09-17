@@ -4605,3 +4605,64 @@ def test_kokkos_region_has_no_aliases_unless_it_is_given_them():
     """
     assert _region().aliases == ()
     assert "AnonymousSpace" not in KokkosWriter()(_region())
+
+
+def _stencil_kernel_schedule():
+    """Return a kernel whose loop bound is a scalar formal.
+
+    LFRic hands a stencil's size to the kernel as a scalar, one value per
+    cell, and the kernel counts to it. In the kernel's own text nothing can
+    change it while the loop runs; in the region's text it is a read of a
+    staged View, which is the difference this fixture exists for.
+
+    :returns: the kernel schedule the region below carries.
+    :rtype: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+    """
+    source = """
+subroutine stencil_sum_code(nlayers, field, stencil_size, undf_w3)
+  use constants_mod, only : r_def, i_def
+  integer(kind=i_def), intent(in) :: nlayers, stencil_size, undf_w3
+  real(kind=r_def), dimension(undf_w3), intent(inout) :: field
+  integer(kind=i_def) :: i
+  do i = 2, stencil_size
+    field(i) = field(i) + field(i - 1)
+  end do
+end subroutine stencil_sum_code
+"""
+    routine = FortranReader().psyir_from_source(source).walk(Routine)[0]
+    symbol_table = routine.symbol_table.detach()
+    children = [child.detach() for child in routine.children[:]]
+    return KernelSchedule.create(
+        "stencil_sum_code", symbol_table=symbol_table, children=children)
+
+
+def test_kokkos_loop_bound_that_is_a_per_cell_scalar_is_hoisted():
+    """A bound the region stages as a per-cell View is evaluated once.
+
+    ``CWriter`` leaves a reference to a scalar the body does not assign in
+    the loop header, and is right to: nothing in the kernel's tree can change
+    it. This writer knows something the tree does not say -- that the scalar
+    is written as ``stencil_size(cell)``, a global read of staged memory --
+    and a global read in a ``for`` header is re-read on every trip, which is
+    not what the Fortran ``DO`` it came from does. Three of the prototype's
+    captured regions carry a loop of this shape.
+    """
+    region = KokkosRegion(
+        name="stencil_sum_kokkos",
+        schedule=_stencil_kernel_schedule(),
+        cell_count="ncells",
+        arguments=(
+            KokkosScalar("nlayers", "int"),
+            KokkosView("field", "field_data", "double", ("undf_w3",),
+                       index_offsets=(1,)),
+            KokkosView("stencil_size", "stencil_size_data", "int",
+                       ("ncells",), extra_indices=("cell",), read_only=True,
+                       random_access=True),
+            KokkosScalar("undf_w3", "int"),
+            KokkosScalar("ncells", "int"),
+        ))
+    code = KokkosWriter()(region)
+
+    assert "const int i_stop = stencil_size(cell);" in code
+    assert "for(i=2; i<=i_stop; i+=1)" in code
+    assert "for(i=2; i<=stencil_size(cell); i+=1)" not in code

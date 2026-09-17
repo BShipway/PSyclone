@@ -1541,6 +1541,20 @@ leading one has to be exact and the addresses are the ones the Fortran
 computes; a build with `KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK` would nonetheless
 report the index as out of range.
 
+A second consequence reaches the loop headers. `KokkosWriter.reference_node`
+writes a scalar formal the region describes as a per-cell View --
+`stencil_size`, which LFRic hands the kernel one value per cell -- as
+`stencil_size(cell)`, a read of staged memory. In the kernel's own tree it is
+a name that nothing in the body assigns, so `CWriter._is_fixed_at_entry` would
+leave it in a `for` header and the generated loop would read the View on every
+trip. `KokkosWriter` therefore overrides that predicate: a reference
+`_per_cell_indices` recognises is not fixed at entry here, whatever the tree
+says, and the bound is evaluated once before the loop like any other memory
+read. `_per_cell_indices` is the one place the per-cell shape is recognised,
+and `reference_node` reads it too, so the two cannot disagree. Three of the
+prototype's captured regions -- `monotonic_update`, `poly2d_reconstruction`
+and `propagate_onion_layers` -- have a loop of exactly this shape.
+
 Extents
 ~~~~~~~
 

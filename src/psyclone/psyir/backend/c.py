@@ -470,8 +470,7 @@ class CWriter(CIntrinsicsMixin, LanguageWriter):
             return not step_expr.children[0].value.startswith("-")
         return False
 
-    @staticmethod
-    def _is_fixed_at_entry(expr, node):
+    def _is_fixed_at_entry(self, expr, node):
         '''Whether a bound expression has one value for the whole loop.
 
         Fortran fixes a ``DO`` loop's trip count when the loop is entered;
@@ -488,6 +487,12 @@ class CWriter(CIntrinsicsMixin, LanguageWriter):
         tree does not rule out the body, another thread or another member of
         the team writing between one trip and the next.
 
+        It is a method rather than a function because a back-end can know
+        things about a reference that the tree does not say.
+        :py:class:`~psyclone.psyir.backend.kokkos.KokkosWriter` overrides it
+        for the one case it has: a scalar formal the region describes as a
+        per-cell View is a name in the PSyIR and a memory read in the text.
+
         :param expr: the bound expression being judged.
         :type expr: :py:class:`psyclone.psyir.nodes.Node`
         :param node: the loop the expression is a bound of.
@@ -500,7 +505,7 @@ class CWriter(CIntrinsicsMixin, LanguageWriter):
         if isinstance(expr, Literal):
             return True
         if isinstance(expr, Operation):
-            return all(CWriter._is_fixed_at_entry(child, node)
+            return all(self._is_fixed_at_entry(child, node)
                        for child in expr.children)
         if (not isinstance(expr, Reference)
                 or isinstance(expr, (ArrayReference, StructureReference))
