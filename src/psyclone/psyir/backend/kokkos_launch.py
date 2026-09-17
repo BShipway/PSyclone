@@ -160,6 +160,93 @@ def _scratch_level(region, item):
     return "1" if item.name in global_scratch_names(region) else "0"
 
 
+#: The name of the generated wrapper a member-local array is declared as.
+MEMBER_LOCAL_TYPE = "KokkosMemberLocal"
+
+
+def team_scratch_items(region):
+    """Return the scratch arrays the team shares, member-local ones aside.
+
+    These are the arrays the launch reserves team scratch for. A region
+    whose every scratch array is member-local reserves none and asks for
+    none, which is why callers ask this rather than testing
+    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.scratch`.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the shared scratch arrays, in the order the region gives them.
+    :rtype: Tuple[
+        :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`, ...]
+    """
+    return tuple(item for item in region.scratch if not item.member_local)
+
+
+def member_local_definition(region):
+    """Return the wrapper definition a member-local array is declared as.
+
+    A kernel-local array the team does not have to share is held by every
+    member instead: it is declared inside the functor, so each member's copy
+    is its own, and no team scratch is reserved for it. Which arrays those
+    are is decided where the region is described, by
+    ``LFRicKokkosCallMixin._is_member_local``.
+
+    The storage is wrapped in a struct rather than declared as a plain C
+    array so that a subscript of it is written exactly as a subscript of the
+    View it replaces: ``x(i)`` and ``x(i, j)`` are what
+    :py:meth:`~psyclone.psyir.backend.kokkos_array_expression_mixin.\
+KokkosArrayExpressionMixin.arrayreference_node` emits for any described
+    array, and nothing else in the writer has to know which of the two kinds
+    of storage it reached. The elements are ordered as ``LayoutLeft`` orders
+    them, leftmost subscript fastest, which is the order the View had.
+
+    Nothing is emitted for a region with no member-local array, so every
+    region generated before this existed is generated as it was then.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the definition and the blank line after it, or the empty
+        string.
+    :rtype: str
+    """
+    if not any(item.member_local for item in region.scratch):
+        return ""
+    return (
+        "// A kernel-local array small enough for every member of a team to\n"
+        "// hold its own copy, and which no loop spread over the team ever\n"
+        "// touches, is held here rather than shared in team scratch: the\n"
+        "// members all compute the same values into it, so sharing one buys\n"
+        "// nothing and costs a Kokkos::single and a barrier at every write.\n"
+        "// Elements are ordered as LayoutLeft ordered the View's.\n"
+        "template <typename T, int N0, int N1 = 1, int N2 = 1>\n"
+        f"struct {MEMBER_LOCAL_TYPE} {{\n"
+        "  T data[N0 * N1 * N2];\n"
+        "  KOKKOS_INLINE_FUNCTION T &operator()(int i0) { return data[i0]; }\n"
+        "  KOKKOS_INLINE_FUNCTION T &operator()(int i0, int i1) {\n"
+        "    return data[i0 + N0 * i1];\n"
+        "  }\n"
+        "  KOKKOS_INLINE_FUNCTION T &operator()(int i0, int i1, int i2) {\n"
+        "    return data[i0 + N0 * (i1 + N1 * i2)];\n"
+        "  }\n"
+        "};\n\n")
+
+
+def _member_local_declaration(item, indent):
+    """Return the declaration of one member-local array.
+
+    :param item: the scratch array, which ``member_local`` is set on.
+    :type item: :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`
+    :param str indent: the leading whitespace, as :py:func:`_scratch_text`
+        uses it.
+
+    :returns: the declaration line.
+    :rtype: str
+    """
+    return (f"{indent}{MEMBER_LOCAL_TYPE}<{item.c_type}, "
+            f"{', '.join(item.extents)}> {item.name};\n")
+
+
 def _scratch_text(region, allocation, indent):
     """Return the four pieces of C++ a region's scratch arrays generate.
 
@@ -180,23 +267,30 @@ def _scratch_text(region, allocation, indent):
         because the flat shape nests its body one level deeper.
     :type indent: str
 
+    A member-local array is not in team scratch at all, so it contributes
+    no alias and no size: it appears among the constructions alone, as the
+    declaration :py:func:`member_local_definition` describes, in the place
+    its View construction would have stood.
+
     :returns: the type aliases, the level-0 ``shmem_size`` sum (``0`` where
-        every array moved to level 1), the level-1 sum (empty where none
-        did), and the View constructions.
+        every array moved to level 1 or to a member), the level-1 sum (empty
+        where none did), and the constructions.
     :rtype: Tuple[str, str, str, str]
     """
+    shared = team_scratch_items(region)
     aliases = "".join(
         f"  using {item.name}_scratch_t = Kokkos::View<{item.c_type}"
         f"{'*' * len(item.extents)}, Kokkos::LayoutLeft, ScratchSpace, "
         "Unmanaged>;\n"
-        for item in region.scratch)
+        for item in shared)
     by_level = {"0": [], "1": []}
-    for item in region.scratch:
+    for item in shared:
         by_level[_scratch_level(region, item)].append(
             f"{item.name}_scratch_t::shmem_size({', '.join(item.extents)})")
     sizes = "\n      + ".join(by_level["0"]) or "0"
     sizes_global = "\n      + ".join(by_level["1"])
     constructions = "".join(
+        _member_local_declaration(item, indent) if item.member_local else
         f"{indent}{item.name}_scratch_t {item.name}("
         f"{allocation.replace('(0)', f'({_scratch_level(region, item)})')}, "
         f"{', '.join(item.extents)});\n"
@@ -258,6 +352,8 @@ def scratch_guard(region):
 
     Nothing is emitted for a region whose scratch does not divide, so every
     region generated before division was admitted generates what it did then.
+    A member-local array is not asked either: its shape is a compile-time
+    constant, so a run-time check that it is not negative is dead code.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -266,7 +362,7 @@ def scratch_guard(region):
         string where no scratch extent divides.
     :rtype: str
     """
-    divided = [(item.name, extent) for item in region.scratch
+    divided = [(item.name, extent) for item in team_scratch_items(region)
                for extent in item.extents if "/" in extent]
     if not divided:
         return ""
@@ -418,7 +514,7 @@ def _team_scratch(region):
     """
     aliases, sizes, sizes_global, constructions = _scratch_text(
         region, "team.team_scratch(0)", "    ")
-    if not region.scratch:
+    if not team_scratch_items(region):
         return "", "", constructions
     return (
         f"{aliases}\n{scratch_guard(region)}"

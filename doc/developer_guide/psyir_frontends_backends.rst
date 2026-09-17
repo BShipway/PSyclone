@@ -1057,7 +1057,9 @@ at once, which is a race in the memory model even though the values agree. So
 -- at the top of the body, inside an `if`, or inside a serial loop, where
 each iteration's write is wrapped on its own. Scratch moves with the same
 change of meaning: `team.team_scratch(0)` with `PerTeam`, since a per-cell
-temporary is team-shared once a team is a cell.
+temporary is team-shared once a team is a cell. The exception is a
+*member-local* array, below: the members do not share one, so its writes are
+left bare and wrapping them would leave every member but one unwritten.
 
 A scalar is a third case, and the one whose correctness rests on where its
 declaration is written. Every member has its own copy of a local declared at
@@ -1257,6 +1259,38 @@ merged pointer is generic on both sides and there is nothing to
 specialise. `kokkos_launch.global_scratch_names` says which arrays move; the
 type alias, the `shmem_size` arithmetic and the subscripts are unchanged,
 because a `ScratchSpace` View is the same View at either level.
+
+A kernel-local array the team does not have to share is not in team scratch
+at all. Two conditions together say when it need not be. The first is
+correctness: **no loop the launch spreads over the team names the array**,
+so every member computes the same values into it and no member ever reads
+another's. The second is cost: **its shape is a compile-time constant** of
+at most sixteen elements and at most three dimensions, so a copy each is
+cheap. `LFRicKokkosCallMixin._is_member_local` decides, against the loops
+the region names and the targets of its aliases -- a handle needs a View to
+be aimed at, so an aliased array keeps its scratch one -- and sets
+`KokkosScratch.member_local`.
+
+The writer then declares such an array inside the functor as
+`KokkosMemberLocal<T, N0, ...>`, a struct that `member_local_definition` in
+`kokkos_launch` emits at file scope ahead of the region, holding a flat
+array it subscripts as `LayoutLeft` ordered the View's. It is a struct
+rather than a plain C array so that a subscript of it is written exactly as
+a subscript of any described array, and nothing else in the writer has to
+know which of the two kinds of storage it reached. Such an array contributes
+no type alias and no `shmem_size` term -- `kokkos_launch.team_scratch_items`
+is what the launch sizes itself from -- and its writes are emitted bare. A
+region whose every kernel-local array moves this way requests no team
+scratch and generates as a region with none.
+
+What this is worth is that a two-element array of team-uniform integers held
+in team scratch buys nothing and costs a `Kokkos::single` and a barrier at
+every write: `ffsl_flux_xy_panel_remap` holds four of them, and eight of its
+238 barriers went with them. Separately and more seriously, holding them
+there is what `nvcc` 13.3 miscompiled at any optimisation above
+`-Xcicc -O1`, which is why that region was built under a per-region flag
+until this existed (`psy-ir-aidev`, phase 7 tasks W7 and W7b). Nine of the
+272 regions the model captures hold such an array.
 
 The writer validates an alias as it validates the rest: the name must not
 collide with a described array or a local, there must be at least one
