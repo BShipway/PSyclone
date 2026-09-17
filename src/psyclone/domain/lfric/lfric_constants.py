@@ -375,7 +375,7 @@ class LFRicConstants():
             "outward_normals_to_vertical_faces", "outward_normals_to_faces"]
 
         # Valid mesh names
-        LFRicConstants.VALID_MESH_NAMES = ["adjacent_face"]
+        LFRicConstants.VALID_MESH_NAMES = ["adjacent_face", "cell_next"]
 
         # ---------- Map from scalar intrinsic type to its precision ----------
         LFRicConstants.SCALAR_PRECISION_MAP = \

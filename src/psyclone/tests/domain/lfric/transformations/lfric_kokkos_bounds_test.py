@@ -152,6 +152,65 @@ _FULL_SECTION_KERNEL = _SECTION_KERNEL.replace(
     "    difference(:) = difference(:) + (b_idx + nl)")
 
 
+# A mesh property with a declared extent. 'cell_next' is indexed by the
+# reference element's face count, which the PSy layer passes in front of it,
+# so a kernel may declare it 'cell_next(nfaces_re)' and the region stages the
+# whole array by that extent and the cell count -- the declared-bounds route
+# rather than the measured one 'adjacent_face(:)' takes above.
+_CELL_NEXT_ALGORITHM = """
+program kokkos_cell_next_test
+  use field_mod, only : field_type
+  use cell_next_sum_kernel_mod, only : cell_next_sum_kernel_type
+  implicit none
+  type(field_type) :: field_out, field_in
+  call invoke(cell_next_sum_kernel_type(field_out, field_in))
+end program kokkos_cell_next_test
+"""
+
+_CELL_NEXT_KERNEL = """
+module cell_next_sum_kernel_mod
+  use argument_mod, only : arg_type, gh_field, gh_real, gh_write, gh_read, &
+                           cell_column, mesh_data_type, cell_next
+  use constants_mod, only : i_def, r_def
+  use fs_continuity_mod, only : w3
+  use kernel_mod, only : kernel_type
+  implicit none
+  type, public, extends(kernel_type) :: cell_next_sum_kernel_type
+    type(arg_type) :: meta_args(2) = (/                                &
+         arg_type(gh_field, gh_real, gh_write, w3),                    &
+         arg_type(gh_field, gh_real, gh_read,  w3) /)
+    type(mesh_data_type) :: meta_mesh(1) = (/ mesh_data_type(cell_next) /)
+    integer :: operates_on = cell_column
+  contains
+    procedure, nopass :: cell_next_sum_code
+  end type cell_next_sum_kernel_type
+contains
+  subroutine cell_next_sum_code(nlayers, field_out, field_in,   &
+                                ndf_w3, undf_w3, map_w3,        &
+                                nfaces_re, cell_next)
+    integer(kind=i_def), intent(in) :: nlayers, ndf_w3, undf_w3
+    integer(kind=i_def), intent(in) :: nfaces_re
+    integer(kind=i_def), intent(in) :: cell_next(nfaces_re)
+    real(kind=r_def), dimension(undf_w3), intent(inout) :: field_out
+    real(kind=r_def), dimension(undf_w3), intent(in) :: field_in
+    integer(kind=i_def), dimension(ndf_w3), intent(in) :: map_w3
+    integer(kind=i_def) :: k, df, face
+    do k = 0, nlayers - 1
+      do df = 1, ndf_w3
+        field_out(map_w3(df) + k) = field_in(map_w3(df) + k)
+        do face = 1, nfaces_re
+          if (cell_next(face) > 0) then
+            field_out(map_w3(df) + k) = field_out(map_w3(df) + k) + &
+                field_in(map_w3(df) + k)
+          end if
+        end do
+      end do
+    end do
+  end subroutine cell_next_sum_code
+end module cell_next_sum_kernel_mod
+"""
+
+
 @pytest.fixture(name="implicit_target")
 # pylint: disable-next=unused-argument
 def implicit_target_fixture(tmp_path, clear_module_manager_instance):
@@ -208,6 +267,14 @@ def full_section_target_fixture(tmp_path, clear_module_manager_instance):
     """Create an invoke whose kernel assigns a whole array at once."""
     return _invoke(
         tmp_path, "fv_difference", _SECTION_ALGORITHM, _FULL_SECTION_KERNEL)
+
+
+@pytest.fixture(name="cell_next_target")
+# pylint: disable-next=unused-argument
+def cell_next_target_fixture(tmp_path, clear_module_manager_instance):
+    """Create an invoke whose kernel takes the cell_next mesh property."""
+    return _invoke(
+        tmp_path, "cell_next_sum", _CELL_NEXT_ALGORITHM, _CELL_NEXT_KERNEL)
 
 
 def test_lfric_kokkos_trans_sizes_an_assumed_shape_from_the_actual(
@@ -270,6 +337,36 @@ def test_lfric_kokkos_trans_sizes_a_rank_2_assumed_shape(implicit_target):
             "SIZE(out_normals_to_horiz_faces, dim=1), "
             "SIZE(out_normals_to_horiz_faces, dim=2), "
             "SIZE(adjacent_face, dim=1), loop0_stop)" in fortran)
+
+
+def test_lfric_kokkos_trans_stages_a_mesh_property_by_its_declared_extent(
+        cell_next_target):
+    """A mesh property declared with its face count is staged by it.
+
+    'cell_next' arrives with 'nfaces_re' in front of it, so the kernel can
+    declare 'cell_next(nfaces_re)' and the region's View takes that extent
+    and the cell count directly: no measurement, no extra scalar. The PSy
+    layer gets the property from the mesh and the face count from the
+    reference element, as it does for 'adjacent_face'.
+    """
+    psy, loop, _ = cell_next_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert (("auto cell_next = lfric_kokkos::stage<\n"
+             "      Kokkos::View<const int**, Kokkos::LayoutLeft, "
+             "MemorySpace, ReadOnly>>(\n"
+             "      cell_next_data, lfric_kokkos::Role::readonly, "
+             "nfaces_re, ncells);") in cpp)
+    assert "cell_next_extent" not in cpp
+    assert "if ((cell_next((face - 1), cell) > 0)) {" in cpp
+
+    fortran = str(psy.gen)
+    assert "nfaces_re = reference_element%get_number_faces()" in fortran
+    assert "cell_next => mesh%get_cell_next()" in fortran
+    assert ("call cell_next_sum_kokkos(nlayers_field_out, field_out_data, "
+            "field_in_data, ndf_w3, undf_w3, map_w3, nfaces_re, cell_next, "
+            "loop0_stop)" in fortran)
 
 
 def test_lfric_kokkos_trans_refuses_an_assumed_shape_with_no_actual(
