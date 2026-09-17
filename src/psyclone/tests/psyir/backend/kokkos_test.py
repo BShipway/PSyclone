@@ -2114,6 +2114,32 @@ def test_kokkos_writer_refuses_epsilon_of_an_undescribed_kind():
             "region does not describe." in str(error.value))
 
 
+def test_kokkos_writer_writes_merge_as_a_conditional_expression():
+    """``MERGE`` is Fortran's choice of two values and ``?:`` is C++'s.
+
+    Written as an operator rather than as a function so that an element of
+    an array expression costs no temporary, and parenthesised because ``?:``
+    binds more loosely than nearly everything it can sit inside.
+    """
+    assert _written_expressions("""
+  a = merge(1.0_r_def, 0.0_r_def, i == 1)
+  a = b + merge(b, c, i < j)
+""") == ["((i == 1) ? 1.0 : 0.0)", "(b + ((i < j) ? b : c))"]
+
+
+def test_kokkos_writer_leaves_a_merge_of_the_wrong_arity_to_the_c_writer():
+    """Only the three-argument ``MERGE`` is written here.
+
+    PSyIR's frontend will not build another, so this is the guard on the
+    handler and not a shape any kernel writes; it is asserted because the
+    probe that lists the supported intrinsics reports arity with the name.
+    """
+    writer = KokkosWriter()
+    writer._kind_types = dict(_INTRINSIC_KINDS)
+    assert writer._kokkos_select(
+        IntrinsicCall(IntrinsicCall.Intrinsic.MERGE)) is None
+
+
 def test_kokkos_writer_leaves_an_unknown_intrinsic_to_the_c_writer():
     """An intrinsic neither writer knows raises the C writer's own error."""
     with pytest.raises(VisitorError) as error:

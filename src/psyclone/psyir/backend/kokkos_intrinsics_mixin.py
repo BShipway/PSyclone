@@ -179,7 +179,7 @@ class KokkosIntrinsicsMixin:
         width a Fortran kind asks for, and it emits unqualified names that are
         host functions. Each case this method does not recognise falls back to
         it, so the set of intrinsics supported here is the C writer's plus
-        ``EPSILON``, plus integer ``MAX`` and ``MIN``.
+        ``EPSILON`` and ``MERGE``, plus integer ``MAX`` and ``MIN``.
 
         :param node: the intrinsic call to write.
         :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
@@ -191,11 +191,47 @@ class KokkosIntrinsicsMixin:
             not describe, or if the C writer has no handler for it.
         """
         for handler in (self._kokkos_cast, self._kokkos_numeric_limit,
-                        self._kokkos_function):
+                        self._kokkos_select, self._kokkos_function):
             written = handler(node)
             if written is not None:
                 return written
         return super().intrinsiccall_node(node)
+
+    def _kokkos_select(self, node):
+        """Write ``MERGE`` as C++'s conditional expression.
+
+        ``MERGE(t, f, mask)`` is Fortran's choice between two values, and
+        ``mask ? t : f`` is the same choice in C++. It is written here rather
+        than left to the C writer, which has no handler for it, and it is
+        written as an operator rather than as a function so that an element of
+        an array expression -- ``s1(:) = MERGE(1.0, 0.0, spt_case(:) == 1)``,
+        which is how LFRic's horizontal FFSL transport selects a panel-edge
+        case -- becomes one expression per element with no temporary.
+
+        The conditional evaluates only the arm it selects, where Fortran is
+        free to evaluate both. That is a narrowing of what runs and never of
+        what is computed: an ``IntrinsicCall`` argument is an expression, and
+        an expression a captured region may hold is free of side effects by
+        the capture contract.
+
+        The whole expression is parenthesised. ``?:`` binds more loosely than
+        almost everything it can be written inside, and a region is generated
+        to compile rather than to be read.
+
+        :param node: the intrinsic call to write.
+        :type node: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+
+        :returns: the conditional expression, or ``None`` if this is not a
+            ``MERGE`` or does not carry the three arguments one takes.
+        :rtype: Optional[str]
+        """
+        if node.intrinsic is not IntrinsicCall.Intrinsic.MERGE:
+            return None
+        if len(node.arguments) != 3:
+            return None
+        chosen, otherwise, mask = node.arguments
+        return (f"({self._visit(mask)} ? {self._visit(chosen)} "
+                f": {self._visit(otherwise)})")
 
     def _kokkos_cast(self, node):
         """Write ``REAL`` or ``INT`` at the width its own kind asks for.

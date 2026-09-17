@@ -77,6 +77,34 @@ still run to the exact size -- so the only change is that the local is as
 long as the bound rather than exactly as long as it needs to be, which is
 what a scratch allocation is anyway.
 
+**A bound is a name or an expression.** A name is looked up in the caller's
+table, which is what the vertical FFSL transport needs: its helper's column
+is bounded by the kernel's own ``nlayers``. Where the caller holds no single
+name that bounds the dummy, the bound is written as Fortran over the names it
+does hold and parsed against the caller's table. LFRic's horizontal FFSL
+transport at cubed-sphere panel edges is that case:
+``ffsl_flux_xy_special_edge_code`` sets ``recon_size`` to ``3 + 2*order`` in
+one branch and to ``1 + 2*order`` in the other, and passes it to
+``ffsl_flux_xy_special_edge_1d``, which sizes ``field_local`` and
+``field_local_tmp`` by it. Neither value is a name the caller holds, and
+``3 + 2*order`` -- the larger of the two, ``order`` being a reconstruction
+order and not negative -- is an expression over one. The sibling kernel this
+one was written from, ``ffsl_flux_xy_panel_remap_kernel_mod``, declares the
+same local as ``field_local(nlayers, 1+2*order)`` in the helper itself and is
+captured for that reason; the bound restores the shape the special-edge
+variant lost by hoisting the computation into its caller.
+
+The expression is parsed against a table holding the caller's own symbols, so
+a name the caller does not declare is refused rather than invented and
+nothing is added to the kernel's table by the attempt. It is held to
+arithmetic over literals and plain scalar names, for the reason
+:py:mod:`psyclone.psyir.backend.kokkos_spread_extent` holds a spread extent
+to them: the launch sizes the scratch these locals become before the functor
+runs, and a call or a subscript is not a value it has there. Whether the
+region can size scratch from the shape that results is
+``LFRicKokkosContractMixin._validate_locals``'s to say, and it says it of
+this shape as it does of any other.
+
 That is an assertion made on the kernel's behalf, as the SKIP table and the
 capture profile's other tables are: PSyclone cannot prove the bound, and a
 bound that is too small is an out-of-bounds write the Fortran build would
@@ -85,11 +113,12 @@ therefore validated for its shape here, refused by name where a callee or
 dummy it names is not found, and left to the capture profile to state with
 its reason beside it.
 """
+from psyclone.psyir.frontend.fortran import FortranReader
 from psyclone.psyir.nodes import (
-    ArrayReference, Container, IntrinsicCall, Literal, Range, Reference,
-    Routine)
+    ArrayReference, BinaryOperation, Container, IntrinsicCall, Literal, Node,
+    Range, Reference, Routine, UnaryOperation)
 from psyclone.psyir.symbols import (
-    ArgumentInterface, ArrayType, DataSymbol)
+    ArgumentInterface, ArrayType, DataSymbol, SymbolTable)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -102,12 +131,15 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` passes; and,
     under the ``bounded_locals`` option, a callee whose automatic local is
     sized by a dummy whose actual is assigned before the call, provided the
     option names that callee, that dummy, and a bound the caller's scope
-    holds.
+    holds -- a name of that scope, or an expression over names of it.
 
     **What is refused.** A pass in which no pending call inlines, with the
     first refusal's own words; an option that is not a mapping of callee
     name to a mapping of dummy name to bound name; an option naming a dummy
-    the callee does not take, or a bound the caller does not hold.
+    the callee does not take, or a bound that is neither a name the caller
+    holds nor a Fortran expression over such names; and a bound expression
+    reading anything but literals and plain scalar names, which the launch
+    could not evaluate where it sizes the scratch.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
@@ -125,6 +157,15 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` passes; and,
     #: it bounds. ``nlayers`` gains ``nlayers_bound``; a clash is resolved
     #: by the symbol table as any new symbol's is.
     _BOUND_SUFFIX = "_bound"
+
+    #: The node types a bound expression may be built from, matched by exact
+    #: class rather than by ``isinstance`` for the reason
+    #: :py:data:`psyclone.psyir.backend.kokkos_spread_extent._EXTENT_NODES`
+    #: is: an ``ArrayReference`` is a ``Reference`` and subscripts storage the
+    #: launch does not hold where it sizes the region's scratch. Anything
+    #: outside arithmetic over literals and plain scalar names -- a call, a
+    #: subscript, a ``CodeBlock`` -- is refused by name.
+    _BOUND_NODES = (BinaryOperation, Literal, Reference, UnaryOperation)
 
     #: The words of the one refusal another inlining can clear:
     #: :py:class:`~psyclone.psyir.transformations.InlineTrans`'s rule that a
@@ -327,16 +368,8 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, so that
                         f"LFRicKokkosTrans' '{cls._BOUNDED_LOCALS_OPTION}' "
                         f"option names '{dummy_name}' as a dummy of "
                         f"'{routine.name}', which takes no such argument.")
-                target = None
-                if caller is not None:
-                    target = caller.symbol_table.lookup(
-                        bound_name, otherwise=None)
-                if target is None:
-                    raise TransformationError(
-                        f"LFRicKokkosTrans' '{cls._BOUNDED_LOCALS_OPTION}' "
-                        f"option bounds '{dummy_name}' of '{routine.name}' "
-                        f"by '{bound_name}', which is not in scope at the "
-                        f"call in '{caller.name if caller else '?'}'.")
+                actual = cls._bound_actual(
+                    caller, routine.name, dummy_name, bound_name)
                 bound = routine_table.lookup(
                     f"{dummy_name}{cls._BOUND_SUFFIX}", otherwise=None)
                 if bound is None:
@@ -359,7 +392,118 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, so that
                 # The actual, once per call: a second call to a callee
                 # already widened finds the dummy there and adds only this.
                 if len(call.arguments) < len(routine_table.argument_list):
-                    call.append_named_arg(None, Reference(target))
+                    call.append_named_arg(None, actual)
+
+    @classmethod
+    def _bound_actual(cls, caller, callee_name, dummy_name, bound_name):
+        """Return the actual a call passes for a bounded dummy.
+
+        A bound that is a name of the caller's scope becomes a
+        :py:class:`~psyclone.psyir.nodes.Reference` to it, which is what the
+        vertical FFSL transport's ``nlayers`` is. Anything else is read as a
+        Fortran expression over the caller's names by
+        :py:meth:`_bound_expression`, which is what the horizontal
+        special-edge transport's ``3 + 2*order`` needs.
+
+        A name the caller's scope does not hold is not read as an expression
+        and then refused for naming itself: it is refused here, in the words
+        the option's reader has always used, so that a misspelt bound reads
+        as a misspelt bound.
+
+        :param caller: the routine the call is made from, or ``None`` where
+            the call is not in one.
+        :type caller: Optional[:py:class:`psyclone.psyir.nodes.Routine`]
+        :param str callee_name: the callee's name, for the message.
+        :param str dummy_name: the dummy being bounded, for the message.
+        :param str bound_name: the bound the option gives, a name or an
+            expression.
+
+        :returns: the expression the call passes as the bound's actual.
+        :rtype: :py:class:`psyclone.psyir.nodes.DataNode`
+
+        :raises TransformationError: if the bound is a name the caller's
+            scope does not hold, or the call is in no routine at all.
+        """
+        table = caller.symbol_table if caller is not None else None
+        if table is not None:
+            if not bound_name.isidentifier():
+                return cls._bound_expression(
+                    caller, callee_name, dummy_name, bound_name)
+            target = table.lookup(bound_name, otherwise=None)
+            if target is not None:
+                return Reference(target)
+        raise TransformationError(
+            f"LFRicKokkosTrans' '{cls._BOUNDED_LOCALS_OPTION}' option bounds "
+            f"'{dummy_name}' of '{callee_name}' by '{bound_name}', which is "
+            f"not in scope at the call in "
+            f"'{caller.name if caller else '?'}'.")
+
+    @classmethod
+    def _bound_expression(cls, caller, callee_name, dummy_name, bound_name):
+        """Read a bound written as Fortran over the caller's own names.
+
+        The expression is parsed against a table of the caller's symbols
+        rather than against the caller's table itself. The frontend answers a
+        name it cannot find by declaring it, and declaring it in the kernel's
+        own table would leave a misspelt bound as a symbol of the kernel
+        instead of as a refusal. Here such a name lands in a table thrown
+        away with the attempt, and the references that reach it are what names
+        the refusal. The symbols added are the caller's own objects, not
+        copies, so the expression the call carries reads the caller's
+        variables and not lookalikes of them.
+
+        The shape of the expression is judged before the names in it. An
+        intrinsic call carries a reference to its own name, which no symbol
+        table holds, and reporting ``max(n, 2)`` as a bound naming an unknown
+        variable ``MAX`` would send the reader looking for a declaration
+        rather than for a simpler bound.
+
+        :param caller: the routine the call is made from.
+        :type caller: :py:class:`psyclone.psyir.nodes.Routine`
+        :param str callee_name: the callee's name, for the message.
+        :param str dummy_name: the dummy being bounded, for the message.
+        :param str bound_name: the bound the option gives, as Fortran.
+
+        :returns: the parsed expression, reading the caller's own symbols.
+        :rtype: :py:class:`psyclone.psyir.nodes.DataNode`
+
+        :raises TransformationError: if the text is not a Fortran expression,
+            if it is not arithmetic over literals and plain scalar names, or
+            if it names anything the caller's scope does not hold.
+        """
+        message = (f"LFRicKokkosTrans' '{cls._BOUNDED_LOCALS_OPTION}' option "
+                   f"bounds '{dummy_name}' of '{callee_name}' by "
+                   f"'{bound_name}'")
+        scope = SymbolTable()
+        for symbol in caller.symbol_table.symbols:
+            scope.add(symbol)
+        try:
+            expression = FortranReader().psyir_from_expression(
+                bound_name, scope)
+        # The frontend reports a text it cannot parse as an expression with
+        # whatever its parser raises; every one of them is a refusal about
+        # the option rather than a failure of the capture.
+        except Exception as err:            # pylint: disable=broad-except
+            raise TransformationError(
+                f"{message}, which is not a Fortran expression: "
+                f"{type(err).__name__}: {err}") from err
+        for node in expression.walk(Node):
+            if node.__class__ not in cls._BOUND_NODES:
+                raise TransformationError(
+                    f"{message}, which the launch could not evaluate where "
+                    f"it sizes the region's scratch: a bound is arithmetic "
+                    f"over literals and plain scalar names, and this one "
+                    f"holds {type(node).__name__} "
+                    f"('{node.debug_string().strip()}').")
+        known = {id(symbol) for symbol in caller.symbol_table.symbols}
+        unknown = sorted({reference.symbol.name
+                          for reference in expression.walk(Reference)
+                          if id(reference.symbol) not in known})
+        if unknown:
+            raise TransformationError(
+                f"{message}, which names {', '.join(unknown)}: not in scope "
+                f"at the call in '{caller.name}'.")
+        return expression
 
     @classmethod
     def _inline_calls(cls, schedule, options=None):
@@ -377,9 +521,12 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, so that
 lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, relaxed
         of a ``TARGET`` formal and of an aliasing ``POINTER`` local, agreed
         with the caller about the origin of a disputed name, read for the
-        declarations of what it imports, and -- where the option asks --
-        given a bound for a local a written argument would size, by
-        :py:meth:`_bound_locals`.
+        declarations of what it imports, given a bound for a local a written
+        argument would size where the option asks, by :py:meth:`_bound_locals`,
+        and handed the one-element section of any element actual it reads as
+        an array of one, by
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_element_mixin.LFRicKokkosElementMixin._section_element_actuals`.
 
         A call refused for a declaration depending on a written argument is
         not final while another is pending: the refusal is kept, the next
@@ -497,6 +644,7 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline` has brought
             cls._agree_on_imports(call)
             cls._read_declarations(call)
             cls._bound_locals(call, table)
+            cls._section_element_actuals(call)
         except TransformationError:
             raise
         # A preparation step that fails in any other way is a refusal too, in
