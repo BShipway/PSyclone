@@ -1898,13 +1898,18 @@ Consider the following example kernel metadata::
   end type testkern_type
 
 This metadata specifies that the ``testkern_type`` kernel requires one
-property of the mesh. There is currently one supported property:
+property of the mesh. There are currently two supported properties:
 
 ======================= ==================================================
 Name                    Description
 ======================= ==================================================
 adjacent_face           Local ID of a neighbouring face in each
                         horizontally-adjacent cell indexed as (face).
+cell_next               Local ID of the cell across each face of the
+                        current cell indexed as (face), in the face order
+                        of the reference element; zero where there is no
+                        cell. Lets a kernel index a local-matrix operator
+                        at its neighbours.
 ======================= ==================================================
 
 .. _lfric-gh-shape:
@@ -2204,14 +2209,26 @@ conventions, are:
       a rank-2 ``integer`` array of kind ``i_def`` with dimensions
       ``(3, nfaces_re)``.
 
-6) If the ``adjacent_face`` mesh property is required then:
+6) For each mesh property required, in the order specified in the
+   ``meta_mesh`` metadata:
 
-   1) If the number of horizontal cell faces obtained from the reference
-      element (``nfaces_re_h``) is not already being passed to the kernel (due
-      to rule 5 above) then supply it here. This is an ``integer`` of kind
-      ``i_def``.
-   2) Pass a rank-1, ``integer`` array of kind ``i_def`` and extent
-      ``nfaces_re_h``.
+   1) If the ``adjacent_face`` mesh property is required then:
+
+      1) If the number of horizontal cell faces obtained from the reference
+         element (``nfaces_re_h``) is not already being passed to the kernel
+         (due to rule 5 above) then supply it here. This is an ``integer``
+         of kind ``i_def``.
+      2) Pass a rank-1, ``integer`` array of kind ``i_def`` and extent
+         ``nfaces_re_h``.
+
+   2) If the ``cell_next`` mesh property is required then:
+
+      1) If the number of cell faces obtained from the reference element
+         (``nfaces_re``) is not already being passed to the kernel (due to
+         rule 5 above) then supply it here. This is an ``integer`` of kind
+         ``i_def``.
+      2) Pass a rank-1, ``integer`` array of kind ``i_def`` and extent
+         ``nfaces_re``.
 
 7) If Quadrature is required (``gh_shape = gh_quadrature_*``) then, for
    each shape in the order specified in the ``gh_shape`` metadata:

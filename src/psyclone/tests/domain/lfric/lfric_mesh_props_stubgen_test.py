@@ -168,3 +168,40 @@ out_normals_to_faces
 
 end module testkern_mesh_prop_quad_mod
 """ == gen
+
+
+def test_mesh_prop_cell_next_stub_gen(fortran_writer):
+    ''' Check that correct kernel stub code is produced when the kernel
+    metadata contains the cell_next mesh property: the number of faces of
+    the reference element, then the property with that extent. '''
+    ast = fpapi.parse(os.path.join(BASE_PATH,
+                                   "testkern_mesh_prop_cell_next_mod.F90"),
+                      ignore_comments=False)
+    metadata = LFRicKernMetadata(ast)
+    kernel = LFRicKern()
+    kernel.load_meta(metadata)
+    gen = fortran_writer(kernel.gen_stub)
+
+    assert """\
+module testkern_mesh_prop_cell_next_mod
+  implicit none
+  public
+
+  contains
+  subroutine testkern_mesh_prop_cell_next_code(nlayers, rscalar_1, \
+field_2_w1, ndf_w1, undf_w1, map_w1, nfaces_re, cell_next)
+    use constants_mod
+    integer(kind=i_def), intent(in) :: nlayers
+    integer(kind=i_def), intent(in) :: ndf_w1
+    integer(kind=i_def), dimension(ndf_w1), intent(in) :: map_w1
+    integer(kind=i_def), intent(in) :: undf_w1
+    real(kind=r_def), intent(in) :: rscalar_1
+    real(kind=r_def), dimension(undf_w1), intent(inout) :: field_2_w1
+    integer(kind=i_def), intent(in) :: nfaces_re
+    integer(kind=i_def), dimension(nfaces_re), intent(in) :: cell_next
+
+
+  end subroutine testkern_mesh_prop_cell_next_code
+
+end module testkern_mesh_prop_cell_next_mod
+""" == gen

@@ -43,6 +43,7 @@ import os
 import pytest
 import fparser
 from fparser import api as fpapi
+from psyclone.core import VariablesAccessMap
 from psyclone.domain.lfric import LFRicKernMetadata
 from psyclone.lfric import LFRicMeshProperties, MeshProperty
 from psyclone.errors import InternalError
@@ -378,3 +379,82 @@ def test_multi_kernel_mesh_props(tmpdir):
             "ndf_w1, undf_w1, map_w1(:,cell), basis_w1_qr, nfaces_re_h, "
             "adjacent_face(:,cell), nfaces_qr, np_xyz_qr, weights_xyz_qr)"
             in gen)
+
+
+# Tests for the cell_next mesh property
+
+CELL_NEXT_MDATA = MESH_PROPS_MDATA.replace("adjacent_face", "cell_next")
+
+
+def test_mdata_parse_cell_next():
+    ''' Check that the cell_next mesh property is recognised. '''
+    fparser.logging.disable(fparser.logging.CRITICAL)
+    ast = fpapi.parse(CELL_NEXT_MDATA, ignore_comments=False)
+    dkm = LFRicKernMetadata(ast, name="testkern_mesh_type")
+    assert dkm.mesh.properties == [MeshProperty.CELL_NEXT]
+
+
+def test_cell_next_kern_args():
+    ''' Check the kernel arguments for the cell_next mesh property: the
+    number of faces of the reference element, then the property sliced at
+    the current cell. '''
+    _, invoke_info = parse(
+        os.path.join(BASE_PATH, "24.6_mesh_prop_cell_next_invoke.f90"),
+        api=TEST_API)
+    psy = PSyFactory(TEST_API, distributed_memory=False).create(invoke_info)
+    kernel = psy.invokes.invoke_list[0].schedule.walk(Kern)[0]
+    mesh_props = LFRicMeshProperties(kernel)
+    assert mesh_props.kern_args() == ["nfaces_re", "cell_next(:,cell)"]
+    # Without an argument list to record into, the accesses are still noted
+    var_accesses = VariablesAccessMap()
+    mesh_props.kern_args(var_accesses=var_accesses)
+    signatures = [str(sig) for sig in var_accesses.all_signatures]
+    assert "nfaces_re" in signatures
+    assert "cell_next(:,cell)" in signatures
+
+
+def test_cell_next_gen(tmpdir):
+    ''' Test code generation for an invoke containing a kernel requiring the
+    cell_next mesh property and nothing of the reference element: the face
+    count is supplied for it, and the property comes from the mesh. '''
+    _, invoke_info = parse(
+        os.path.join(BASE_PATH, "24.6_mesh_prop_cell_next_invoke.f90"),
+        api=TEST_API)
+    psy = PSyFactory(TEST_API, distributed_memory=False).create(invoke_info)
+
+    assert LFRicBuild(tmpdir).code_compiles(psy)
+    gen = str(psy.gen).lower()
+    assert "use reference_element_mod, only : reference_element_type" in gen
+    assert "integer(kind=i_def) :: nfaces_re\n" in gen
+    assert ("integer(kind=i_def), pointer :: cell_next(:,:) => null()"
+            in gen)
+    assert "mesh => f1_proxy%vspace%get_mesh()" in gen
+    assert "reference_element => mesh%get_reference_element()" in gen
+    assert "nfaces_re = reference_element%get_number_faces()" in gen
+    assert "cell_next => mesh%get_cell_next()" in gen
+    assert "nfaces_re_h" not in gen
+    assert "adjacent_face" not in gen
+    assert ("call testkern_mesh_prop_cell_next_code(nlayers_f1, a, f1_data, "
+            "ndf_w1, undf_w1, map_w1(:,cell), nfaces_re, "
+            "cell_next(:,cell))" in gen)
+
+
+def test_cell_next_plus_normals_gen(tmpdir):
+    ''' Test code generation for a kernel requiring the cell_next mesh
+    property beside a reference-element property that already supplies the
+    number of faces: the face count is passed once, before the normals. '''
+    _, invoke_info = parse(
+        os.path.join(BASE_PATH,
+                     "24.7_mesh_prop_cell_next_normals_invoke.f90"),
+        api=TEST_API)
+    psy = PSyFactory(TEST_API, distributed_memory=False).create(invoke_info)
+
+    assert LFRicBuild(tmpdir).code_compiles(psy)
+    gen = str(psy.gen).lower()
+    assert gen.count("nfaces_re = reference_element%get_number_faces()") == 1
+    assert ("call reference_element%get_outward_normals_to_faces("
+            "out_normals_to_faces)" in gen)
+    assert gen.count("cell_next => mesh%get_cell_next()") == 1
+    assert ("call testkern_mesh_prop_cell_next_normals_code(nlayers_f1, a, "
+            "f1_data, ndf_w1, undf_w1, map_w1(:,cell), nfaces_re, "
+            "out_normals_to_faces, cell_next(:,cell))" in gen)

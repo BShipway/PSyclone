@@ -294,6 +294,7 @@ class MeshProperty(Enum):
     ADJACENT_FACE = 1
     NCELL_2D = 2
     NCELL_2D_NO_HALOS = 3
+    CELL_NEXT = 4
 
 
 class MeshPropertiesMetaData():
@@ -313,7 +314,8 @@ class MeshPropertiesMetaData():
     # pylint: disable=too-few-public-methods
     # The properties that may be specified in kernel metadata are a subset
     # of the MeshProperty enumeration values.
-    supported_properties = [MeshProperty.ADJACENT_FACE]
+    supported_properties = [MeshProperty.ADJACENT_FACE,
+                            MeshProperty.CELL_NEXT]
 
     def __init__(self, kernel_name, type_declns):
         # The list of mesh properties requested in the metadata.
@@ -406,12 +408,12 @@ class LFRicMeshProperties(LFRicCollection):
         # Store properties in symbol table
         for prop in self._properties:
             name_lower = prop.name.lower()
-            if prop == MeshProperty.ADJACENT_FACE:
-                # If it's adjacent face, make it a pointer array
+            if prop in (MeshProperty.ADJACENT_FACE, MeshProperty.CELL_NEXT):
+                # A per-cell connectivity array: make it a pointer array
                 self.symtab.find_or_create(
                     name_lower, symbol_type=DataSymbol,
                     datatype=UnsupportedFortranType(
-                        "integer(kind=i_def), pointer :: adjacent_face(:,:) "
+                        f"integer(kind=i_def), pointer :: {name_lower}(:,:) "
                         "=> null()",
                         partial_datatype=ArrayType(
                             LFRicTypes("LFRicIntegerScalarDataType")(),
@@ -460,66 +462,30 @@ class LFRicMeshProperties(LFRicCollection):
 
         arg_list = []
 
+        ref_props = self._kernel.reference_element.properties
         for prop in self._properties:
             if prop == MeshProperty.ADJACENT_FACE:
                 # Is this kernel already being passed the number of horizontal
                 # faces of the reference element?
                 has_nfaces = (
                     RefElementMetaData.Property.NORMALS_TO_HORIZONTAL_FACES
-                    in self._kernel.reference_element.properties or
+                    in ref_props or
                     RefElementMetaData.Property.
-                    OUTWARD_NORMALS_TO_HORIZONTAL_FACES
-                    in self._kernel.reference_element.properties)
-                if not has_nfaces:
-                    if kern_call_arg_list:
-                        sym = kern_call_arg_list.\
-                            append_integer_reference("nfaces_re_h")
-                        name = sym.name
-                    else:
-                        lisdt = LFRicTypes("LFRicIntegerScalarDataType")()
-                        name = self.symtab.\
-                            find_or_create(
-                                "nfaces_re_h", tag="nfaces_re_h",
-                                symbol_type=DataSymbol,
-                                datatype=lisdt
-                            ).name
-                    arg_list.append(name)
-                    if var_accesses is not None:
-                        var_accesses.add_access(Signature(name),
-                                                AccessType.READ, self._kernel)
-
-                adj_face = "adjacent_face"
-                if not stub and kern_call_arg_list:
-                    # Use the functionality in kern_call_arg_list to properly
-                    # declare the symbol and to create a PSyIR reference for it
-                    _, cell_ref = \
-                        kern_call_arg_list.cell_ref_name(var_accesses)
-                    adj_face_sym = kern_call_arg_list. \
-                        append_array_reference(adj_face,
-                                               [":", cell_ref])
-                    # Update the name in case there was a clash
-                    adj_face = adj_face_sym.name
-                    if var_accesses:
-                        var_accesses.add_access(Signature(adj_face),
-                                                AccessType.READ, self._kernel)
-
-                if not stub:
-                    adj_face = self.symtab.find_or_create_tag(
-                        "adjacent_face").name
-                    cell_name = "cell"
-                    if self._kernel.is_coloured():
-                        colour_name = "colour"
-                        cmap_name = self.symtab.find_or_create_tag(
-                            "cmap", root_name="cmap").name
-                        adj_face += (f"(:,{cmap_name}({colour_name},"
-                                     f"{cell_name}))")
-                    else:
-                        adj_face += f"(:,{cell_name})"
-                arg_list.append(adj_face)
-
-                if var_accesses and not kern_call_arg_list:
-                    var_accesses.add_access(Signature(adj_face),
-                                            AccessType.READ, self._kernel)
+                    OUTWARD_NORMALS_TO_HORIZONTAL_FACES in ref_props)
+                arg_list.extend(self._connectivity_args(
+                    "adjacent_face", "nfaces_re_h", has_nfaces, stub,
+                    var_accesses, kern_call_arg_list))
+            elif prop == MeshProperty.CELL_NEXT:
+                # Is this kernel already being passed the number of faces
+                # of the reference element?
+                has_nfaces = (
+                    RefElementMetaData.Property.NORMALS_TO_FACES
+                    in ref_props or
+                    RefElementMetaData.Property.OUTWARD_NORMALS_TO_FACES
+                    in ref_props)
+                arg_list.extend(self._connectivity_args(
+                    "cell_next", "nfaces_re", has_nfaces, stub,
+                    var_accesses, kern_call_arg_list))
             else:
                 raise InternalError(
                     f"kern_args: found unsupported mesh property '{prop}' "
@@ -527,6 +493,81 @@ class LFRicMeshProperties(LFRicCollection):
                     f"'{self._kernel.name}'. Only members of the MeshProperty "
                     f"Enum are permitted ({list(MeshProperty)}).")
 
+        return arg_list
+
+    def _connectivity_args(self, name, nfaces_name, has_nfaces, stub,
+                           var_accesses, kern_call_arg_list):
+        '''
+        Provides the kernel arguments for a mesh property that is a per-cell
+        connectivity array indexed by face: the face count it is indexed by,
+        unless the kernel already receives that through a reference-element
+        property, and then the array itself sliced at the current cell.
+        Optionally records the accesses in var_accesses.
+
+        :param str name: the name of the array (``adjacent_face`` or
+            ``cell_next``).
+        :param str nfaces_name: the name of the face-count scalar the array
+            is indexed by (``nfaces_re_h`` or ``nfaces_re``).
+        :param bool has_nfaces: whether the kernel already receives that
+            scalar through a reference-element property.
+        :param bool stub: whether or not we are generating code for a
+            kernel stub.
+        :param var_accesses: optional VariablesAccessMap instance to store
+            the information about variable accesses.
+        :type var_accesses:
+            Optional[:py:class:`psyclone.core.VariablesAccessMap`]
+        :param kern_call_arg_list: an optional KernCallArgList instance
+            used to store PSyIR representation of the arguments.
+        :type kern_call_arg_list:
+            Optional[:py:class:`psyclone.domain.lfric.KernCallArgList`]
+
+        :returns: the kernel arguments for this mesh property.
+        :rtype: list[str]
+
+        '''
+        arg_list = []
+        if not has_nfaces:
+            if kern_call_arg_list:
+                sym = kern_call_arg_list.append_integer_reference(nfaces_name)
+                nfaces = sym.name
+            else:
+                lisdt = LFRicTypes("LFRicIntegerScalarDataType")()
+                nfaces = self.symtab.find_or_create(
+                    nfaces_name, tag=nfaces_name, symbol_type=DataSymbol,
+                    datatype=lisdt).name
+            arg_list.append(nfaces)
+            if var_accesses is not None:
+                var_accesses.add_access(Signature(nfaces),
+                                        AccessType.READ, self._kernel)
+
+        array = name
+        if not stub and kern_call_arg_list:
+            # Use the functionality in kern_call_arg_list to properly
+            # declare the symbol and to create a PSyIR reference for it
+            _, cell_ref = kern_call_arg_list.cell_ref_name(var_accesses)
+            array_sym = kern_call_arg_list.append_array_reference(
+                array, [":", cell_ref])
+            # Update the name in case there was a clash
+            array = array_sym.name
+            if var_accesses:
+                var_accesses.add_access(Signature(array),
+                                        AccessType.READ, self._kernel)
+
+        if not stub:
+            array = self.symtab.find_or_create_tag(name).name
+            cell_name = "cell"
+            if self._kernel.is_coloured():
+                colour_name = "colour"
+                cmap_name = self.symtab.find_or_create_tag(
+                    "cmap", root_name="cmap").name
+                array += f"(:,{cmap_name}({colour_name},{cell_name}))"
+            else:
+                array += f"(:,{cell_name})"
+        arg_list.append(array)
+
+        if var_accesses and not kern_call_arg_list:
+            var_accesses.add_access(Signature(array),
+                                    AccessType.READ, self._kernel)
         return arg_list
 
     def invoke_declarations(self):
@@ -541,8 +582,8 @@ class LFRicMeshProperties(LFRicCollection):
         for prop in self._properties:
             # The LFRicMeshes class will have created a mesh object so we
             # don't need to do that here.
-            if prop == MeshProperty.ADJACENT_FACE:
-                self.symtab.lookup_with_tag("adjacent_face")
+            if prop in (MeshProperty.ADJACENT_FACE, MeshProperty.CELL_NEXT):
+                self.symtab.lookup_with_tag(prop.name.lower())
             elif prop == MeshProperty.NCELL_2D_NO_HALOS:
                 self.symtab.find_or_create(
                     "ncell_2d_no_halos",
@@ -572,15 +613,17 @@ class LFRicMeshProperties(LFRicCollection):
         '''
         super().stub_declarations()
         for prop in self._properties:
-            if prop == MeshProperty.ADJACENT_FACE:
-                adj_face = self.symtab.lookup("adjacent_face")
-                dimension = self.symtab.lookup("nfaces_re_h")
-                adj_face.datatype = ArrayType(
+            if prop in (MeshProperty.ADJACENT_FACE, MeshProperty.CELL_NEXT):
+                array = self.symtab.lookup(prop.name.lower())
+                dimension = self.symtab.lookup(
+                    "nfaces_re_h" if prop == MeshProperty.ADJACENT_FACE
+                    else "nfaces_re")
+                array.datatype = ArrayType(
                             LFRicTypes("LFRicIntegerScalarDataType")(),
                             [Reference(dimension)])
-                adj_face.interface = ArgumentInterface(
+                array.interface = ArgumentInterface(
                                             ArgumentInterface.Access.READ)
-                self.symtab.append_argument(adj_face)
+                self.symtab.append_argument(array)
             elif prop == MeshProperty.NCELL_2D:
                 ncell_2d = self.symtab.lookup("ncell_2d")
                 ncell_2d.interface = ArgumentInterface(
@@ -657,13 +700,13 @@ class LFRicMeshProperties(LFRicCollection):
 
         init_cursor = cursor
         for prop in self._properties:
-            if prop == MeshProperty.ADJACENT_FACE:
-                adj_face = self.symtab.find_or_create_tag(
-                    "adjacent_face")
+            if prop in (MeshProperty.ADJACENT_FACE, MeshProperty.CELL_NEXT):
+                name = prop.name.lower()
+                array = self.symtab.find_or_create_tag(name)
                 assignment = Assignment.create(
-                        lhs=Reference(adj_face),
+                        lhs=Reference(array),
                         rhs=Call.create(StructureReference.create(
-                            mesh, ["get_adjacent_face"])),
+                            mesh, [f"get_{name}"])),
                         is_pointer=True)
                 self._invoke.schedule.addchild(assignment, cursor)
                 cursor += 1
@@ -811,17 +854,22 @@ class LFRicReferenceElement(LFRicCollection):
         # entries by using OrderedDict.
         self._properties = []
         self._nfaces_h_required = False
+        self._nfaces_required = False
 
         for call in self.kernel_calls:
             if call.reference_element:
                 self._properties.extend(call.reference_element.properties)
             if call.mesh and call.mesh.properties:
-                # If a kernel requires a property of the mesh then it will
-                # also require the number of horizontal faces of the
-                # reference element.
-                self._nfaces_h_required = True
+                # A mesh property is a per-cell array indexed by face, so a
+                # kernel requiring one also requires the face count of the
+                # reference element it is indexed by.
+                if MeshProperty.ADJACENT_FACE in call.mesh.properties:
+                    self._nfaces_h_required = True
+                if MeshProperty.CELL_NEXT in call.mesh.properties:
+                    self._nfaces_required = True
 
-        if not (self._properties or self._nfaces_h_required):
+        if not (self._properties or self._nfaces_h_required or
+                self._nfaces_required):
             return
 
         if self._properties:
@@ -873,7 +921,8 @@ class LFRicReferenceElement(LFRicCollection):
         if (RefElementMetaData.Property.NORMALS_TO_FACES
                 in self._properties or
                 RefElementMetaData.Property.OUTWARD_NORMALS_TO_FACES
-                in self._properties):
+                in self._properties or
+                self._nfaces_required):
             self._nfaces_symbol = symtab.find_or_create(
                 "nfaces_re", tag="nfaces_re", symbol_type=DataSymbol,
                 datatype=LFRicTypes("LFRicIntegerScalarDataType")())
@@ -1003,7 +1052,8 @@ class LFRicReferenceElement(LFRicCollection):
 
         '''
         super().invoke_declarations()
-        if not self._properties and not self._nfaces_h_required:
+        if not (self._properties or self._nfaces_h_required or
+                self._nfaces_required):
             # No reference-element properties required
             return
 
@@ -1032,18 +1082,26 @@ class LFRicReferenceElement(LFRicCollection):
 
         '''
         super().stub_declarations()
-        if not (self._properties or self._nfaces_h_required):
+        if not (self._properties or self._nfaces_h_required or
+                self._nfaces_required):
             return
 
         # Declare the necessary scalars (duplicates are ignored)
         scalars = list(self._arg_properties.values())
-        nfaces_h = self.symtab.find_or_create(
-            "nfaces_re_h", tag="nfaces_re_h",
-            symbol_type=DataSymbol,
-            datatype=LFRicTypes("LFRicIntegerScalarDataType")()
-        )
-        if self._nfaces_h_required and nfaces_h not in scalars:
-            scalars.append(nfaces_h)
+        if self._nfaces_h_required:
+            nfaces_h = self.symtab.find_or_create(
+                "nfaces_re_h", tag="nfaces_re_h",
+                symbol_type=DataSymbol,
+                datatype=LFRicTypes("LFRicIntegerScalarDataType")()
+            )
+            if nfaces_h not in scalars:
+                scalars.append(nfaces_h)
+        if self._nfaces_required:
+            nfaces = self.symtab.find_or_create(
+                "nfaces_re", tag="nfaces_re", symbol_type=DataSymbol,
+                datatype=LFRicTypes("LFRicIntegerScalarDataType")())
+            if nfaces not in scalars:
+                scalars.append(nfaces)
 
         for nface in scalars:
             sym = self.symtab.find_or_create(
@@ -1075,7 +1133,8 @@ class LFRicReferenceElement(LFRicCollection):
         :returns: Updated cursor value.
 
         '''
-        if not (self._properties or self._nfaces_h_required):
+        if not (self._properties or self._nfaces_h_required or
+                self._nfaces_required):
             return cursor
 
         mesh_obj = self.symtab.find_or_create_tag("mesh")
