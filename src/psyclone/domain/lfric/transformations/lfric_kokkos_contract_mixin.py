@@ -80,7 +80,7 @@ therefore not supported.
 from psyclone.core import AccessType
 from psyclone.psyir.nodes import (
     ArrayConstructor, ArrayReference, Assignment, Call, CodeBlock,
-    IntrinsicCall, Range, Reference)
+    IntrinsicCall, Range, Reference, Schedule)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
 from psyclone.psyir.symbols import ArrayType, DataSymbol
 from psyclone.psyir.transformations import TransformationError
@@ -435,6 +435,37 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
                 and isinstance(target.symbol, DataSymbol)
                 and isinstance(target.symbol.datatype, ArrayType))
 
+    @staticmethod
+    def _statement_text(node):
+        """Return the opening line of the statement ``node`` stands in.
+
+        A refusal that quotes only the offending expression leaves a reader
+        of a six-hundred-line kernel to find which of its statements was
+        meant, so the statement is named instead. It is found by climbing to
+        the node a :py:class:`~psyclone.psyir.nodes.Schedule` holds directly
+        rather than by asking for the ancestor
+        :py:class:`~psyclone.psyir.nodes.Statement`, because a
+        :py:class:`~psyclone.psyir.nodes.Call` is itself a ``Statement`` and
+        the ancestor of the section in ``if (MAXVAL(a(i:j)) > 0)`` would be
+        the ``MAXVAL`` rather than the ``if``.
+
+        Only the first line is quoted. The statement a section stands outside
+        an assignment in is usually an ``if`` or a ``do``, whose text is its
+        whole body, and the line that opens it is the one that names the
+        section.
+
+        :param node: the node whose statement is wanted.
+        :type node: :py:class:`psyclone.psyir.nodes.Node`
+
+        :returns: the first line of that statement's source text.
+        :rtype: str
+        """
+        statement = node
+        while statement.parent is not None and \
+                not isinstance(statement.parent, Schedule):
+            statement = statement.parent
+        return statement.debug_string().strip().splitlines()[0].strip()
+
     @classmethod
     def _validate_sections(cls, schedule):
         """Check that every array-valued assignment can be lowered to a loop.
@@ -461,7 +492,12 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
         blocker, named by
         :py:meth:`LFRicKokkosInlineMixin._inline_calls`. So this rule steps
         aside rather than reporting the argument as a second, weaker reason
-        for the same refusal. The shape an ``ALLOCATE``
+        for the same refusal. Nor is a section this rule's to refuse when a
+        scalar-valued fold encloses it:
+        :py:meth:`LFRicKokkosIntrinsicMixin._lower_reductions` has already
+        moved ``if (MAXVAL(a(i:j)) > 0)`` into an assignment of its own, and
+        the section reaching here is one no fold accounts for. The shape an
+        ``ALLOCATE``
         states is not a section at all: it is a declaration written as a
         statement, and :py:meth:`_lower_allocations` is what reads it.
 
@@ -470,7 +506,7 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
 
         :raises TransformationError: if a section stands outside an assignment
             other than as the argument of a call, and so is beyond what
-            lowering can reach.
+            lowering can reach. The refusal names the statement it stands in.
         :raises TransformationError: if an array-valued assignment cannot be
             lowered, in which case the reason is the one PSyclone gives.
         """
@@ -486,7 +522,8 @@ lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._written_as_a_nest`'s
             raise TransformationError(
                 "LFRicKokkosTrans cannot capture an array section outside "
                 "an assignment: only a whole-column assignment can be "
-                "lowered to a loop the generated region can express.")
+                "lowered to a loop the generated region can express. The "
+                f"section stands in '{cls._statement_text(section)}'.")
         if not any(cls._is_array_valued(assignment)
                    for assignment in schedule.walk(Assignment)):
             return

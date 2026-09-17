@@ -40,7 +40,8 @@ instantiated. It holds no instance state and every method is a
 ``classmethod``, which is what makes the mixin sound: it is a namespace with an
 inheritable ``cls``, not an object.
 
-Two things live here, and they are the same thing seen from either end.
+Three things live here, and the first two are the same thing seen from either
+end.
 
 :py:meth:`LFRicKokkosIntrinsicMixin._validate_intrinsics` closes the gap
 between what ``validate`` accepted and what the writers could write.
@@ -67,14 +68,30 @@ translation. The launch computes its scratch size on the host, before it enters
 the region, where the only values in scope are the region's own scalars: an
 extent that is a reduction over the kernel's data is not one, and an allocation
 inside a loop is not one array with a size at all. Both are refused by name.
+
+:py:meth:`LFRicKokkosIntrinsicMixin._lower_reductions` converts in the same
+direction as the allocations do, and for the same reason: it moves a statement
+into the one shape every later rule already knows. The backend writes ``SUM``,
+``MINVAL``, ``MAXVAL`` and ``DOT_PRODUCT`` as a bounded loop over a scalar
+accumulator, and writes them on the right-hand side of an assignment and
+nowhere else, because a loop is not an expression in C++ and has to be placed
+*ahead* of the statement that reads its value. A fold standing anywhere else
+-- ``if (MAXVAL(switch(low:high)) > 0)``, which is how the FFSL
+departure-point kernels ask whether a sweep found any cell -- is given an
+assignment of its own immediately before the statement it stood in, and the
+call is replaced by a reference to the scalar that assignment writes. What was
+refused twice over, once for the fold the writer had no spelling for in that
+position and once for the section standing outside an assignment, is then the
+statement pair the transformation already lowers.
 """
 
 from psyclone.psyir.backend.kokkos import KokkosWriter
 from psyclone.psyir.backend.kokkos_array_intrinsics import (
     KokkosArrayIntrinsics)
 from psyclone.psyir.nodes import (
-    ArrayReference, IntrinsicCall, Loop, Range, Reference)
-from psyclone.psyir.symbols import ArrayType
+    ArrayReference, Assignment, IntrinsicCall, Loop, Range, Reference,
+    Schedule, WhileLoop)
+from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
 from psyclone.psyir.transformations.transformation_error import (
     TransformationError)
 
@@ -90,6 +107,13 @@ class LFRicKokkosIntrinsicMixin:
     #: rather than anything a writer spells.
     _ALLOCATIONS = (IntrinsicCall.Intrinsic.ALLOCATE,
                     IntrinsicCall.Intrinsic.DEALLOCATE)
+
+    #: The root name of the scalar a hoisted fold leaves its value in. The
+    #: intrinsic's own name goes in front of it, so a reader of the generated
+    #: region meets ``maxval_result`` where the Fortran read ``MAXVAL``, and
+    #: ``SymbolTable.new_symbol`` numbers a second one rather than colliding
+    #: with the first or with anything the kernel declared.
+    _FOLD_RESULT = "result"
 
     #: Arguments of an ``ALLOCATE`` that say something beyond the shape.
     #: ``source`` and ``mold`` state the value or the type as well, and
@@ -160,6 +184,115 @@ KokkosArrayIntrinsics`, which generates the nest over the destination
                 f"LFRicKokkosTrans cannot capture this kernel: "
                 f"{' '.join(unshapeable)} The refusal is the Kokkos writer's "
                 "own, asked here rather than left to the back-end.")
+
+    @classmethod
+    def _lower_reductions(cls, schedule):
+        """Give every fold outside an assignment a scalar of its own.
+
+        ``SUM``, ``MINVAL``, ``MAXVAL`` and ``DOT_PRODUCT`` are written by
+        :py:class:`~psyclone.psyir.backend.kokkos_array_intrinsics.\
+KokkosArrayIntrinsics`
+        as a bounded loop over an accumulator, placed ahead of the statement
+        that reads the accumulator, because a loop is not an expression in
+        C++. The one position that offers such a place is the right-hand side
+        of an assignment, and the writer says so itself in
+        :py:meth:`~psyclone.psyir.backend.kokkos_intrinsics_mixin.\
+KokkosIntrinsicsMixin.written_by_the_array_tier`, which is the question asked
+        here rather than a second copy of it.
+
+        A fold anywhere else is moved rather than refused. ``if
+        (MAXVAL(switch(low:high)) > 0)`` becomes ``maxval_result =
+        MAXVAL(switch(low:high))`` immediately before the ``if``, and the
+        condition reads the scalar. Immediately before, and not hoisted any
+        further: the operands of these folds are the running arrays of a
+        sweep, so a statement moved past another that writes one of them would
+        fold different values. Placing it in the statement's own position
+        keeps the order the Fortran states, and with it the bit-exactness of
+        a one-thread host build, since the loop the writer generates runs the
+        section's own indices in the section's own order.
+
+        Only a fold whose *value* is a scalar is moved. ``MATMUL``,
+        ``TRANSPOSE``, ``RESHAPE`` and a ``SUM`` with a ``dim`` produce
+        arrays, which would need a temporary of their own shape: those stay
+        where they are and keep whatever refusal they already had.
+
+        The position is read from the innermost node the enclosing
+        :py:class:`~psyclone.psyir.nodes.Schedule` holds, rather than from
+        :py:meth:`~psyclone.psyir.nodes.Node.ancestor` of
+        :py:class:`~psyclone.psyir.nodes.Statement`: a
+        :py:class:`~psyclone.psyir.nodes.Call` is itself a ``Statement``, so
+        the ancestor of the ``MAXVAL`` in ``ABS(MAXVAL(a))`` is the ``ABS``,
+        which has no place in a schedule to insert anything before.
+
+        :param schedule: the kernel schedule being captured, rewritten in
+            place.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+
+        :raises TransformationError: if the fold stands in the condition of a
+            ``DO WHILE``, where the value is re-read on every trip and a
+            statement before the loop would be evaluated once.
+        """
+        # One fold at a time, re-walking after each: the statement a fold is
+        # moved into carries copies of everything that was inside it, and the
+        # originals leave the tree with it, so a list taken once would hold
+        # nodes that are no longer part of the schedule. Each pass strictly
+        # reduces what is left, because a moved fold -- and every fold inside
+        # it -- is one the tier now writes where it stands.
+        while True:
+            pending = [call for call in schedule.walk(IntrinsicCall)
+                       if cls._is_hoisted_fold(call)]
+            if not pending:
+                return
+            cls._hoist_fold(schedule, pending[0])
+
+    @staticmethod
+    def _is_hoisted_fold(call):
+        """Answer whether this call is a fold standing where no loop can go.
+
+        :param call: the intrinsic call to judge.
+        :type call: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+
+        :returns: whether :py:meth:`_lower_reductions` moves it.
+        :rtype: bool
+        """
+        return (KokkosArrayIntrinsics.handles(call)
+                and isinstance(call.datatype, ScalarType)
+                and not KokkosWriter.written_by_the_array_tier(call))
+
+    @classmethod
+    def _hoist_fold(cls, schedule, call):
+        """Move one fold into an assignment of its own.
+
+        :param schedule: the kernel schedule holding the fold, whose symbol
+            table declares the scalar.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param call: the fold to move.
+        :type call: :py:class:`psyclone.psyir.nodes.IntrinsicCall`
+
+        :raises TransformationError: if the fold stands in the condition of a
+            ``DO WHILE``.
+        """
+        statement = call
+        while not isinstance(statement.parent, Schedule):
+            statement = statement.parent
+        if isinstance(statement, WhileLoop) and any(
+                node is call
+                for node in statement.condition.walk(IntrinsicCall)):
+            condition = statement.condition.debug_string().strip()
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture "
+                f"'{call.debug_string().strip()}' where it stands, in the "
+                f"condition 'do while ({condition})': the generated region "
+                "computes a fold in a loop of its own, which would stand "
+                "before the while loop and be evaluated once where Fortran "
+                "evaluates the condition on every trip.")
+        symbol = schedule.symbol_table.new_symbol(
+            f"{call.intrinsic.name.lower()}_{cls._FOLD_RESULT}",
+            symbol_type=DataSymbol, datatype=call.datatype)
+        statement.parent.children.insert(
+            statement.position,
+            Assignment.create(Reference(symbol), call.copy()))
+        call.replace_with(Reference(symbol))
 
     @classmethod
     def _lower_allocations(cls, schedule):

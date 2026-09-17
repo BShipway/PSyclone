@@ -408,8 +408,9 @@ Additionally, there are three partially-implemented back-ends
   `psyclone.psyir.backend.kokkos_team_scalars` -- which decides, before any
   code is generated, which of the body's scalars belong to one member of a
   team -- a seventh, `psyclone.psyir.backend.kokkos_staging` -- which
-  holds the C++ header a region obtains its Views from, and the Python that
-  writes the three statements naming it -- an eighth, and `spread_extents`
+  writes the three statements naming the C++ header a region obtains its
+  Views from, and hands out that header's text from its sibling
+  `psyclone.psyir.backend.kokkos_staging_header` -- an eighth, and `spread_extents`
   in `psyclone.psyir.backend.kokkos_spread_extent` -- which reads how far
   the loops a region spreads actually run, so that the hierarchical launch
   can size its team from them -- a ninth; all are described
@@ -625,10 +626,15 @@ fixed parameter after a parameter pack.
 The three statements are written by `stage_declaration`, `unstage_statement`
 and `release_statement` in `psyclone.psyir.backend.kokkos_staging`, and
 `view_declaration` there is what `KokkosWriter` calls for each of a region's
-Views. The header itself is `header_text()` in the same module, a single C++
-string; the module imports nothing from PSyclone, so a build script can load
-it from source and write the header out beside the regions it generates
-without a PSyclone environment.
+Views. The header itself is `header_text()` in the same module, which returns
+a single C++ string held in the sibling module
+`psyclone.psyir.backend.kokkos_staging_header`; the header is seven hundred
+lines of C++ and the module that holds the spellings is the one a reader of
+the back-end wants, so the two are kept apart. Neither imports PSyclone at
+import time, so a build script can load `kokkos_staging` from source -- by
+path, with no PSyclone environment at all -- and write the header out beside
+the regions it generates; `header_text()` finds its sibling beside itself when
+it was loaded that way, and imports it normally when it was not.
 
 `LFRIC_KOKKOS_STAGING` is read once, at the first region entry of the
 process, and names one of three modes. `none`, the default, is an unmanaged
@@ -646,13 +652,27 @@ copies every call instead of consulting that cache. An unrecognised value is
 `Kokkos::abort`ed rather than treated as `none`: a misspelt mode that fell
 back silently would be reported as a run in the mode it names.
 
+`unstage()` copies the device buffer back before it touches the block's
+reference count, and not after. The count records every argument that landed
+on one `(pointer, bytes)` key, and only *written* arguments unstage: a
+read-only `const` View of the same field raises it and never lowers it. A
+region call handed one field as both a written and a read argument therefore
+had its device write discarded while the copy-out sat behind the count -- 48
+suppressed copies-out per `C16_MG` step in `all` mode, 146 of 272 captured
+regions susceptible, and `non-field` and `none` never on the path. The
+copy-out is what the block's data warrants whichever argument is unstaging
+it; the count keeps its other job, which is deciding when the block may be
+released.
+
 At `Kokkos::finalize` the header reports what it did on stderr. One line of
 totals::
 
   lfric_kokkos: staging=non-field staged=… cached=… hits=… shared=…
                 copies_in=… copies_out=… prefetch=on|off prefetches=…
                 prefetch_bytes=… prefetch_refused=… prefetch_skipped=…
-                prefetch_stride=… field_stages=…
+                prefetch_stride=… field_stages=… prefetch_dedupe=on|off
+                prefetch_repeat_call=… prefetch_repeat_prev=…
+                prefetch_deduped=…
 
 and then one line per role, printed whether or not that role was met so that
 a reader and a parser find the same four rows in every run::
@@ -730,10 +750,32 @@ back to a Fortran `ALLOCATE`, so a region may legitimately be handed a
 pointer no prefetch can take: such a call is counted as `prefetch_refused`,
 the sticky CUDA error it leaves is cleared, and the run carries on. Every
 staging of a field therefore ends in exactly one of `prefetches`,
-`prefetch_refused` and `prefetch_skipped`, and those three sum to
-`field_stages`. The line is printed whenever the knob is on, even in a mode
-that stages nothing, so that a knob which resolved off cannot be read as a
-lever that did not pay.
+`prefetch_refused`, `prefetch_skipped` and `prefetch_deduped`, and those four
+sum to `field_stages`. The line is printed whenever the knob is on, even in a
+mode that stages nothing, so that a knob which resolved off cannot be read as
+a lever that did not pay.
+
+One region call may stage one field twice -- a field vector's component under
+two arguments, an invoke whose actual appears under two formals, a built-in
+whose input and output are one field -- and the second prefetch asks the
+driver to move a range it has just been asked to move.
+`LFRIC_KOKKOS_STAGING_PREFETCH_DEDUPE=1` issues it once instead: the ranges
+prefetched in the current call are kept, keyed by `(pointer, bytes)` like
+every other key here, and a staging that matches one of them is counted in
+`prefetch_deduped` and not issued. The list is dropped at `release()`, ahead
+of the mode check there because `none` mode returns early from the rest of
+that function and still prefetches, so nothing is ever skipped across a call
+boundary: between two regions the host writes fields, which is what put those
+pages on the host to begin with. The header cannot see that host code, so
+`prefetch_repeat_prev` -- ranges the *previous* call prefetched -- is counted
+and reported but never skipped; it is an upper bound on what a cross-call
+dedupe could remove rather than a saving available to one. Both counts are
+taken only while the knob is on, and read zero with it off: keeping the
+census on the default path cost more than the repeats it counts are worth,
+so the census and the dedupe are one knob and a run that wants the numbers
+asks for them. Nothing about what any launch reads changes either way: a
+prefetch is a hint, and a page the driver did not move is faulted in by the
+launch that reads it.
 
 The role is not the writer's to decide. `KokkosView.role` carries it, and it
 is set by the LFRic transformation, which is the only part of the system that
@@ -930,11 +972,20 @@ unwritable argument would stand in for the call it sits under. `LBOUND`,
 before the writer sees them -- and neither are the array-valued intrinsics of
 the next section, which no handler writes and which lowering replaces first.
 Where the lowering does *not* replace one, a handler writes it after all and
-it is asked like any other: `_written_by_the_array_tier` steps over such a
+it is asked like any other: `written_by_the_array_tier` steps over such a
 call only on a right-hand side that is not itself an array constructor,
 because `assignment_node` decides which statements are lowered on exactly
 that question and a constructor is spread over its destination element by
 element.
+
+That predicate is public because the LFRic transformation asks it too.
+`LFRicKokkosIntrinsicMixin._lower_reductions` uses it to decide which
+scalar-valued folds it must move into an assignment of their own before the
+writer is reached -- a `MAXVAL` in an `IF` condition being the case that
+arises -- and a second copy of the rule in the transformation would be a
+second copy to keep in step with this one. The writer is therefore the sole
+authority on where the tier writes a call, and both the refusal and the
+rewrite are derived from it.
 
 `unshapeable_expressions(schedule, kind_types)` is the other half of the same
 question, and the half that probe cannot ask. An array-valued intrinsic where
@@ -1662,6 +1713,25 @@ written in -- reaches the writer as it stands and is generated here.
 `LFRicKokkosIntrinsicMixin._written_as_a_nest` is what
 `LFRicKokkosContractMixin._is_array_valued` asks, alongside the array
 constructor it excludes for the same reason.
+
+Because `hoist` places its loops *ahead of the statement*, the positions it
+can serve are on, or within, a right-hand side. A scalar-valued fold anywhere
+else -- `if (MAXVAL(switch(low:high)) > 0)`, the shape the FFSL
+departure-point kernels ask a sweep's result in -- has no statement to be
+placed ahead of, and used to be refused twice: once by
+`unsupported_intrinsics`, the ordinary handler having no spelling for it,
+and once by `LFRicKokkosContractMixin._validate_sections`, its operand being
+a section outside every assignment. `LFRicKokkosIntrinsicMixin
+._lower_reductions` moves such a fold into an assignment of its own,
+inserted in the position of the statement it stood in and no earlier, and
+replaces the call with a reference to the scalar. Both refusals then have
+nothing to refuse, and the statement pair is the one the section lowering
+and this tier already write. The move asks `written_by_the_array_tier`
+rather than restating where the tier writes, takes only folds whose
+`datatype` is a `ScalarType` -- an array-valued result would need a
+temporary of its own shape -- and refuses the condition of a `WhileLoop`,
+where Fortran re-reads the value on every trip and a statement before the
+loop would be evaluated once.
 
 `space` and `consumed` are what `KokkosArrayExpression` asks before it sizes
 a nest. An operand is not a section of the statement it appears in --

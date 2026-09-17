@@ -343,7 +343,7 @@ class KokkosIntrinsicsMixin:
         return f"({allowed[0]})Kokkos::{name}({argument})"
 
     @staticmethod
-    def _written_by_the_array_tier(call):
+    def written_by_the_array_tier(call):
         """Answer whether the array-valued tier writes this call for us.
 
         Being one of that tier's intrinsics is not enough: the tier generates
@@ -352,6 +352,15 @@ class KokkosIntrinsicsMixin:
         in a condition, in a subscript or as an actual argument is left to the
         ordinary handler, which is why this asks where the call is as well as
         what it is.
+
+        It is public because two callers ask it and both are asking the same
+        thing. :py:meth:`unsupported_intrinsics` asks it to decide whether a
+        call needs a handler at all, and
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_intrinsic_mixin.LFRicKokkosIntrinsicMixin._lower_reductions`
+        asks it to decide whether a call must be moved into a position the
+        tier does write. A second copy of the rule in the transformation
+        would be a second copy to keep in step with this one.
 
         A right-hand side that is an array constructor is such a position
         too. Its values are positional and the C writer spreads them over the
@@ -418,7 +427,7 @@ KokkosArrayExpressionMixin.assignment_node`
         refused = []
         for call in schedule.walk(IntrinsicCall):
             if call.intrinsic in self._QUERIES \
-                    or self._written_by_the_array_tier(call):
+                    or self.written_by_the_array_tier(call):
                 continue
             probe = call.copy()
             for argument in probe.arguments:

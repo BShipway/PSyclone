@@ -274,3 +274,100 @@ def test_lfric_kokkos_trans_validate_refuses_a_constructor_operand(
     # The shape the tier does write is not refused with it.
     LFRicKokkosTrans().validate(matmul_loop)
     assert "MATMUL" not in LFRicKokkosTrans().apply(matmul_loop)
+
+
+def test_kokkos_fold_in_a_condition_is_moved_into_an_assignment(
+        fold_condition_target):
+    """A fold outside an assignment is given a scalar of its own.
+
+    ``if (MAXVAL(switch(low:high)) > 0)`` is how the FFSL departure-point
+    kernels ask whether a sweep found any cell, and it was refused twice: for
+    the fold, which the array tier writes as a loop and so writes only on the
+    right-hand side of an assignment, and for the section, which was
+    therefore outside every assignment. Moving the fold into an assignment of
+    its own immediately before the statement settles both, and leaves the
+    statement pair the transformation already lowers.
+    """
+    _, loop, _ = fold_condition_target
+
+    LFRicKokkosTrans().validate(loop)
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    # The fold is a bounded loop over an accumulator, running the section's
+    # own indices in the section's own order, and the condition reads the
+    # scalar that loop leaves behind.
+    assert "Kokkos::reduction_identity<double>::max()" in cpp
+    assert "for (int _kae_j0 = k_low; _kae_j0 <= k_high; _kae_j0++)" in cpp
+    assert "maxval_result = _kae_r0;" in cpp
+    assert "if (((maxval_result > 0.0) &&" in cpp
+    # The fold standing beside it in the same condition is moved too, which
+    # is what re-walking after each move is for.
+    assert "minval_result = _kae_r1;" in cpp
+    assert "minval_result < 1" in cpp
+    # The fold inside the branch is an operand of a larger right-hand side,
+    # which the array tier does write where it stands. It keeps its place:
+    # the move takes only what the tier leaves, and asks the tier itself.
+    assert "(_kae_r2 * 2" in cpp
+    assert cpp.count("Kokkos::min(") == 2
+    assert "MAXVAL" not in cpp and "MINVAL" not in cpp
+    # One launch still, as the contract states: the folds are loops inside
+    # the region, not regions of their own.
+    assert cpp.count("Kokkos::parallel_for(\"") == 1
+
+
+def test_kokkos_fold_moved_before_the_statement_it_stood_in(
+        fold_condition_target):
+    """The assignment is placed in the statement's own position.
+
+    Not hoisted any further: the operands of these folds are the running
+    arrays of a sweep, so a statement moved past another that writes one of
+    them would fold different values.
+    """
+    _, loop, kernel = fold_condition_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    LFRicKokkosTrans._lower_reductions(schedule)
+
+    text = schedule.debug_string()
+    assert "maxval_result = MAXVAL(partial(k_low:k_high))\n" in text
+    assert text.index("maxval_result = MAXVAL") \
+        < text.index("if (maxval_result >")
+    assert "swept(nlayers) = partial(nlayers)\n" in text
+    assert text.index("swept(nlayers) = partial(nlayers)\n") \
+        < text.index("maxval_result = MAXVAL")
+    assert loop is not None
+
+
+def test_kokkos_fold_refused_in_a_while_condition(fold_while_target):
+    """A DO WHILE condition is the one position the move cannot serve.
+
+    Fortran evaluates the condition on every trip; an assignment standing
+    before the loop is evaluated once. The refusal names the fold and the
+    condition it stands in rather than reporting the section it reads.
+    """
+    _, loop, _ = fold_while_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "MAXVAL(partial(k_low:k_high))" in str(error.value)
+    assert "do while" in str(error.value)
+    assert "on every trip" in str(error.value)
+
+
+def test_kokkos_section_outside_an_assignment_names_its_statement(
+        fold_unmoved_target):
+    """A section no fold accounts for is still refused, by statement.
+
+    ``ANY`` is not one of the array tier's intrinsics, so nothing moves and
+    the section stands outside every assignment as it always did. The refusal
+    now names the statement it stands in, which is what a reader of a
+    six-hundred-line kernel needs to act on it.
+    """
+    _, loop, _ = fold_unmoved_target
+
+    with pytest.raises(TransformationError) as error:
+        LFRicKokkosTrans().validate(loop)
+
+    assert "array section outside an assignment" in str(error.value)
+    assert "partial(k_low:k_high)" in str(error.value)
