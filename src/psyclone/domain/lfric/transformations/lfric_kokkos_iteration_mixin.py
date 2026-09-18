@@ -168,6 +168,21 @@ class LFRicKokkosIterationMixin:
     #: dof would be telling a reviewer something untrue about what it does.
     _DOF_COUNT = "ndofs"
 
+    #: The mesh's own cell count, which a COLOURED launch takes as a formal
+    #: beside :py:attr:`_CELL_COUNT` and no other launch takes at all.
+    #:
+    #: An uncoloured launch has one count doing two jobs: it bounds the
+    #: launch, and it is the last extent of every per-cell View, because the
+    #: launch's index is the cell. A coloured launch separates the two. Its
+    #: bound counts the cells of one colour, and its index runs over those;
+    #: the cell it then reads out of the colour map is a mesh cell, whose
+    #: index runs to this. Slicing the dofmaps to the colour's count instead
+    #: describes each View as shorter than the indices the body reads from
+    #: it, which is a read past the end of the staged copy wherever the
+    #: staging header takes one, and an unnoticed read into the caller's own
+    #: longer storage where it does not.
+    _MESH_CELL_COUNT = "ncells_mesh"
+
     #: The first cell of a launch that does not begin at the first cell of
     #: the mesh. Only a loop over the halo cells alone has one; see
     #: :py:attr:`~psyclone.psyir.backend.kokkos.KokkosRegion.cell_start`.
@@ -183,7 +198,7 @@ class LFRicKokkosIterationMixin:
     #: three are reserved for every region, whichever of them that region
     #: goes on to use, so that whether a kernel is refused for a name
     #: collision does not depend on which iteration space its loop had.
-    _BOUND_NAMES = (_CELL_COUNT, _DOF_COUNT, _CELL_START)
+    _BOUND_NAMES = (_CELL_COUNT, _DOF_COUNT, _CELL_START, _MESH_CELL_COUNT)
 
     @classmethod
     def _validate_iteration_space(cls, node):
@@ -389,6 +404,27 @@ class LFRicKokkosIterationMixin:
         :rtype: str
         """
         return cls._DOF_COUNT if cls._is_dof(node) else cls._CELL_COUNT
+
+    @classmethod
+    def _slice_extent_name(cls, node):
+        """Name the scalar every per-cell View of ``node``'s region ends in.
+
+        It is :py:meth:`_count_name`'s answer for every launch whose own
+        index is what the body indexes by, which is every launch but a
+        coloured one: there, the index counts one colour's cells and the
+        body indexes by the mesh cell the colour map supplies, so the extent
+        and the bound are two different counts and the region takes both.
+
+        :param node: the loop being captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :returns: :py:attr:`_MESH_CELL_COUNT` for a coloured loop and
+            :py:meth:`_count_name`'s answer for every other.
+        :rtype: str
+        """
+        if node.loop_type == cls._COLOURED_LOOP_TYPE:
+            return cls._MESH_CELL_COUNT
+        return cls._count_name(node)
 
     @classmethod
     def _start_name(cls, node):

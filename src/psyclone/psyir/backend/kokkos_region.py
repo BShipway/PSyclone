@@ -407,6 +407,20 @@ class KokkosColourMap:
     #: :py:attr:`KokkosRegion.cell_index`: that one names the mesh cell, and
     #: is what the body's dofmaps are indexed by.
     index: str
+    #: The scalar counting the mesh's cells, which is the last extent of
+    #: every View the body slices by :py:attr:`KokkosRegion.cell_index`.
+    #:
+    #: It is a field of its own because a coloured launch has two counts and
+    #: an uncoloured one has a single count doing both jobs.
+    #: :py:attr:`KokkosRegion.cell_count` bounds the launch and counts the
+    #: cells of ONE COLOUR; the cell the map then supplies is a mesh cell,
+    #: whose index runs to the mesh's count and not to that one. A region
+    #: that sliced its dofmaps by the launch's bound would describe a View
+    #: shorter than the indices it reads from it -- which is a read past the
+    #: end wherever the staging header copies a View rather than aliasing the
+    #: caller's storage, and therefore an illegal access on a device and
+    #: silently right on a host.
+    mesh_cell_count: str
 
 
 @dataclass(frozen=True)

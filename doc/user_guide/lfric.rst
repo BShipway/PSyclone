@@ -4569,12 +4569,15 @@ OpenMP path takes: a loop
 already rewritten is accepted, the inner ``cells_in_colour`` loop being the
 one captured while the outer loop over colours stays in the PSy layer and
 enters the region once per colour. No atomic is generated there, the cells
-of one colour meeting at no dof. Such a region carries three arguments an
-uncoloured one does not -- LFRic's colour map, the colour being launched and
-the number of colours -- and declares its cell from them rather than from
-its launch index; the number of colours is not redundant beside the map,
-because the map crosses the ABI as bare storage and is rebuilt inside the
-region as a rank-2 View, where that number is the ``LayoutLeft`` stride.
+of one colour meeting at no dof. Such a region carries four arguments an
+uncoloured one does not -- LFRic's colour map, the colour being launched,
+the number of colours and the mesh's own cell count -- and declares its cell
+from the first three rather than from its launch index; the number of
+colours is not redundant beside the map, because the map crosses the ABI as
+bare storage and is rebuilt inside the region as a rank-2 View, where that
+number is the ``LayoutLeft`` stride, and the mesh's cell count is what every
+View the body slices by the cell is sized to, the launch's own bound being a
+count of one colour's cells and not of the mesh's.
 Which answer is taken follows the loop the transformation is given, unless
 the ``atomics`` option of ``apply`` says otherwise. Asking for both
 answers at once is refused -- ``True`` on a coloured loop guards data no
@@ -5665,10 +5668,11 @@ takes. A loop
 already rewritten is accepted: the inner ``cells_in_colour`` loop is the
 one captured, the outer loop over colours stays in the PSy layer and
 enters the region once per colour, and no atomic is generated, because
-the cells of one colour meet at no dof. Such a region carries three
+the cells of one colour meet at no dof. Such a region carries four
 arguments an uncoloured one does not -- LFRic's colour map, the colour
-being launched, and the number of colours -- and declares its cell from
-them, ``const int cell = cmap(colour - 1, cell_in_colour) - 1;``. The
+being launched, the number of colours, and the mesh's own cell count --
+and declares its cell from the first three,
+``const int cell = cmap(colour - 1, cell_in_colour) - 1;``. The
 number of colours is not redundant beside the map: the map crosses the
 ABI as bare storage and is rebuilt as a rank-2 View inside the region,
 where that number is the ``LayoutLeft`` stride and so the extent that
@@ -5691,14 +5695,23 @@ itself on any thread count and a serial Fortran run on none. Measured
 over a ten-timestep LFRic model run, the differences are one part in
 1e10 or smaller, and neither is a defect.
 
-One thing a coloured region does is worth stating, because a debug build
-will say so. Its per-cell Views are strided by the launch's cell count,
-which for a coloured launch is the cells of *this* colour, while the
-index they are read at is the mesh cell the colour map returns. Under
-``LayoutLeft`` the last extent takes no part in the address, so the
-addresses are the ones the Fortran computes; a build with
-``KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK`` would nonetheless report the index
-as out of range.
+**The mesh's cell count is the fourth argument for a reason that only a
+device run shows.** A coloured region has two counts. The launch's bound
+is the cells of *this* colour, because that is how many iterations there
+are; the index every per-cell View is read at is the mesh cell the colour
+map returns, which runs to the mesh's count. Slicing those Views to the
+launch's bound -- which is what this transformation did until 2026-09-18 --
+describes each of them as shorter than the indices read from it. Under
+``LayoutLeft`` the last extent takes no part in an address, so every host
+run computed the addresses the Fortran computes and was right, and only a
+build with ``KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK`` said otherwise. What that
+argument missed is that an extent is not only an address: in the
+``non-field`` and ``all`` staging modes the header allocates a device copy
+of a read-only View of exactly the product of its extents, so a View
+described short is an allocation short, and the first read past the
+colour's count is an illegal access. The coloured arm had been exercised
+only on a host, where the View lies over the caller's longer array and the
+same read lands inside it.
 
 **A loop this transformation leaves behind may still be transformed
 afterwards**, colouring included, even though capturing forces the

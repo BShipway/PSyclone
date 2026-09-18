@@ -735,13 +735,28 @@ KokkosArrayExpressionMixin.assignment_node`
         LFRic's colour map, the colour this launch is on, and the number of
         colours.
 
-        The last of those looks redundant beside the map itself and is not.
+        The third of those looks redundant beside the map itself and is not.
         The map is passed as bare storage and rebuilt as a View inside the
         region, and its first extent is the ``LayoutLeft`` stride: get that
         wrong and every lookup reads the wrong cell. The second extent has
         no such duty -- under ``LayoutLeft`` it takes no part in the address
-        -- so the cell count is reused for it rather than a fourth argument
-        added.
+        -- so the launch's own count is reused for it.
+
+        A FOURTH ARGUMENT COUNTS THE MESH'S CELLS, and it is the one thing
+        here that is not about the map. An uncoloured region has a single
+        count doing two jobs: it bounds the launch, and it is the last extent
+        of every View the body slices by the cell, because there the launch's
+        index is the cell. Colouring separates them -- the bound counts one
+        colour's cells and the cell the map yields is a mesh cell -- so a
+        region that kept one count would describe each dofmap as shorter
+        than the indices the body reads from it. That is invisible while the
+        staging header aliases the caller's storage, which is longer, and is
+        a read past the end of the copy as soon as the header takes one: the
+        coloured arm was written and exercised on a host, and the first
+        device run of it stopped at ``cudaErrorIllegalAddress``. The value is
+        the bound the same loop would have carried uncoloured, asked of
+        :py:class:`~psyclone.domain.lfric.LFRicLoop` rather than rebuilt
+        here, so that the two cannot drift.
 
         Nothing is described for an uncoloured loop, so such a region
         generates exactly the source it generated before this existed.
@@ -758,7 +773,7 @@ KokkosArrayExpressionMixin.assignment_node`
             the launch index must not also be.
 
         :returns: the region's colour map or ``None``, the descriptions of
-            the three generated arguments, and the actuals the PSy layer
+            the four generated arguments, and the actuals the PSy layer
             passes for them.
         :rtype: tuple[
             Optional[
@@ -769,7 +784,9 @@ KokkosArrayExpressionMixin.assignment_node`
             list[:py:class:`psyclone.psyir.nodes.Reference`]]
 
         :raises TransformationError: if the PSy layer has no name for the
-            number of colours, as :py:meth:`_colour_symbols` raises it.
+            number of colours, as :py:meth:`_colour_symbols` raises it, or
+            if the loop carries an upper bound with no uncoloured
+            equivalent, as :py:meth:`_mesh_cell_actual` raises it.
         """
         if node.loop_type != cls._COLOURED_LOOP_TYPE:
             return None, (), []
@@ -783,8 +800,13 @@ KokkosArrayExpressionMixin.assignment_node`
             cls._clear_name(schedule.symbol_table, candidate, taken)
             for candidate in (map_symbol.name, colour_symbol.name,
                               ncolours_symbol.name, "cell_in_colour"))
+        # The mesh count is not passed through _clear_name: it is one of
+        # _BOUND_NAMES, which every region reserves against the kernel's own
+        # formals whether it goes on to take it or not, so it is clear of
+        # them already.
         colours = KokkosColourMap(
-            name=map_name, colour=colour_name, index=index)
+            name=map_name, colour=colour_name, index=index,
+            mesh_cell_count=cls._MESH_CELL_COUNT)
         arguments = (
             # Both origins are Fortran's: the colour is one-based, and the
             # launch's zero-based index names the cell one past it. The
@@ -796,10 +818,75 @@ KokkosArrayExpressionMixin.assignment_node`
                        read_only=True, random_access=True, role="readonly"),
             KokkosScalar(colour_name, "int"),
             KokkosScalar(ncolours, "int"),
+            KokkosScalar(cls._MESH_CELL_COUNT, "int"),
         )
         return colours, arguments, [
             Reference(map_symbol), Reference(colour_symbol),
-            Reference(ncolours_symbol)]
+            Reference(ncolours_symbol), cls._mesh_cell_actual(node)]
+
+    @classmethod
+    def _mesh_cell_actual(cls, node):
+        """Build the PSy layer's expression for the mesh's cell count.
+
+        The value wanted is the upper bound the captured loop would carry if
+        it had not been coloured, because that is what bounds the cell
+        indices the colour map yields: a colouring changes the order the
+        cells are visited in and not which cells they are. ``ncolour``
+        replaced ``ncells`` and ``colour_halo`` replaced ``cell_halo`` when
+        :py:class:`~psyclone.transformations.LFRicColourTrans` ran, so the
+        mapping back is those two pairs and nothing else --
+        :py:meth:`LFRicKokkosIterationMixin._validate_iteration_space`
+        refuses every other coloured bound, including the tiled ones, before
+        this is reached.
+
+        The expression is asked of the loop rather than assembled here. What
+        ``cell_halo`` renders as is LFRic's business and has parts this
+        transformation has no view of -- the halo depth the colouring
+        carried, the mesh the invoke named, whether distributed memory is on
+        at all -- and a second copy of that knowledge would be one more thing
+        to keep in step with the API.
+
+        :param node: the coloured loop being captured.
+        :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
+
+        :returns: the PSy layer expression for the mesh's cell count.
+        :rtype: :py:class:`psyclone.psyir.nodes.DataNode`
+
+        :raises TransformationError: if the loop's upper bound is not one of
+            the two a colouring produces.
+        """
+        # The loop is asked for a bound it does not currently carry, so the
+        # name is put back before anything else reads it. Restoring in a
+        # 'finally' rather than after the call because upper_bound_psyir
+        # raises for a bound its configuration does not support, and a loop
+        # left renamed would then be lowered as an uncoloured one.
+        # pylint: disable=protected-access
+        uncoloured = {"ncolour": "ncells", "colour_halo": "cell_halo"}
+        coloured_bound = node._upper_bound_name
+        if coloured_bound not in uncoloured:
+            raise TransformationError(
+                f"LFRicKokkosTrans cannot capture a coloured loop whose "
+                f"upper bound is '{coloured_bound}': the region slices its "
+                f"per-cell arrays by the mesh's cell count, and only "
+                f"'ncolour' and 'colour_halo' name a bound this "
+                f"transformation can state that count for.")
+        # A coloured loop carries its field's NAME and space but not the
+        # argument itself: LFRicColourTrans copies what the coloured bounds
+        # need, and those two bounds reach the field through the colour
+        # tables instead. Without distributed memory the mesh's own count is
+        # the field's -- 'ncells' asks the proxy for get_ncell -- so the
+        # argument is put back for the question, by the definition
+        # :py:meth:`~psyclone.domain.lfric.LFRicLoop.load` uses, and taken
+        # off again with the bound.
+        field = node._field
+        node._upper_bound_name = uncoloured[coloured_bound]
+        if field is None:
+            node._field = node.kernel.arguments.iteration_space_arg()
+        try:
+            return node.upper_bound_psyir()
+        finally:
+            node._upper_bound_name = coloured_bound
+            node._field = field
 
     @staticmethod
     def _clear_name(table, candidate, taken):

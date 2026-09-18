@@ -239,6 +239,112 @@ def test_lfric_kokkos_trans_accepts_a_coloured_loop(shared_write_target):
     assert "atomic" not in cpp
 
 
+def test_lfric_kokkos_trans_slices_a_coloured_region_by_the_mesh(
+        shared_write_target):
+    """A coloured region counts one colour and slices by the whole mesh.
+
+    Two counts, and they are not interchangeable. The launch is bounded by
+    this colour's cells, because that is how many iterations there are; every
+    View the body slices by the cell is sized by the MESH's cells, because
+    the cell the map yields is a mesh cell and runs to the mesh's count.
+
+    An uncoloured region has one formal doing both jobs and this one had too,
+    which is a description of a dofmap shorter than the indices read from it.
+    Nothing says so while the staging header leaves a View over the caller's
+    own storage: the read lands in the caller's longer array and is right.
+    The first device run, where the header copies each read-only View to a
+    device allocation of exactly its extents, stopped at
+    ``cudaErrorIllegalAddress`` -- so the shape is asserted here, on a host,
+    where it is otherwise invisible.
+    """
+    psy, loop, _ = shared_write_target
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+
+    cpp = LFRicKokkosTrans().apply(_coloured_inner(schedule))
+    fortran = str(psy.gen)
+
+    # Both counts cross the ABI, and the region names each for what it is.
+    assert "ncells_mesh" in _formals(cpp)
+    assert "ncells" in _formals(cpp)
+    # The launch runs this colour's cells.
+    assert "Kokkos::RangePolicy<>(0, ncells)" in cpp
+    # The dofmap is staged to the mesh's, because the body indexes it by the
+    # mesh cell the map supplied.
+    assert re.search(r"map_w2_data, lfric_kokkos::Role::readonly,\s*"
+                     r"ndf_w2, ncells_mesh\)", cpp)
+    assert "ndf_w2, ncells)" not in cpp
+
+    # The PSy layer passes the mesh's count before the colour's, which is the
+    # order the signature declares them in.
+    call_line = [line for line in fortran.splitlines()
+                 if "call inc_probe_kokkos(" in line][0]
+    assert ("cmap, colour, ncolour, mesh%get_last_halo_cell(1), "
+            "last_halo_cell_all_colours(colour,1)") in call_line
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_takes_the_mesh_count_from_the_uncoloured_bound(
+        tmp_path, clear_module_manager_instance):
+    """The mesh count is whatever bound the loop carried before colouring.
+
+    'ncolour' is what LFRicColourTrans leaves where 'ncells' was and
+    'colour_halo' what it leaves where 'cell_halo' was, so the count of the
+    cells the colours between them cover is the bound of the loop it
+    replaced. Asked of the loop rather than assembled here, so that what a
+    bound renders as -- a mesh method, a proxy method, with or without
+    distributed memory -- stays LFRic's answer and not a second copy of it.
+    This invoke has distributed memory off, so the pair is the other one:
+    'ncolour' maps back to 'ncells', which without distributed memory is the
+    field proxy's own cell count and not a mesh method at all.
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL,
+        dist_mem=False)
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+    inner = _coloured_inner(schedule)
+    assert inner.upper_bound_name == "ncolour"
+
+    LFRicKokkosTrans().apply(inner)
+    call_line = [line for line in str(psy.gen).splitlines()
+                 if "call inc_probe_kokkos(" in line][0]
+
+    assert "acc_proxy%vspace%get_ncell(), last_edge_cell_all_colours(colour)" \
+        in call_line
+
+
+# pylint: disable-next=unused-argument
+def test_lfric_kokkos_trans_refuses_a_coloured_bound_with_no_mesh_count(
+        tmp_path, clear_module_manager_instance):
+    """A coloured bound this transformation cannot undo is refused.
+
+    Only the two bounds a colouring produces have an uncoloured partner to
+    read the mesh's cell count from. The tiled bounds do not, and neither
+    would any bound added later; a region built for one would slice its
+    dofmaps by a count of something else. The loop is renamed here rather
+    than produced, because every route that reaches this transformation with
+    another bound is refused before it -- which is the point: the refusal is
+    the backstop for a route that does not exist yet.
+    """
+    psy, loop, _ = _invoke(
+        tmp_path, "inc_probe", _SHARED_WRITE_ALGORITHM, _SHARED_WRITE_KERNEL)
+    schedule = psy.invokes.invoke_list[0].schedule
+    LFRicColourTrans().apply(loop)
+    inner = _coloured_inner(schedule)
+    inner._upper_bound_name = "ntilecolours"
+
+    with pytest.raises(TransformationError) as err:
+        LFRicKokkosTrans._mesh_cell_actual(inner)
+    assert "upper bound is 'ntilecolours'" in str(err.value)
+    assert "slices its per-cell arrays by the mesh's cell count" in str(
+        err.value)
+    # And the loop is left as it was found, so a refusal cannot lower it as
+    # an uncoloured loop afterwards.
+    assert inner._upper_bound_name == "ntilecolours"
+    assert psy is not None
+
+
 def test_lfric_kokkos_trans_colours_a_loop_that_takes_an_operator(
         shared_write_operator_target):
     """A coloured operator kernel reads its cell through the colour map.
@@ -483,11 +589,12 @@ def test_lfric_kokkos_trans_colours_a_team_launch(
     assert "Kokkos::atomic" not in cpp
     assert "first_cell" not in cpp
 
-    # The PSy layer passes the map, the colour and this colour's cell count.
+    # The PSy layer passes the map, the colour, the mesh's cell count and
+    # this colour's.
     call_line = [line for line in str(psy.gen).splitlines()
                  if "call column_scale_kokkos(" in line][0]
-    assert "cmap, colour, ncolour, last_halo_cell_all_colours(colour,1)" \
-        in call_line
+    assert ("cmap, colour, ncolour, mesh%get_last_halo_cell(1), "
+            "last_halo_cell_all_colours(colour,1)") in call_line
 
 
 # pylint: disable-next=unused-argument
