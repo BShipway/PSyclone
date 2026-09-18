@@ -442,6 +442,22 @@ def test_get_partial_datatype():
     # Check fparser2 tree is unmodified
     assert ids == [id(entry) for entry in walk(node)]
 
+    # Entry in symbol table with partial information. PROTECTED restricts
+    # assignment to a module's variable from outside that module and says
+    # nothing about its type, so it is dropped like the other three and the
+    # declaration that is re-parsed is the one the type came from. LFRic's
+    # generated configuration modules declare every namelist variable this
+    # way, so without it a model's enumerations have no type at all.
+    reader = FortranStringReader("integer, public, protected :: l1 = 2")
+    node = Specification_Part(reader).content[0]
+    ids = [id(entry) for entry in walk(node)]
+    datatype, init = processor._get_partial_datatype(node, fake_parent, st, {})
+    assert isinstance(datatype, ScalarType)
+    assert isinstance(init, Literal)
+    assert datatype.intrinsic is ScalarType.Intrinsic.INTEGER
+    # Check fparser2 tree is unmodified
+    assert ids == [id(entry) for entry in walk(node)]
+
     # Entry in symbol table with partial information. Example has one
     # unsupported attribute and one supported attribute.
     reader = FortranStringReader("real*4, target, dimension(10,20) :: l1")

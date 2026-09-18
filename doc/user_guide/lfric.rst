@@ -4346,7 +4346,17 @@ body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like
 any other. A formal carrying any other attribute PSyclone does not model --
 ``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
-``InlineTrans``'s words. A callee's own ``POINTER`` local is relaxed too
+``InlineTrans``'s words. An *actual* argument declared ``PROTECTED`` is
+relaxed the same way and for the same kind of reason: the attribute forbids
+assignment from outside the declaring module, which passing the variable to
+a routine whose formal Fortran has already required to be ``intent(in)``
+does not do, so a declaration carrying nothing beyond its type, its shape,
+its visibility and ``PROTECTED`` is given its partial datatype and the call
+matches its callee. That is what lets LFRic's configuration enumerations --
+``coord_system``, ``geometry``, ``topology``, which the generated
+configuration modules declare ``PROTECTED`` because the namelist reader is
+the only thing that may set them -- be passed to a helper the region
+inlines. A callee's own ``POINTER`` local is relaxed too
 where it only ever aims at a whole array, and becomes a ``View`` handle in
 the generated region; every other use of such a pointer is refused by name.
 Inlined against a section actual -- ``call edge(field(w3_idx:w3_idx +
@@ -5056,6 +5066,40 @@ refused in ``InlineTrans``'s own words. This is what puts LFRic's
 refusal. The local ``real(kind=r_tran), pointer :: field_ptr(:)`` those
 routines aim at either the column or a logarithm of it is the subject of the
 next rule.
+
+**A PROTECTED actual argument is inlinable.** The same refusal reaches a
+call from the other side. An LFRic configuration module declares every
+variable its namelist reader sets as ``integer(kind=i_def), public,
+protected``, and ``PROTECTED`` is not modelled either, so such a variable
+arrives as an
+:py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` and a call
+passing one is reported by ``InlineTrans`` as matching no routine of the
+callee's name at all -- the argument's type against the formal's, with no
+mention of the attribute that caused it. ``PROTECTED`` says that nothing
+outside the declaring module may assign to the variable. Passing it as an
+actual argument assigns to nothing, and Fortran has already refused the call
+that would by requiring the formal to be ``intent(in)``; the compiler that
+built the kernel settled that before PSyclone saw it. So before the callee
+is inlined, an actual whose declaration carries nothing beyond its type, its
+shape, its visibility and ``PROTECTED`` is given the partial datatype the
+frontend parsed out of that declaration, and the call matches. An actual
+carrying any other unmodelled attribute -- ``POINTER``, ``ALLOCATABLE``, or
+``TARGET`` beside ``PROTECTED`` -- is left as it is and refused as before.
+As with a ``TARGET`` formal, the rewrite is made on the copy the capture
+works on, so a later capture of another kernel reading the same variable
+meets it as its own module declares it.
+
+This is what puts LFRic's ``sci_native_jacobian_mod`` helpers, which the
+``convert_hdiv_native`` kernels call with three such enumerations, past that
+refusal. Reaching the frontend at all needed one change there: a declaration
+carrying ``PROTECTED`` used to have no partial datatype, because
+:py:class:`~psyclone.psyir.frontend.fparser2.Fparser2Reader` strips only
+``POINTER``, ``TARGET`` and ``OPTIONAL`` before re-parsing a declaration it
+could not model. It strips ``PROTECTED`` too, on the same grounds: the
+attribute restricts assignment and says nothing about the type, so the
+declaration left behind is one whose type is the one the symbol has, and the
+symbol itself still carries the whole declaration as it does for the other
+three.
 
 **A local POINTER aiming at whole arrays is a View handle.** A helper that
 declares ``real(kind=r_def), pointer :: p(:)``, aims it at one whole array

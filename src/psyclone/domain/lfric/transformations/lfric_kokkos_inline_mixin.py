@@ -955,6 +955,75 @@ lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin`), one whose actual and formal
                            for attribute in attributes):
                         symbol.datatype = datatype.partial_datatype
 
+    #: The attributes an actual argument's declaration may carry and still
+    #: be given its partial datatype by
+    #: :py:meth:`_relax_protected_actuals`. ``PROTECTED`` is the one that
+    #: makes an LFRic configuration variable's declaration unmodelled; the
+    #: other three are already in the partial datatype or in the symbol --
+    #: ``DIMENSION`` as its shape, and the two visibilities as the symbol's
+    #: own -- and so are not attributes being dropped. Matched by prefix,
+    #: since ``DIMENSION`` is written with a parenthesised value.
+    _PROTECTED_ATTRIBUTES = ("PROTECTED", "DIMENSION", "PUBLIC", "PRIVATE")
+
+    @classmethod
+    def _relax_protected_actuals(cls, call):
+        """Give every ``PROTECTED`` actual of ``call`` its own type.
+
+        ``PROTECTED`` says that a module's variable may not be assigned to
+        from outside the module. Passing it as an actual argument neither
+        assigns to it nor weakens the guarantee -- Fortran already refuses
+        the call that would, by requiring the formal to be ``intent(in)``,
+        and the compiler that built the kernel has settled that. So the
+        attribute has nothing to say about whether the call's arguments
+        match its callee's formals -- but the PSyIR does not model it, so
+        the variable arrives as an
+        :py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` and
+        :py:class:`~psyclone.psyir.transformations.InlineTrans` reports the
+        call's arguments as not matching any routine of the callee's name.
+        Replacing such a symbol's type with the partial datatype the
+        frontend did parse is what removes that refusal, and it removes only
+        that one: a declaration carrying any other unmodelled attribute --
+        ``POINTER``, ``ALLOCATABLE``, ``TARGET`` -- is left as it is and
+        refused as before.
+
+        This is what makes LFRic's *native jacobian* helper inlinable. The
+        four kernels that call it pass ``coord_system``, ``geometry`` and
+        ``topology``, the enumerations LFRic's generated configuration
+        modules declare ``PROTECTED`` because the namelist reader is the
+        only thing that may set them, and every one of them arrives
+        unmodelled.
+
+        The rewrite is made on the symbols the call site names, which are
+        the kernel schedule's own -- the copy
+        :py:meth:`_rooted_copy` took, during a validate, and the schedule
+        itself during an apply. Neither is the tree the frontend parsed, so
+        a later capture of another kernel reading the same configuration
+        variable meets it as its own module declares it.
+
+        The partial datatype is taken rather than copied: it is part of the
+        declaration being replaced, which nothing holds afterwards.
+
+        :param call: the call whose actual arguments are to be relaxed.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+        """
+        for argument in call.arguments:
+            for reference in argument.walk(Reference):
+                symbol = reference.symbol
+                datatype = getattr(symbol, "datatype", None)
+                if not isinstance(datatype, UnsupportedFortranType):
+                    continue
+                attributes = cls._declaration_attributes(datatype.declaration)
+                # Two questions with one answer: a declaration the frontend
+                # could parse nothing of leaves nothing to put in the
+                # symbol's place, and one that is unmodelled for some other
+                # reason is not this rewrite's to relax.
+                if (datatype.partial_datatype is None
+                        or "PROTECTED" not in attributes):
+                    continue
+                if all(attribute.startswith(cls._PROTECTED_ATTRIBUTES)
+                       for attribute in attributes):
+                    symbol.datatype = datatype.partial_datatype
+
     @staticmethod
     def _rooted_copy(schedule):
         """Return a copy of ``schedule`` that keeps its scope chain.
