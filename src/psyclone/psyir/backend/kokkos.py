@@ -931,16 +931,20 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             scalars.
         :type scalar_names: Set[str]
 
-        :raises ValueError: if any of the three names is not a C++
-            identifier; if the map is not passed as a View or the colour is
-            not passed as a scalar; if the launch's own index is the cell
-            index, which would declare the cell from itself; or if that index
-            is also a region argument, which the declaration would shadow.
+        :raises ValueError: if any of the four names is not a C++
+            identifier; if the map is not passed as a View, or the colour or
+            the mesh cell count is not passed as a scalar; if the launch's
+            own index is the cell index, which would declare the cell from
+            itself; if that index is also a region argument, which the
+            declaration would shadow; or if a View the body slices by the
+            mesh cell is not sliced to the mesh's count.
         """
         colours = region.colour_map
         for description, name in (("map", colours.name),
                                   ("colour", colours.colour),
-                                  ("index", colours.index)):
+                                  ("index", colours.index),
+                                  ("mesh cell count",
+                                   colours.mesh_cell_count)):
             if not is_identifier(name):
                 raise ValueError(
                     f"Kokkos colour {description} '{name}' is not a C++ "
@@ -959,6 +963,26 @@ KokkosArrayExpressionMixin.arrayreference_node` instead.
             raise ValueError(
                 f"Kokkos colour index '{colours.index}' is also a region "
                 "argument.")
+        if colours.mesh_cell_count not in scalar_names:
+            raise ValueError(
+                f"Kokkos mesh cell count '{colours.mesh_cell_count}' is not "
+                "a scalar argument.")
+        # The launch's bound counts one colour's cells and the map turns the
+        # launch's index into a mesh cell, so a View the body slices by that
+        # cell has to be described to the mesh's length. Checked here rather
+        # than left to the caller because the two counts are both ints and
+        # both plausible, and the wrong one reads past the end of a staged
+        # copy -- which a host run, aliasing the caller's longer storage,
+        # does not notice.
+        for argument in region.arguments:
+            if (isinstance(argument, KokkosView)
+                    and argument.extra_indices == (region.cell_index,)
+                    and argument.extents[-1] != colours.mesh_cell_count):
+                raise ValueError(
+                    f"Kokkos View '{argument.name}' is sliced by the mesh "
+                    f"cell '{region.cell_index}' but its last extent is "
+                    f"'{argument.extents[-1]}' rather than the mesh cell "
+                    f"count '{colours.mesh_cell_count}'.")
 
     def _validate_view(self, view):
         """Validate the ownership and dimensional contract for one View.

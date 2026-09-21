@@ -4346,7 +4346,17 @@ body neither creates nor breaks, so such a formal is given the type the
 frontend did parse from its declaration and the callee is then inlined like
 any other. A formal carrying any other attribute PSyclone does not model --
 ``POINTER``, ``ALLOCATABLE``, ``VALUE`` -- is refused as before, in
-``InlineTrans``'s words. A callee's own ``POINTER`` local is relaxed too
+``InlineTrans``'s words. An *actual* argument declared ``PROTECTED`` is
+relaxed the same way and for the same kind of reason: the attribute forbids
+assignment from outside the declaring module, which passing the variable to
+a routine whose formal Fortran has already required to be ``intent(in)``
+does not do, so a declaration carrying nothing beyond its type, its shape,
+its visibility and ``PROTECTED`` is given its partial datatype and the call
+matches its callee. That is what lets LFRic's configuration enumerations --
+``coord_system``, ``geometry``, ``topology``, which the generated
+configuration modules declare ``PROTECTED`` because the namelist reader is
+the only thing that may set them -- be passed to a helper the region
+inlines. A callee's own ``POINTER`` local is relaxed too
 where it only ever aims at a whole array, and becomes a ``View`` handle in
 the generated region; every other use of such a pointer is refused by name.
 Inlined against a section actual -- ``call edge(field(w3_idx:w3_idx +
@@ -4559,12 +4569,15 @@ OpenMP path takes: a loop
 already rewritten is accepted, the inner ``cells_in_colour`` loop being the
 one captured while the outer loop over colours stays in the PSy layer and
 enters the region once per colour. No atomic is generated there, the cells
-of one colour meeting at no dof. Such a region carries three arguments an
-uncoloured one does not -- LFRic's colour map, the colour being launched and
-the number of colours -- and declares its cell from them rather than from
-its launch index; the number of colours is not redundant beside the map,
-because the map crosses the ABI as bare storage and is rebuilt inside the
-region as a rank-2 View, where that number is the ``LayoutLeft`` stride.
+of one colour meeting at no dof. Such a region carries four arguments an
+uncoloured one does not -- LFRic's colour map, the colour being launched,
+the number of colours and the mesh's own cell count -- and declares its cell
+from the first three rather than from its launch index; the number of
+colours is not redundant beside the map, because the map crosses the ABI as
+bare storage and is rebuilt inside the region as a rank-2 View, where that
+number is the ``LayoutLeft`` stride, and the mesh's cell count is what every
+View the body slices by the cell is sized to, the launch's own bound being a
+count of one colour's cells and not of the mesh's.
 Which answer is taken follows the loop the transformation is given, unless
 the ``atomics`` option of ``apply`` says otherwise. Asking for both
 answers at once is refused -- ``True`` on a coloured loop guards data no
@@ -5056,6 +5069,40 @@ refused in ``InlineTrans``'s own words. This is what puts LFRic's
 refusal. The local ``real(kind=r_tran), pointer :: field_ptr(:)`` those
 routines aim at either the column or a logarithm of it is the subject of the
 next rule.
+
+**A PROTECTED actual argument is inlinable.** The same refusal reaches a
+call from the other side. An LFRic configuration module declares every
+variable its namelist reader sets as ``integer(kind=i_def), public,
+protected``, and ``PROTECTED`` is not modelled either, so such a variable
+arrives as an
+:py:class:`~psyclone.psyir.symbols.UnsupportedFortranType` and a call
+passing one is reported by ``InlineTrans`` as matching no routine of the
+callee's name at all -- the argument's type against the formal's, with no
+mention of the attribute that caused it. ``PROTECTED`` says that nothing
+outside the declaring module may assign to the variable. Passing it as an
+actual argument assigns to nothing, and Fortran has already refused the call
+that would by requiring the formal to be ``intent(in)``; the compiler that
+built the kernel settled that before PSyclone saw it. So before the callee
+is inlined, an actual whose declaration carries nothing beyond its type, its
+shape, its visibility and ``PROTECTED`` is given the partial datatype the
+frontend parsed out of that declaration, and the call matches. An actual
+carrying any other unmodelled attribute -- ``POINTER``, ``ALLOCATABLE``, or
+``TARGET`` beside ``PROTECTED`` -- is left as it is and refused as before.
+As with a ``TARGET`` formal, the rewrite is made on the copy the capture
+works on, so a later capture of another kernel reading the same variable
+meets it as its own module declares it.
+
+This is what puts LFRic's ``sci_native_jacobian_mod`` helpers, which the
+``convert_hdiv_native`` kernels call with three such enumerations, past that
+refusal. Reaching the frontend at all needed one change there: a declaration
+carrying ``PROTECTED`` used to have no partial datatype, because
+:py:class:`~psyclone.psyir.frontend.fparser2.Fparser2Reader` strips only
+``POINTER``, ``TARGET`` and ``OPTIONAL`` before re-parsing a declaration it
+could not model. It strips ``PROTECTED`` too, on the same grounds: the
+attribute restricts assignment and says nothing about the type, so the
+declaration left behind is one whose type is the one the symbol has, and the
+symbol itself still carries the whole declaration as it does for the other
+three.
 
 **A local POINTER aiming at whole arrays is a View handle.** A helper that
 declares ``real(kind=r_def), pointer :: p(:)``, aims it at one whole array
@@ -5621,10 +5668,11 @@ takes. A loop
 already rewritten is accepted: the inner ``cells_in_colour`` loop is the
 one captured, the outer loop over colours stays in the PSy layer and
 enters the region once per colour, and no atomic is generated, because
-the cells of one colour meet at no dof. Such a region carries three
+the cells of one colour meet at no dof. Such a region carries four
 arguments an uncoloured one does not -- LFRic's colour map, the colour
-being launched, and the number of colours -- and declares its cell from
-them, ``const int cell = cmap(colour - 1, cell_in_colour) - 1;``. The
+being launched, the number of colours, and the mesh's own cell count --
+and declares its cell from the first three,
+``const int cell = cmap(colour - 1, cell_in_colour) - 1;``. The
 number of colours is not redundant beside the map: the map crosses the
 ABI as bare storage and is rebuilt as a rank-2 View inside the region,
 where that number is the ``LayoutLeft`` stride and so the extent that
@@ -5647,14 +5695,23 @@ itself on any thread count and a serial Fortran run on none. Measured
 over a ten-timestep LFRic model run, the differences are one part in
 1e10 or smaller, and neither is a defect.
 
-One thing a coloured region does is worth stating, because a debug build
-will say so. Its per-cell Views are strided by the launch's cell count,
-which for a coloured launch is the cells of *this* colour, while the
-index they are read at is the mesh cell the colour map returns. Under
-``LayoutLeft`` the last extent takes no part in the address, so the
-addresses are the ones the Fortran computes; a build with
-``KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK`` would nonetheless report the index
-as out of range.
+**The mesh's cell count is the fourth argument for a reason that only a
+device run shows.** A coloured region has two counts. The launch's bound
+is the cells of *this* colour, because that is how many iterations there
+are; the index every per-cell View is read at is the mesh cell the colour
+map returns, which runs to the mesh's count. Slicing those Views to the
+launch's bound -- which is what this transformation did until 2026-09-18 --
+describes each of them as shorter than the indices read from it. Under
+``LayoutLeft`` the last extent takes no part in an address, so every host
+run computed the addresses the Fortran computes and was right, and only a
+build with ``KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK`` said otherwise. What that
+argument missed is that an extent is not only an address: in the
+``non-field`` and ``all`` staging modes the header allocates a device copy
+of a read-only View of exactly the product of its extents, so a View
+described short is an allocation short, and the first read past the
+colour's count is an illegal access. The coloured arm had been exercised
+only on a host, where the View lies over the caller's longer array and the
+same read lands inside it.
 
 **A loop this transformation leaves behind may still be transformed
 afterwards**, colouring included, even though capturing forces the

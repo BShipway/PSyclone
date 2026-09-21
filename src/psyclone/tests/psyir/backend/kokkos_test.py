@@ -58,17 +58,25 @@ end subroutine moist_dyn_gas_code
         "moist_dyn_gas_code", symbol_table=symbol_table, children=children)
 
 
-def _region(cell_count="ncells"):
+def _region(cell_count="ncells", extent=None):
     """Return the explicit launch and argument contract for the test body.
 
-    :param str cell_count: the formal the launch is bounded by, which is also
-        the last extent of every per-cell View. It is a parameter because the
-        count a region covers is whatever bound the loop it came from
-        carried; the default is only the commonest of those.
+    :param str cell_count: the formal the launch is bounded by. It is a
+        parameter because the count a region covers is whatever bound the
+        loop it came from carried; the default is only the commonest of
+        those.
+    :param extent: the last extent of every per-cell View, or ``None`` for
+        the count. The two are one formal for every launch whose own index is
+        the cell, and two for a coloured launch, whose index counts one
+        colour's cells while the cell it reads from the map runs to the
+        mesh's count.
+    :type extent: Optional[str]
 
     :returns: the region the writer is asked to generate.
     :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     """
+    if extent is None:
+        extent = cell_count
     return KokkosRegion(
         name="moist_dyn_gas_kokkos",
         schedule=_kernel_schedule(),
@@ -85,7 +93,7 @@ def _region(cell_count="ncells"):
             KokkosScalar("undf_wtheta", "int"),
             KokkosView(
                 "map_wtheta", "map_wtheta_data", "int",
-                ("ndf_wtheta", cell_count), index_offsets=(1,),
+                ("ndf_wtheta", extent), index_offsets=(1,),
                 extra_indices=("cell",), read_only=True,
                 random_access=True),
             KokkosScalar(cell_count, "int"),
@@ -3439,7 +3447,7 @@ def _coloured_region(**overrides):
     :returns: the coloured region.
     :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     """
-    base = _region(cell_count="ncells_in_colour")
+    base = _region(cell_count="ncells_in_colour", extent="ncells_mesh")
     fields = {
         "arguments": base.arguments + (
             KokkosView("cmap", "cmap_data", "int",
@@ -3447,9 +3455,11 @@ def _coloured_region(**overrides):
                        read_only=True, random_access=True),
             KokkosScalar("colour", "int"),
             KokkosScalar("ncolours", "int"),
+            KokkosScalar("ncells_mesh", "int"),
         ),
         "colour_map": KokkosColourMap(
-            name="cmap", colour="colour", index="cell_in_colour"),
+            name="cmap", colour="colour", index="cell_in_colour",
+            mesh_cell_count="ncells_mesh"),
     }
     fields.update(overrides)
     return replace(base, **fields)
@@ -3516,7 +3526,8 @@ def test_kokkos_team_launches_index_the_colour_too():
     colour's cells would return early for most of the cells it was given.
     """
     colours = KokkosColourMap(
-        name="cmap", colour="colour", index="cell_in_colour")
+        name="cmap", colour="colour", index="cell_in_colour",
+        mesh_cell_count="ncells_mesh")
     flat = team_launch(replace(_scratch_region(), colour_map=colours), "", "")
     assert ("const int cell_in_colour = team.league_rank() * "
             "team.team_size() + rank;") in flat
@@ -3535,17 +3546,33 @@ def test_kokkos_team_launches_index_the_colour_too():
     ("colour", "cmap", "Kokkos colour 'cmap' is not a scalar"),
     ("index", "cell", "is also the region's cell index"),
     ("index", "nlayers", "Kokkos colour index 'nlayers' is also a region"),
+    ("mesh_cell_count", "n cells",
+     "Kokkos colour mesh cell count 'n cells' is not a C++"),
+    ("mesh_cell_count", "cmap",
+     "Kokkos mesh cell count 'cmap' is not a scalar"),
+    ("mesh_cell_count", "ncells_in_colour",
+     "Kokkos View 'map_wtheta' is sliced by the mesh cell 'cell' but its "
+     "last extent is 'ncells_mesh' rather than the mesh cell count "
+     "'ncells_in_colour'"),
 ])
 def test_kokkos_writer_rejects_a_broken_colour_map(field, value, message):
     """Each way the map could be wrong is refused where it is described.
 
-    None of the seven announces itself downstream. Three are not identifiers
+    None of the ten announces itself downstream. Four are not identifiers
     and generate text that does not compile, which is the mild case. The
-    other four compile: a map that is not a View, or a colour that is not a
-    scalar, indexes something that is not the map; an index equal to the cell
-    index declares the cell from itself; and an index that is also an
-    argument is shadowed by the declaration, so the launch would read the
+    rest compile: a map that is not a View, or a colour or mesh count that is
+    not a scalar, indexes something that is not the map; an index equal to
+    the cell index declares the cell from itself; and an index that is also
+    an argument is shadowed by the declaration, so the launch would read the
     argument's value for every cell.
+
+    The last row is the one that compiles, runs and is right on a host. A
+    coloured region has two counts -- the launch's, of one colour's cells,
+    and the mesh's, which the cell the map yields runs to -- and a dofmap
+    sliced to the first is described shorter than the indices read from it.
+    Where the staging header leaves the View over the caller's own storage
+    the read lands inside the caller's longer array; where it copies the
+    View to a device allocation of exactly its extents, it does not.
     """
     region = _coloured_region()
     colours = replace(region.colour_map, **{field: value})
@@ -4054,16 +4081,24 @@ def _coloured_scratch_region(**overrides):
         _scratch_region(),
         name="tri_solve_coloured_kokkos",
         cell_count="ncells_in_colour",
-        arguments=_scratch_region().arguments + (
+        # The map is sliced to the mesh, not to the colour: the launch
+        # index counts one colour's cells and the cell it reads out of the
+        # map is a mesh cell.
+        arguments=tuple(
+            replace(argument, extents=("ndf", "ncells_mesh"))
+            if getattr(argument, "name", None) == "map" else argument
+            for argument in _scratch_region().arguments) + (
             KokkosScalar("ncells_in_colour", "int"),
             KokkosView("cmap", "cmap_data", "int",
                        ("ncolours", "ncells_in_colour"), index_offsets=(1, 1),
                        read_only=True, random_access=True),
             KokkosScalar("colour", "int"),
             KokkosScalar("ncolours", "int"),
+            KokkosScalar("ncells_mesh", "int"),
         ),
         colour_map=KokkosColourMap(
-            name="cmap", colour="colour", index="cell_in_colour"))
+            name="cmap", colour="colour", index="cell_in_colour",
+            mesh_cell_count="ncells_mesh"))
     return replace(region, **overrides) if overrides else region
 
 
@@ -4103,7 +4138,8 @@ def test_kokkos_launch_helpers_are_independent_of_each_other():
     neither combination is a special case of the other.
     """
     colours = KokkosColourMap(
-        name="cmap", colour="colour", index="cell_in_colour")
+        name="cmap", colour="colour", index="cell_in_colour",
+        mesh_cell_count="ncells_mesh")
     plain = _region()
     coloured = replace(plain, colour_map=colours)
 
@@ -4165,7 +4201,8 @@ def test_kokkos_writer_refuses_a_colour_map_on_a_dof_region():
     described.
     """
     colours = KokkosColourMap(
-        name="cmap", colour="colour", index="cell_in_colour")
+        name="cmap", colour="colour", index="cell_in_colour",
+        mesh_cell_count="ncells_mesh")
     with pytest.raises(ValueError) as error:
         KokkosWriter()(_dof_region(colour_map=colours))
 

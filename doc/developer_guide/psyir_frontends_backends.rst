@@ -1537,6 +1537,16 @@ a scalar; the caller enters the region once per colour. No atomic is
 generated for such a region, because the cells of one colour meet at no dof,
 and the two fields are alternatives rather than a sequence.
 
+`KokkosColourMap` also names the region's `mesh_cell_count`, which is a
+scalar argument of its own. A coloured region has two counts and they are
+not interchangeable: `KokkosRegion.cell_count` bounds the launch and counts
+the cells of ONE COLOUR, while the cell the lookup above yields is a mesh
+cell and runs to the mesh's count. Every View the body slices by
+`KokkosRegion.cell_index` is therefore given the mesh count as its last
+extent, and `_validate_colour_map` refuses a region where one is not: a
+dofmap described to the launch's bound is shorter than the indices read
+from it.
+
 A kernel that takes an operator is given the cell index as an argument, and
 under colouring the PSy layer supplies it as `cmap(colour, cell)` rather than
 as `cell`. `LFRicKokkosContractMixin._is_the_loops_cell` recognises both
@@ -1546,14 +1556,21 @@ map's answer: `const int cell = cell_1 + 1;` follows the lookup above, where
 `matrix_vector` call site in GungHo is of this shape, so refusing it would
 leave the coloured arm without the commonest shared write there is.
 
-One consequence is worth knowing before a debug build reports it. A coloured
-region's per-cell Views -- its dofmaps, and a sliced actual like a stencil's
--- are strided by the launch's cell count, which is the cells of this colour,
-while the index they are read at is the mesh cell the map returned. Under
-`LayoutLeft` the trailing extent takes no part in an address, so only the
-leading one has to be exact and the addresses are the ones the Fortran
-computes; a build with `KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK` would nonetheless
-report the index as out of range.
+That two-count rule replaces an earlier account of the same shape, and the
+way it was wrong is worth recording. A coloured region's per-cell Views --
+its dofmaps, and a sliced actual like a stencil's -- were strided by the
+launch's cell count, which is the cells of this colour, while the index they
+are read at is the mesh cell the map returned. Under `LayoutLeft` the
+trailing extent takes no part in an address, so the addresses computed were
+the ones the Fortran computes and every host run was right; only a build
+with `KOKKOS_ENABLE_DEBUG_BOUNDS_CHECK` said otherwise. What the argument
+missed is that the extents are not only addressing. `lfric_kokkos::stage`
+in the `non-field` and `all` modes ALLOCATES a device copy of a read-only
+View of exactly the product of its extents and copies that many elements
+into it, so a View described short is a device allocation short, and the
+first read past the colour's count is an illegal access. The coloured arm
+had only ever been run on a host, where the unmanaged View lies over the
+caller's longer array and the same read lands inside it.
 
 A second consequence reaches the loop headers. `KokkosWriter.reference_node`
 writes a scalar formal the region describes as a per-cell View --

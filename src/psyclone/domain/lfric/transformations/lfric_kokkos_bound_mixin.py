@@ -519,7 +519,8 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, so that
         Container the call is made from by
         :py:meth:`~psyclone.domain.lfric.transformations.\
 lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, relaxed
-        of a ``TARGET`` formal and of an aliasing ``POINTER`` local, agreed
+        of a ``TARGET`` formal, of a ``PROTECTED`` actual and of an aliasing
+        ``POINTER`` local, agreed
         with the caller about the origin of a disputed name, read for the
         declarations of what it imports, given a bound for a local a written
         argument would size where the option asks, by :py:meth:`_bound_locals`,
@@ -643,6 +644,7 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline` has brought
             cls._alias_locals(call)
             cls._agree_on_imports(call)
             cls._read_declarations(call)
+            cls._relax_protected_actuals(call)
             cls._bound_locals(call, table)
             cls._section_element_actuals(call)
         except TransformationError:

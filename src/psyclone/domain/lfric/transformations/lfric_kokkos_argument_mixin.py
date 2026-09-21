@@ -462,13 +462,12 @@ class LFRicKokkosArgumentMixin:
     @classmethod
     def _region_arguments(cls, formals, per_cell, cell_index, renames,
                           count, start, shared=frozenset(), colour=(),
-                          roles=None):
-        # Seven descriptions of one argument list, which is what describing
+                          roles=None, *, extent):
+        # Eight descriptions of one argument list, which is what describing
         # an argument list takes; grouping them into an object would only
         # move the count into its constructor. The locals are one per
         # argument for the same reason: the list is assembled in the order
-        # the signature declares, and a shorter routine would be one that
-        # assembled part of it somewhere else.
+        # the signature declares.
         # pylint: disable=too-many-arguments, too-many-positional-arguments
         # pylint: disable=too-many-locals
         """Describe the generated signature down to the cell count.
@@ -500,13 +499,10 @@ class LFRicKokkosArgumentMixin:
             argument of its own, appended after the kernel's formals and
             before the cell count so that the order here and the order
             :py:meth:`_region` extends the actuals in are one order.
-        :param str count: the formal the launch is bounded above by, which is
-            also the last extent of every sliced View. It is
-            ``LFRicKokkosIterationMixin._count_name``'s answer for the loop
-            being captured, and is passed rather than read from
-            ``LFRicKokkosIterationMixin._CELL_COUNT`` because a
-            loop over dofs counts dofs, and a coloured loop counts the cells
-            of one colour.
+        :param str count: the formal the launch is bounded above by. It is
+            ``LFRicKokkosIterationMixin._count_name``'s answer for the loop,
+            passed rather than read from ``_CELL_COUNT`` because a loop over
+            dofs counts dofs and a coloured loop one colour's cells.
         :param start: the formal the launch begins at, or ``None`` for a
             launch beginning at zero. It is
             ``LFRicKokkosIterationMixin._start_name``'s answer,
@@ -550,6 +546,11 @@ class LFRicKokkosArgumentMixin:
             placed by its access: read-only, therefore cacheable, therefore
             read from a copy taken before the last kernel that assembled it.
         :type roles: Optional[Mapping[str, str]]
+        :param str extent: the last extent of every sliced View, as
+            ``LFRicKokkosIterationMixin._slice_extent_name`` names it: the
+            count, for a launch whose own index is the cell, and a formal of
+            its own for a coloured launch, whose index counts one colour's
+            cells while the cell its map yields runs to the mesh's.
 
         :returns: one description per generated C argument, in call order, up
             to and including the count and, where there is one, the first
@@ -558,10 +559,8 @@ class LFRicKokkosArgumentMixin:
             :py:class:`psyclone.psyir.backend.kokkos.KokkosScalar`,
             :py:class:`psyclone.psyir.backend.kokkos.KokkosView`], ...]
         """
-        # The two bounds are parameters of their own rather than one pair,
-        # because each is written into the signature in a place of its own
-        # and only one of them is optional.
-        # pylint: disable=too-many-arguments,too-many-positional-arguments
+        # The bounds are parameters of their own rather than one group,
+        # because each is written into the signature in a place of its own.
         arguments = []
         for symbol in formals:
             c_type = cls._c_type(symbol)
@@ -569,7 +568,7 @@ class LFRicKokkosArgumentMixin:
             read_only = (
                 symbol.interface.access == ArgumentInterface.Access.READ)
             # A per-cell formal the kernel declares as a scalar has no shape
-            # of its own, so the cell count is its whole shape.
+            # of its own, so the cell extent is its whole shape.
             extents = cls._rename_extents(cls._extents(symbol), renames)
             if not extents and not sliced:
                 arguments.append(KokkosScalar(symbol.name, c_type))
@@ -584,7 +583,7 @@ class LFRicKokkosArgumentMixin:
                 role = "readonly" if read_only else "readwrite"
             arguments.append(KokkosView(
                 symbol.name, f"{symbol.name}_data", c_type,
-                extents + ((count,) if sliced else ()),
+                extents + ((extent,) if sliced else ()),
                 index_offsets=cls._rename_extents(
                     cls._origins(symbol), renames),
                 extra_indices=(cell_index,) if sliced else (),
@@ -760,10 +759,10 @@ LFRicKokkosTrans.apply` makes.
         :returns: the region, the actuals the PSy layer passes for its
             formals, and the module state it carries. The actuals returned
             already carry every measured assumed shape, then the storage
-            extent of every per-cell size, and then the colour map, colour
-            and colour count of a coloured loop, appended after the kernel's
-            own because :py:meth:`_region_arguments` puts those arguments in
-            the same place and in the same order.
+            extent of every per-cell size, and then the colour map, colour,
+            colour count and mesh cell count of a coloured loop, appended
+            after the kernel's own because :py:meth:`_region_arguments` puts
+            them in the same place and the same order.
         :rtype: tuple[
             :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`,
             list[:py:class:`psyclone.psyir.nodes.DataNode`],
@@ -829,7 +828,8 @@ LFRicKokkosTrans.apply` makes.
                 cls._shared_formals(kernel, schedule,
                                     cls._asserts_disjoint(options))
                 if cls._uses_atomics(node, options) else {},
-                colour_arguments, roles)
+                colour_arguments, roles,
+                extent=cls._slice_extent_name(node))
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
@@ -947,7 +947,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
                 symbol_table, name, container, orig_name))
             for name, container, orig_name, _, _ in constants)
         # region.arguments is the formals, then the storage extent of each
-        # per-cell size, then a coloured loop's three colour arguments, then
+        # per-cell size, then a coloured loop's four colour arguments, then
         # the count, then a halo loop's first cell, then the constants --
         # which is exactly the order 'actuals' is in once _region's own
         # extensions and the appends above have run. The last two are
