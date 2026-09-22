@@ -2814,13 +2814,19 @@ def test_call_may_write(fortran_reader, monkeypatch):
     assert InlineTrans._call_may_write(opaque, sym, call) is True
     monkeypatch.undo()
 
-    # An internal procedure sees its host's local variables. One is a routine
-    # symbol the calling routine itself owns.
+    # An internal procedure sees its host's local variables, and is a routine
+    # symbol the calling routine itself owns. Ownership alone is not the test,
+    # though: module inlining moves a sibling's imported names into the
+    # routine's own table, and a name that is there because it was imported is
+    # another module's procedure and sees nothing of this routine.
     table = call.ancestor(Routine).symbol_table
+    rsym = opaque.routine.symbol
+    assert rsym.is_import
     monkeypatch.setattr(
         table, "lookup",
-        lambda name, **kwargs: (sym if name == sym.name
-                                else opaque.routine.symbol))
+        lambda name, **kwargs: sym if name == sym.name else rsym)
+    assert InlineTrans._call_may_write(opaque, sym, call) is False
+    monkeypatch.setattr(rsym, "interface", AutomaticInterface())
     assert InlineTrans._call_may_write(opaque, sym, call) is True
 
 

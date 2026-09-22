@@ -974,13 +974,16 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
                 if ref.symbol is sym:
                     return True
 
-        # An internal procedure sees its host's local variables. One is a
-        # routine symbol the calling routine itself owns.
+        # An internal procedure sees its host's local variables, and is a
+        # routine symbol the calling routine itself owns. A name owned only
+        # because it was imported into that scope is not one: the procedure
+        # is another module's and sees nothing of this routine. An owned name
+        # that is neither resolves towards being able to write.
         try:
             rsym = call.routine.symbol
         except (AttributeError, SymbolError):
             return True
-        return owned_by_scope(rsym.name, rsym)
+        return owned_by_scope(rsym.name, rsym) and not rsym.is_import
 
     def validate(
                 self,
