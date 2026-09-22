@@ -4981,6 +4981,15 @@ those locals by it, and passes it at every call; the callee's loops still
 run to the exact size. The region then sizes the scratch those locals
 become from the bound, which is arithmetic over region scalars, as it must.
 
+An opaque call standing between the caller's entry and the call is not such
+an assignment on its own. A call whose body PSyclone cannot read has to be
+assumed to write whatever it can reach, but what it can reach does not
+include a variable of the caller it is not given and does not see by host
+association, so such a call no longer refuses the callee by itself. A call
+given that variable, whether by itself or inside an expression, a variable
+of module scope or of a declaration PSyIR does not model, and an internal
+procedure of the caller, are each assumed to write it as before.
+
 The bound is a name of that scope, or a Fortran expression over names of it.
 The name is what the vertical FFSL transport needs, where the kernel's own
 ``nlayers`` bounds every sub-column length it computes. The expression is

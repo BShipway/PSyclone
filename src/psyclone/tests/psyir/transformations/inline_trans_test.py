@@ -48,8 +48,8 @@ from psyclone.psyir.nodes import (
     Assignment, Call, CodeBlock, IntrinsicCall, Loop, Node, Reference,
     Routine, Statement)
 from psyclone.psyir.symbols import (
-    AutomaticInterface, DataSymbol, ImportInterface, Symbol,
-    UnresolvedInterface, UnresolvedType)
+    AutomaticInterface, DataSymbol, ImportInterface, StaticInterface, Symbol,
+    UnresolvedInterface, UnresolvedType, UnsupportedFortranType)
 from psyclone.psyir.transformations import (
     InlineTrans, TransformationError)
 from psyclone.tests.utilities import Compile, get_invoke
@@ -2695,6 +2695,148 @@ def test_validate_automatic_array_sized_by_arg(fortran_reader, monkeypatch):
         inline_trans.validate(call)
     assert ("Unexpected node type (Statement) returned from Reference."
             "previous_accesses()" in str(err.value))
+
+
+# The source of the tests below: one automatic array in the callee sized by an
+# argument, and one opaque call standing between the caller's entry and the
+# call to be inlined. Only the declaration of 'ndim' and the arguments of the
+# opaque call change from case to case.
+_SIZED_BY_ARG = (
+    "module test_mod\n"
+    "  use other_mod, only: opaque\n"
+    "  integer :: junk\n"
+    "{module_decl}"
+    "contains\n"
+    "subroutine main({dummy_args})\n"
+    "  real, dimension(10, 10) :: var = 0.0\n"
+    "{local_decl}"
+    "  junk = opaque({opaque_args})\n"
+    "  call sub(var, ndim, ndim)\n"
+    "end subroutine main\n"
+    "subroutine sub(x, ilen, jlen)\n"
+    "  real, dimension(ilen, jlen), intent(inout) :: x\n"
+    "  integer, intent(in) :: ilen, jlen\n"
+    "  real, dimension(ilen*2, jlen) :: work\n"
+    "  x(:,:) = x(:,:) + 1.0\n"
+    "  work(:,:) = 0.0\n"
+    "end subroutine sub\n"
+    "end module test_mod\n"
+)
+# 'ndim' as a dummy argument of 'main'. A local would be no test at all: the
+# definition-use chain does not offer the opaque call as a previous access of
+# a local it was not given, so such a call never reaches _call_may_write.
+_NDIM_IS_DUMMY = {"dummy_args": "ndim",
+                  "local_decl": "  integer, intent(in) :: ndim\n",
+                  "module_decl": ""}
+
+
+def _sized_by_arg_call(fortran_reader, opaque_args="", **kwargs):
+    '''
+    :returns: the Call to 'sub' in the source above, built with the given
+        declarations and opaque-call arguments.
+    :rtype: :py:class:`psyclone.psyir.nodes.Call`
+    '''
+    fields = {"module_decl": "", "local_decl": "", "dummy_args": ""}
+    fields.update(kwargs)
+    psyir = fortran_reader.psyir_from_source(
+        _SIZED_BY_ARG.format(opaque_args=opaque_args, **fields))
+    for call in psyir.walk(Call):
+        if call.routine.symbol.name == "sub":
+            return call
+    raise AssertionError("no call to 'sub' in the test source")
+
+
+def test_validate_automatic_array_sized_by_arg_opaque_call(fortran_reader):
+    '''
+    An opaque call standing between the routine's entry and the call does not
+    by itself prevent inlining: it cannot write a variable it is not given and
+    cannot otherwise reach. It does prevent inlining once it is given that
+    variable, or once the variable is one it could reach by other means.
+    '''
+    inline_trans = InlineTrans()
+
+    # opaque() is not given 'ndim' and cannot reach it, so although the chain
+    # offers the call as a previous access of 'ndim', it cannot have written
+    # it.
+    call = _sized_by_arg_call(fortran_reader, **_NDIM_IS_DUMMY)
+    assert isinstance(call.arguments[1].previous_accesses()[-1], Call)
+    inline_trans.validate(call)
+
+    # Given 'ndim' inside an expression, opaque() could write it.
+    call = _sized_by_arg_call(fortran_reader, opaque_args="ndim + 1",
+                              **_NDIM_IS_DUMMY)
+    with pytest.raises(TransformationError) as err:
+        inline_trans.validate(call)
+    assert ("depends on 'ilen' which is passed by argument and may be written "
+            "to before the call ('opaque(ndim + 1)')" in str(err.value))
+
+    # A module variable is reachable by opaque() whether it is passed or not.
+    call = _sized_by_arg_call(fortran_reader,
+                              module_decl="  integer :: ndim\n")
+    with pytest.raises(TransformationError) as err:
+        inline_trans.validate(call)
+    assert ("depends on 'ilen' which is passed by argument and may be written "
+            "to before the call ('opaque()')" in str(err.value))
+
+    # Passing 'ndim' as an actual in its own right is caught earlier, by the
+    # write that the chain records at that reference.
+    call = _sized_by_arg_call(fortran_reader, opaque_args="ndim",
+                              **_NDIM_IS_DUMMY)
+    with pytest.raises(TransformationError) as err:
+        inline_trans.validate(call)
+    assert ("depends on 'ilen' which is passed by argument and is assigned to "
+            "before the call ('opaque(ndim)')" in str(err.value))
+
+
+def test_call_may_write(fortran_reader, monkeypatch):
+    '''
+    The escapes in _call_may_write that no source reaches through validate,
+    every one of which resolves towards the call being able to write.
+    '''
+    call = _sized_by_arg_call(fortran_reader, **_NDIM_IS_DUMMY)
+    opaque = call.ancestor(Routine).walk(Call)[0]
+    sym = call.arguments[1].symbol
+    assert InlineTrans._call_may_write(opaque, sym, call) is False
+
+    # A call outside any Routine says nothing about what it can reach.
+    assert InlineTrans._call_may_write(opaque, sym, call.copy()) is True
+
+    # A symbol that is neither an argument nor a local of the routine.
+    monkeypatch.setattr(sym, "interface", StaticInterface())
+    assert InlineTrans._call_may_write(opaque, sym, call) is True
+    monkeypatch.undo()
+
+    # A pointer or a target may be written through an alias, and a
+    # declaration PSyclone does not model may be either.
+    monkeypatch.setattr(
+        sym, "datatype",
+        UnsupportedFortranType("integer, pointer :: ndim"))
+    assert InlineTrans._call_may_write(opaque, sym, call) is True
+    monkeypatch.undo()
+
+    # An internal procedure sees its host's local variables. One is a routine
+    # symbol the calling routine itself owns.
+    table = call.ancestor(Routine).symbol_table
+    monkeypatch.setattr(
+        table, "lookup",
+        lambda name, **kwargs: (sym if name == sym.name
+                                else opaque.routine.symbol))
+    assert InlineTrans._call_may_write(opaque, sym, call) is True
+
+
+def test_call_may_write_unreadable_routine(fortran_reader, monkeypatch):
+    '''
+    A call whose routine symbol cannot be read is assumed to write anything.
+    '''
+    call = _sized_by_arg_call(fortran_reader, **_NDIM_IS_DUMMY)
+    opaque = call.ancestor(Routine).walk(Call)[0]
+    sym = call.arguments[1].symbol
+
+    def _boom(_self):
+        raise AttributeError("no routine")
+
+    monkeypatch.setattr(type(opaque), "routine", property(_boom))
+    assert InlineTrans._call_may_write(opaque, sym, call) is True
 
 
 def test_apply_merges_symbol_table_with_routine(fortran_reader):
