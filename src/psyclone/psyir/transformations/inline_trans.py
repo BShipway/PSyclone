@@ -924,6 +924,67 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
         # Just an array reference.
         return ArrayReference.create(actual_arg.symbol, members[0][1])
 
+    @staticmethod
+    def _call_may_write(call: Call, sym: DataSymbol, node: Call) -> bool:
+        '''
+        Whether `call`, which precedes `node` in the same routine, could write
+        to `sym`, where `sym` is the symbol of an actual argument of `node`.
+
+        A call whose body is not available has to be assumed to write anything
+        it can reach, but it cannot reach a local variable of the routine that
+        contains it. This distinguishes the two, so that an opaque call
+        standing between a routine's entry and a call to be inlined does not
+        by itself prevent the inlining.
+
+        Every uncertainty is resolved towards True.
+
+        :param call: the preceding call.
+        :param sym: the symbol whose value must be unchanged at `node`.
+        :param node: the call being considered for inlining.
+
+        :returns: whether the preceding call could write to the symbol.
+
+        '''
+        scope = node.ancestor(Routine)
+        if scope is None:
+            return True
+        table = scope.symbol_table
+
+        def owned_by_scope(name, symbol):
+            '''
+            :returns: whether `name` resolves to `symbol` in the routine's own
+                table rather than in an enclosing scope.
+            :rtype: bool
+            '''
+            return table.lookup(
+                name, scope_limit=scope, otherwise=None) is symbol
+
+        # A symbol the routine does not itself own may be reached by other
+        # means -- module scope, an import, a common block -- so assume it is.
+        # A pointer or a target may be written through an alias, and a
+        # declaration PSyIR does not model may be either.
+        if (not owned_by_scope(sym.name, sym) or
+                not (sym.is_argument or sym.is_automatic) or
+                isinstance(sym.datatype, UnsupportedType)):
+            return True
+
+        # Given to the call, by itself or inside an expression.
+        for arg in call.arguments:
+            for ref in arg.walk(Reference):
+                if ref.symbol is sym:
+                    return True
+
+        # An internal procedure sees its host's local variables, and is a
+        # routine symbol the calling routine itself owns. A name owned only
+        # because it was imported into that scope is not one: the procedure
+        # is another module's and sees nothing of this routine. An owned name
+        # that is neither resolves towards being able to write.
+        try:
+            rsym = call.routine.symbol
+        except (AttributeError, SymbolError):
+            return True
+        return owned_by_scope(rsym.name, rsym) and not rsym.is_import
+
     def validate(
                 self,
                 node: Call,
@@ -1187,6 +1248,13 @@ class InlineTrans(Transformation, CalleeTransformationMixin):
                     # tenths of the time inlining a kernel with thirty
                     # helper calls took (2026-09-13).
                     exprn = prev.ancestor(Statement, include_self=True)
+                    if (isinstance(prev, Call) and
+                            not isinstance(prev, (Kern, IntrinsicCall)) and
+                            not self._call_may_write(
+                                prev, actual_arg.symbol, node)):
+                        # A call that cannot reach this symbol cannot have
+                        # written it, whatever else it does.
+                        continue
                     if isinstance(prev, (CodeBlock, Call, Kern, Loop)):
                         raise TransformationError(
                             f"Cannot inline routine '{routine.name}' "

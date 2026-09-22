@@ -515,6 +515,13 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, so that
         ran, and a call sharing a statement with the one just inlined may have
         been moved out of it.
 
+        Each walk begins by rebuilding as array accesses the nodes that only
+        look like calls, by
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._rebuild_data_accesses`. It
+        is inside the loop for the same reason the walk is: an inlined body
+        brings its own subscripted names in with it.
+
         Each callee is prepared before it is inlined: brought into the
         Container the call is made from by
         :py:meth:`~psyclone.domain.lfric.transformations.\
@@ -560,6 +567,10 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._INLINE_LIMIT` of them have
         # pylint: disable=no-member
         table = cls._bounded_locals(options)
         for _ in range(cls._INLINE_LIMIT):
+            # Before each pass, because an inlined body brings its own
+            # subscripted names in with it and a name is only known to be data
+            # once its module has been read.
+            cls._rebuild_data_accesses(schedule)
             pending = cls._pending_calls(schedule)
             if not pending:
                 return

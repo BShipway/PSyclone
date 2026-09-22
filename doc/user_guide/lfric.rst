@@ -4981,6 +4981,15 @@ those locals by it, and passes it at every call; the callee's loops still
 run to the exact size. The region then sizes the scratch those locals
 become from the bound, which is arithmetic over region scalars, as it must.
 
+An opaque call standing between the caller's entry and the call is not such
+an assignment on its own. A call whose body PSyclone cannot read has to be
+assumed to write whatever it can reach, but what it can reach does not
+include a variable of the caller it is not given and does not see by host
+association, so such a call no longer refuses the callee by itself. A call
+given that variable, whether by itself or inside an expression, a variable
+of module scope or of a declaration PSyIR does not model, and an internal
+procedure of the caller, are each assumed to write it as before.
+
 The bound is a name of that scope, or a Fortran expression over names of it.
 The name is what the vertical FFSL transport needs, where the kernel's own
 ``nlayers`` bounds every sub-column length it computes. The expression is
@@ -5044,6 +5053,26 @@ meaning of is read as one by the frontend, and resolving it can reach a
 datum and raise :py:exc:`TypeError` rather than refuse. That too is a
 refusal here, so that :py:meth:`validate` declines a kernel it cannot
 capture instead of raising out of PSyclone.
+
+**A subscripted module array is read as one where the module says so.**
+Refusing such a name would decline a kernel over a guess the frontend had
+to make, so before each pass of the inlining the declaration is read back
+from the module that exports it, and a name it declares as an array whose
+rank matches the subscripts is rebuilt as the array access it always was.
+LFRic's ``PANEL_ROT_MATRIX(i, k, panel_id)``, an element of a ``parameter``
+array of ``coord_transform_mod``, is the case this exists for; the array
+then reaches the region as a by-value formal the PSy layer supplies, the
+way every module datum does. It is done inside the loop rather than once
+because an inlined body brings its own subscripted names in with it.
+
+Each condition of the rewrite rules a call out rather than making one
+unlikely: the node stands in an expression, since a statement cannot be an
+array access; it has arguments, since ``f()`` is a call whatever ``f`` is;
+none of them is named, since a subscript carries no keyword; and the
+declaration read back is an array of that rank. A name whose module is not
+on the search path, or whose declaration PSyIR does not model -- a
+``target`` or an ``allocatable`` array -- settles nothing, stays the call
+it was parsed as and is refused as above.
 
 **A TARGET formal is inlinable; another unmodelled attribute is not.** A
 dummy argument declared ``target`` reaches the PSyIR as an
