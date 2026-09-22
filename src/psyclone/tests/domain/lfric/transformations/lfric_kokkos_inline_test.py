@@ -94,12 +94,22 @@ _EXTERNAL_CALLEE_KERNEL = _LOCAL_KERNEL.replace(
 # module's source settles which. This is the shape the limited-area kernels
 # have, and it is the shape that reaches a TypeError rather than a refusal
 # when PSyclone is asked for the callee.
+#
+# The array is a ``target``, which is a declaration PSyIR does not model, so
+# reading the module back gives a symbol with no shape to match the
+# subscript against and the node stays the call it was parsed as. An array
+# whose declaration *is* modelled is rebuilt as the access it always was, by
+# :py:meth:`LFRicKokkosInlineMixin._rebuild_data_accesses`, and is captured
+# rather than refused -- see ``lfric_kokkos_inline_array_test.py``. What is
+# kept here is the refusal underneath it: a callee that resolves to a datum
+# raises out of PSyclone, and the caller is owed a refusal and not a
+# traceback.
 _ARRAY_LIKE_MODULE = """
 module weights_config_mod
   use constants_mod, only : r_def
   implicit none
   private
-  real(kind=r_def), public :: blend_weights(3) = &
+  real(kind=r_def), public, target :: blend_weights(3) = &
       (/ 1.0_r_def, 2.0_r_def, 3.0_r_def /)
 end module weights_config_mod
 """
@@ -660,6 +670,12 @@ def test_lfric_kokkos_trans_refuses_an_array_like_call(
     DataSymbol cannot be specialised into a RoutineSymbol. The mixin turns
     that into a refusal, so the caller is told the kernel is not captured
     instead of seeing PSyclone's traceback.
+
+    The array is declared a ``target``, so PSyIR holds its declaration
+    unmodelled and has no shape to match the subscript against. Where the
+    shape is there, the node is rebuilt as the access it always was and the
+    kernel is captured; this is the case underneath that one, where there is
+    nothing to rebuild it from and the refusal is all that is owed.
     """
     _, loop, _ = array_like_call_target
 

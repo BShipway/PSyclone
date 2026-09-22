@@ -58,10 +58,12 @@ module that was never read, an argument whose type does not match the formal
 
 from psyclone.domain.common.transformations import KernelModuleInlineTrans
 from psyclone.psyir.nodes import (
-    Call, Container, IntrinsicCall, Reference, Routine, ScopingNode)
+    ArrayReference, Call, Container, IntrinsicCall, Reference, Routine,
+    Schedule, ScopingNode)
 from psyclone.psyir.symbols import (
-    ContainerSymbol, GenericInterfaceSymbol, ImportInterface, RoutineSymbol,
-    Symbol, SymbolError, UnsupportedFortranType)
+    ArrayType, ContainerSymbol, DataSymbol, GenericInterfaceSymbol,
+    ImportInterface, RoutineSymbol, Symbol, SymbolError,
+    UnsupportedFortranType)
 from psyclone.psyir.transformations import InlineTrans, TransformationError
 
 
@@ -130,6 +132,15 @@ lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin`), one whose actual and formal
     caught and refused with the rest: a kernel this transformation cannot
     capture must be declined, not turned into a traceback out of a
     transformation the caller merely asked to validate.
+
+    Where the module *can* be read, though, refusing it would be declining a
+    kernel over a guess the frontend had to make and this class does not:
+    :py:meth:`_rebuild_data_accesses` reads the declaration back and rebuilds
+    the node as the array access it always was, before the inlining asks for
+    a body that was never there. LFRic's ``PANEL_ROT_MATRIX(i, k, panel_id)``
+    is the case, and an element of a ``parameter`` array is the shape of it.
+    The refusal above is what remains underneath, for a name no module
+    settles.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
@@ -814,6 +825,65 @@ lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin`), one whose actual and formal
         # way the symbol is left as it was: see the docstring above.
         except (KeyError, SymbolError):
             pass
+
+    @classmethod
+    def _rebuild_data_accesses(cls, schedule):
+        """Rebuild as array accesses the calls in ``schedule`` that read data.
+
+        ``PANEL_ROT_MATRIX(i, k, panel_id)`` is an element of a ``parameter``
+        array of LFRic's ``coord_transform_mod``, and the frontend cannot see
+        that from the file that reads it: a name brought in by a ``use ...,
+        only`` is a bare :py:class:`~psyclone.psyir.symbols.Symbol`, with no
+        type to say whether the parentheses subscript an array or pass
+        arguments to a function, and the frontend settles that ambiguity
+        towards :py:class:`~psyclone.psyir.nodes.Call` because a call is the
+        safer of the two to be wrong about.
+
+        It is the wrong one here, and being wrong about it costs the whole
+        kernel: the inlining sees a call it must bring a body in for, asks
+        PSyclone to resolve the callee, and reaches the module's *datum* of
+        that name instead of a routine -- which raises :py:exc:`TypeError`
+        out of ``specialise`` and refuses the capture. The module is on the
+        search path, so rather than guess, the declaration is read the way
+        :py:meth:`_read_declarations` reads one, and a name the module
+        declares as an array of the right rank is rebuilt as the access it
+        always was.
+
+        Only that case is rewritten, and each of its conditions is one that
+        makes a call impossible rather than merely unlikely: the node stands
+        in an expression, since a statement cannot be an array access; it has
+        arguments, since ``f()`` is a call whatever ``f`` is; none of them is
+        named, since an array subscript has no keyword; and the declaration
+        read back is an array whose rank the subscripts match. Anything else
+        is left as the call it was parsed as, to be inlined or refused as
+        before.
+
+        :param schedule: the kernel schedule to rewrite in place.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        """
+        for call in cls._pending_calls(schedule):
+            if isinstance(call.parent, Schedule):
+                continue
+            arguments = call.arguments
+            if not arguments or any(call.argument_names):
+                continue
+            reference = call.routine
+            if reference is None:
+                continue
+            symbol = reference.symbol
+            # pylint: disable-next=unidiomatic-typecheck
+            if type(symbol) is Symbol and symbol.is_import:
+                table = symbol.find_symbol_table(call)
+                if table is not None:
+                    cls._read_declaration(table, symbol)
+            if not isinstance(symbol, DataSymbol):
+                continue
+            datatype = symbol.datatype
+            if (not isinstance(datatype, ArrayType) or
+                    len(datatype.shape) != len(arguments)):
+                continue
+            call.replace_with(ArrayReference.create(
+                symbol, [argument.copy() for argument in arguments]))
 
     @classmethod
     def _callee_is_local(cls, call):
