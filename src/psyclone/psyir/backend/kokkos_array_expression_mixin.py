@@ -546,6 +546,9 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
         than one region each and what the Fortran meant: the statement is one
         assignment.
 
+        A whole-array target is an array write too, though it carries no
+        subscript: ``d = matmul(a, b)`` writes every element of ``d``.
+
         An assignment holding a :py:class:`~psyclone.psyir.nodes.Range` is no
         statement at all in C++, so it is not generated as one:
         :py:class:`KokkosArrayExpression` lowers it to a nest first, and the
@@ -574,8 +577,13 @@ KokkosIntrinsicsMixin.unsupported_intrinsics`,
         :raises VisitorError: if an atomic View is written by a statement no
             atomic can carry out.
         """
+        # A whole-array target is named without a subscript, ``d = matmul(a,
+        # b)``, and is as much an array write as ``d(i) = w``: Task F2 of the
+        # Phase 7 close found compound_operator's ``d`` written by every
+        # member at once and read by the spread loop after it with no
+        # barrier between, because this test once asked only for a subscript.
         writes_an_array = isinstance(node.lhs, ArrayReference) or isinstance(
-            node.rhs, ArrayConstructor)
+            node.rhs, ArrayConstructor) or node.lhs.symbol.is_array
         # An array constructor's values are positional, and the C writer
         # spreads them over the destination itself; a nest would have to
         # subscript the constructor, which nothing can render.
