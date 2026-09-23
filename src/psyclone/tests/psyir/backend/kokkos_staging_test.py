@@ -207,7 +207,7 @@ def test_kokkos_staging_header_prefetches_a_field_behind_a_knob():
     # Unset is off, so a build that has not asked for it is the build it was.
     assert "return value != nullptr && value[0] != '\\0' &&\n" \
         "           std::strcmp(value, \"0\") != 0;" in text
-    assert "cudaMemPrefetchAsync(const_cast<void *>(pointer), bytes, " \
+    assert "cudaMemPrefetchAsync(const_cast<void *>(pointer), issued, " \
         "on_device, 0," in text
     assert "stream_of(Kokkos::DefaultExecutionSpace())" in text
     assert "inline cudaStream_t stream_of(const Kokkos::Cuda &space) {" in text
@@ -278,12 +278,62 @@ def test_kokkos_staging_header_announces_what_the_prefetch_did():
     assert "prefetch_stride=%zu field_stages=%zu " in text
     assert 'prefetching() ? "on" : "off"' in text
     assert "if (sum.staged + sum.cached > 0 || prefetching()) {" in text
-    # The dedupe's own fields, ending the line: what it resolved to, the
-    # repeats there were to take within a call and across the call boundary,
-    # and the calls it did not issue.
+    # The dedupe's own fields: what it resolved to, the repeats there were
+    # to take within a call and across the call boundary, and the calls it
+    # did not issue. Then, ending the line, the prefetches cut short at the
+    # end of their allocation.
     assert "prefetch_dedupe=%s prefetch_repeat_call=%zu " in text
-    assert "prefetch_repeat_prev=%zu prefetch_deduped=%zu\\n" in text
+    assert "prefetch_repeat_prev=%zu prefetch_deduped=%zu " in text
+    assert '"prefetch_clamped=%zu\\n",' in text
+    assert "current.prefetch_deduped, current.prefetch_clamped);" in text
     assert 'dedupe_prefetch() ? "on" : "off"' in text
+
+
+def test_kokkos_staging_header_clamps_a_prefetch_to_its_allocation():
+    """A prefetch never names a range past the end of its allocation.
+
+    A region's View of a field is as long as its function space's undf,
+    which counts dofs out to the mesh's deepest halo, while LFRic allocates
+    a field only out to its own halo depth. At six ranks the two differ and
+    an unclamped prefetch asks the driver for a range past the allocation,
+    which it refuses: compute-sanitizer memcheck counted 13,599 such
+    refusals in one C16 step. The emitted range is therefore the smaller of
+    the View's length and the room the driver reports between the pointer
+    and the end of its allocation; a pointer the driver cannot place is
+    refused rather than prefetched unbounded; and the bytes counted are the
+    bytes issued.
+    """
+    text = header_text()
+
+    # The driver's allocation query, reached without linking libcuda and
+    # resolved once, inside the CUDA-only part of the header.
+    guard = text.index("#if defined(KOKKOS_ENABLE_CUDA)")
+    assert text.index("#include <cuda.h>") > guard
+    assert "cudaGetDriverEntryPointByVersion(\"cuMemGetAddressRange\"" \
+        in text
+    assert "static const AddressRange query = []() {" in text
+    room = text.index("inline std::size_t allocation_room(")
+    assert guard < room < text.index("#endif  // KOKKOS_ENABLE_CUDA")
+    # The room runs from the pointer, not the allocation's base, to its end;
+    # a pointer outside the reported range gets none.
+    assert "return std::size_t(base + size - address);" in text
+    assert "address < base ||\n      address - base >= size) {" in text
+    # The prefetch: unplaceable is refused, the range is clamped, and what
+    # was issued is what is counted.
+    prefetch = text[text.index("inline void prefetch(State &current"):]
+    prefetch = prefetch[:prefetch.index("\n}\n")]
+    assert ("const std::size_t room = allocation_room(pointer);\n"
+            "  if (room == 0) {\n"
+            "    current.prefetch_refused += 1;\n"
+            "    return;\n  }") in prefetch
+    assert "const std::size_t issued = std::min(bytes, room);" in prefetch
+    assert prefetch.index("std::min(bytes, room)") < \
+        prefetch.index("cudaMemPrefetchAsync(")
+    assert "cudaMemPrefetchAsync(const_cast<void *>(pointer), bytes," \
+        not in prefetch
+    assert "current.prefetch_bytes += issued;" in prefetch
+    assert "if (issued < bytes) {\n    current.prefetch_clamped += 1;" \
+        in prefetch
 
 
 def test_kokkos_staging_header_dedupes_a_repeated_field_in_one_call():

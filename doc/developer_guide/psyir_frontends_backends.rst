@@ -716,7 +716,7 @@ totals::
                 prefetch_bytes=… prefetch_refused=… prefetch_skipped=…
                 prefetch_stride=… field_stages=… prefetch_dedupe=on|off
                 prefetch_repeat_call=… prefetch_repeat_prev=…
-                prefetch_deduped=…
+                prefetch_deduped=… prefetch_clamped=…
 
 and then one line per role, printed whether or not that role was met so that
 a reader and a parser find the same four rows in every run::
@@ -798,6 +798,23 @@ staging of a field therefore ends in exactly one of `prefetches`,
 sum to `field_stages`. The line is printed whenever the knob is on, even in a
 mode that stages nothing, so that a knob which resolved off cannot be read as
 a lever that did not pay.
+
+A prefetch never runs past the end of the field's allocation. A region's
+View of a field is as long as its function space's `undf`, which counts dofs
+out to the mesh's deepest halo, but LFRic allocates a field only out to the
+field's own halo depth, which may be shallower. On one rank there is no halo
+and the two lengths agree; on several they do not, and a prefetch of the
+View's whole length would name a range the allocation does not hold, which
+the driver refuses. So the header asks the driver where the allocation
+holding the pointer ends -- `cuMemGetAddressRange`, reached through
+`cudaGetDriverEntryPointByVersion` so that no region has to link `libcuda`
+-- and issues the smaller of the two lengths. The query is made on every
+prefetch rather than remembered, because a freed block's address can come
+back holding a different size. A pointer the driver cannot place is counted
+as `prefetch_refused`; a prefetch cut short is still counted in `prefetches`,
+and also in `prefetch_clamped`, and `prefetch_bytes` counts what was issued.
+No launch reads past the field's own halo, so the part cut off is never
+wanted on the card.
 
 One region call may stage one field twice -- a field vector's component under
 two arguments, an invoke whose actual appears under two formals, a built-in
