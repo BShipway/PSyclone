@@ -97,6 +97,7 @@ HEADER_TEXT = r'''
 // After Kokkos, which is what defines KOKKOS_ENABLE_CUDA, so that this
 // header says the same thing wherever a region includes it.
 #if defined(KOKKOS_ENABLE_CUDA)
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #endif
 
@@ -375,6 +376,7 @@ struct State {
   std::size_t prefetch_bytes = 0;     // their total size
   std::size_t prefetch_refused = 0;   // pointers the driver would not take
   std::size_t prefetch_skipped = 0;   // held back by the stride
+  std::size_t prefetch_clamped = 0;   // issued short, at the allocation's end
   // Repeats, which are what the dedupe is worth. A staging of a range this
   // region call has already prefetched is the dedupe's own; a staging of a
   // range the call *before* prefetched is counted but never skipped, and is
@@ -475,6 +477,52 @@ inline bool managed_pointer(State &current, const void *pointer) {
   return answer;
 }
 
+// How many bytes lie between this pointer and the end of the allocation
+// holding it, or zero when the driver cannot say. A region's View of a field
+// is as long as its function space's undf, which counts dofs out to the
+// mesh's deepest halo, but LFRic allocates a field only out to the field's
+// own halo depth (field_mod: get_last_dof_halo(field_halo_depth)), which may
+// be shallower. At one rank there is no halo and the two agree; at six they
+// do not, and a prefetch of the View's whole length names a range past the
+// allocation, which the driver refuses -- 13,599 refusals in one C16 step at
+// six ranks under compute-sanitizer memcheck (2026-09-22). No launch reads
+// past the field's own halo, so the tail is never wanted on the card, and
+// the range is clamped to what the allocation holds.
+//
+// Only the driver knows an allocation's extent. cuMemGetAddressRange is
+// reached through the runtime's entry-point query, so that no region has to
+// link libcuda for it, and resolved once. Asked per prefetch rather than
+// remembered per pointer: a freed block's address can come back holding a
+// different size, and a remembered size would then overrun again. Called
+// with the state's lock held.
+using AddressRange = CUresult (*)(CUdeviceptr *, std::size_t *, CUdeviceptr);
+
+inline std::size_t allocation_room(const void *pointer) {
+  static const AddressRange query = []() {
+    void *function = nullptr;
+    cudaDriverEntryPointQueryResult found{};
+    if (cudaGetDriverEntryPointByVersion("cuMemGetAddressRange", &function,
+                                         12000, cudaEnableDefault,
+                                         &found) != cudaSuccess ||
+        found != cudaDriverEntryPointSuccess) {
+      (void)cudaGetLastError();
+      return AddressRange(nullptr);
+    }
+    return reinterpret_cast<AddressRange>(function);
+  }();
+  if (query == nullptr) {
+    return 0;
+  }
+  const CUdeviceptr address = reinterpret_cast<CUdeviceptr>(pointer);
+  CUdeviceptr base = 0;
+  std::size_t size = 0;
+  if (query(&base, &size, address) != CUDA_SUCCESS || address < base ||
+      address - base >= size) {
+    return 0;
+  }
+  return std::size_t(base + size - address);
+}
+
 #endif  // KOKKOS_ENABLE_CUDA
 
 // Is this range in a list of them? The lists are a call's worth of ranges,
@@ -483,10 +531,12 @@ inline bool holds(const std::vector<Key> &keys, const Key &key) {
   return std::find(keys.begin(), keys.end(), key) != keys.end();
 }
 
-// Move one field's range to the card, if the driver will take it. Every
-// staging of a field either issues a prefetch, is refused, is held back by
-// the stride or is a repeat the dedupe dropped, so those four sum to
-// field_stages. Lock held.
+// Move one field's range to the card, if the driver will take it, and no
+// further than the end of its allocation (allocation_room says why the two
+// can differ). Every staging of a field either issues a prefetch, is
+// refused, is held back by the stride or is a repeat the dedupe dropped, so
+// those four sum to field_stages; a clamped prefetch is still an issued one,
+// and prefetch_clamped counts how many were. Lock held.
 inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
   const std::size_t index = current.field_stages;
   current.field_stages += 1;
@@ -528,10 +578,16 @@ inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
     current.prefetch_refused += 1;
     return;
   }
+  const std::size_t room = allocation_room(pointer);
+  if (room == 0) {
+    current.prefetch_refused += 1;
+    return;
+  }
+  const std::size_t issued = std::min(bytes, room);
   cudaMemLocation on_device{};
   on_device.type = cudaMemLocationTypeDevice;
   on_device.id = device;
-  if (cudaMemPrefetchAsync(const_cast<void *>(pointer), bytes, on_device, 0,
+  if (cudaMemPrefetchAsync(const_cast<void *>(pointer), issued, on_device, 0,
                            stream_of(Kokkos::DefaultExecutionSpace())) !=
       cudaSuccess) {
     (void)cudaGetLastError();
@@ -539,7 +595,10 @@ inline void prefetch(State &current, const void *pointer, std::size_t bytes) {
     return;
   }
   current.prefetches += 1;
-  current.prefetch_bytes += bytes;
+  current.prefetch_bytes += issued;
+  if (issued < bytes) {
+    current.prefetch_clamped += 1;
+  }
   if (stride > 0) {
     current.prefetched_at[pointer] = index;
   }
@@ -655,7 +714,8 @@ inline void finish() {
                  "prefetch_refused=%zu prefetch_skipped=%zu "
                  "prefetch_stride=%zu field_stages=%zu "
                  "prefetch_dedupe=%s prefetch_repeat_call=%zu "
-                 "prefetch_repeat_prev=%zu prefetch_deduped=%zu\n",
+                 "prefetch_repeat_prev=%zu prefetch_deduped=%zu "
+                 "prefetch_clamped=%zu\n",
                  mode_name(mode()), sum.staged, sum.cached, sum.hits,
                  sum.shared, sum.copies_in, sum.copies_out,
                  prefetching() ? "on" : "off", current.prefetches,
@@ -663,7 +723,7 @@ inline void finish() {
                  current.prefetch_skipped, prefetch_stride(),
                  current.field_stages, dedupe_prefetch() ? "on" : "off",
                  current.prefetch_repeat_call, current.prefetch_repeat_prev,
-                 current.prefetch_deduped);
+                 current.prefetch_deduped, current.prefetch_clamped);
     // One line per role, whether or not that role was met, so that a reader
     // and a parser both find the same four rows in every run.
     for (int index = 0; index < role_count; ++index) {
