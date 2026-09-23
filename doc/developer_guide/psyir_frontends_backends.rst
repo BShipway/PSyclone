@@ -1181,7 +1181,10 @@ at once, which is a race in the memory model even though the values agree. So
 `KokkosWriter.assignment_node` wraps such an assignment in
 `Kokkos::single(Kokkos::PerTeam(team), ...)` and a barrier, wherever it sits
 -- at the top of the body, inside an `if`, or inside a serial loop, where
-each iteration's write is wrapped on its own. Scratch moves with the same
+each iteration's write is wrapped on its own. What makes an assignment an
+array write is the type of its target, not a subscript on it: ``d =
+matmul(a, b)`` names ``d`` whole and writes every element, and is wrapped as
+``d(i) = w`` is. Scratch moves with the same
 change of meaning: `team.team_scratch(0)` with `PerTeam`, since a per-cell
 temporary is team-shared once a team is a cell. The exception is a
 *member-local* array, below: the members do not share one, so its writes are
