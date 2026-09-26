@@ -403,9 +403,11 @@ def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
     assert "swept_scratch_t::shmem_size(nlayers)" in cpp
     # Team scratch, not thread scratch: every member of the team works on the
     # one column, so one allocation is shared rather than one per member.
-    assert "partial_scratch_t partial(team.team_scratch(0), nlayers);" in cpp
-    assert "swept_scratch_t swept(team.team_scratch(0), nlayers);" in cpp
-    assert "PerTeam(scratch_bytes)" in cpp
+    assert ("partial_scratch_t partial("
+            "team.team_scratch(0), nlayers);") in cpp
+    assert ("swept_scratch_t swept("
+            "team.team_scratch(0), nlayers);") in cpp
+    assert "PerTeam(scratch_bytes_0)" in cpp
 
     # The launch is the hierarchical shape. It has no bounds guard, because
     # the league is one team per cell rather than a flat range of ranks that
@@ -427,10 +429,10 @@ def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
     # The two recurrences stay serial, each write made by one member and
     # published to the rest before the next statement reads it.
     assert ("Kokkos::single(Kokkos::PerTeam(team), [&]() {\n"
-            "      partial((1 - 1)) = "
+            "        partial((1 - 1)) = "
             "field_in((map_w3((1 - 1), cell) - 1));\n"
-            "    });\n"
-            "    team.team_barrier();" in cpp)
+            "      });\n"
+            "      team.team_barrier();" in cpp)
     assert "for(k=2; k<=nlayers; k+=1)" in cpp
 
     # The backward sweep counts down. Before the CWriter followed the step
@@ -444,7 +446,7 @@ def test_lfric_kokkos_trans_places_a_local_array_in_scratch(local_target):
     assert "int k;" in cpp
     assert ("Kokkos::parallel_for(Kokkos::TeamVectorRange"
             "(team, 1, nlayers + 1),\n"
-            "        [&](const int k) {" in cpp)
+            "          [&](const int k) {" in cpp)
 
     # Nothing about the scratch reaches the Fortran side: it is allocated by
     # the launch, so the ABI is the same as any other region's.

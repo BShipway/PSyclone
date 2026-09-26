@@ -123,7 +123,8 @@ def test_lfric_kokkos_trans_takes_a_literal_extent(literal_local_target):
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "swept_scratch_t::shmem_size(nlayers, 4)" in cpp
-    assert "swept_scratch_t swept(team.team_scratch(0), nlayers, 4);" in cpp
+    assert ("swept_scratch_t swept("
+            "team.team_scratch(0), nlayers, 4);") in cpp
     assert ("using swept_scratch_t = Kokkos::View<double**, "
             "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;" in cpp)
     # Both indices lose their Fortran base, not just the first.
@@ -145,7 +146,8 @@ def test_lfric_kokkos_trans_takes_an_arithmetic_extent(
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "swept_scratch_t::shmem_size((nlayers + 1))" in cpp
-    assert ("swept_scratch_t swept(team.team_scratch(0), (nlayers + 1));"
+    assert ("swept_scratch_t swept("
+            "team.team_scratch(0), (nlayers + 1));"
             in cpp)
 
 
@@ -165,7 +167,8 @@ def test_lfric_kokkos_trans_takes_an_explicit_lower_bound_of_one(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "swept_scratch_t swept(team.team_scratch(0), nlayers);" in cpp
+    assert ("swept_scratch_t swept("
+            "team.team_scratch(0), nlayers);") in cpp
 
 
 def test_lfric_kokkos_trans_accepts_a_zero_based_local(
@@ -194,7 +197,8 @@ def test_lfric_kokkos_trans_accepts_a_zero_based_local(
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "u_e_scratch_t::shmem_size((nlayers + 1))" in cpp
-    assert "u_e_scratch_t u_e(team.team_scratch(0), (nlayers + 1));" in cpp
+    assert ("u_e_scratch_t u_e("
+            "team.team_scratch(0), (nlayers + 1));") in cpp
     # Every subscript of it, not only the one the assignment writes.
     assert "u_e((k - 0))" in cpp
     assert "u_e((nlayers - 0))" in cpp

@@ -546,8 +546,9 @@ def test_kokkos_writer_places_locals_in_team_scratch():
     # carries the scratch request, since a backend other than OpenMP may
     # answer differently for a launch that asks for none.
     probe = code.index("TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)")
-    assert ".set_scratch_size(0, Kokkos::PerThread(scratch_bytes));" in \
-        code[probe:]
+    assert (".set_scratch_size(0, Kokkos::PerThread(scratch_bytes_0))\n"
+            "            .set_scratch_size(1, "
+            "Kokkos::PerThread(scratch_bytes_1));") in code[probe:]
     assert "const int team_size = probe.team_size_recommended(body, " \
         "Kokkos::ParallelForTag());" in code
     assert "const int league_size = (ncells + team_size - 1) / team_size;" \
@@ -620,8 +621,8 @@ def test_kokkos_writer_sizes_and_builds_every_scratch_array():
     for name in ("x_new", "tri_plus_new"):
         assert f"using {name}_scratch_t = Kokkos::View<double*, " \
             "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;" in code
-        assert f"{name}_scratch_t {name}(team.thread_scratch(0), nlayers);" \
-            in code
+        assert (f"{name}_scratch_t {name}("
+                "team.thread_scratch(0), nlayers);") in code
 
     # Summed, not counted once: a request covering one of two arrays hands
     # the second one memory the first is already using.
@@ -701,7 +702,15 @@ def test_kokkos_team_launch_never_asks_team_size_max():
     merely suboptimal, so its absence is asserted and not just the presence
     of its replacement.
     """
-    assert "team_size_max" not in KokkosWriter()(_scratch_region())
+    code = KokkosWriter()(_scratch_region())
+    assert "team_size_max(body" not in code
+    # The one question put to team_size_max is whether a warp's scratch fits
+    # in shared memory, asked of a functor that does nothing, on a GPU only.
+    assert code.count("team_size_max(") == 1
+    assert "team_size_max(KokkosScratchProbe()," in code
+    assert (code.index("#if defined(KOKKOS_ENABLE_CUDA)")
+            < code.index("team_size_max(")
+            < code.index("#else\n  const int scratch_level = 0;"))
 
 
 def test_kokkos_launch_module_renders_both_existing_shapes():
@@ -789,7 +798,8 @@ def test_kokkos_hierarchical_region_places_scratch_per_team():
         KokkosScratch("x_new", "double", ("nlayers",), index_offsets=(1,)),)))
 
     assert ".set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))" in code
-    assert "x_new_scratch_t x_new(team.team_scratch(0), nlayers);" in code
+    assert ("x_new_scratch_t x_new("
+            "team.team_scratch(0), nlayers);") in code
     for absent in ("PerThread", "thread_scratch"):
         assert absent not in code
 
@@ -1471,7 +1481,7 @@ def test_kokkos_cell_position_declared_in_team_launch():
     """The flat team launch declares it after computing its own index."""
     code = KokkosWriter()(_with_cell_position(_renamed(_scratch_region())))
 
-    assert "\n      const int cell = cell_1 + 1;\n" in code
+    assert "\n        const int cell = cell_1 + 1;\n" in code
     assert code.index("const int cell_1 = team.league_rank()") < \
         code.index("const int cell = cell_1 + 1;")
 
@@ -1808,7 +1818,8 @@ def test_kokkos_writer_takes_a_literal_extent():
     code = KokkosWriter()(_scratch_region(scratch=scratch))
 
     assert "x_new_scratch_t::shmem_size(4)\n" in code
-    assert "x_new_scratch_t x_new(team.thread_scratch(0), 4);" in code
+    assert ("x_new_scratch_t x_new("
+            "team.thread_scratch(0), 4);") in code
     # The other array is still sized from a name, so the two forms coexist in
     # one request rather than the writer having switched mode.
     assert "+ tri_plus_new_scratch_t::shmem_size(nlayers);" in code
@@ -1823,7 +1834,8 @@ def test_kokkos_writer_takes_an_arithmetic_extent():
     code = KokkosWriter()(_scratch_region(scratch=scratch))
 
     assert "x_new_scratch_t::shmem_size((nlayers + 1))\n" in code
-    assert "x_new_scratch_t x_new(team.thread_scratch(0), (nlayers + 1));" \
+    assert ("x_new_scratch_t x_new("
+            "team.thread_scratch(0), (nlayers + 1));") \
         in code
 
 
@@ -1847,7 +1859,8 @@ def test_kokkos_writer_includes_algorithm_for_an_integer_maximum():
                            "#include <algorithm>\n"
                            '#include "lfric_kokkos_staging.hpp"\n\n')
     assert code.count("#include <algorithm>") == 1
-    assert code.count(extent) == 2
+    # Once in the size and once in each copy of the launch's construction.
+    assert code.count(extent) == 3
 
     plain = KokkosWriter()(_scratch_region())
     assert plain.startswith("#include <Kokkos_Core.hpp>\n"
@@ -4122,7 +4135,8 @@ def test_kokkos_coloured_team_launch_indexes_the_colour_and_the_mesh():
     assert "const int cell = cmap(colour - 1, cell_in_colour) - 1;" in code
     # The scratch is still per team member, and the body still reads the
     # mesh cell the map produced.
-    assert "x_new_scratch_t x_new(team.thread_scratch(0), nlayers);" in code
+    assert ("x_new_scratch_t x_new("
+            "team.thread_scratch(0), nlayers);") in code
     assert "map((1 - 1), cell)" in code
     # Colouring is the answer to the shared write here, so there is no other.
     assert "Kokkos::atomic" not in code
@@ -4476,14 +4490,17 @@ def test_kokkos_alias_target_scratch_lives_in_global_level():
         aliases=(KokkosAlias(name="chosen", targets=("y", "x_new")),)))
 
     assert "x_new_scratch_t x_new(team.thread_scratch(1), nlayers);" in code
-    assert ("tri_plus_new_scratch_t tri_plus_new(team.thread_scratch(0), "
-            "nlayers);") in code
+    assert ("tri_plus_new_scratch_t tri_plus_new("
+            "team.thread_scratch(0), nlayers);") in code
     assert ("const size_t scratch_bytes = "
             "tri_plus_new_scratch_t::shmem_size(nlayers);") in code
-    assert ("const size_t scratch_bytes_1 = "
+    assert ("const size_t alias_bytes = "
             "x_new_scratch_t::shmem_size(nlayers);") in code
+    assert ("const size_t scratch_bytes_1 = "
+            "(scratch_level == 1 ? scratch_bytes : 0) + alias_bytes;") in code
+    # A probe and a launch in each copy of the launch.
     assert code.count(
-        ".set_scratch_size(1, Kokkos::PerThread(scratch_bytes_1))") == 2
+        ".set_scratch_size(1, Kokkos::PerThread(scratch_bytes_1))") == 4
     # The type alias and the subscripts do not change with the level.
     assert ("using x_new_scratch_t = Kokkos::View<double*, "
             "Kokkos::LayoutLeft, ScratchSpace, Unmanaged>;") in code
@@ -4493,26 +4510,29 @@ def test_kokkos_alias_with_every_scratch_targeted_leaves_level_zero_empty():
     """Level 0 asks for nothing when every scratch array moved to level 1.
 
     ``_alias_region`` aims its handle at both scratch arrays, so both move;
-    the level-0 sum is then written as ``0`` rather than as an empty
-    expression, and the level-1 sum carries both.
+    the sum whose level is chosen at run time is then written as ``0``
+    rather than as an empty expression, and the alias sum carries both.
     """
     code = KokkosWriter()(_alias_region())
 
     assert "const size_t scratch_bytes = 0;" in code
-    assert ("const size_t scratch_bytes_1 = "
+    assert ("const size_t alias_bytes = "
             "x_new_scratch_t::shmem_size(nlayers)\n"
             "      + tri_plus_new_scratch_t::shmem_size(nlayers);") in code
     assert "thread_scratch(0)" not in code
     assert code.count("thread_scratch(1)") == 2
 
 
-def test_kokkos_region_without_alias_requests_no_global_scratch():
-    """No alias, no level-1 request: the text generated before is kept."""
+def test_kokkos_region_without_alias_requests_level_one_only_to_spill():
+    """No alias, no alias bytes: level 1 is asked for the spill alone."""
     code = KokkosWriter()(_scratch_region())
 
-    assert "scratch_bytes_1" not in code
-    assert "set_scratch_size(1" not in code
-    assert "thread_scratch(1)" not in code
+    assert "alias_bytes" not in code
+    assert ("const size_t scratch_bytes_1 = "
+            "(scratch_level == 1 ? scratch_bytes : 0);") in code
+    # The level-1 copy of the launch names level 1; the level-0 copy, the
+    # only one a host backend compiles, does not.
+    assert "thread_scratch(1)" not in code[code.index("  } else\n"):]
 
 
 def test_kokkos_hierarchical_alias_target_uses_team_scratch_level_one():
@@ -4530,10 +4550,11 @@ def test_kokkos_hierarchical_alias_target_uses_team_scratch_level_one():
     code = KokkosWriter()(region)
 
     assert "x_new_scratch_t x_new(team.team_scratch(1), nlayers);" in code
-    assert ("tri_plus_new_scratch_t tri_plus_new(team.team_scratch(0), "
-            "nlayers);") in code
-    assert (".set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))\n"
-            "          .set_scratch_size(1, Kokkos::PerTeam(scratch_bytes_1))"
+    assert ("tri_plus_new_scratch_t tri_plus_new("
+            "team.team_scratch(0), nlayers);") in code
+    assert (".set_scratch_size(0, Kokkos::PerTeam(scratch_bytes_0))\n"
+            "            .set_scratch_size(1, "
+            "Kokkos::PerTeam(scratch_bytes_1))"
             ) in code
     assert "thread_scratch" not in code
 

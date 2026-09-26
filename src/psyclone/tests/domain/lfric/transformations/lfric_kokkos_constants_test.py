@@ -311,7 +311,8 @@ def test_lfric_kokkos_trans_places_a_local_sized_by_a_named_constant(
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "v_dot_n_scratch_t::shmem_size(4)" in cpp
-    assert "v_dot_n_scratch_t v_dot_n(team.team_scratch(0), 4);" in cpp
+    assert ("v_dot_n_scratch_t v_dot_n("
+            "team.team_scratch(0), 4);") in cpp
     # The name is nowhere in the generated unit: not in the extent, not in
     # the body, and not across the interface.
     assert "nfaces" not in cpp
@@ -366,7 +367,8 @@ def test_lfric_kokkos_trans_accepts_an_array_parameter(array_constant_target):
 
     assert "const int face_order[4] = {1, 2, 3, 4};" in cpp
     assert "static const" not in cpp
-    assert cpp.count("const int face_order") == 1
+    # Once in each copy of the launch.
+    assert cpp.count("const int face_order") == 2
     assert "partial((face_order[(k - 1)] - 1))" in cpp
     assert "face_order[(1 - 1)]" in cpp
     assert "face_order" not in fortran
