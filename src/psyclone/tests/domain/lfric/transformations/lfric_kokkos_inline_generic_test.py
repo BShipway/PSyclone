@@ -178,8 +178,9 @@ def test_a_specific_settles_its_own_module_generic(
                 if not isinstance(call, IntrinsicCall)]
     assert "sweep_column" not in cpp
     assert "damping" not in cpp
-    # Twice, once per call site, and the weighted specific's literal nowhere.
-    assert cpp.count("1.0 / ") == 2
+    # Once per call site in each copy of the launch, and the weighted
+    # specific's literal nowhere.
+    assert cpp.count("1.0 / ") == 4
     assert "9.0" not in cpp
 
 

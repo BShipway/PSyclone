@@ -478,8 +478,8 @@ def test_lfric_kokkos_trans_prefers_a_routine_the_container_holds(
     assert "sibling_step" not in cpp
     assert "shared_edge" not in cpp
     # The shared routine's one statement is in the body twice, once from
-    # each helper.
-    assert cpp.count("* 0.5") == 2
+    # each helper, and the body is in each copy of the launch.
+    assert cpp.count("* 0.5") == 4
 
 
 def test_lfric_kokkos_trans_settles_a_name_from_the_container_import(
@@ -1122,8 +1122,9 @@ def test_callee_calling_its_own_module_is_inlined(
                 if not isinstance(call, IntrinsicCall)]
     assert "sweep_column" not in cpp
     assert "damping" not in cpp
-    # Twice: an unresolved symbol would have refused the second inlining.
-    assert cpp.count("1.0 / ") == 2
+    # Twice in each copy of the launch: an unresolved symbol would have
+    # refused the second inlining.
+    assert cpp.count("1.0 / ") == 4
     assert "const int top_edge" in cpp
     assert "use edge_index_mod, only : top_edge" in str(psy.gen).lower()
 

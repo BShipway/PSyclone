@@ -244,7 +244,8 @@ def test_lfric_kokkos_trans_accepts_a_section_actual(
     # The local is a rank-2 automatic, so it is team scratch rather than a
     # temporary of the lowering's own: the nests write through the View the
     # region already described.
-    assert "vector_scratch_t vector(team.team_scratch(0), nlayers, 3);" in cpp
+    assert ("vector_scratch_t vector("
+            "team.team_scratch(0), nlayers, 3);") in cpp
     # 'vector = 0.0' became a nest over both of its dimensions, the second
     # spread over the team and the first -- the contiguous one under
     # LayoutLeft -- swept inside it.
@@ -493,8 +494,9 @@ def test_apply_keeps_tri_solve_flat(tri_solve_target):
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "team_size_recommended(body, Kokkos::ParallelForTag())" in cpp
-    assert "x_new_scratch_t x_new(team.thread_scratch(0), nlayers);" in cpp
-    assert "if (cell >= ncells) {\n        return;\n      }" in cpp
+    assert ("x_new_scratch_t x_new("
+            "team.thread_scratch(0), nlayers);") in cpp
+    assert "if (cell >= ncells) {\n          return;\n        }" in cpp
     assert "TeamVectorRange" not in cpp
     assert "Kokkos::single" not in cpp
     # The flat launch does read the league rank -- it folds it and the member

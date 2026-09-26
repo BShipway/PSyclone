@@ -308,11 +308,12 @@ def test_kokkos_fold_in_a_condition_is_moved_into_an_assignment(
     # which the array tier does write where it stands. It keeps its place:
     # the move takes only what the tier leaves, and asks the tier itself.
     assert "(_kae_r2 * 2" in cpp
-    assert cpp.count("Kokkos::min(") == 2
+    # Twice in each copy of the launch.
+    assert cpp.count("Kokkos::min(") == 4
     assert "MAXVAL" not in cpp and "MINVAL" not in cpp
-    # One launch still, as the contract states: the folds are loops inside
-    # the region, not regions of their own.
-    assert cpp.count("Kokkos::parallel_for(\"") == 1
+    # One launch still in each copy of the launch, as the contract states:
+    # the folds are loops inside the region, not regions of their own.
+    assert cpp.count("Kokkos::parallel_for(\"") == 2
 
 
 def test_kokkos_fold_moved_before_the_statement_it_stood_in(

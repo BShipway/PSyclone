@@ -95,7 +95,8 @@ def test_kokkos_writer_serialises_a_whole_array_write_by_the_team():
     barrier = code.index("team.team_barrier();\n", product)
     spread = code.index("Kokkos::TeamVectorRange(team, 1, nlayers + 1)")
     assert single < product < barrier < spread
-    assert code.count("Kokkos::single(Kokkos::PerTeam(team)") == 1
+    # Once in each copy of the launch.
+    assert code.count("Kokkos::single(Kokkos::PerTeam(team)") == 2
 
 
 def test_kokkos_writer_leaves_a_whole_scalar_write_to_every_member():

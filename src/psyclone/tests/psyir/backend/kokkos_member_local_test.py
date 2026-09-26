@@ -250,8 +250,9 @@ def test_kokkos_writer_writes_a_member_local_array_without_a_single():
     assert "    local_dofs((2 - 1)) = nlayers;\n" in code
     # The View write beside them still takes the guard, so what is asserted
     # above is the member-local array and not the launch shape.
-    assert "Kokkos::single(Kokkos::PerTeam(team), [&]() {\n      y((" in code
-    assert code.count("Kokkos::single(Kokkos::PerTeam(team)") == 1
+    assert "Kokkos::single(Kokkos::PerTeam(team), [&]() {\n        y((" in code
+    # Once in each copy of the launch.
+    assert code.count("Kokkos::single(Kokkos::PerTeam(team)") == 2
 
 
 def test_kokkos_writer_reads_a_member_local_array_like_the_view_it_was():

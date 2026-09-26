@@ -259,9 +259,12 @@ def _scratch_text(region, allocation, indent):
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     :param allocation: the member function the Views are constructed over,
-        ``team.thread_scratch(0)`` or ``team.team_scratch(0)``; the level in
-        it is rewritten to ``1`` for the arrays
-        :py:func:`global_scratch_names` places in global memory.
+        ``team.thread_scratch`` or ``team.team_scratch``, without its level.
+        The level is ``1`` for the arrays :py:func:`global_scratch_names`
+        places in global memory, and ``scratch_level`` -- the run-time
+        choice :py:func:`scratch_placement` makes -- for every other, which
+        :py:func:`scratch_level_dispatch` then replaces with a literal in
+        each copy of the launch.
     :type allocation: str
     :param indent: the leading whitespace of each construction, which differs
         because the flat shape nests its body one level deeper.
@@ -272,9 +275,10 @@ def _scratch_text(region, allocation, indent):
     declaration :py:func:`member_local_definition` describes, in the place
     its View construction would have stood.
 
-    :returns: the type aliases, the level-0 ``shmem_size`` sum (``0`` where
-        every array moved to level 1 or to a member), the level-1 sum (empty
-        where none did), and the constructions.
+    :returns: the type aliases, the ``shmem_size`` sum of the arrays whose
+        level is chosen at run time (``0`` where every array is an alias
+        target or member-local), the sum of the alias targets (empty where
+        there are none), and the constructions.
     :rtype: Tuple[str, str, str, str]
     """
     shared = team_scratch_items(region)
@@ -291,44 +295,192 @@ def _scratch_text(region, allocation, indent):
     sizes_global = "\n      + ".join(by_level["1"])
     constructions = "".join(
         _member_local_declaration(item, indent) if item.member_local else
-        f"{indent}{item.name}_scratch_t {item.name}("
-        f"{allocation.replace('(0)', f'({_scratch_level(region, item)})')}, "
-        f"{', '.join(item.extents)});\n"
+        f"{indent}{item.name}_scratch_t {item.name}({allocation}("
+        f"{'1' if _scratch_level(region, item) == '1' else 'scratch_level'}"
+        f"), {', '.join(item.extents)});\n"
         for item in region.scratch)
     return aliases, sizes, sizes_global, constructions
 
 
-def global_scratch_size(sizes_global):
-    """Return the level-1 size computation, or nothing where none is needed.
+#: The name of the generated functor the scratch-level probe is asked about.
+SCRATCH_PROBE_TYPE = "KokkosScratchProbe"
 
-    :param str sizes_global: the level-1 ``shmem_size`` sum from
-        :py:func:`_scratch_text`, empty where no array moved.
 
-    :returns: the comment and the ``scratch_bytes_1`` computation.
+def scratch_probe_definition(region):
+    """Return the functor :py:func:`scratch_placement` asks Kokkos about.
+
+    ``team_size_max`` answers for a functor, and the region's own functor
+    cannot be the one asked: it captures the level being chosen, so it
+    does not exist until the choice is made. A functor that does nothing
+    answers the same question about shared memory, which is the only
+    question asked of it. It is a named struct rather than a lambda because
+    it is defined outside the region's function: ``nvcc`` does not accept an
+    extended lambda defined inside another.
+
+    Nothing is emitted for a region with no scratch. A flat launch whose
+    every array is member-local still names the probe, although its empty
+    request never reaches it, so the test is on any scratch rather than on
+    :py:func:`team_scratch_items`.
+
+    :param region: the region being generated.
+    :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+    :returns: the definition and the blank line after it, or the empty
+        string.
     :rtype: str
     """
-    if not sizes_global:
+    if not region.scratch:
         return ""
     return (
-        "  // The arrays below are targets of an alias handle and live in\n"
-        "  // level-1 (global) team scratch: a handle aimed at shared memory\n"
-        "  // in one branch and at a global View in the other is a pointer\n"
-        "  // nvcc 13.3 wrongly specialises to shared memory.\n"
-        f"  const size_t scratch_bytes_1 = {sizes_global};\n")
+        "// Asked by the launch below which scratch level its arrays fit in:\n"
+        "// a functor that does nothing is enough to ask Kokkos whether a\n"
+        "// team of a warp can hold a request in shared memory.\n"
+        f"struct {SCRATCH_PROBE_TYPE} {{\n"
+        "  KOKKOS_INLINE_FUNCTION void operator()(\n"
+        "      const Kokkos::TeamPolicy<>::member_type &) const {}\n"
+        "};\n\n")
 
 
-def global_scratch_policy(sizes_global, per):
-    """Return the level-1 request to append to a ``TeamPolicy``.
+def scratch_placement(sizes_global, per):
+    """Return the run-time choice of scratch level and the two requests.
 
-    :param str sizes_global: the level-1 sum, empty where no array moved.
+    Level-0 team scratch is shared memory on a GPU, and Kokkos 4.7 caps it
+    at the device's default per-block limit -- 48 KiB on an H100 -- rather
+    than opting in to the larger carve-out. A region's scratch is a set of
+    column arrays, so its size grows with ``nlayers``: at 30 levels every
+    region fits, while at 85 the horizontal FFSL flux regions ask for over
+    100 KiB a team and ``operator_tri_solve`` for 3.4 KiB a thread, and
+    Kokkos refuses the launch. The number of levels is known only at run
+    time, so the level is chosen there.
+
+    The arrays stay in level 0 when the request fits, and all of them move
+    to level 1 -- global memory, which Kokkos caps at 20 MB a team -- when
+    it does not fit a team of one warp. Whether it fits is answered in two
+    steps. :py:meth:`TeamPolicy::scratch_size_max` is a static bound that
+    assumes a team of 1024; a request under it fits whatever the team, and
+    that is every region at 30 levels but one, so the common case asks
+    nothing of the device. A request over it is put to ``team_size_max``,
+    with :py:func:`scratch_probe_definition`'s functor, which answers
+    against the per-block limit Kokkos checks at launch and returns 0 where
+    no team fits. A request that does not fit a warp is moved rather than
+    run on a narrower team, because a narrower team idles the rest of the
+    warp.
+
+    A host backend keeps level 0, which is ordinary memory there.
+
+    The alias targets :py:func:`global_scratch_names` places in level 1
+    stay there whatever is chosen, and are added to the level-1 request.
+
+    :param str sizes_global: the alias targets' ``shmem_size`` sum from
+        :py:func:`_scratch_text`, empty where there are none.
     :param str per: ``PerThread`` or ``PerTeam``, matching the launch.
 
-    :returns: the ``.set_scratch_size(1, ...)`` text, or nothing.
+    :returns: the alias targets' size, the choice of ``scratch_level`` and
+        the ``scratch_bytes_0`` and ``scratch_bytes_1`` requests.
     :rtype: str
     """
-    if not sizes_global:
-        return ""
-    return f"\n          .set_scratch_size(1, Kokkos::{per}(scratch_bytes_1))"
+    alias_bytes = ""
+    if sizes_global:
+        alias_bytes = (
+            "  // These arrays are targets of an alias handle and live in\n"
+            "  // level-1 (global) team scratch: a handle aimed at shared\n"
+            "  // memory in one branch and at a global View in the other is\n"
+            "  // a pointer nvcc 13.3 wrongly specialises to shared memory.\n"
+            f"  const size_t alias_bytes = {sizes_global};\n")
+    request = ("scratch_bytes * TeamPolicy::vector_length_max()"
+               if per == "PerThread" else "scratch_bytes")
+    return (
+        f"{alias_bytes}"
+        "  // Level 0 is shared memory on a GPU, capped at the per-block\n"
+        "  // default; the column arrays above grow with nlayers, so a\n"
+        "  // request that does not fit a team of one warp there moves to\n"
+        "  // level 1, global memory.\n"
+        "#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)\n"
+        "  const bool scratch_fits =\n"
+        f"      {request} <= size_t(TeamPolicy::scratch_size_max(0))\n"
+        "      || TeamPolicy(1, Kokkos::AUTO)\n"
+        "                 .set_scratch_size("
+        f"0, Kokkos::{per}(scratch_bytes))\n"
+        f"                 .team_size_max({SCRATCH_PROBE_TYPE}(), "
+        "Kokkos::ParallelForTag())\n"
+        "             >= TeamPolicy::vector_length_max();\n"
+        "  const int scratch_level = scratch_fits ? 0 : 1;\n"
+        "#else\n"
+        "  const int scratch_level = 0;\n"
+        "#endif\n"
+        "  const size_t scratch_bytes_0 = "
+        "scratch_level == 0 ? scratch_bytes : 0;\n"
+        "  const size_t scratch_bytes_1 = "
+        "(scratch_level == 1 ? scratch_bytes : 0)"
+        f"{' + alias_bytes' if sizes_global else ''};\n")
+
+
+def scratch_level_dispatch(launch):
+    """Return ``launch`` with its run-time scratch level made a constant.
+
+    :py:func:`_scratch_text` constructs the arrays whose level is chosen at
+    run time over ``scratch_level``, the variable
+    :py:func:`scratch_placement` sets. Passing that variable to
+    ``thread_scratch`` or ``team_scratch`` inside the functor is correct but
+    slow: ``nvcc`` can emit shared-memory loads and stores only where it can
+    prove a pointer is into shared memory, and with the level a run-time
+    value it cannot, so every access goes through a generic load. On an H100
+    (2026-09-26) that took ``ffsl_flux_xy_special_edge`` from 833
+    shared-memory loads to 2, and slowed the whole model by 4% at C48 and
+    6% at C144 with every region still in level 0.
+
+    So the launch is generated twice, once for each level, each with the
+    level as a literal, and the run-time choice selects one of the two.
+    Only a GPU backend compiles the level-1 copy: on a host backend
+    ``scratch_level`` is always 0, and the level-0 copy alone is compiled,
+    in a block of its own.
+
+    A launch that does not construct over ``scratch_level`` -- every array
+    of the region an alias target or member-local -- is returned unchanged.
+
+    :param str launch: the launch text, from the functor to the
+        ``parallel_for``, indented as at the top of the region's function.
+
+    :returns: the launch, or the two copies and the branch between them.
+    :rtype: str
+    """
+    token = "_scratch(scratch_level)"
+    if token not in launch:
+        return launch
+
+    def copy(level):
+        return "".join(
+            line if line.startswith("#") or not line.strip() else f"  {line}"
+            for line in launch.replace(
+                token, f"_scratch({level})").splitlines(keepends=True))
+
+    return (
+        "  // One copy of the launch for each level, each naming its level\n"
+        "  // as a constant: nvcc emits shared-memory loads only where it\n"
+        "  // can prove the arrays are in level 0.\n"
+        "#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)\n"
+        "  if (scratch_level == 1) {\n"
+        f"{copy(1)}"
+        "  } else\n"
+        "#endif\n"
+        "  {\n"
+        f"{copy(0)}"
+        "  }\n")
+
+
+def scratch_policy(per):
+    """Return the scratch requests to append to a ``TeamPolicy``.
+
+    Both levels are always requested; a level asked for no bytes allocates
+    nothing.
+
+    :param str per: ``PerThread`` or ``PerTeam``, matching the launch.
+
+    :returns: the two ``.set_scratch_size`` calls.
+    :rtype: str
+    """
+    return (f".set_scratch_size(0, Kokkos::{per}(scratch_bytes_0))\n"
+            f"          .set_scratch_size(1, Kokkos::{per}(scratch_bytes_1))")
 
 
 def scratch_guard(region):
@@ -451,19 +603,21 @@ def team_launch(region, local_declarations, body):
     :type body: str
 
     :returns: the scratch type aliases, :py:func:`scratch_guard`, the size
-        computation, the bound body, the team-size probe and the
-        ``parallel_for``.
+        computation, and then the bound body, the team-size probe and the
+        ``parallel_for``, once for each scratch level where
+        :py:func:`scratch_level_dispatch` makes two copies.
     :rtype: str
     """
     aliases, sizes, sizes_global, constructions = _scratch_text(
-        region, "team.thread_scratch(0)", "      ")
+        region, "team.thread_scratch", "      ")
     _, offset, span = launch_offsets(region)
-    level_one = global_scratch_policy(sizes_global, "PerThread")
+    request = scratch_policy("PerThread")
     return (
         f"{aliases}\n"
         f"{scratch_guard(region)}"
         f"  const size_t scratch_bytes = {sizes};\n"
-        f"{global_scratch_size(sizes_global)}\n"
+        f"{scratch_placement(sizes_global, 'PerThread')}\n"
+    ) + scratch_level_dispatch(
         "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
         "    Kokkos::parallel_for(Kokkos::TeamThreadRange(team, "
         "team.team_size()),\n"
@@ -481,16 +635,14 @@ def team_launch(region, local_declarations, body):
         "    });\n"
         "  };\n\n"
         "  TeamPolicy probe = TeamPolicy(1, Kokkos::AUTO)\n"
-        "      .set_scratch_size(0, Kokkos::PerThread(scratch_bytes))"
-        f"{level_one};\n"
+        f"          {request};\n"
         "  const int team_size = probe.team_size_recommended(body, "
         "Kokkos::ParallelForTag());\n"
         f"  const int league_size = ({span} + team_size - 1)"
         " / team_size;\n"
         f'  Kokkos::parallel_for("{region.name}",\n'
         "      TeamPolicy(league_size, team_size)\n"
-        "          .set_scratch_size(0, "
-        f"Kokkos::PerThread(scratch_bytes)){level_one},\n"
+        f"          {request},\n"
         "      body);\n")
 
 
@@ -513,15 +665,14 @@ def _team_scratch(region):
     :rtype: Tuple[str, str, str]
     """
     aliases, sizes, sizes_global, constructions = _scratch_text(
-        region, "team.team_scratch(0)", "    ")
+        region, "team.team_scratch", "    ")
     if not team_scratch_items(region):
         return "", "", constructions
     return (
         f"{aliases}\n{scratch_guard(region)}"
         f"  const size_t scratch_bytes = {sizes};\n"
-        f"{global_scratch_size(sizes_global)}\n",
-        "\n          .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes))"
-        + global_scratch_policy(sizes_global, "PerTeam"),
+        f"{scratch_placement(sizes_global, 'PerTeam')}\n",
+        f"\n          {scratch_policy('PerTeam')}",
         constructions)
 
 
@@ -654,6 +805,10 @@ def hierarchical_launch(region, local_declarations, body, extents=()):
     the backend how wide a team it will run *this functor* with, and a
     functor cannot be asked about before it exists.
 
+    In all three shapes, a region with scratch whose level is chosen at run
+    time generates its launch twice, once for each level; see
+    :py:func:`scratch_level_dispatch`.
+
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     :param local_declarations: the generated declarations of the kernel's
@@ -668,8 +823,10 @@ def hierarchical_launch(region, local_declarations, body, extents=()):
     :type extents: Tuple[str, ...]
 
     :returns: the scratch type aliases, :py:func:`scratch_guard` and the
-        size computation where the region has scratch, the team size where
-        it is computed, and the ``parallel_for`` over one team per cell.
+        size computation where the region has scratch, then the team size
+        where it is computed and the ``parallel_for`` over one team per cell,
+        once for each scratch level where :py:func:`scratch_level_dispatch`
+        makes two copies.
     :rtype: str
     """
     preamble, scratch_request, constructions = _team_scratch(region)
@@ -685,13 +842,12 @@ def hierarchical_launch(region, local_declarations, body, extents=()):
     launch = (f'  Kokkos::parallel_for("{region.name}",\n'
               f"      {policy},\n")
     if not computed:
-        return (
-            f"{preamble}{launch}"
+        return preamble + scratch_level_dispatch(
+            f"{launch}"
             "      KOKKOS_LAMBDA(const TeamMember &team) {\n"
             f"{functor}"
             "  });\n")
-    return (
-        f"{preamble}"
+    return preamble + scratch_level_dispatch(
         "  auto body = KOKKOS_LAMBDA(const TeamMember &team) {\n"
         f"{functor}"
         "  };\n\n"

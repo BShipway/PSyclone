@@ -1136,10 +1136,11 @@ the region has to use one name for both.
 A region with scratch launches over `Kokkos::TeamPolicy<>`. A Fortran
 automatic local such as `real(r_def), dimension(nlayers) :: x_new` has an
 extent that is a runtime value, so it cannot become a C++ local; it becomes
-a `Kokkos::View` over `team.thread_scratch(0)`, sized by `shmem_size`. That
-is the allocation Kokkos provides for exactly this case -- no heap traffic,
-no storage outliving the launch, and shared memory rather than global on a
-GPU.
+a `Kokkos::View` over `team.thread_scratch(0)`, sized by
+`shmem_size`. That is the allocation Kokkos provides for exactly this case --
+no heap traffic, no storage outliving the launch, and shared memory rather
+than global on a GPU wherever the request fits there; the level is
+chosen at run time, as described after the alias targets below.
 
 Cells are tiled across the ranks of a team rather than given a team each, so
 that each rank takes one cell with its own per-thread scratch and the
@@ -1374,8 +1375,8 @@ is already `const`.
 A scratch array that is the target of an alias is placed in **level-1** team
 scratch -- `team.team_scratch(1)`, requested with
 `.set_scratch_size(1, Kokkos::PerTeam(scratch_bytes_1))` -- which the CUDA
-backend keeps in global memory, while every other scratch array stays in
-level 0, shared memory. That is a workaround for a code-generation defect
+backend keeps in global memory, whatever level the region's other scratch
+arrays are given. That is a workaround for a code-generation defect
 rather than a design preference: a handle aimed at a shared-memory array in
 one branch and at a global argument View in the other is a pointer the
 compiler must keep generic, and `nvcc` 13.3 does not. It infers "shared" for
@@ -1388,6 +1389,45 @@ merged pointer is generic on both sides and there is nothing to
 specialise. `kokkos_launch.global_scratch_names` says which arrays move; the
 type alias, the `shmem_size` arithmetic and the subscripts are unchanged,
 because a `ScratchSpace` View is the same View at either level.
+
+Every other scratch array is placed at a level chosen at run time,
+`scratch_level`, which `kokkos_launch.scratch_placement` emits ahead of the
+functor that captures it. Level 0 is shared memory on a GPU, and Kokkos 4.7
+checks a launch against the device's default per-block limit -- 48 KiB on an
+H100 -- rather than opting in to the larger carve-out. A region's scratch is a
+set of column arrays, so its request grows with `nlayers`, which only the run
+knows: at 30 levels every region fits, while at 85 the horizontal FFSL flux
+regions ask for over 100 KiB a team and Kokkos refuses the launch. The
+generated code therefore asks whether the request fits a team of one warp in
+level 0, and moves all of the region's chosen arrays to level 1 when it does
+not. The question is answered in two steps. `TeamPolicy::scratch_size_max(0)`
+is a static bound that assumes a team of 1024, so a request under it -- a
+per-thread one multiplied by a warp -- fits and the device is not asked;
+above it, `team_size_max` is asked of a policy carrying the request and of
+`KokkosScratchProbe`, a functor that does nothing, defined ahead of the region
+by `kokkos_launch.scratch_probe_definition` because `nvcc` refuses an extended
+lambda defined inside another. It answers against the limit the launch is
+checked against and returns 0 where no team fits. The region's own functor
+cannot be asked, since it captures the level being chosen. The two levels are
+then requested as `scratch_bytes_0` and `scratch_bytes_1`, the second adding
+the alias targets' bytes, and both the team-size probe and the launch carry
+both requests. A host backend is always given level 0.
+
+The functor does not construct its arrays over `scratch_level` itself. It
+would be correct, but `nvcc` emits shared-memory loads and stores only where
+it can prove a pointer is into shared memory, and a level that is a run-time
+value defeats that proof: every access becomes a generic load, which on an
+H100 took `ffsl_flux_xy_special_edge` from 833 shared-memory loads to 2 and
+slowed the whole model with every region still in level 0. So
+`kokkos_launch.scratch_level_dispatch` generates the launch twice, from the
+functor to the `parallel_for`, once with each level as a literal, and
+`if (scratch_level == 1)` selects between them. The level-1 copy is inside
+the GPU guard, so a host backend compiles the level-0 copy alone. A region
+whose every array has a fixed level -- all alias targets or member-local --
+has one launch, as before. A lambda cannot be shared between the two copies
+through a template, because `nvcc` also refuses an extended lambda inside a
+generic lambda, so the text itself is duplicated, and a device build compiles
+each such region's body twice.
 
 A kernel-local array the team does not have to share is not in team scratch
 at all. Two conditions together say when it need not be. The first is

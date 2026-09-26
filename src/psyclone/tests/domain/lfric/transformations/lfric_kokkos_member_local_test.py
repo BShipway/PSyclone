@@ -232,7 +232,8 @@ def test_the_described_region_shares_one_a_spread_loop_touches(
     cpp = LFRicKokkosTrans().apply(loop)
 
     assert "KokkosMemberLocal" not in cpp
-    assert "local_dofs_scratch_t local_dofs(team.team_scratch(0), 2);" in cpp
+    assert ("local_dofs_scratch_t local_dofs("
+            "team.team_scratch(0), 2);") in cpp
     assert "Kokkos::single(Kokkos::PerTeam(team), [&]() {" in cpp
 
 
