@@ -53,7 +53,8 @@ settles is still refused, in ``InlineTrans``'s own words.
 
 from psyclone.psyir.nodes import Call, Container, Reference, Routine
 from psyclone.psyir.symbols import (
-    ContainerSymbol, DataSymbol, ImportInterface, Symbol, SymbolError)
+    AutomaticInterface, ContainerSymbol, DataSymbol, ImportInterface,
+    RoutineSymbol, Symbol, SymbolError)
 
 
 class LFRicKokkosImportMixin:
@@ -373,8 +374,58 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._rooted_copy` took of the
         for callee in cls._local_callees(call):
             cls._resolve_from_container(callee, container)
             cls._resolve_shared_names(site, callee.symbol_table)
+            cls._alias_clashing_imports(site, callee)
             cls._resolve_shared_names(callee, site.symbol_table)
             cls._prefer_local_routines(callee, container)
+
+    @staticmethod
+    def _alias_clashing_imports(site, callee):
+        """Import under a new local name each of ``callee``'s clashing names.
+
+        LFRic's ``held_suarez_fv_code`` takes ``kappa`` as an argument and
+        calls ``held_suarez_equilibrium_theta``, which reads ``kappa``
+        through its module's ``use planet_config_mod``. The merge
+        ``InlineTrans`` makes has to rename one of the two and can rename
+        neither: an argument may be named by keyword in a call, and an
+        import is named by its module. Fortran has an answer for the
+        second, the rename in a ``use``: the callee's import is made
+        ``use planet_config_mod, only : kappa_1 => kappa``, which reads the
+        same variable under a name the call site does not hold.
+
+        Only a data import of the callee's own table is aliased, and only
+        where the call site holds the name as data other than an import of
+        that name from the same module; two imports of one name from one
+        module are the same variable, and the merge accepts them. A routine
+        on either side is :py:meth:`_prefer_local_routines`' to settle.
+
+        :param site: the routine the call is made from.
+        :type site: :py:class:`psyclone.psyir.nodes.Routine`
+        :param callee: the routine about to be inlined into it.
+        :type callee: :py:class:`psyclone.psyir.nodes.Routine`
+        """
+        table = callee.symbol_table
+        for symbol in list(table.symbols):
+            if (isinstance(symbol, (ContainerSymbol, RoutineSymbol))
+                    or not symbol.is_import):
+                continue
+            other = site.symbol_table.lookup(symbol.name, otherwise=None)
+            interface = symbol.interface
+            orig_name = interface.orig_name or symbol.name
+            if other is None or isinstance(other, RoutineSymbol) or (
+                    other.is_import
+                    and other.interface.container_symbol.name.lower()
+                    == interface.container_symbol.name.lower()
+                    and (other.interface.orig_name or other.name).lower()
+                    == orig_name.lower()):
+                continue
+            # SymbolTable.rename_symbol refuses an import, since the name is
+            # the module's; it is given a local interface for the rename and
+            # its import back, now naming the module's name as its origin.
+            symbol.interface = AutomaticInterface()
+            table.rename_symbol(symbol, site.symbol_table.next_available_name(
+                symbol.name, other_table=table))
+            symbol.interface = ImportInterface(interface.container_symbol,
+                                               orig_name=orig_name)
 
     @classmethod
     def _resolve_from_container(cls, routine, container):

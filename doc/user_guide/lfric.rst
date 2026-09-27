@@ -4400,7 +4400,12 @@ where that module cannot be read. A name a callee imports that the kernel's
 module already holds as a routine -- one an earlier inlining brought in, as
 the horizontal FFSL kernels' two helpers both bring in
 ``fourth_order_horizontal_edge`` -- has the callee's calls aimed at that
-routine and its import taken out, the two being one routine of one module. An imported name a later pass needs the
+routine and its import taken out, the two being one routine of one module.
+A name a callee imports that the call site holds as data of its own --
+``held_suarez_fv_code`` takes ``kappa`` as an argument, and the helper it
+calls reads ``planet_config_mod``'s ``kappa`` -- is imported under a new
+local name, ``use planet_config_mod, only : kappa_1 => kappa``, since the
+merge can rename neither an argument nor an import. An imported name a later pass needs the
 type of is read from its module too, so an array section bounded by a
 module's parameter is lowered by that parameter's value. Types agreeing is a scored judgement rather than
 an identity: a literal actual stating no kind, an actual whose type PSyclone cannot

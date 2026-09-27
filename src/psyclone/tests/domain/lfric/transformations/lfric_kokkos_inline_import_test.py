@@ -314,6 +314,53 @@ def test_a_clash_no_module_settles_is_still_refused(
             "['missing_face_mod']") in message
 
 
+# LFRic's held_suarez_fv_code: the kernel holds `kappa` as an argument and
+# its helper reads the `kappa` of planet_config_mod. Here the kernel holds `s`
+# as a local and its helper reads the `s` of face_index_mod.
+_SHADOWING_FACE_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use face_sweep_mod, only : sweep_column").replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    real(kind=r_def) :: s\n").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    s = 0.5_r_def\n"
+    "    call sweep_column(nlayers, partial, swept)\n"
+    "    swept(1) = swept(1) + s\n")
+
+
+def test_a_name_the_call_site_holds_otherwise_is_imported_renamed(
+        tmp_path, clear_module_manager_instance):
+    """A callee's import the call site holds as a local is aliased.
+
+    Neither `s` can be renamed by the merge: the kernel's could be named in
+    a call, were it an argument as LFRic's `kappa` is, and the helper's is
+    the module's name. The helper's is imported under a name of its own,
+    `s_1 => s`, which is the same variable, and the region reads the
+    module's value under that name.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    psy, loop, kernel = _face_invoke(
+        tmp_path, _SHADOWING_FACE_KERNEL, _NAMED_FACE_HELPER)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    imported = schedule.symbol_table.lookup("s_1")
+    assert imported.interface.orig_name == "s"
+    assert imported.interface.container_symbol.name == "face_index_mod"
+    assert "s_1" in cpp
+    assert "use face_index_mod, only : s_1=>s" in str(psy.gen).lower()
+
+
 def test_a_call_outside_a_routine_has_no_scopes_to_agree():
     """A call with no routine around it is left alone rather than read.
 
