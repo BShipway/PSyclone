@@ -1506,7 +1506,12 @@ dimension does that agree with the subscripts the Fortran body writes.
 than beside the other descriptions because it was moved out first, when
 `kokkos.py` was at the size limit this project sets; the rest followed it
 into `psyclone.psyir.backend.kokkos_region`, and both are re-exported from
-`kokkos` so that neither move is visible to an importer.
+`kokkos` so that neither move is visible to an importer. The checks
+`KokkosWriter` makes of a region before it generates anything -- `_validate`
+and the `_validate_*` methods this section names -- were the third move, to
+`KokkosValidationMixin` in `psyclone.psyir.backend.kokkos_validation_mixin`,
+which `KokkosWriter` inherits first so that its own `_validate` is the one
+found.
 
 The cell position
 ~~~~~~~~~~~~~~~~~

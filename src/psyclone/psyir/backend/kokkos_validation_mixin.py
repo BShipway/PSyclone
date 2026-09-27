@@ -1,0 +1,597 @@
+# -----------------------------------------------------------------------------
+# BSD 3-Clause License
+#
+# Copyright (c) 2026, Science and Technology Facilities Council.
+# All rights reserved.
+# -----------------------------------------------------------------------------
+"""The checks :py:class:`~psyclone.psyir.backend.kokkos.KokkosWriter` makes of
+a region description before it generates anything.
+
+Split from :py:mod:`~psyclone.psyir.backend.kokkos` when that module passed
+pylint's thousand-line limit. The checks are one subject -- whether a
+:py:class:`~psyclone.psyir.backend.kokkos_region.KokkosRegion` describes
+something the writer can generate -- and none of them writes any source, so
+they read as well on their own as beside the writer.
+"""
+
+from psyclone.psyir.backend.kokkos_array_expression import KokkosScratch
+from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.backend.kokkos_region import (
+    KokkosAlias, KokkosRegion, KokkosScalar, KokkosView, extent_names,
+    is_extent, is_identifier, is_offset)
+from psyclone.psyir.nodes import (
+    Assignment, CodeBlock, KernelSchedule, Literal, Loop)
+
+
+class KokkosValidationMixin:
+    """Reject a region description the writer could not generate.
+
+    Inherited by :py:class:`~psyclone.psyir.backend.kokkos.KokkosWriter`,
+    whose :py:meth:`__call__` asks :py:meth:`_validate` first. The methods
+    read the writer's own attributes, such as its supported C types, through
+    ``self``, so the mixin is not usable on its own.
+    """
+    # pylint: disable=too-few-public-methods
+
+    def _validate(self, region):
+        """Reject incomplete or unsupported region descriptions.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :raises TypeError: if ``region`` is not a
+            :py:class:`KokkosRegion`, if its schedule is not a
+            :py:class:`~psyclone.psyir.nodes.KernelSchedule`, if an argument
+            is neither a :py:class:`KokkosScalar` nor a
+            :py:class:`KokkosView`, if an argument's or a kind's C type is not
+            in :py:attr:`_SUPPORTED_TYPES`, if a View's index offsets are
+            not integers, if a :py:attr:`KokkosRegion.parallel_loops` entry is
+            not a :py:class:`~psyclone.psyir.nodes.Loop`, if a constant is
+            not a :py:class:`KokkosConstant` of a supported C type, if an
+            alias is not a :py:class:`KokkosAlias`, or if the
+            region's
+            :py:attr:`KokkosRegion.team_size` is neither ``None`` nor an
+            ``int`` -- ``bool`` among them, since ``TeamPolicy(ncells, True)``
+            is a legal team of one that nothing downstream would report.
+        :raises ValueError: if a dof region describes scratch or names a
+            loop to spread over a team, neither of which the dof launch has
+            anywhere to put; if a dof region names a colour map, a dof loop
+            having no shared write to colour away; if a coloured region also
+            names a first cell, whose two counts are of different things; if
+            the region's name, its cell count, its first
+            cell, an argument name, a kind name or a View's data name or
+            region indices are not C++ identifiers; if a View's or a
+            scratch array's extent is not an integer expression over named
+            sizes; if the schedule contains a
+            :py:class:`~psyclone.psyir.nodes.CodeBlock`; if two arguments
+            share a C ABI name; if the cell count or the first cell is not
+            itself a scalar argument; if the cell position breaks the contract
+            :py:meth:`_validate_cell_position` states; if a colour map
+            breaks the contract :py:meth:`_validate_colour_map` states; if a
+            kernel argument
+            has no description; if a View
+            breaks the ownership or dimensional contract
+            :py:meth:`_validate_view` states; if a scratch array breaks the
+            contract :py:meth:`_validate_scratch` states; if a parallel loop
+            is not in the region's schedule, is nested inside another of them,
+            or has a step other than the literal ``1``; if a constant has no
+            values or is not one dimensional; if an alias breaks the
+            contract :py:meth:`_validate_alias` states; or if the team size
+            is not positive.
+        """
+        # A validator is a list of checks, and reads better as one than as an
+        # arbitrary split into halves that share every name they compute.
+        # pylint: disable=too-many-branches, too-many-statements
+        # pylint: disable=too-many-locals
+        if not isinstance(region, KokkosRegion):
+            raise TypeError(
+                "KokkosWriter expects a KokkosRegion but found "
+                f"'{type(region).__name__}'.")
+        if not isinstance(region.schedule, KernelSchedule):
+            raise TypeError("KokkosRegion schedule must be a KernelSchedule.")
+        if not is_identifier(region.name):
+            raise ValueError(
+                f"Kokkos region name '{region.name}' is not a C++ identifier.")
+        if not is_identifier(region.cell_count):
+            raise ValueError(
+                f"Cell count '{region.cell_count}' is not a C++ identifier.")
+        if not is_identifier(region.cell_index):
+            raise ValueError(
+                f"Cell index '{region.cell_index}' is not a C++ identifier.")
+        if region.cell_start is not None and not is_identifier(
+                region.cell_start):
+            raise ValueError(
+                f"First cell '{region.cell_start}' is not a C++ identifier.")
+        if region.dof and (region.scratch or region.parallel_loops):
+            raise ValueError(
+                "A dof region has no team, so it can neither place scratch "
+                "nor spread a loop over one.")
+        if region.dof and region.colour_map is not None:
+            raise ValueError(
+                "A dof region writes one dof per iteration and no two "
+                "iterations write the same one, so it has no shared write "
+                "for a colour map to separate.")
+        if region.colour_map is not None and region.cell_start is not None:
+            raise ValueError(
+                "A coloured region's launch counts the cells of one colour "
+                "and a first cell counts the mesh's, so a coloured region "
+                "cannot begin past the first cell of its colour.")
+        if region.schedule.walk(CodeBlock):
+            raise ValueError("Kokkos regions cannot contain a CodeBlock.")
+
+        for kind, c_type in region.kind_types:
+            if not is_identifier(kind):
+                raise ValueError(
+                    f"Kokkos kind name '{kind}' is not a C++ identifier.")
+            if c_type not in self._SUPPORTED_TYPES:
+                raise TypeError(
+                    f"Kokkos kind '{kind}' has unsupported C type "
+                    f"'{c_type}'.")
+
+        abi_names = set()
+        view_names = set()
+        scalar_names = set()
+        for argument in region.arguments:
+            if not isinstance(argument, (KokkosScalar, KokkosView)):
+                raise TypeError(
+                    "KokkosRegion arguments must be KokkosScalar or "
+                    "KokkosView instances, found "
+                    f"'{type(argument).__name__}'.")
+            if argument.c_type not in self._SUPPORTED_TYPES:
+                raise TypeError(
+                    f"Kokkos argument '{argument.name}' has unsupported C "
+                    f"type '{argument.c_type}'.")
+            if not is_identifier(argument.name):
+                raise ValueError(
+                    f"Kokkos argument name '{argument.name}' is invalid.")
+            if isinstance(argument, KokkosScalar):
+                abi_name = argument.name
+                scalar_names.add(argument.name)
+            else:
+                abi_name = argument.data_name
+                view_names.add(argument.name)
+                self._validate_view(argument)
+            if abi_name in abi_names:
+                raise ValueError(f"Duplicate C ABI argument '{abi_name}'.")
+            abi_names.add(abi_name)
+
+        if region.cell_count not in scalar_names:
+            raise ValueError(
+                f"Cell count '{region.cell_count}' is not a scalar argument.")
+        if region.cell_start is not None and (
+                region.cell_start not in scalar_names):
+            raise ValueError(
+                f"First cell '{region.cell_start}' is not a scalar argument.")
+        if region.colour_map is not None:
+            self._validate_colour_map(region, view_names, scalar_names)
+
+        schedule_arguments = {
+            symbol.name
+            for symbol in region.schedule.symbol_table.argument_list
+        }
+        provided = scalar_names | view_names
+        if region.cell_position is not None:
+            self._validate_cell_position(
+                region, schedule_arguments, provided)
+            # Described by declaration rather than by argument, so it counts
+            # as provided for the completeness check below.
+            provided = provided | {region.cell_position}
+        missing = schedule_arguments - provided
+        if missing:
+            raise ValueError(
+                "Kokkos region does not describe kernel arguments: "
+                f"{', '.join(sorted(missing))}.")
+
+        # Scratch is deliberately not folded into the loop above: it is not a
+        # kernel formal, so it takes no part in the C ABI or in the check
+        # that every formal was described.
+        used_names = abi_names | view_names
+        for item in region.scratch:
+            self._validate_scratch(item, scalar_names, used_names)
+            used_names.add(item.name)
+        # A carried constant is one dimensional, because that is what a
+        # Fortran parameter array the region can index in C storage order is.
+        for item in region.constants:
+            if (not isinstance(item, KokkosConstant)
+                    or item.c_type not in self._SUPPORTED_TYPES):
+                raise TypeError(
+                    "KokkosRegion constants must be KokkosConstant instances "
+                    f"of a supported C type, found '{item}'.")
+            if not item.values or len(item.index_offsets) != 1:
+                raise ValueError(
+                    f"Kokkos constant '{item.name}' must have at least one "
+                    "value and exactly one index offset.")
+
+        # Last, because an alias names arrays the checks above described.
+        described_arrays = {
+            item.name: item
+            for item in (*region.arguments, *region.scratch)
+            if not isinstance(item, KokkosScalar)}
+        # The names the body assigns *through* rather than aims: a pointer
+        # assignment is where the alias is aimed and is not a write to what
+        # it names. Read once and passed down, since a walk of the schedule
+        # per alias would say the same thing every time.
+        written = {
+            assignment.lhs.symbol.name
+            for assignment in region.schedule.walk(Assignment)
+            if not assignment.is_pointer} if region.aliases else set()
+        for alias in region.aliases:
+            self._validate_alias(alias, described_arrays, used_names, written)
+            used_names.add(alias.name)
+
+        self._validate_launch(region)
+
+    @staticmethod
+    def _validate_alias(alias, arrays, used_names, written):
+        """Reject an alias the region could not correctly declare.
+
+        Each of these compiles, or fails to, a long way from the description
+        that caused it, and two of them do not fail at all. An alias sharing
+        a name with an argument or a scratch array declares a handle that
+        shadows it, so the body's every later use of that name reads the
+        alias; and an alias whose targets are of different rank or element
+        type generates a handle copy the compiler rejects with a template
+        error naming neither the pointer nor the region.
+
+        The targets' extents are deliberately not compared. Assigning one
+        View handle to another carries the target's extents with it, which is
+        exactly the Fortran's meaning: after ``p => x``, ``size(p)`` is
+        ``size(x)``.
+
+        A pointer aimed at a read-only array and *written through* is the
+        one refusal here that is not about the declaration. The handle is
+        declared ``const`` because one of its targets is
+        (:py:meth:`_alias_declaration` says why), so the write does not
+        compile; but the Fortran behind it was writing through an array the
+        callee may only read, which is a program error rather than a shape
+        this could capture differently. It is refused by name so that the
+        error read is that one rather than a template failure inside a
+        ``View``'s ``operator()``.
+
+        :param alias: the alias to check.
+        :type alias: :py:class:`psyclone.psyir.backend.kokkos.KokkosAlias`
+        :param arrays: the region's arrays -- its View arguments and its
+            scratch -- keyed by name.
+        :type arrays: Dict[str, Union[
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosView`,
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`]]
+        :param used_names: the names the region has already given something.
+        :type used_names: Set[str]
+        :param written: the names the body assigns through, as opposed to
+            the ones it aims with a pointer assignment.
+        :type written: Set[str]
+
+        :raises TypeError: if ``alias`` is not a
+            :py:class:`KokkosAlias`.
+        :raises ValueError: if the alias's name is not a C++ identifier or is
+            one the region has already used; if it names no target; if a
+            target is not an array the region describes; if its targets do
+            not agree on element type and rank; or if the body writes through
+            it and any of its targets is read-only.
+        """
+        if not isinstance(alias, KokkosAlias):
+            raise TypeError(
+                "KokkosRegion aliases must be KokkosAlias instances, found "
+                f"'{type(alias).__name__}'.")
+        if not is_identifier(alias.name):
+            raise ValueError(
+                f"Kokkos alias name '{alias.name}' is not a C++ identifier.")
+        if alias.name in used_names:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' has the name of an argument or "
+                "a scratch array it would shadow.")
+        if not alias.targets:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' names no array to alias.")
+        missing = [name for name in alias.targets if name not in arrays]
+        if missing:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' aliases "
+                f"{', '.join(sorted(set(missing)))}, which the region does "
+                "not describe as an array.")
+        shapes = {(arrays[name].c_type, len(arrays[name].extents))
+                  for name in alias.targets}
+        if len(shapes) > 1:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' aliases arrays of more than "
+                "one element type or rank, which no one handle can hold.")
+        # An argument and a scratch array together are deliberately NOT
+        # refused. Their Views are of different memory spaces, but the handle
+        # is declared in ``Kokkos::AnonymousSpace``, which is assignable from
+        # both; element type, rank and layout are all that then have to
+        # agree, and the check above is where they do.
+        read_only = sorted(
+            name for name in set(alias.targets)
+            if getattr(arrays[name], "read_only", False))
+        if alias.name in written and read_only:
+            raise ValueError(
+                f"Kokkos alias '{alias.name}' is written through, but it "
+                f"aliases {', '.join(read_only)}, which the region may only "
+                "read: the Fortran writes through a pointer aimed at an "
+                "array it was given to read.")
+
+    def _validate_cell_position(self, region, formals, described):
+        """Reject a cell position the region could not correctly declare.
+
+        Checked rather than trusted for the reason
+        :py:meth:`_validate_launch` gives: none of the four mistakes stops a
+        build. A name that is not a formal declares a local nothing reads; a
+        name the region also passes puts a parameter and a local of the same
+        name in one scope, which C++ resolves in favour of the local; and a
+        name equal to the launch index generates ``const int cell = cell + 1``,
+        which initialises an object from itself.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+        :param formals: the names of the schedule's kernel arguments.
+        :type formals: Set[str]
+        :param described: the names ``region.arguments`` already covers.
+        :type described: Set[str]
+
+        :raises ValueError: if the cell position is not a C++ identifier, is
+            not one of the schedule's kernel arguments, is also described as a
+            region argument, or is the launch's own cell index.
+        """
+        position = region.cell_position
+        if not is_identifier(position):
+            raise ValueError(
+                f"Cell position '{position}' is not a C++ identifier.")
+        if position == region.cell_index:
+            raise ValueError(
+                f"Cell position '{position}' is also the launch's cell "
+                "index.")
+        if position not in formals:
+            raise ValueError(
+                f"Cell position '{position}' is not a kernel argument.")
+        if position in described:
+            raise ValueError(
+                f"Cell position '{position}' is also described as a region "
+                "argument.")
+
+    @staticmethod
+    def _validate_launch(region):
+        """Validate the loops and the team size the hierarchical launch takes.
+
+        These are checked rather than trusted because none of the four
+        mistakes below announces itself downstream: a loop from another
+        schedule is never matched by identity and silently generates a serial
+        ``for``, and the other three generate C++ that compiles and means
+        something the Fortran did not.
+
+        :param region: the region description to check.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+
+        :raises TypeError: if a ``parallel_loops`` entry is not a
+            :py:class:`~psyclone.psyir.nodes.Loop`, or if ``team_size`` is
+            neither ``None`` nor an ``int``.
+        :raises ValueError: if a parallel loop is not in the region's
+            schedule, is nested inside another of them, or has a step other
+            than the literal ``1``; or if the team size is not positive.
+        """
+        for entry in region.parallel_loops:
+            if not isinstance(entry, Loop):
+                raise TypeError(
+                    "KokkosRegion parallel_loops must be Loop instances, "
+                    f"found '{type(entry).__name__}'.")
+            if not any(entry is loop
+                       for loop in region.schedule.walk(Loop)):
+                raise ValueError(
+                    f"Kokkos parallel loop over '{entry.variable.name}' is "
+                    "not in the region's schedule.")
+            ancestor = entry.ancestor(Loop)
+            while ancestor is not None:
+                if any(ancestor is other
+                       for other in region.parallel_loops):
+                    raise ValueError(
+                        f"Kokkos parallel loop over '{entry.variable.name}' "
+                        "is nested inside another parallel loop.")
+                ancestor = ancestor.ancestor(Loop)
+            step = entry.step_expr
+            if not isinstance(step, Literal) or step.value != "1":
+                raise ValueError(
+                    f"Kokkos parallel loop over '{entry.variable.name}' has "
+                    "a step that is not the literal 1; TeamVectorRange has "
+                    "no stride.")
+
+        if region.team_size is None:
+            return
+        if isinstance(region.team_size, bool) or not isinstance(
+                region.team_size, int):
+            raise TypeError(
+                "KokkosRegion team_size must be None or an int, found "
+                f"'{type(region.team_size).__name__}'.")
+        if region.team_size <= 0:
+            raise ValueError(
+                f"KokkosRegion team_size must be positive, found "
+                f"{region.team_size}.")
+
+    def _validate_scratch(self, scratch, scalar_names, used_names):
+        """Validate one kernel-local array placed in team scratch.
+
+        :param scratch: the scratch description to check.
+        :type scratch:
+            :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`
+        :param scalar_names: the names of the region's scalar arguments, which
+            are the only extents the generated C++ can name.
+        :type scalar_names: Set[str]
+        :param used_names: every name already taken by an argument, a View or
+            an earlier scratch array.
+        :type used_names: Set[str]
+
+        :raises ValueError: if the scratch is not a
+            :py:class:`KokkosScratch`; if its name is not a C++ identifier or
+            is already taken; if it has no extents, an extent that is not an
+            integer expression over named sizes, or an extent naming something
+            that is not a scalar argument of the region; or if its rank does
+            not match the index offsets supplied for it.
+        :raises TypeError: if its C type is not in
+            :py:attr:`_SUPPORTED_TYPES`, or an index offset is neither an
+            integer nor an integer expression over named sizes.
+        """
+        if not isinstance(scratch, KokkosScratch):
+            raise ValueError(
+                "KokkosRegion scratch must be KokkosScratch instances, found "
+                f"'{type(scratch).__name__}'.")
+        if not is_identifier(scratch.name):
+            raise ValueError(
+                f"Kokkos scratch name '{scratch.name}' is invalid.")
+        if scratch.name in used_names:
+            raise ValueError(
+                f"Kokkos scratch '{scratch.name}' collides with an existing "
+                "region name.")
+        if scratch.c_type not in self._SUPPORTED_TYPES:
+            raise TypeError(
+                f"Kokkos scratch '{scratch.name}' has unsupported C type "
+                f"'{scratch.c_type}'.")
+        if not scratch.extents:
+            raise ValueError(
+                f"Kokkos scratch '{scratch.name}' must have extents.")
+        for extent in scratch.extents:
+            if not is_extent(extent):
+                raise ValueError(
+                    f"Kokkos scratch '{scratch.name}' has extent '{extent}' "
+                    "which is not an integer expression over named sizes.")
+            # Sorted for the same reason the transformation sorts: the
+            # refusal names one offender, and a set has no fixed order.
+            for name in sorted(extent_names(extent)):
+                if name not in scalar_names:
+                    raise ValueError(
+                        f"Kokkos scratch '{scratch.name}' has extent "
+                        f"'{extent}', which is sized from '{name}' rather "
+                        "than from a scalar argument.")
+        if len(scratch.extents) != len(scratch.index_offsets):
+            raise ValueError(
+                f"Kokkos scratch '{scratch.name}' dimensions do not match its "
+                "kernel indices.")
+        if not all(is_offset(offset) for offset in scratch.index_offsets):
+            raise TypeError(
+                f"Kokkos scratch '{scratch.name}' index offsets must be "
+                "integers or integer expressions over named sizes.")
+
+    def _validate_colour_map(self, region, view_names, scalar_names):
+        """Validate the names a coloured launch generates and reads.
+
+        Checked rather than trusted for the reason
+        :py:meth:`_validate_cell_position` gives, and with one addition that
+        is worse than any of those: a colour map that is not passed, or is
+        passed as something other than a View, generates a lookup of a name
+        the translation unit does not hold, and the region would run every
+        cell of every colour at once if the lookup were quietly dropped.
+
+        :param region: the region whose colour map is to be checked.
+        :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+        :param view_names: the names ``region.arguments`` passes as Views.
+        :type view_names: Set[str]
+        :param scalar_names: the names ``region.arguments`` passes as
+            scalars.
+        :type scalar_names: Set[str]
+
+        :raises ValueError: if any of the four names is not a C++
+            identifier; if the map is not passed as a View, or the colour or
+            the mesh cell count is not passed as a scalar; if the launch's
+            own index is the cell index, which would declare the cell from
+            itself; if that index is also a region argument, which the
+            declaration would shadow; or if a View the body slices by the
+            mesh cell is not sliced to the mesh's count.
+        """
+        colours = region.colour_map
+        for description, name in (("map", colours.name),
+                                  ("colour", colours.colour),
+                                  ("index", colours.index),
+                                  ("mesh cell count",
+                                   colours.mesh_cell_count)):
+            if not is_identifier(name):
+                raise ValueError(
+                    f"Kokkos colour {description} '{name}' is not a C++ "
+                    "identifier.")
+        if colours.name not in view_names:
+            raise ValueError(
+                f"Kokkos colour map '{colours.name}' is not a View argument.")
+        if colours.colour not in scalar_names:
+            raise ValueError(
+                f"Kokkos colour '{colours.colour}' is not a scalar argument.")
+        if colours.index == region.cell_index:
+            raise ValueError(
+                f"Kokkos colour index '{colours.index}' is also the region's "
+                "cell index, so the cell would be declared from itself.")
+        if colours.index in view_names | scalar_names:
+            raise ValueError(
+                f"Kokkos colour index '{colours.index}' is also a region "
+                "argument.")
+        if colours.mesh_cell_count not in scalar_names:
+            raise ValueError(
+                f"Kokkos mesh cell count '{colours.mesh_cell_count}' is not "
+                "a scalar argument.")
+        # The launch's bound counts one colour's cells and the map turns the
+        # launch's index into a mesh cell, so a View the body slices by that
+        # cell has to be described to the mesh's length. Checked here rather
+        # than left to the caller because the two counts are both ints and
+        # both plausible, and the wrong one reads past the end of a staged
+        # copy -- which a host run, aliasing the caller's longer storage,
+        # does not notice.
+        for argument in region.arguments:
+            if (isinstance(argument, KokkosView)
+                    and argument.extra_indices == (region.cell_index,)
+                    and argument.extents[-1] != colours.mesh_cell_count):
+                raise ValueError(
+                    f"Kokkos View '{argument.name}' is sliced by the mesh "
+                    f"cell '{region.cell_index}' but its last extent is "
+                    f"'{argument.extents[-1]}' rather than the mesh cell "
+                    f"count '{colours.mesh_cell_count}'.")
+
+    def _validate_view(self, view):
+        """Validate the ownership and dimensional contract for one View.
+
+        :param view: the View description to check.
+        :type view: :py:class:`psyclone.psyir.backend.kokkos.KokkosView`
+
+        :raises ValueError: if the View is managed, so would own LFRic
+            storage; if its data name or region indices are not C++
+            identifiers; if an extent is not an integer expression over named
+            sizes; if its rank does not match the kernel and region indices
+            supplied for it; if it is writable while asking for
+            ``RandomAccess``; if it is read only while asking for atomic
+            updates, which would be a description of an update that cannot
+            happen; or if it asks for an atomic store without being atomic at
+            all, which would say that cells replace an element no two of them
+            reach.
+        :raises TypeError: if an index offset is neither an integer nor an
+            integer expression over named sizes.
+        """
+        if view.managed:
+            raise ValueError(f"Kokkos View '{view.name}' must be unmanaged.")
+        if not is_identifier(view.data_name):
+            raise ValueError(
+                f"Kokkos View data name '{view.data_name}' is invalid.")
+        if not view.extents or not all(
+                is_extent(extent) for extent in view.extents):
+            raise ValueError(
+                f"Kokkos View '{view.name}' must have extents that are "
+                "integer expressions over named sizes.")
+        if len(view.extents) != (
+                len(view.index_offsets) + len(view.extra_indices)):
+            raise ValueError(
+                f"Kokkos View '{view.name}' dimensions do not match its "
+                "kernel and region indices.")
+        if not all(is_offset(offset) for offset in view.index_offsets):
+            raise TypeError(
+                f"Kokkos View '{view.name}' index offsets must be integers or "
+                "integer expressions over named sizes.")
+        if not all(is_identifier(index)
+                   for index in view.extra_indices):
+            raise ValueError(
+                f"Kokkos View '{view.name}' has an invalid region index.")
+        if view.random_access and not view.read_only:
+            raise ValueError(
+                f"Kokkos View '{view.name}' uses RandomAccess but is "
+                "writable.")
+        if view.atomic and view.read_only:
+            raise ValueError(
+                f"Kokkos View '{view.name}' is atomic but read only.")
+        if view.atomic_store and not view.atomic:
+            raise ValueError(
+                f"Kokkos View '{view.name}' stores atomically but is not "
+                "atomic.")
+
+
+__all__ = ["KokkosValidationMixin"]
