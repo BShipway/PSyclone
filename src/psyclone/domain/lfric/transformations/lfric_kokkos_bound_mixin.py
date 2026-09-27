@@ -534,7 +534,11 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline`, relaxed
         and handed the one-element section of any element actual it reads as
         an array of one, by
         :py:meth:`~psyclone.domain.lfric.transformations.\
-lfric_kokkos_element_mixin.LFRicKokkosElementMixin._section_element_actuals`.
+lfric_kokkos_element_mixin.LFRicKokkosElementMixin._section_element_actuals`,
+        and a local to hold any array expression it is passed, by
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_temporary_mixin.LFRicKokkosTemporaryMixin.\
+_hoist_array_expressions`.
 
         A call refused for a declaration depending on a written argument is
         not final while another is pending: the refusal is kept, the next
@@ -658,6 +662,7 @@ lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin._module_inline` has brought
             cls._relax_protected_actuals(call)
             cls._bound_locals(call, table)
             cls._section_element_actuals(call)
+            cls._hoist_array_expressions(call)
         except TransformationError:
             raise
         # A preparation step that fails in any other way is a refusal too, in

@@ -1,0 +1,175 @@
+# -----------------------------------------------------------------------------
+# BSD 3-Clause License
+#
+# Copyright (c) 2026, Science and Technology Facilities Council.
+# All rights reserved.
+# -----------------------------------------------------------------------------
+"""Tests for an array expression passed to a callee the capture inlines."""
+
+# pylint: disable=protected-access
+
+import pytest
+
+from lfric_kokkos_sources import _LOCAL_ALGORITHM, _LOCAL_KERNEL, _invoke
+
+from psyclone.domain.lfric.transformations import LFRicKokkosTrans
+from psyclone.psyir.frontend.fortran import FortranReader
+from psyclone.psyir.nodes import Assignment, Call, IntrinsicCall, Routine
+
+
+# LFRic's `jacobian_abr2XYZ` in miniature: an array-valued function whose
+# dummy is read element by element, which is what an expression actual cannot
+# be substituted into.
+_SHIFT_MODULE = """
+module shift_mod
+  use constants_mod, only : i_def, r_def
+  implicit none
+  private
+  public :: shifted
+contains
+  function shifted(levels, radius) result(column)
+    integer(kind=i_def), intent(in) :: levels
+    real(kind=r_def), dimension(levels), intent(in) :: radius
+    real(kind=r_def), dimension(levels) :: column
+    integer(kind=i_def) :: j
+    do j = 1, levels
+      column(j) = 2.0_r_def * radius(j)
+    end do
+  end function shifted
+end module shift_mod
+"""
+
+# The same call in the positions the preparation has to tell apart.
+_PLACES = """
+module places_mod
+  use unknown_mod, only : opaque, opaque_t
+  implicit none
+contains
+  subroutine places(n, a, r, out, s)
+    integer, intent(in) :: n
+    real, intent(in) :: a, r(n)
+    real, intent(inout) :: out(n)
+    type(opaque_t), intent(in) :: s(n)
+    out = shifted(n, r)
+    out = shifted(n, a + 1.0)
+    out = shifted(n, opaque + 1.0)
+    do while (any(shifted(n, r + 1.0) > 0.0))
+      out = 0.0
+    end do
+    out = shifted(n, r + 1.0) + shifted(n, 2.0 * r)
+    out = shifted(n, cshift(s, 1))
+  end subroutine places
+  function shifted(levels, radius) result(column)
+    integer, intent(in) :: levels
+    real, intent(in) :: radius(levels)
+    real :: column(levels)
+    column = radius
+  end function shifted
+end module places_mod
+"""
+
+
+def _places():
+    """Parse :py:data:`_PLACES` and return its calls to ``shifted``.
+
+    :returns: the routine and its calls to ``shifted``, in source order.
+    :rtype: Tuple[:py:class:`psyclone.psyir.nodes.Routine`,
+        List[:py:class:`psyclone.psyir.nodes.Call`]]
+    """
+    psyir = FortranReader().psyir_from_source(_PLACES)
+    routine = next(routine for routine in psyir.walk(Routine)
+                   if routine.name == "places")
+    calls = [call for call in routine.walk(Call)
+             if not isinstance(call, IntrinsicCall)]
+    return routine, calls
+
+
+def test_an_array_expression_actual_is_captured(
+        tmp_path, clear_module_manager_instance):
+    """LFRic's `chi_3_df+radius` actual reaches the region through a local.
+
+    The kernel passes `partial + 1.0_r_def` where the helper reads
+    `radius(j)`. The expression is assigned to `shifted_actual` before the
+    statement, the helper is inlined against that, and no call is left:
+    the local is a column array like the kernel's own, and is placed in
+    scratch beside them.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    kernel_source = _LOCAL_KERNEL.replace(
+        "  use kernel_mod, only : kernel_type",
+        "  use kernel_mod, only : kernel_type\n"
+        "  use shift_mod, only : shifted").replace(
+        "    swept(nlayers) = partial(nlayers)\n"
+        "    do k = nlayers - 1, 1, -1\n"
+        "      swept(k) = swept(k + 1) - partial(k)\n"
+        "    end do\n",
+        "    swept = shifted(nlayers, partial + 1.0_r_def)\n")
+    _, loop, kernel = _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, kernel_source,
+        extra={"shift_mod": _SHIFT_MODULE})
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert ("shifted_actual((idx - 1)) = (partial((idx - 1)) + 1.0);"
+            in cpp)
+    assert "(2.0 * shifted_actual((j - 1)))" in cpp
+
+
+def test_only_an_array_expression_is_hoisted():
+    """A variable, a scalar and an expression of unknown type are left.
+
+    The first three calls pass `r`, `a + 1.0` and `opaque + 1.0`: a
+    variable the inliner substitutes as it is, a scalar it substitutes as
+    a value, and an expression whose type the PSyIR does not know. The last
+    passes an array of a derived type the PSyIR knows only by name. Neither
+    of those two has a declaration to give a local. None is rewritten.
+    """
+    routine, calls = _places()
+    before = routine.debug_string()
+
+    for call in calls[:3] + calls[6:]:
+        LFRicKokkosTrans._hoist_array_expressions(call)
+
+    assert routine.debug_string() == before
+
+
+def test_a_while_condition_is_left_alone():
+    """An expression in a `do while` condition is not moved before the loop.
+
+    An assignment before the loop would be evaluated once, where Fortran
+    evaluates the condition on every trip.
+    """
+    routine, calls = _places()
+    before = routine.debug_string()
+
+    LFRicKokkosTrans._hoist_array_expressions(calls[3])
+
+    assert routine.debug_string() == before
+
+
+@pytest.mark.parametrize("index, expression", [(4, "r + 1.0"),
+                                               (5, "2.0 * r")])
+def test_each_expression_gets_its_own_local(index, expression):
+    """Two calls in one statement each get a local, before the statement.
+
+    `new_symbol` numbers the second, and each assignment stands immediately
+    before the statement the call was in, in the order they were made.
+    """
+    routine, calls = _places()
+    statement = calls[4].ancestor(Assignment)
+
+    LFRicKokkosTrans._hoist_array_expressions(calls[4])
+    LFRicKokkosTrans._hoist_array_expressions(calls[5])
+
+    name = {4: "shifted_actual", 5: "shifted_actual_1"}[index]
+    hoisted = statement.parent.children[statement.position - 6 + index]
+    assert hoisted.lhs.name == name
+    assert hoisted.rhs.debug_string() == expression
+    assert f"shifted(n, {name})" in statement.debug_string()
+    local = routine.symbol_table.lookup(name)
+    assert local.datatype.shape[0].upper.debug_string() == "n"

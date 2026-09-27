@@ -4343,7 +4343,16 @@ to the generated region. Anything the call does not fix to one element -- an
 extent still a variable, a dummy of more than one element, an element of an
 array of rank two or more -- is left as the kernel wrote it and refused in
 ``InlineTrans``'s own words with the call named, a narrowing of what the
-callee reads being worse than a refusal. A formal declared ``TARGET`` is
+callee reads being worse than a refusal. A call passing **an array
+expression** -- LFRic's native Jacobian passes ``chi_3_df+radius`` to
+``jacobian_abr2XYZ``, which reads ``radius(:)`` -- has the temporary Fortran
+would have made written out: the expression is assigned to a new local
+array of its own shape, ``jacobian_abr2xyz_actual``, immediately before the
+statement, and the call is passed that. The local is a column array like
+the kernel's own and is placed beside them. An expression whose shape or
+element type PSyIR cannot state, and one in the condition of a ``do
+while``, where an assignment before the loop would be evaluated once, are
+left as written and refused by ``InlineTrans``. A formal declared ``TARGET`` is
 none of those: the attribute
 constrains what a pointer elsewhere may be aimed at, which substituting a
 body neither creates nor breaks, so such a formal is given the type the
