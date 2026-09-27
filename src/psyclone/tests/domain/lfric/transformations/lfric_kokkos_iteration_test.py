@@ -441,9 +441,9 @@ def _dof_kernel_with(extent):
         "    out_dof = partial(2)\n")
 
 
-# pylint: disable-next=unused-argument
+@pytest.mark.usefixtures("clear_module_manager_instance")
 def test_lfric_kokkos_trans_holds_a_small_array_of_a_dof_kernel_per_dof(
-        tmp_path, clear_module_manager_instance):
+        tmp_path):
     """Each iteration of a dof launch holds its own copy of a small array.
 
     The dof launch has no team scratch, but an array of a small fixed shape
