@@ -435,6 +435,8 @@ class KernelModuleInlineTrans(Transformation):
                     :py:class:`psyclone.psyir.nodes.Call`
         :param options: a dictionary with options for transformations.
         :type options: Optional[Dict[str, Any]]
+        :param kwargs: additional keyword arguments, passed on to
+            :py:meth:`validate`.
 
         '''
         if isinstance(node, CodedKern) and node.module_inline:
