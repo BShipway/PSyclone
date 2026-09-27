@@ -4355,7 +4355,11 @@ expression** -- LFRic's native Jacobian passes ``chi_3_df+radius`` to
 would have made written out: the expression is assigned to a new local
 array of its own shape, ``jacobian_abr2xyz_actual``, immediately before the
 statement, and the call is passed that. The local is a column array like
-the kernel's own and is placed beside them. An expression whose shape or
+the kernel's own and is placed beside them. The same is done where the
+call is between two routines of the callee's module, as that one is: the
+sibling is inlined into ``native_jacobian`` in the module's own tree before
+``native_jacobian`` travels, and the local travels with it. An expression
+whose shape or
 element type PSyIR cannot state, and one in the condition of a ``do
 while``, where an assignment before the loop would be evaluated once, are
 left as written and refused by ``InlineTrans``. A formal declared ``TARGET`` is

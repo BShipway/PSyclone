@@ -39,6 +39,20 @@ contains
 end module shift_mod
 """
 
+# LFRic's `native_jacobian` in miniature: a public routine passing an
+# expression to a private sibling, which the capture inlines into it in the
+# module's own tree before the routine is brought into the kernel's.
+_NATIVE_MODULE = _SHIFT_MODULE.replace("shift_mod", "native_mod").replace(
+    "  public :: shifted\n", "  public :: native\n").replace(
+    "contains\n", """contains
+  subroutine native(levels, radius, column)
+    integer(kind=i_def), intent(in) :: levels
+    real(kind=r_def), dimension(levels), intent(in) :: radius
+    real(kind=r_def), dimension(levels), intent(inout) :: column
+    column = shifted(levels, radius + 1.0_r_def)
+  end subroutine native
+""")
+
 # The same call in the positions the preparation has to tell apart.
 _PLACES = """
 module places_mod
@@ -117,6 +131,41 @@ def test_an_array_expression_actual_is_captured(
                 if not isinstance(call, IntrinsicCall)]
     assert ("shifted_actual((idx - 1)) = (partial((idx - 1)) + 1.0);"
             in cpp)
+    assert "(2.0 * shifted_actual((j - 1)))" in cpp
+
+
+def test_an_array_expression_a_sibling_is_passed_is_captured(
+        tmp_path, clear_module_manager_instance):
+    """An expression passed between two routines of one module is hoisted.
+
+    `native` passes `radius + 1.0_r_def` to its private sibling `shifted`,
+    as `native_jacobian` passes `chi_3_df+radius` to `jacobian_abr2XYZ`.
+    The sibling is inlined into `native` in the module's tree, which is
+    not the kernel's body, so the expression is given its local there; the
+    local then travels with `native` into the region.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    kernel_source = _LOCAL_KERNEL.replace(
+        "  use kernel_mod, only : kernel_type",
+        "  use kernel_mod, only : kernel_type\n"
+        "  use native_mod, only : native").replace(
+        "    swept(nlayers) = partial(nlayers)\n"
+        "    do k = nlayers - 1, 1, -1\n"
+        "      swept(k) = swept(k + 1) - partial(k)\n"
+        "    end do\n",
+        "    call native(nlayers, partial, swept)\n")
+    _, loop, kernel = _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, kernel_source,
+        extra={"native_mod": _NATIVE_MODULE})
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    assert "shifted_actual" in cpp
     assert "(2.0 * shifted_actual((j - 1)))" in cpp
 
 

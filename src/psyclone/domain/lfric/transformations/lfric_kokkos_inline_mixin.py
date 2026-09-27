@@ -359,14 +359,35 @@ lfric_kokkos_import_mixin.LFRicKokkosImportMixin._carry_module_names`, which
                     container, container.walk(Call)[position])
                 trial = container.copy()
                 try:
-                    cls._name_the_sibling(trial, position, sibling)
-                    cls._localise_imports(cls._sibling(trial, sibling))
-                    InlineTrans().apply(trial.walk(Call)[position])
-                    cls._name_the_sibling(container, position, sibling)
-                    cls._localise_imports(cls._sibling(container, sibling))
-                    InlineTrans().apply(container.walk(Call)[position])
+                    for tree in (trial, container):
+                        cls._absorb_one(tree, position, sibling)
                 except Exception:                # pylint: disable=W0703
                     break
+
+    @classmethod
+    def _absorb_one(cls, container, position, sibling):
+        """Inline the call at ``position`` in ``container``, a sibling's.
+
+        The call is prepared as a kernel's own call is before ``InlineTrans``
+        sees it: made to name the routine it runs, the routine's imports
+        localised, and each array expression it passes given a local.
+        LFRic's ``native_jacobian`` passes ``chi_3_df+radius`` to its
+        sibling ``jacobian_abr2XYZ``, and that expression stops
+        ``InlineTrans`` here just as it would in a kernel's body. The call
+        is held rather than looked up again after the expression moves,
+        since what moves may contain calls of its own.
+
+        :param container: the Container being rewritten, or its copy.
+        :type container: :py:class:`psyclone.psyir.nodes.Container`
+        :param int position: where in the Container's calls the call is.
+        :param str sibling: the routine the call runs, lowercased.
+        """
+        cls._name_the_sibling(container, position, sibling)
+        cls._localise_imports(cls._sibling(container, sibling))
+        call = container.walk(Call)[position]
+        # pylint: disable-next=no-member
+        cls._hoist_array_expressions(call)
+        InlineTrans().apply(call)
 
     @classmethod
     def _own_module_call(cls, container, name):
