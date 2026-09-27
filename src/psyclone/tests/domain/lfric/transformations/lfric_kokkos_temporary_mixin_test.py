@@ -384,6 +384,31 @@ def test_an_operand_is_hoisted_only_where_it_has_to_be():
     assert "TRANSPOSE(m)" in statements[6].debug_string()
 
 
+def test_an_operand_nesting_an_intrinsic_is_hoisted_after_it():
+    """An intrinsic inside a hoisted operand is prepared before the move.
+
+    LFRic's `compute_total_pv` takes the `dot_product` of a sum holding a
+    `matmul` and of a `matmul` of `2.0 * r`. Both operands are prepared, the
+    inner one first, so the sum's local reads it already in place.
+    """
+    psyir = FortranReader().psyir_from_source(
+        "subroutine nested(m, r, v, s)\n"
+        "  real, intent(in) :: m(3,3), r(3), v(3)\n"
+        "  real, intent(out) :: s\n"
+        "  s = dot_product(matmul(transpose(m), r) + v, "
+        "matmul(transpose(m), 2.0 * r))\n"
+        "end subroutine nested\n")
+    routine = psyir.walk(Routine)[0]
+
+    LFRicKokkosTrans._hoist_intrinsic_operands(routine)
+
+    assert [statement.debug_string() for statement in routine.children] == [
+        "matmul_operand = 2.0 * r\n",
+        "dot_product_operand = MATMUL(TRANSPOSE(m), r) + v\n",
+        "s = DOT_PRODUCT(dot_product_operand, "
+        "MATMUL(TRANSPOSE(m), matmul_operand))\n"]
+
+
 def test_a_scalar_conversion_keeps_its_type():
     """An elemental call on scalars is typed as the PSyIR types it."""
     _, statements = _hoists()

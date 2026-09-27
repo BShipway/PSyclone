@@ -246,11 +246,16 @@ KokkosArrayIntrinsics` writes ``MATMUL``, ``DOT_PRODUCT``, the folds and
         condition of a ``DO WHILE``, for the reason
         :py:meth:`_hoist_array_expressions` gives.
 
+        The calls are visited innermost first. A hoisted operand is moved,
+        so an intrinsic nested in it, as LFRic's ``compute_total_pv`` nests
+        ``matmul`` in a sum ``dot_product`` reads, has to have been prepared
+        already: visited afterwards it would no longer be in the schedule.
+
         :param schedule: the kernel schedule to prepare.
         :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
         """
         table = schedule.symbol_table
-        for call in schedule.walk(IntrinsicCall):
+        for call in reversed(schedule.walk(IntrinsicCall)):
             if not KokkosArrayIntrinsics.handles(call):
                 continue
             statement = call
