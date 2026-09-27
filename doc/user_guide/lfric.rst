@@ -4303,7 +4303,12 @@ it. Data of the callee's own module travels where Fortran would let it: a
 and a name the module makes public is imported from it, so the Held--Suarez
 helpers' ``KF`` and ``KA`` reach the region as values and
 ``coord_transform_mod``'s public ``PANEL_ROT_MATRIX`` as an import the PSy
-layer makes too. A private *variable* does not: ``chi2xyz``, reading a
+layer makes too. That holds when the callee is reached through a generic
+interface, as ``nodal_xyz_coordinates_code`` reaches
+``alphabetar2xyz_r_double`` through ``alphabetar2xyz``: the call is made to
+the interface brought into the kernel's Container, whose specifics carry
+the data, rather than to the one it was imported as. A private *variable*
+does not: ``chi2xyz``, reading a
 rotation matrix ``sci_chi_transform_mod`` keeps private at run time, is
 still refused for that datum, since nothing outside the module may name it.
 Being in

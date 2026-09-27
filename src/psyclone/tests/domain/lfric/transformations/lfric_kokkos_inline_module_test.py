@@ -24,19 +24,26 @@ from psyclone.psyir.transformations import TransformationError
 # of the first; `stretch` and `to_stretch` are the run-time state
 # `init_chi_transforms` sets, as the `lfric_core` edit declares it: public
 # and protected. `hidden` is that state as the file declared it before the
-# edit, private, and nothing can carry it.
+# edit, private, and nothing can carry it. `ROTATE` and the generic
+# `rotate_column` are `coord_transform_mod`'s `PANEL_ROT_MATRIX` and
+# `alphabetar2xyz`: a public parameter array read by the specifics of a
+# generic interface.
 _DAMPING_MODULE = """
 module damping_mod
-  use constants_mod, only : i_def, r_def, l_def
+  use constants_mod, only : i_def, r_def, r_single, l_def
   implicit none
   private
+  integer(kind=i_def), public, parameter :: ROTATE(3) = (/ 2, 3, 5 /)
   real(kind=r_def), parameter :: KF = 1._r_def/86400._r_def
   real(kind=r_def), parameter :: KA = KF/40.0_r_def
   real(kind=r_def), public, parameter :: ks = 3.0_r_def
   real(kind=r_def), public, protected :: stretch = 1.0_r_def
   logical(kind=l_def), public, protected :: to_stretch
   real(kind=r_def) :: hidden
-  public :: damp_column, scale_column, hidden_column
+  public :: damp_column, scale_column, hidden_column, rotate_column
+  interface rotate_column
+    module procedure rotate_column_r_single, rotate_column_r_double
+  end interface rotate_column
 contains
   subroutine damp_column(levels, source, result)
     integer(kind=i_def), intent(in) :: levels
@@ -66,6 +73,24 @@ contains
       result(j) = source(j) * hidden
     end do
   end subroutine hidden_column
+  subroutine rotate_column_r_single(levels, source, result)
+    integer(kind=i_def), intent(in) :: levels
+    real(kind=r_single), dimension(levels), intent(in) :: source
+    real(kind=r_single), dimension(levels), intent(inout) :: result
+    integer(kind=i_def) :: j
+    do j = 1, levels
+      result(j) = source(j) * real(ROTATE(1 + mod(j, 3)), r_single)
+    end do
+  end subroutine rotate_column_r_single
+  subroutine rotate_column_r_double(levels, source, result)
+    integer(kind=i_def), intent(in) :: levels
+    real(kind=r_def), dimension(levels), intent(in) :: source
+    real(kind=r_def), dimension(levels), intent(inout) :: result
+    integer(kind=i_def) :: j
+    do j = 1, levels
+      result(j) = source(j) * real(ROTATE(1 + mod(j, 3)), r_def)
+    end do
+  end subroutine rotate_column_r_double
 end module damping_mod
 """
 
@@ -182,6 +207,33 @@ def test_a_public_protected_variable_travels_as_an_import(
     assert "const bool to_stretch" in cpp
     assert ("use damping_mod, only : stretch, to_stretch"
             in str(psy.gen).lower())
+
+
+def test_a_generic_callee_carries_its_module_names(
+        tmp_path, clear_module_manager_instance):
+    """A specific reached through a generic reads its module's names too.
+
+    This is LFRic's `alphabetar2xyz`, which `nodal_xyz_coordinates_code`
+    calls: its double-precision specific reads `PANEL_ROT_MATRIX`, a public
+    parameter array of its module. The declaration is carried into both
+    specifics while the interface is brought into the kernel's Container,
+    and the call is then made to the interface brought in, not the import it
+    was written against -- else the move would read the cached module's
+    specific, which the carry has already been taken back out of. The
+    array crosses the ABI as a read-only View, as any module array does.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    psy, loop, kernel = _damping_invoke(tmp_path, "rotate_column")
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert _no_call_left(kernel)
+    assert "(double)rotate(((1 + (j % 3)) - 1))" in cpp
+    assert "use damping_mod, only : rotate" in str(psy.gen).lower()
+    assert _cached_names("rotate_column_r_double") == [
+        "levels", "source", "result", "j"]
 
 
 def test_a_private_variable_is_still_refused(

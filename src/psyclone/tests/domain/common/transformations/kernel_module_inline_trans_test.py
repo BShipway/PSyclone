@@ -1008,6 +1008,59 @@ def test_module_inline_interface_leaves_source_module_alone(monkeypatch,
     assert call.get_callees()
 
 
+@pytest.mark.parametrize("use_in", ["module", "routine"])
+def test_module_inline_interface_repoints_the_call(monkeypatch,
+                                                   fortran_reader, use_in):
+    '''Test that a call to an interface refers, once the interface is
+    module-inlined, to the interface declared in the caller's Container, and
+    so resolves to the routines brought in rather than to those of the module
+    they came from. The routines' own names are not the interface's, so the
+    call is not re-pointed by the loop that re-points calls to them.
+
+    '''
+    make_external_module(monkeypatch, fortran_reader, "my_mod",
+                         '''\
+    module my_mod
+      interface my_interface
+        module procedure :: my_sub, my_other_sub
+      end interface my_interface
+    contains
+      subroutine my_sub(arg)
+        real*8, dimension(10), intent(inout) :: arg
+        arg(1:10) = 1.0
+      end subroutine my_sub
+      subroutine my_other_sub(arg)
+        real*4, dimension(10), intent(inout) :: arg
+        arg(1:10) = 1.0
+      end subroutine my_other_sub
+    end module my_mod
+    ''')
+    use = "use my_mod, only: my_interface"
+    code = f'''\
+    module second_mod
+      {use if use_in == "module" else ""}
+    contains
+      subroutine doit()
+        {use if use_in == "routine" else ""}
+        implicit none
+        real*4, dimension(10) :: var
+        call my_interface(var)
+        call my_interface(var)
+      end subroutine doit
+    end module second_mod'''
+    psyir = fortran_reader.psyir_from_source(code)
+    first, second = psyir.walk(Call)
+    KernelModuleInlineTrans().apply(first)
+    container = psyir.walk(Container)[1]
+    local_sym = container.symbol_table.lookup("my_interface")
+    assert isinstance(local_sym, GenericInterfaceSymbol)
+    assert first.routine.symbol is local_sym
+    assert second.routine.symbol is local_sym
+    local = container.walk(Routine)
+    assert all(any(callee is routine for routine in local)
+               for callee in first.get_callees())
+
+
 def test_rm_imported_routine_symbol(fortran_reader):
     '''
     Tests for the _rm_imported_routine_symbol() utility method.
