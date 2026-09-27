@@ -4268,7 +4268,7 @@ refused. The region is a C++ function with no Fortran to call into, so
 other rule looks at the body, and a callee that itself calls is inlined in
 its turn, one call at a time until none is left; a callee brings its own
 loops, locals and sections with it and each is then judged like the
-kernel's own. The repetition is bounded at eight calls into one body, and
+kernel's own. The repetition is bounded at sixty-four calls into one body, and
 the bound is load-bearing rather than defensive: ``InlineTrans`` has no
 recursion check, so a routine that calls itself would be substituted into
 itself for as long as it was asked, and reaching the bound is instead a
@@ -4297,11 +4297,15 @@ travels. A sibling that cannot be substituted -- one declaring a static
 local, say, or one reached through an interface whose specifics differ in a
 kind PSyclone cannot reduce to a value, so that the arguments settle nothing
 -- leaves its call where the file put it, and the refusal that follows names
-it. Data of the callee's module is not in
-scope and is not brought into it by this: ``chi2xyz``, which reads a
-rotation matrix its module keeps at run time, is still refused for that
-datum, a named constant being the only thing that crosses a container
-boundary. Being in
+it. Data of the callee's own module travels where Fortran would let it: a
+``parameter`` of that module is declared again in the callee, with its value,
+and a name the module makes public is imported from it, so the Held--Suarez
+helpers' ``KF`` and ``KA`` reach the region as values and
+``coord_transform_mod``'s public ``PANEL_ROT_MATRIX`` as an import the PSy
+layer makes too. A private *variable* does not: ``chi2xyz``, reading a
+rotation matrix ``sci_chi_transform_mod`` keeps private at run time, is
+still refused for that datum, since nothing outside the module may name it.
+Being in
 scope is not being inlinable, and the rest of the judgement is PSyclone's
 rather than this transformation's: a callee reading data private to its own
 module, one whose declarations depend on an argument the call site writes to
@@ -5025,6 +5029,22 @@ by-value formal the PSy layer supplies. This is what puts LFRic's
 ``sci_face_selector_support_mod`` reading the face indices ``W``, ``S``,
 ``E`` and ``N`` from ``reference_element_mod`` -- inside the capture.
 
+A callee reading a name of its *own* module is another matter, because
+``KernelModuleInlineTrans`` refuses a routine that reads anything declared
+beside it: moving the routine would leave the name behind. Two kinds of name
+are given a declaration of the callee's own for the length of the move, each
+the one Fortran would accept for it anywhere. A name the module makes
+public is imported from that module, and reaches the region as every
+imported name does -- a constant by its value, a variable as a by-value
+formal. A private ``parameter`` is declared again as a ``parameter`` of the
+callee with the same type and value, a constant it depends on first, and
+the region carries the arithmetic: LFRic's ``held_suarez_forcings_mod``
+declares ``KA = KF/40.0_r_def``, both private, and the region reads
+``(1. / 86400.) / 40.0``. A private *variable* is neither, and the move
+refuses it as before. The declarations are added to the module PSyclone
+cached, since that is the one the move reads, and taken out again when the
+move is over, so the next kernel reads the module as its file declares it.
+
 It is in scope whether or not the frontend could tell it from an array.
 ``selector(face)`` standing in an expression is a function reference or an
 element of an array, and where the kernel's own file does not settle which
@@ -5036,8 +5056,8 @@ Only a bare symbol is: a name PSyclone has already typed as data is left
 alone, and asking for its body reaches the datum and is refused below.
 
 Being in scope is not being inlinable, and the rest of the judgement is
-PSyclone's rather than this transformation's: a callee reading data
-private to its own module, one whose declarations depend on an argument
+PSyclone's rather than this transformation's: a callee reading a
+variable private to its own module, one whose declarations depend on an argument
 the call site writes to before calling, one whose actual and formal types
 do not agree, one holding a CodeBlock. Each is refused in ``InlineTrans``'
 own words with the call named, because those words say what to fix and a

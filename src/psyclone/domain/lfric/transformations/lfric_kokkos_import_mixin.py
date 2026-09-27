@@ -53,7 +53,7 @@ settles is still refused, in ``InlineTrans``'s own words.
 
 from psyclone.psyir.nodes import Call, Container, Reference, Routine
 from psyclone.psyir.symbols import (
-    ContainerSymbol, ImportInterface, Symbol, SymbolError)
+    ContainerSymbol, DataSymbol, ImportInterface, Symbol, SymbolError)
 
 
 class LFRicKokkosImportMixin:
@@ -66,11 +66,163 @@ lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin` or by the sibling absorption
 lfric_kokkos_inline_mixin.LFRicKokkosInlineMixin`, just before a call is
     inlined, and rewrites only copies: the call site's own copy of the file
     and the callee brought into it. The module the ``ModuleManager`` caches is
-    left as its file declares it.
+    left as its file declares it. The one rule that has to touch that module
+    -- :py:meth:`_carry_module_names`, since the move reads the callee from
+    it -- puts it back as it found it the moment the move is over.
     """
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
     # pylint: disable=too-few-public-methods
+
+    @classmethod
+    def _carry_module_names(cls, call):
+        """Give ``call``'s callee its own declaration of its module's names.
+
+        :py:class:`~psyclone.domain.common.transformations.\
+KernelModuleInlineTrans` refuses a routine that reads anything declared
+        beside it in its own module, because moving the routine would leave
+        the name behind: it "accesses data from its outer scope". LFRic's
+        Held--Suarez helpers read ``KF``, ``KA`` and five more ``parameter``
+        values of ``held_suarez_forcings_mod``, its panel transforms read
+        ``PANEL_ROT_MATRIX`` of ``coord_transform_mod``, and each is refused
+        on that ground alone. Two kinds of name can be made to travel, and
+        each is given the declaration Fortran would accept for it anywhere:
+
+        * a name its module makes **public** is imported from that module,
+          as a ``use <module>, only : <name>`` of the routine's own. Every
+          scope that may name it can import it, the PSy layer included, so
+          it then reaches the region the way any imported name does: a
+          constant by its value and a variable as a by-value argument
+          (:py:class:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_constants_mixin.LFRicKokkosConstantsMixin`);
+        * a **private** ``parameter`` is declared again, as a ``parameter``
+          of the routine's own with the same type and value. Shadowing a
+          module's constant with an equal local one changes nothing the
+          routine computes, and a constant is a value the region carries
+          rather than a name it has to import. Where its value names another
+          constant of the module -- ``KA = KF/40.0_r_def`` -- that one is
+          carried first, by the same two rules.
+
+        A private *variable* is neither: nothing outside its module may name
+        it, so nothing can carry it, and the move is left to refuse it in its
+        own words. That is LFRic's ``sci_chi_transform_mod`` state as the file
+        declares it, which the ``lfric_core`` edit this capability was scoped
+        with makes ``public, protected``.
+
+        **The module rewritten is the cached one, and it is put back.**
+        ``KernelModuleInlineTrans`` reads the callee through
+        :py:meth:`~psyclone.psyir.nodes.Call.get_callees`, which answers with
+        the Container the ``ModuleManager`` parsed, so the declarations have
+        to be added there to be seen at all. The move takes a copy, and the
+        copy keeps them; the caller hands what this returns to
+        :py:meth:`_restore_module_names` as soon as the move is over, whether
+        it succeeded or not, and the module then reads as its file does.
+
+        It is asked only about a callee in another Container: one already in
+        the call's Container is a routine of the kernel's own module, which
+        is not moved, and whose names the constants mixin reads where they
+        stand.
+
+        :param call: the call whose callee is about to be moved.
+        :type call: :py:class:`psyclone.psyir.nodes.Call`
+
+        :returns: what was added, one entry per name, for
+            :py:meth:`_restore_module_names` to undo.
+        :rtype: List[Tuple[:py:class:`psyclone.psyir.nodes.Routine`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            Optional[:py:class:`psyclone.psyir.symbols.ContainerSymbol`]]]
+        """
+        try:
+            callees = call.get_callees()
+        except Exception:                        # pylint: disable=W0703
+            # A callee PSyclone cannot resolve has nothing to prepare, and
+            # the caller reports the name it could not reach.
+            return []
+        carried = []
+        for callee in callees:
+            container = callee.ancestor(Container)
+            for signature in callee.reference_accesses().all_signatures:
+                cls._carry_module_name(callee, container, signature.var_name,
+                                       carried)
+        return carried
+
+    @classmethod
+    def _carry_module_name(cls, routine, container, name, carried):
+        """Give ``routine`` its own declaration of one name of its module.
+
+        The rules are :py:meth:`_carry_module_names`'s. A name the routine
+        already declares, or one ``container`` does not declare itself, is
+        left alone, and so is anything but data: a sibling procedure is
+        absorbed rather than carried.
+
+        :param routine: the callee to give the declaration to.
+        :type routine: :py:class:`psyclone.psyir.nodes.Routine`
+        :param container: the callee's own module.
+        :type container: :py:class:`psyclone.psyir.nodes.Container`
+        :param str name: the name the routine reads.
+        :param carried: what has been added so far, appended to.
+        :type carried: List[Tuple[:py:class:`psyclone.psyir.nodes.Routine`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            Optional[:py:class:`psyclone.psyir.symbols.ContainerSymbol`]]]
+        """
+        table = routine.symbol_table
+        if name in table:
+            return
+        symbol = container.symbol_table.lookup(
+            name, scope_limit=container, otherwise=None)
+        if (not isinstance(symbol, DataSymbol) or symbol.is_import
+                or symbol.is_unresolved):
+            return
+        added = None
+        if symbol.visibility == Symbol.Visibility.PUBLIC:
+            if container.name in table:
+                source = table.lookup(container.name)
+            else:
+                source = added = ContainerSymbol(container.name)
+                table.add(source)
+            local = symbol.copy()
+            local.interface = ImportInterface(source)
+        elif symbol.is_constant:
+            for reference in symbol.initial_value.walk(Reference):
+                cls._carry_module_name(routine, container,
+                                       reference.symbol.name, carried)
+            local = symbol.copy()
+            for reference in local.initial_value.walk(Reference):
+                reference.symbol = table.lookup(reference.symbol.name)
+        else:
+            return
+        table.add(local)
+        for reference in routine.walk(Reference):
+            if reference.symbol is symbol:
+                reference.symbol = local
+        carried.append((routine, symbol, local, added))
+
+    @staticmethod
+    def _restore_module_names(carried):
+        """Undo :py:meth:`_carry_module_names`, last name first.
+
+        Each routine's references are pointed back at its module's symbol,
+        the declaration it was given is removed, and a ``use`` of its own
+        module added for the purpose goes with the last name it imported.
+        Last first, because a constant carried for another's value was
+        carried before it.
+
+        :param carried: what :py:meth:`_carry_module_names` returned.
+        :type carried: List[Tuple[:py:class:`psyclone.psyir.nodes.Routine`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            :py:class:`psyclone.psyir.symbols.DataSymbol`,
+            Optional[:py:class:`psyclone.psyir.symbols.ContainerSymbol`]]]
+        """
+        for routine, symbol, local, added in reversed(carried):
+            for reference in routine.walk(Reference):
+                if reference.symbol is local:
+                    reference.symbol = symbol
+            table = routine.symbol_table
+            table.remove(local)
+            if added is not None:
+                table.remove(added)
 
     @classmethod
     def _localise_imports(cls, routine):

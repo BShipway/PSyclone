@@ -98,9 +98,12 @@ class LFRicKokkosInlineMixin:
     Anything else -- a callee whose module is not on the search path, so that
     PSyclone has only a name for it -- is out of scope and refused.
 
-    **Data of the callee's module is not in scope, and a procedure of it is
-    not data.** A callee reading a variable its own module declares --
-    LFRic's ``chi2xyz`` and ``chi2xyz_rot_mat`` -- is refused, and refused
+    **Data of the callee's module is in scope where Fortran lets it travel.**
+    A ``parameter`` of the callee's module travels with it, and so does any
+    name that module makes public: the first as a constant of the callee's
+    own, the second as an import the PSy layer can make too. A callee
+    reading a *private variable* of its module -- LFRic's ``chi2xyz`` and
+    ``chi2xyz_rot_mat`` as the file declares it -- is refused, and refused
     for the right reason: the region would need the PSy layer to import that
     name and pass it, which is what ``LFRicKokkosConstantsMixin`` does for a
     variable of the *kernel's* module and cannot do for one the callee's
@@ -223,6 +226,14 @@ lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin`), one whose actual and formal
         before the body travels, and what arrives in the kernel's Container
         is a routine with no sibling left to reach for.
 
+        **A callee that reads its own module's names is given them.** A
+        ``parameter`` or public name of the callee's module is declared in
+        the callee for the length of the move by
+        :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_import_mixin.LFRicKokkosImportMixin._carry_module_names`, which
+        says which names can travel and how, and the module is put back
+        afterwards.
+
         **The callee's symbol is specialised first.** ``selector(face)`` in an
         expression is a function reference or an element of an array, and
         where the kernel's own file does not settle which the frontend leaves
@@ -260,11 +271,14 @@ lfric_kokkos_bound_mixin.LFRicKokkosBoundMixin`), one whose actual and formal
         # pylint: disable-next=unidiomatic-typecheck
         if routine is not None and type(routine.symbol) is Symbol:
             routine.symbol.specialise(RoutineSymbol)
+        carried = cls._carry_module_names(call)
         try:
             KernelModuleInlineTrans().apply(call)
             return None
         except (TransformationError, TypeError) as err:
             return None if cls._callee_is_local(call) else str(err)
+        finally:
+            cls._restore_module_names(carried)
 
     @classmethod
     def _absorb_own_module_calls(cls, call):
