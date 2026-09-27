@@ -28,12 +28,14 @@ from dataclasses import replace
 import pytest
 
 from psyclone.psyir.backend.kokkos import (
-    KokkosRegion, KokkosScalar, KokkosScratch, KokkosView, KokkosWriter)
+    KokkosConstant, KokkosRegion, KokkosScalar, KokkosScratch, KokkosView,
+    KokkosWriter)
 from psyclone.psyir.backend.kokkos_launch import (
-    MEMBER_LOCAL_TYPE, _member_local_declaration, member_local_definition,
+    MEMBER_LOCAL_TYPE, member_local_declaration, member_local_definition,
     team_scratch_items)
 from psyclone.psyir.frontend.fortran import FortranReader
-from psyclone.psyir.nodes import KernelSchedule, Loop, Routine
+from psyclone.psyir.nodes import KernelSchedule, Literal, Loop, Routine
+from psyclone.psyir.symbols import ScalarType
 
 
 # A level loop whose results the team shares in ``column``, and beside it the
@@ -266,6 +268,89 @@ def test_kokkos_writer_reads_a_member_local_array_like_the_view_it_was():
     assert "local_dofs((2 - 1))) - local_dofs((1 - 1))" in code
 
 
+# A dof kernel holding a small array, as ``convert_cart2sphere_vector_code``
+# does once ``cart2sphere_scalar`` and its ``spherical_vec(2)`` are inlined
+# into it.
+_DOF_KERNEL = """
+subroutine rotate_code(out_dof, in_dof)
+  use constants_mod, only : r_def
+  real(kind=r_def), intent(inout) :: out_dof
+  real(kind=r_def), intent(in) :: in_dof
+  real(kind=r_def), dimension(2) :: pair
+  pair(1) = 2.0_r_def * in_dof
+  pair(2) = pair(1) + in_dof
+  out_dof = pair(2)
+end subroutine rotate_code
+"""
+
+
+def _dof_region():
+    """Return a dof region whose one kernel-local array is member-local.
+
+    :returns: the region.
+    :rtype: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
+    """
+    return KokkosRegion(
+        name="rotate_kokkos",
+        schedule=_schedule(_DOF_KERNEL, "rotate_code"),
+        cell_count="ndofs",
+        cell_index="df",
+        dof=True,
+        arguments=(
+            KokkosView("out_dof", "out_dof_data", "double", ("ndofs",),
+                       extra_indices=("df",)),
+            KokkosView("in_dof", "in_dof_data", "double", ("ndofs",),
+                       extra_indices=("df",), read_only=True,
+                       random_access=True),
+            KokkosScalar("ndofs", "int"),
+        ),
+        kind_types=(("r_def", "double"),),
+        scratch=(
+            KokkosScratch(
+                "pair", "double", ("2",), index_offsets=(1,),
+                member_local=True),))
+
+
+def test_kokkos_writer_declares_a_dof_iterations_array_in_its_lambda():
+    """A dof launch has no team, so each iteration holds its own copy.
+
+    The array is declared inside the range lambda where the scalars are,
+    and its writes need no ``Kokkos::single``: nothing else runs the
+    iteration. None of the team machinery is generated -- no policy, no
+    scratch space and no probe asking which level scratch fits in -- since
+    there is no team scratch to reserve.
+    """
+    code = KokkosWriter()(_dof_region())
+
+    assert code.index(f"struct {MEMBER_LOCAL_TYPE} {{") < code.index(
+        'extern "C"')
+    assert ("KOKKOS_LAMBDA(const int df) {\n"
+            f"    {MEMBER_LOCAL_TYPE}<double, 2> pair;\n"
+            "    pair((1 - 1)) = (2.0 * in_dof(df));\n" in code)
+    assert "out_dof(df) = pair((2 - 1));" in code
+    for team in ("TeamPolicy", "ScratchSpace", "KokkosScratchProbe",
+                 "Kokkos::single("):
+        assert team not in code
+
+
+def test_kokkos_writer_declares_a_dof_iterations_array_after_constants():
+    """The constants come first, as in every shape, since they read nothing.
+
+    A constant is prepended to the locals after the array is, so the order
+    is fixed by that and not by the order the region lists them in.
+    """
+    integer = ScalarType(ScalarType.Intrinsic.INTEGER,
+                         ScalarType.Precision.UNDEFINED)
+    region = replace(_dof_region(), constants=(
+        KokkosConstant("offsets", "int", (Literal("1", integer),),
+                       index_offsets=(1,)),))
+
+    code = KokkosWriter()(region)
+
+    assert (f"    const int offsets[1] = {{1}};\n"
+            f"    {MEMBER_LOCAL_TYPE}<double, 2> pair;\n" in code)
+
+
 @pytest.mark.parametrize("extents,expected", [
     (("2",), "KokkosMemberLocal<int, 2> local_dofs;"),
     (("2", "3"), "KokkosMemberLocal<int, 2, 3> local_dofs;"),
@@ -282,4 +367,4 @@ def test_member_local_declaration_renders_every_rank_it_subscripts(
     item = KokkosScratch(
         "local_dofs", "int", extents, index_offsets=(1,) * len(extents),
         member_local=True)
-    assert _member_local_declaration(item, "    ") == f"    {expected}\n"
+    assert member_local_declaration(item, "    ") == f"    {expected}\n"

@@ -32,8 +32,8 @@ from psyclone.psyir.backend.kokkos_spread_extent import spread_extents
 from psyclone.psyir.backend.kokkos_team_scalars import (
     team_private_scalars)
 from psyclone.psyir.backend.kokkos_launch import (
-    hierarchical_launch, member_local_definition, range_launch,
-    scratch_probe_definition, team_launch, team_scratch_items)
+    hierarchical_launch, member_local_declaration, member_local_definition,
+    range_launch, scratch_probe_definition, team_launch, team_scratch_items)
 from psyclone.psyir.backend.kokkos_launch_dof import dof_launch
 from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.backend.kokkos_validation_mixin import (
@@ -160,7 +160,8 @@ class KokkosWriter(KokkosValidationMixin, KokkosIntrinsicsMixin,
             f"  {alias}\n" for alias in (
                 "using TeamPolicy = Kokkos::TeamPolicy<>;",
                 "using TeamMember = TeamPolicy::member_type;",
-            )) if region.scratch or region.parallel_loops else ""
+            )) if (region.scratch or region.parallel_loops) and not \
+            region.dof else ""
         if team_scratch_items(region):
             team_aliases += (
                 "  using ScratchSpace = "
@@ -171,7 +172,10 @@ class KokkosWriter(KokkosValidationMixin, KokkosIntrinsicsMixin,
         # directly in the functor, as the range shape's does.
         scratch_names = {item.name for item in region.scratch}
         alias_names = {alias.name for alias in region.aliases}
-        self._depth = 3 if region.scratch and not region.parallel_loops else 2
+        # A dof region's scratch is all member-local and needs no team, so
+        # its body sits in the range lambda as a range region's does.
+        self._depth = 3 if region.scratch and not (
+            region.parallel_loops or region.dof) else 2
         # Ahead of the locals, and left after the scratch constructions each
         # launch shape emits although an ``AnonymousSpace`` handle no longer
         # needs its target to have been constructed first: moving it would
@@ -227,6 +231,15 @@ class KokkosWriter(KokkosValidationMixin, KokkosIntrinsicsMixin,
         self._views, self._kind_types = {}, {}
         self._parallel_loops = ()
         self._private_scalars = {}
+
+        if region.dof:
+            # The cell shapes declare a member-local array among their
+            # scratch constructions. The dof shape has none, so its arrays,
+            # which the validation has shown are all member-local, are
+            # declared with the locals, behind the constants added below.
+            local_declarations = "".join(
+                member_local_declaration(item, constant_indent)
+                for item in region.scratch) + local_declarations
 
         # Inside the body, not at file scope: nvcc will not read a namespace
         # scope array from device code. First, since a constant reads nothing.

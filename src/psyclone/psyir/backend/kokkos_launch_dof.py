@@ -99,7 +99,9 @@ def dof_launch(region, local_declarations, body):
         that space is cells or dofs.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
     :param local_declarations: the generated declarations of the kernel's
-        scalar locals, already indented.
+        scalar locals and of the small arrays each iteration holds its own
+        copy of, already indented. Declared inside the lambda, both are
+        private to the iteration that declares them.
     :type local_declarations: str
     :param body: the generated kernel body, already indented.
     :type body: str

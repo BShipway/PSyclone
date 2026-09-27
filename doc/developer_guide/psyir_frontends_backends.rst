@@ -1102,8 +1102,9 @@ A region naming `dof` launches over `Kokkos::RangePolicy<>(0, ndofs)` with a
 it replaces iterated over the degrees of freedom of a function space rather
 than over cell columns, so the index is a position in each of the Views the
 region carries and reaches no dofmap. The shape has no team, so a dof region
-naming `scratch` or `parallel_loops` is rejected by `_validate` rather than
-launched over a shape that would drop them. An LFRic built-in reaches this
+naming `parallel_loops`, or `scratch` that is not member-local (below), is
+rejected by `_validate` rather than launched over a shape that would drop
+them. An LFRic built-in reaches this
 shape as any coded dof kernel does: `LFRicKokkosBuiltinMixin`, in
 `domain/lfric/transformations/lfric_kokkos_builtin_mixin.py`, gives the
 built-in the kernel schedule it never had -- one positional scalar formal per
@@ -1460,6 +1461,18 @@ there is what `nvcc` 13.3 miscompiled at any optimisation above
 `-Xcicc -O1`, which is why that region was built under a per-region flag
 until this existed (`psy-ir-aidev`, phase 7 tasks W7 and W7b). Nine of the
 272 regions the model captures hold such an array.
+
+A dof region is asked the same question although it spreads no loop, because
+it has no team at all: a copy held by each iteration is the only storage its
+flat launch can give an array. No loop is spread, so the correctness
+condition holds of every array, and the size and the alias target decide;
+an array they refuse is refused by the transformation, since there is no
+scratch to fall back on. The writer declares the arrays with the locals,
+inside the range lambda and behind the constants, rather than among scratch
+constructions the dof shape does not have, and emits neither the team
+aliases nor the scratch-level probe for the region. The case that needs it
+is `convert_cart2sphere_vector_code`, which gains `cart2sphere_scalar`'s
+`spherical_vec(2)` once the helper is inlined into it.
 
 The writer validates an alias as it validates the rest: the name must not
 collide with a described array or a local, there must be at least one

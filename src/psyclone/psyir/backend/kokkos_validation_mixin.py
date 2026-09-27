@@ -16,6 +16,7 @@ they read as well on their own as beside the writer.
 
 from psyclone.psyir.backend.kokkos_array_expression import KokkosScratch
 from psyclone.psyir.backend.kokkos_constant import KokkosConstant
+from psyclone.psyir.backend.kokkos_launch import team_scratch_items
 from psyclone.psyir.backend.kokkos_region import (
     KokkosAlias, KokkosRegion, KokkosScalar, KokkosView, extent_names,
     is_extent, is_identifier, is_offset)
@@ -53,9 +54,10 @@ class KokkosValidationMixin:
             :py:attr:`KokkosRegion.team_size` is neither ``None`` nor an
             ``int`` -- ``bool`` among them, since ``TeamPolicy(ncells, True)``
             is a legal team of one that nothing downstream would report.
-        :raises ValueError: if a dof region describes scratch or names a
-            loop to spread over a team, neither of which the dof launch has
-            anywhere to put; if a dof region names a colour map, a dof loop
+        :raises ValueError: if a dof region describes team scratch -- an
+            array not held by each iteration -- or names a loop to spread
+            over a team, neither of which the dof launch has anywhere to
+            put; if a dof region names a colour map, a dof loop
             having no shared write to colour away; if a coloured region also
             names a first cell, whose two counts are of different things; if
             the region's name, its cell count, its first
@@ -102,10 +104,13 @@ class KokkosValidationMixin:
                 region.cell_start):
             raise ValueError(
                 f"First cell '{region.cell_start}' is not a C++ identifier.")
-        if region.dof and (region.scratch or region.parallel_loops):
+        # A member-local array is declared inside the launch rather than
+        # placed, so it is the one kind of scratch a dof region may carry.
+        if region.dof and (team_scratch_items(region)
+                           or region.parallel_loops):
             raise ValueError(
-                "A dof region has no team, so it can neither place scratch "
-                "nor spread a loop over one.")
+                "A dof region has no team, so it can neither place team "
+                "scratch nor spread a loop over one.")
         if region.dof and region.colour_map is not None:
             raise ValueError(
                 "A dof region writes one dof per iteration and no two "

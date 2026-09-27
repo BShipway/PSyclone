@@ -4186,7 +4186,8 @@ with neither keeps the ``RangePolicy``. A loop over LFRic's ``dof`` or
 columns: a flat ``RangePolicy`` over the loop's own dof count, with no
 dofmap reached and no cell index in the body, each iteration writing one
 dof and no two writing the same one. That shape has no team, so a kernel
-over dofs holding an automatic array or a loop to spread is refused; an
+over dofs holding a loop to spread is refused, as is an automatic array
+other than one small enough for each iteration to hold its own copy; an
 LFRic builtin is refused too, PSyclone generating its body rather than
 reading it from a kernel file. A loop over the halo cells alone begins
 where the owned cells end, and the cell it begins at crosses as a second
@@ -4852,9 +4853,14 @@ columns would need one or the other.
 
 What it does not have is a team. A dof launch is a flat range with
 nowhere to place scratch and no members to spread a loop over, so a
-kernel over dofs carrying an automatic array, or a loop the dependency
-analysis would spread, is refused by name rather than launched over a
-shape that would silently drop it. That refusal is asked after the rules
+kernel over dofs carrying a loop the dependency analysis would spread is
+refused by name rather than launched over a shape that would silently drop
+it. An automatic array is refused in the same way unless each iteration
+can hold a copy of its own: a fixed shape of at most sixteen elements and
+three dimensions, with no pointer aimed at it. Such an array is declared
+inside the launch, beside the scalar locals. It is the shape
+``convert_cart2sphere_vector_code`` has once ``cart2sphere_scalar``, which
+holds a two-element array, is inlined into it. That refusal is asked after the rules
 a cell-column launch would apply, so a body a cell launch could not take
 either is still refused for the reason it always was.
 

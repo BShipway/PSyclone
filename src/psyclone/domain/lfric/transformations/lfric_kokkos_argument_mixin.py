@@ -656,7 +656,8 @@ LFRicKokkosTrans.apply` makes.
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
-            scratch=cls._scratch_arrays(schedule, renames, parallel_loops),
+            scratch=cls._scratch_arrays(
+                schedule, renames, parallel_loops, dof),
             aliases=cls._region_aliases(schedule, renames),
             parallel_loops=parallel_loops,
             team_size=(options or {}).get(cls._TEAM_SIZE_OPTION))
@@ -693,7 +694,8 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
             for name, targets in cls._alias_targets(schedule).items())
 
     @classmethod
-    def _scratch_arrays(cls, schedule, renames, parallel_loops=()):
+    def _scratch_arrays(cls, schedule, renames, parallel_loops=(),
+                        dof=False):
         """Describe the kernel's automatic arrays, per-cell sizes renamed.
 
         A local sized from a stencil's size -- ``dimension(stencil_size)`` --
@@ -712,6 +714,8 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
             arrays a member may hold its own copy of.
         :type parallel_loops: tuple[
             :py:class:`psyclone.psyir.nodes.Loop`, ...]
+        :param bool dof: whether the region is launched over dofs, passed
+            on to ``cls._local_arrays`` for the same decision.
 
         :returns: one description per automatic array, in declaration order.
         :rtype: tuple[
@@ -722,7 +726,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
                     extents=cls._rename_extents(item.extents, renames),
                     index_offsets=cls._rename_extents(
                         item.index_offsets, renames))
-            for item in cls._local_arrays(schedule, parallel_loops))
+            for item in cls._local_arrays(schedule, parallel_loops, dof))
 
     @classmethod
     def _call_region(cls, node, region, actuals, constants):
