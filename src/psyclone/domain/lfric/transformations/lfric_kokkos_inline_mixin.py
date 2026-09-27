@@ -755,21 +755,35 @@ lfric_kokkos_import_mixin.LFRicKokkosImportMixin._read_declarations` reads
         """
         for argument in call.arguments:
             for reference in argument.walk(Reference):
-                symbol = reference.symbol
-                datatype = getattr(symbol, "datatype", None)
-                if not isinstance(datatype, UnsupportedFortranType):
-                    continue
-                attributes = cls._declaration_attributes(datatype.declaration)
-                # Two questions with one answer: a declaration the frontend
-                # could parse nothing of leaves nothing to put in the
-                # symbol's place, and one that is unmodelled for some other
-                # reason is not this rewrite's to relax.
-                if (datatype.partial_datatype is None
-                        or "PROTECTED" not in attributes):
-                    continue
-                if all(attribute.startswith(cls._PROTECTED_ATTRIBUTES)
-                       for attribute in attributes):
-                    symbol.datatype = datatype.partial_datatype
+                cls._relax_protected(reference.symbol)
+
+    @classmethod
+    def _relax_protected(cls, symbol):
+        """Give ``symbol`` its partial datatype if ``PROTECTED`` is all it
+        drops.
+
+        The rule :py:meth:`_relax_protected_actuals` applies to each actual,
+        and :py:meth:`~psyclone.domain.lfric.transformations.\
+lfric_kokkos_import_mixin.LFRicKokkosImportMixin._carry_module_name` to a
+        module variable it imports on a callee's behalf.
+
+        :param symbol: the symbol to relax.
+        :type symbol: :py:class:`psyclone.psyir.symbols.Symbol`
+        """
+        datatype = getattr(symbol, "datatype", None)
+        if not isinstance(datatype, UnsupportedFortranType):
+            return
+        attributes = cls._declaration_attributes(datatype.declaration)
+        # Two questions with one answer: a declaration the frontend could
+        # parse nothing of leaves nothing to put in the symbol's place, and
+        # one that is unmodelled for some other reason is not this rewrite's
+        # to relax.
+        if (datatype.partial_datatype is None
+                or "PROTECTED" not in attributes):
+            return
+        if all(attribute.startswith(cls._PROTECTED_ATTRIBUTES)
+               for attribute in attributes):
+            symbol.datatype = datatype.partial_datatype
 
     @staticmethod
     def _rooted_copy(schedule):

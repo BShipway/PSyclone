@@ -222,3 +222,174 @@ def test_each_expression_gets_its_own_local(index, expression):
     assert f"shifted(n, {name})" in statement.debug_string()
     local = routine.symbol_table.lookup(name)
     assert local.datatype.shape[0].upper.debug_string() == "n"
+
+
+# The shape of LFRic's alphabetar2xyz, reached through a module of its own:
+# a constructor inside an array expression, an elemental conversion of a
+# section of a module parameter passed to MATMUL, and a MATMUL over the
+# module's PROTECTED state, which is sci_chi_transform_mod's chi2xyz_rot_mat.
+_ROTATE_MODULE = """
+module rotate_mod
+  use constants_mod, only : i_def, r_def, r_second
+  implicit none
+  private
+  real(kind=r_second), public, parameter :: ROT(3,3,2) = reshape((/ &
+      1.0_r_second, 0.0_r_second, 0.0_r_second, &
+      0.0_r_second, 1.0_r_second, 0.0_r_second, &
+      0.0_r_second, 0.0_r_second, 1.0_r_second, &
+      0.0_r_second, 1.0_r_second, 0.0_r_second, &
+      1.0_r_second, 0.0_r_second, 0.0_r_second, &
+      0.0_r_second, 0.0_r_second, 1.0_r_second /), (/ 3, 3, 2 /))
+  real(kind=r_def), public, protected :: turn(3,3)
+  public :: rotated
+contains
+  subroutine rotated(alpha, panel, xyz)
+    real(kind=r_def), intent(in) :: alpha
+    integer(kind=i_def), intent(in) :: panel
+    real(kind=r_def), dimension(3), intent(out) :: xyz
+    real(kind=r_def), dimension(3) :: local
+    local = alpha * (/ 1.0_r_def, tan(alpha), 2.0_r_def /)
+    xyz = matmul(real(ROT(:,:,panel), r_def), local)
+    xyz = matmul(turn, xyz)
+  end subroutine rotated
+end module rotate_mod
+"""
+
+_ROTATING_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use rotate_mod, only : rotated").replace(
+    "    real(kind=r_def), dimension(nlayers) :: swept\n",
+    "    real(kind=r_def), dimension(nlayers) :: swept\n"
+    "    real(kind=r_def), dimension(3) :: xyz\n").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    call rotated(partial(1), 2_i_def, xyz)\n"
+    "    swept = xyz(1) + xyz(3)\n")
+
+_HOISTS = """
+module hoists_mod
+  use unknown_mod, only : opaque
+  implicit none
+contains
+  subroutine hoists(n, a, r, m, out)
+    integer, intent(in) :: n
+    real, intent(in) :: a, r(3), m(3,3)
+    real, intent(inout) :: out(3)
+    real :: s
+    out = (/ a, a, a /)
+    out = a * (/ r, a /)
+    out = 2.0 * (/ opaque, a, a /)
+    s = sum((/ a, a /))
+    out(1) = a * sum((/ a, a /))
+    do while (sum(matmul(2.0 * m, r)) > 0.0)
+      out = 0.0
+    end do
+    out = matmul(transpose(m), r)
+    out = matmul(m, r) + matmul(m, opaque + r)
+    out = matmul(real(m, 8), 2.0 * r)
+    s = real(a)
+  end subroutine hoists
+end module hoists_mod
+"""
+
+
+def _hoists():
+    """Parse :py:data:`_HOISTS` and return its routine and statements.
+
+    :returns: the routine and the statements of its body, in source order.
+    :rtype: Tuple[:py:class:`psyclone.psyir.nodes.Routine`,
+        List[:py:class:`psyclone.psyir.nodes.Statement`]]
+    """
+    psyir = FortranReader().psyir_from_source(_HOISTS)
+    routine = next(routine for routine in psyir.walk(Routine)
+                   if routine.name == "hoists")
+    return routine, list(routine.children)
+
+
+def test_alphabetar2xyz_is_captured(tmp_path, clear_module_manager_instance):
+    """The three shapes `alphabetar2xyz` carries reach the region.
+
+    The constructor becomes `constructor`, assigned element by element; the
+    converted section becomes `matmul_operand`, a loop over the section;
+    and the PROTECTED matrix the helper imports on its module's behalf is
+    typed as the real array it is, and taken as a formal of the region.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    _, loop, kernel = _invoke(
+        tmp_path, "column_solve", _LOCAL_ALGORITHM, _ROTATING_KERNEL,
+        extra={"rotate_mod": _ROTATE_MODULE})
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    table = schedule.symbol_table
+    assert table.lookup("constructor").datatype.shape[0].upper.value == "3"
+    assert "constructor((2 - 1)) = Kokkos::tan(partial((1 - 1)));" in cpp
+    assert ("local((idx - 1)) = (partial((1 - 1)) * "
+            "constructor((idx - 1)));" in cpp)
+    assert ("matmul_operand((idx_2 - 1), (idx_1 - 1)) = "
+            "(double)rot((idx_2 - 1), (idx_1 - 1), (2 - 1));" in cpp)
+    assert "const double *turn_data" in cpp
+
+
+def test_a_constructor_is_hoisted_only_inside_an_array_expression():
+    """A constructor is moved only where the lowering would meet it.
+
+    Standing alone on the right it is what the backend writes already;
+    holding an array element, or one of unknown type, it has no length or
+    declaration to give a local; in a fold whose value is a scalar, or in
+    an assignment to one element, it is not in an assignment the lowering
+    rewrites. Only the second statement of all of those qualifies, and it
+    holds an array element, so nothing is moved.
+    """
+    routine, _ = _hoists()
+    before = routine.debug_string()
+
+    LFRicKokkosTrans._hoist_constructors(routine)
+
+    assert routine.debug_string() == before
+
+
+def test_an_operand_is_hoisted_only_where_it_has_to_be():
+    """An intrinsic operand is moved only when it is an array expression.
+
+    A whole array stays, and so does another intrinsic of the tier, which
+    the writer subscripts itself; an operand in a `do while` condition
+    stays, since an assignment before the loop is evaluated once; an
+    operand of unknown type stays for want of a declaration. `real(m, 8)`,
+    which the PSyIR types as a scalar, and `2.0 * r` are each given a local
+    before their statement, `real(m, 8)` of `m`'s shape.
+    """
+    routine, statements = _hoists()
+
+    LFRicKokkosTrans._hoist_intrinsic_operands(routine)
+
+    names = [statement.lhs.name for statement in routine.children
+             if isinstance(statement, Assignment)
+             and statement.lhs.name.startswith("matmul_operand")]
+    assert names == ["matmul_operand", "matmul_operand_1"]
+    local = routine.symbol_table.lookup("matmul_operand")
+    assert len(local.datatype.shape) == 2
+    assert statements[-2].debug_string() == (
+        "out = MATMUL(matmul_operand, matmul_operand_1)\n")
+    assert "opaque + r" in statements[-3].debug_string()
+    assert "2.0 * m" in statements[5].debug_string()
+    assert "TRANSPOSE(m)" in statements[6].debug_string()
+
+
+def test_a_scalar_conversion_keeps_its_type():
+    """An elemental call on scalars is typed as the PSyIR types it."""
+    _, statements = _hoists()
+    conversion = statements[-1].rhs
+
+    datatype = LFRicKokkosTrans._elemental_datatype(conversion)
+
+    assert datatype is not None
+    assert datatype == conversion.datatype

@@ -184,6 +184,12 @@ lfric_kokkos_constants_mixin.LFRicKokkosConstantsMixin`);
                 table.add(source)
             local = symbol.copy()
             local.interface = ImportInterface(source)
+            # PROTECTED forbids assignment from outside the module, which
+            # the routine being moved never makes, and it is what leaves
+            # LFRic's chi2xyz_rot_mat unmodelled: the matrix the region
+            # reads is its partial datatype, an ordinary real array.
+            # pylint: disable-next=no-member
+            cls._relax_protected(local)
         elif symbol.is_constant:
             for reference in symbol.initial_value.walk(Reference):
                 cls._carry_module_name(routine, container,

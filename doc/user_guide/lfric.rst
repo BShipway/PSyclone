@@ -4379,7 +4379,11 @@ matches its callee. That is what lets LFRic's configuration enumerations --
 ``coord_system``, ``geometry``, ``topology``, which the generated
 configuration modules declare ``PROTECTED`` because the namelist reader is
 the only thing that may set them -- be passed to a helper the region
-inlines. A callee's own ``POINTER`` local is relaxed too
+inlines. A module variable declared ``PROTECTED`` that a moved callee
+imports from its own module -- ``sci_chi_transform_mod``'s
+``chi2xyz_rot_mat`` -- is given its partial datatype by the same rule, and
+reaches the region as any other module variable. A callee's own ``POINTER``
+local is relaxed too
 where it only ever aims at a whole array, and becomes a ``View`` handle in
 the generated region; every other use of such a pointer is refused by name.
 Inlined against a section actual -- ``call edge(field(w3_idx:w3_idx +
@@ -4417,10 +4421,12 @@ constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
 dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
 generated as one assignment per element, into the array the kernel has
 already declared and from the origin its declaration gives. A constructor
-used as a value rather than as a whole right-hand side -- an actual argument,
-an operand, or one nested inside another -- is refused by naming the
-position, because C has no array-valued expression and the region creates no
-temporary to hold one. A ``DO WHILE`` loop in the body is generated as a C
+that is an operand of an array expression -- ``panel_1_xyz = radius /
+panel_rho * (/ 1.0, tan(alpha), tan(beta) /)`` in ``alphabetar2xyz`` -- is
+first assigned to a local of its own, ``constructor``, and the expression
+reads that. Any other constructor used as a value -- an actual argument, or
+one nested inside another -- is refused by naming the position, because C
+has no array-valued expression. A ``DO WHILE`` loop in the body is generated as a C
 ``while``, and is never spread across the team. An unlabelled ``EXIT`` is
 generated as a C ``break``, which leaves the same loop the Fortran leaves;
 the loop it leaves is never spread across the team either, since a lambda
@@ -5370,7 +5376,11 @@ backend generates runs the section's own indices in the section's own
 order. Only a fold whose *value* is a scalar is moved: ``MATMUL``,
 ``TRANSPOSE``, ``RESHAPE`` and a ``SUM`` with a ``dim`` produce arrays,
 which would need a temporary of their own shape, and they keep whatever
-refusal they already had. The one position the move cannot serve is the
+refusal they already had. What *is* given a temporary is an operand of one
+of these intrinsics that is an array expression rather than an array:
+``matmul(real(PANEL_ROT_MATRIX(:,:,panel_id), r_double), xyz)`` has its
+first operand assigned to a local, ``matmul_operand``, of the section's
+shape, before the statement, and that assignment is lowered like any other. The one position the move cannot serve is the
 condition of a ``DO WHILE``, which Fortran evaluates on every trip where
 an assignment before the loop is evaluated once; that is refused, naming
 the fold and the condition.
@@ -5382,10 +5392,12 @@ is generated as one assignment per element, into the array the kernel has
 already declared and from the origin that declaration gives. A braced
 initialiser is not the alternative it looks like: C accepts one only on a
 declaration, and the array is declared before the statement is reached.
-Anywhere else -- an actual argument, an operand of an expression, a
-constructor nested inside another -- the constructor has to survive as an
-array in its own right, which needs a temporary this region does not
-create, so the backend refuses it by naming the position and
+An operand of an array expression is given that shape first: it is
+assigned whole to a local, ``constructor``, and the expression reads the
+local. Anywhere else -- an actual argument, a constructor nested inside
+another -- the constructor has to survive as an array in its own right,
+which needs a temporary this region does not create, so the backend
+refuses it by naming the position and
 :py:meth:`apply` reports that refusal as it does any other the backend
 raises. An implied-do constructor never reaches the backend at all: the
 PSyIR frontend does not model one, so ``[ (i, i=1,n) ]`` arrives as a

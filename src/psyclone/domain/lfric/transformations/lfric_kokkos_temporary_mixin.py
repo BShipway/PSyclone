@@ -69,8 +69,11 @@ evaluated once and Fortran evaluates the condition on every trip. Either is
 then refused by ``InlineTrans`` in its own words, with the call named.
 """
 
+from psyclone.psyir.backend.kokkos_array_intrinsics import (
+    KokkosArrayIntrinsics)
 from psyclone.psyir.nodes import (
-    Assignment, Literal, Reference, Routine, Schedule, WhileLoop)
+    ArrayConstructor, Assignment, IntrinsicCall, Literal, Reference, Routine,
+    Schedule, WhileLoop)
 from psyclone.psyir.symbols import ArrayType, DataSymbol, ScalarType
 
 
@@ -86,6 +89,15 @@ class LFRicKokkosTemporaryMixin:
     #: ``SymbolTable.new_symbol`` numbers a second one rather than colliding
     #: with the first or with anything the kernel declared.
     _ACTUAL_TEMPORARY = "actual"
+
+    #: The name of the local an array constructor is assigned to when it
+    #: stands inside a larger array expression; numbered by
+    #: ``SymbolTable.new_symbol`` as the one above is.
+    _CONSTRUCTOR_TEMPORARY = "constructor"
+
+    #: The root name of the local an array-valued intrinsic's operand is
+    #: assigned to; the intrinsic's own name goes in front of it.
+    _OPERAND_TEMPORARY = "operand"
 
     @classmethod
     def _hoist_array_expressions(cls, call):
@@ -119,11 +131,39 @@ class LFRicKokkosTemporaryMixin:
             actual.replace_with(Reference(local))
 
     @staticmethod
-    def _is_array_expression(actual):
+    def _elemental_datatype(operand):
+        """Return the type of ``operand``, an elemental call's being an array.
+
+        The PSyIR types an elemental intrinsic by its scalar result:
+        ``real(PANEL_ROT_MATRIX(:,:,panel_id), r_double)`` is a
+        ``real(r_double)``. Applied to an array, Fortran gives an array of
+        that result in the argument's shape, and that is the type returned.
+
+        :param operand: the expression to type.
+        :type operand: :py:class:`psyclone.psyir.nodes.DataNode`
+
+        :returns: its type, with an elemental call applied to an array
+            given that array's shape.
+        :rtype: :py:class:`psyclone.psyir.symbols.DataType`
+        """
+        datatype = operand.datatype
+        if not (isinstance(operand, IntrinsicCall) and operand.is_elemental
+                and isinstance(datatype, ScalarType)):
+            return datatype
+        for argument in operand.arguments:
+            if isinstance(argument.datatype, ArrayType):
+                return ArrayType(datatype, argument.datatype.shape)
+        return datatype
+
+    @staticmethod
+    def _is_array_expression(actual, datatype=None):
         """Return whether ``actual`` is an expression with a declarable shape.
 
         :param actual: the actual argument to judge.
         :type actual: :py:class:`psyclone.psyir.nodes.DataNode`
+        :param datatype: the type to judge it by, where the caller knows it
+            better than ``actual.datatype`` does; that one by default.
+        :type datatype: Optional[:py:class:`psyclone.psyir.symbols.DataType`]
 
         :returns: whether it is neither a variable nor a literal, and its
             type is an array of a known intrinsic type whose every extent is
@@ -132,13 +172,106 @@ class LFRicKokkosTemporaryMixin:
         """
         if isinstance(actual, (Reference, Literal)):
             return False
-        datatype = actual.datatype
+        datatype = datatype or actual.datatype
         if not isinstance(datatype, ArrayType):
             return False
         if not isinstance(datatype.intrinsic, ScalarType.Intrinsic):
             return False
         return all(isinstance(extent, ArrayType.ArrayBounds)
                    for extent in datatype.shape)
+
+    @classmethod
+    def _hoist_constructors(cls, schedule):
+        """Assign each array constructor inside an array expression to a local.
+
+        LFRic's ``alphabetar2xyz`` writes ``xyz = radius / rho * (/ 1.0,
+        tan(alpha), tan(beta) /)``.
+        :py:class:`~psyclone.psyir.transformations.ArrayAssignment2LoopsTrans`
+        declines any assignment holding a constructor, since the loop it
+        writes would subscript the constructor, and no writer can render
+        that. A constructor standing alone on the right is what the backend
+        already writes element by element, so the constructor is given that
+        shape: it is assigned to a new local immediately before the
+        statement, and the statement reads the local, which the lowering
+        subscripts like any other array.
+
+        A constructor is left as written when any of its elements is itself
+        an array, or its element type is not a known intrinsic one, since
+        then its length or its declaration cannot be stated; the lowering
+        then refuses the statement in its own words.
+
+        :param schedule: the kernel schedule to prepare.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        """
+        table = schedule.symbol_table
+        for constructor in schedule.walk(ArrayConstructor):
+            statement = constructor.ancestor(Assignment)
+            if statement is None or statement.rhs is constructor:
+                continue
+            # pylint: disable-next=no-member
+            if not cls._is_array_valued(statement):
+                continue
+            element = constructor.datatype.elemental_type
+            if not isinstance(element, ScalarType) or any(
+                    not isinstance(child.datatype, ScalarType)
+                    for child in constructor.children):
+                continue
+            local = table.new_symbol(
+                cls._CONSTRUCTOR_TEMPORARY, symbol_type=DataSymbol,
+                datatype=ArrayType(element, [len(constructor.children)]))
+            statement.parent.children.insert(
+                statement.position,
+                Assignment.create(Reference(local), constructor.copy()))
+            constructor.replace_with(Reference(local))
+
+    @classmethod
+    def _hoist_intrinsic_operands(cls, schedule):
+        """Assign each expression an array-valued intrinsic reads to a local.
+
+        :py:class:`~psyclone.psyir.backend.kokkos_array_intrinsics.\
+KokkosArrayIntrinsics` writes ``MATMUL``, ``DOT_PRODUCT``, the folds and
+        the maps as loops that subscript each operand, so an operand has to
+        be something with subscripts: a whole array, a section, or another
+        intrinsic of the tier. LFRic's ``alphabetar2xyz`` reads
+        ``matmul(real(PANEL_ROT_MATRIX(:,:,panel_id), r_double), xyz)``,
+        whose first operand is none of them. As
+        :py:meth:`_hoist_array_expressions` does for an actual, the operand
+        is evaluated into a new local immediately before the statement,
+        where Fortran would have evaluated it into a temporary anyway, and
+        the intrinsic reads the local. The assignment made is array-valued
+        and is lowered to a loop with every other.
+
+        An operand whose shape or element type the PSyIR cannot state is
+        left as written, for the writer to refuse; and so is one in the
+        condition of a ``DO WHILE``, for the reason
+        :py:meth:`_hoist_array_expressions` gives.
+
+        :param schedule: the kernel schedule to prepare.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        """
+        table = schedule.symbol_table
+        for call in schedule.walk(IntrinsicCall):
+            if not KokkosArrayIntrinsics.handles(call):
+                continue
+            statement = call
+            while not isinstance(statement.parent, Schedule):
+                statement = statement.parent
+            if isinstance(statement, WhileLoop):
+                continue
+            for operand in list(call.arguments):
+                if KokkosArrayIntrinsics.handles(operand):
+                    continue
+                datatype = cls._elemental_datatype(operand)
+                if not cls._is_array_expression(operand, datatype):
+                    continue
+                local = table.new_symbol(
+                    f"{call.intrinsic.name.lower()}_"
+                    f"{cls._OPERAND_TEMPORARY}",
+                    symbol_type=DataSymbol, datatype=datatype)
+                statement.parent.children.insert(
+                    statement.position,
+                    Assignment.create(Reference(local), operand.copy()))
+                operand.replace_with(Reference(local))
 
 
 __all__ = ["LFRicKokkosTemporaryMixin"]
