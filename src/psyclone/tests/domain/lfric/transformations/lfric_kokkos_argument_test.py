@@ -14,8 +14,8 @@ from lfric_kokkos_sources import (
     _ALGORITHM, _KERNEL, _OPERATOR_ALGORITHM, _OPERATOR_KERNEL, _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
-from psyclone.domain.lfric.transformations.lfric_kokkos_argument_mixin import (
-    _ArgumentRoles)
+from psyclone.domain.lfric.transformations.lfric_kokkos_argument_roles import (
+    LFRicKokkosArgumentRoles)
 from psyclone.tests.utilities import get_invoke
 
 
@@ -310,7 +310,7 @@ def test_argument_roles_stage_a_columnwise_operator_per_call():
     psy, _ = get_invoke("20.1_cma_apply.f90", "lfric", dist_mem=False, idx=0)
     invoke = psy.invokes.invoke_list[0]
     invoke.setup_psy_layer_symbols()
-    builder = _ArgumentRoles(invoke.schedule.kernels()[0])
+    builder = LFRicKokkosArgumentRoles(invoke.schedule.kernels()[0])
     builder.generate()
 
     roles = {builder._arglist[position]: role
