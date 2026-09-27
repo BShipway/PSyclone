@@ -4313,8 +4313,8 @@ rotation matrix ``sci_chi_transform_mod`` keeps private at run time, is
 still refused for that datum, since nothing outside the module may name it.
 Being in
 scope is not being inlinable, and the rest of the judgement is PSyclone's
-rather than this transformation's: a callee reading data private to its own
-module, one whose declarations depend on an argument the call site writes to
+rather than this transformation's: a callee reading a variable private to its
+own module, one whose declarations depend on an argument the call site writes to
 before calling, and one whose actual and formal types do not agree are each
 refused in ``InlineTrans``'s own words with the call named, followed by
 ``KernelModuleInlineTrans``'s own where the callee could not be brought in
@@ -4997,7 +4997,7 @@ its own array sections in with it and each of those is then judged like
 the kernel's own.
 
 The repetition is bounded by ``LFRicKokkosInlineMixin._INLINE_LIMIT``,
-eight calls into one kernel body, and the bound is load-bearing rather
+sixty-four calls into one kernel body, and the bound is load-bearing rather
 than defensive: ``InlineTrans`` has no recursion check, so a routine that
 calls itself is substituted into itself for as long as it is asked.
 Reaching the bound is a refusal naming the routine still to be inlined.
