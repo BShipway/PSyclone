@@ -4001,14 +4001,16 @@ def test_kokkos_writer_rejects_a_dof_region_asking_for_a_team():
     dof shape anyway would drop the scratch declarations the body then reads,
     which is a compile error at best and a wrong answer at worst, so the
     combination is refused where it is described rather than left to the
-    shape to ignore.
+    shape to ignore. The scratch refused is team scratch: an array each
+    iteration holds its own copy of is declared inside the launch, and
+    ``kokkos_member_local_test`` asserts that it is accepted.
     """
     for overrides in ({"scratch": _scratch_region().scratch},
                       {"parallel_loops": _level_region().parallel_loops}):
         with pytest.raises(ValueError) as error:
             KokkosWriter()(_dof_region(**overrides))
-        assert ("A dof region has no team, so it can neither place scratch "
-                "nor spread a loop over one." in str(error.value))
+        assert ("A dof region has no team, so it can neither place team "
+                "scratch nor spread a loop over one." in str(error.value))
 
 
 def _with_first_cell(region):

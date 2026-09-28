@@ -232,13 +232,14 @@ KokkosArrayExpressionMixin.arrayreference_node` emits for any described
         "};\n\n")
 
 
-def _member_local_declaration(item, indent):
+def member_local_declaration(item, indent):
     """Return the declaration of one member-local array.
 
     :param item: the scratch array, which ``member_local`` is set on.
     :type item: :py:class:`psyclone.psyir.backend.kokkos.KokkosScratch`
-    :param str indent: the leading whitespace, as :py:func:`_scratch_text`
-        uses it.
+    :param str indent: the leading whitespace: that of a team launch's
+        scratch constructions, as :py:func:`_scratch_text` uses it, or that
+        of a dof launch's locals.
 
     :returns: the declaration line.
     :rtype: str
@@ -294,7 +295,7 @@ def _scratch_text(region, allocation, indent):
     sizes = "\n      + ".join(by_level["0"]) or "0"
     sizes_global = "\n      + ".join(by_level["1"])
     constructions = "".join(
-        _member_local_declaration(item, indent) if item.member_local else
+        member_local_declaration(item, indent) if item.member_local else
         f"{indent}{item.name}_scratch_t {item.name}({allocation}("
         f"{'1' if _scratch_level(region, item) == '1' else 'scratch_level'}"
         f"), {', '.join(item.extents)});\n"
@@ -320,7 +321,9 @@ def scratch_probe_definition(region):
     Nothing is emitted for a region with no scratch. A flat launch whose
     every array is member-local still names the probe, although its empty
     request never reaches it, so the test is on any scratch rather than on
-    :py:func:`team_scratch_items`.
+    :py:func:`team_scratch_items`. A dof region is the exception: it has no
+    team to ask about, and every array it carries is member-local, so
+    nothing is emitted for it either.
 
     :param region: the region being generated.
     :type region: :py:class:`psyclone.psyir.backend.kokkos.KokkosRegion`
@@ -329,7 +332,7 @@ def scratch_probe_definition(region):
         string.
     :rtype: str
     """
-    if not region.scratch:
+    if not region.scratch or region.dof:
         return ""
     return (
         "// Asked by the launch below which scratch level its arrays fit in:\n"

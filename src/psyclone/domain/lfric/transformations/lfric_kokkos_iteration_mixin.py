@@ -314,10 +314,18 @@ class LFRicKokkosIterationMixin:
         region it refuses -- a failure part-way through the capture rather
         than a refusal, and a loop the coverage survey had called capturable.
 
-        Neither is a shape a GungHo dof kernel has: a kernel handed one dof
-        of each field has nothing to size a local array by. It is refused
-        rather than left unexamined because the survey is asked of every loop
-        in the model and reports what it is told.
+        A kernel-local array of a small fixed shape needs no scratch: each
+        iteration holds its own copy, declared inside the launch, which is
+        the storage ``LFRicKokkosCallMixin._is_member_local`` describes for
+        a team's members. A GungHo dof kernel handed one dof of each field
+        has nothing to size an array by at run time, and the one it gains by
+        inlining a helper is of that kind -- ``cart2sphere_scalar``'s
+        ``spherical_vec(2)``, reached from
+        ``convert_cart2sphere_vector_code``. Any other array is refused, as
+        is an array an aliasing pointer is aimed at, which would need a View
+        to hand it. They are refused rather than left unexamined because the
+        survey is asked of every loop in the model and reports what it is
+        told.
 
         :param node: the loop that is to be captured.
         :type node: :py:class:`psyclone.domain.lfric.LFRicLoop`
@@ -333,21 +341,26 @@ class LFRicKokkosIterationMixin:
             ...]
 
         :raises TransformationError: if the loop is over dofs and its kernel
-            declares an automatic array.
+            declares an automatic array no iteration can hold a copy of.
         :raises TransformationError: if the loop is over dofs and its kernel
             has a loop that would be spread over a team.
         """
         if not cls._is_dof(node):
             return
+        held = {item.name for item in cls._local_arrays(schedule, dof=True)
+                if item.member_local}
         # Sorted so that a kernel with two of them names the same one on
         # every run.
         for symbol in sorted(schedule.symbol_table.automatic_datasymbols,
                              key=lambda symbol: symbol.name):
-            if symbol.is_array:
+            if symbol.is_array and symbol.name not in held:
                 raise TransformationError(
                     f"LFRicKokkosTrans cannot place the kernel-local array "
                     f"'{symbol.name}' of a loop over dofs: the dof launch is "
-                    "a flat range and has no team to hold scratch.")
+                    "a flat range and has no team to hold scratch, and each "
+                    "iteration holds its own copy only of an array of fixed "
+                    f"shape and at most {cls.MEMBER_LOCAL_MAX_ELEMENTS} "
+                    "elements that no pointer is aimed at.")
         if parallel_loops:
             raise TransformationError(
                 "LFRicKokkosTrans cannot spread a loop of a kernel over dofs "

@@ -4186,7 +4186,8 @@ with neither keeps the ``RangePolicy``. A loop over LFRic's ``dof`` or
 columns: a flat ``RangePolicy`` over the loop's own dof count, with no
 dofmap reached and no cell index in the body, each iteration writing one
 dof and no two writing the same one. That shape has no team, so a kernel
-over dofs holding an automatic array or a loop to spread is refused; an
+over dofs holding a loop to spread is refused, as is an automatic array
+other than one small enough for each iteration to hold its own copy; an
 LFRic builtin is refused too, PSyclone generating its body rather than
 reading it from a kernel file. A loop over the halo cells alone begins
 where the owned cells end, and the cell it begins at crosses as a second
@@ -4268,7 +4269,7 @@ refused. The region is a C++ function with no Fortran to call into, so
 other rule looks at the body, and a callee that itself calls is inlined in
 its turn, one call at a time until none is left; a callee brings its own
 loops, locals and sections with it and each is then judged like the
-kernel's own. The repetition is bounded at eight calls into one body, and
+kernel's own. The repetition is bounded at sixty-four calls into one body, and
 the bound is load-bearing rather than defensive: ``InlineTrans`` has no
 recursion check, so a routine that calls itself would be substituted into
 itself for as long as it was asked, and reaching the bound is instead a
@@ -4297,14 +4298,23 @@ travels. A sibling that cannot be substituted -- one declaring a static
 local, say, or one reached through an interface whose specifics differ in a
 kind PSyclone cannot reduce to a value, so that the arguments settle nothing
 -- leaves its call where the file put it, and the refusal that follows names
-it. Data of the callee's module is not in
-scope and is not brought into it by this: ``chi2xyz``, which reads a
-rotation matrix its module keeps at run time, is still refused for that
-datum, a named constant being the only thing that crosses a container
-boundary. Being in
+it. Data of the callee's own module travels where Fortran would let it: a
+``parameter`` of that module is declared again in the callee, with its value,
+and a name the module makes public is imported from it, so the Held--Suarez
+helpers' ``KF`` and ``KA`` reach the region as values and
+``coord_transform_mod``'s public ``PANEL_ROT_MATRIX`` as an import the PSy
+layer makes too. That holds when the callee is reached through a generic
+interface, as ``nodal_xyz_coordinates_code`` reaches
+``alphabetar2xyz_r_double`` through ``alphabetar2xyz``: the call is made to
+the interface brought into the kernel's Container, whose specifics carry
+the data, rather than to the one it was imported as. A private *variable*
+does not: ``chi2xyz``, reading a
+rotation matrix ``sci_chi_transform_mod`` keeps private at run time, is
+still refused for that datum, since nothing outside the module may name it.
+Being in
 scope is not being inlinable, and the rest of the judgement is PSyclone's
-rather than this transformation's: a callee reading data private to its own
-module, one whose declarations depend on an argument the call site writes to
+rather than this transformation's: a callee reading a variable private to its
+own module, one whose declarations depend on an argument the call site writes to
 before calling, and one whose actual and formal types do not agree are each
 refused in ``InlineTrans``'s own words with the call named, followed by
 ``KernelModuleInlineTrans``'s own where the callee could not be brought in
@@ -4339,7 +4349,20 @@ to the generated region. Anything the call does not fix to one element -- an
 extent still a variable, a dummy of more than one element, an element of an
 array of rank two or more -- is left as the kernel wrote it and refused in
 ``InlineTrans``'s own words with the call named, a narrowing of what the
-callee reads being worse than a refusal. A formal declared ``TARGET`` is
+callee reads being worse than a refusal. A call passing **an array
+expression** -- LFRic's native Jacobian passes ``chi_3_df+radius`` to
+``jacobian_abr2XYZ``, which reads ``radius(:)`` -- has the temporary Fortran
+would have made written out: the expression is assigned to a new local
+array of its own shape, ``jacobian_abr2xyz_actual``, immediately before the
+statement, and the call is passed that. The local is a column array like
+the kernel's own and is placed beside them. The same is done where the
+call is between two routines of the callee's module, as that one is: the
+sibling is inlined into ``native_jacobian`` in the module's own tree before
+``native_jacobian`` travels, and the local travels with it. An expression
+whose shape or
+element type PSyIR cannot state, and one in the condition of a ``do
+while``, where an assignment before the loop would be evaluated once, are
+left as written and refused by ``InlineTrans``. A formal declared ``TARGET`` is
 none of those: the attribute
 constrains what a pointer elsewhere may be aimed at, which substituting a
 body neither creates nor breaks, so such a formal is given the type the
@@ -4356,7 +4379,11 @@ matches its callee. That is what lets LFRic's configuration enumerations --
 ``coord_system``, ``geometry``, ``topology``, which the generated
 configuration modules declare ``PROTECTED`` because the namelist reader is
 the only thing that may set them -- be passed to a helper the region
-inlines. A callee's own ``POINTER`` local is relaxed too
+inlines. A module variable declared ``PROTECTED`` that a moved callee
+imports from its own module -- ``sci_chi_transform_mod``'s
+``chi2xyz_rot_mat`` -- is given its partial datatype by the same rule, and
+reaches the region as any other module variable. A callee's own ``POINTER``
+local is relaxed too
 where it only ever aims at a whole array, and becomes a ``View`` handle in
 the generated region; every other use of such a pointer is refused by name.
 Inlined against a section actual -- ``call edge(field(w3_idx:w3_idx +
@@ -4373,7 +4400,12 @@ where that module cannot be read. A name a callee imports that the kernel's
 module already holds as a routine -- one an earlier inlining brought in, as
 the horizontal FFSL kernels' two helpers both bring in
 ``fourth_order_horizontal_edge`` -- has the callee's calls aimed at that
-routine and its import taken out, the two being one routine of one module. An imported name a later pass needs the
+routine and its import taken out, the two being one routine of one module.
+A name a callee imports that the call site holds as data of its own --
+``held_suarez_fv_code`` takes ``kappa`` as an argument, and the helper it
+calls reads ``planet_config_mod``'s ``kappa`` -- is imported under a new
+local name, ``use planet_config_mod, only : kappa_1 => kappa``, since the
+merge can rename neither an argument nor an import. An imported name a later pass needs the
 type of is read from its module too, so an array section bounded by a
 module's parameter is lowered by that parameter's value. Types agreeing is a scored judgement rather than
 an identity: a literal actual stating no kind, an actual whose type PSyclone cannot
@@ -4394,10 +4426,12 @@ constructor -- ``v_dot_n = (/ -1.0, 1.0, 1.0, -1.0 /)``, or one full-extent
 dimension of an array as ``vert_vec(:,qp1,qp2) = (/ ... /)`` -- which is
 generated as one assignment per element, into the array the kernel has
 already declared and from the origin its declaration gives. A constructor
-used as a value rather than as a whole right-hand side -- an actual argument,
-an operand, or one nested inside another -- is refused by naming the
-position, because C has no array-valued expression and the region creates no
-temporary to hold one. A ``DO WHILE`` loop in the body is generated as a C
+that is an operand of an array expression -- ``panel_1_xyz = radius /
+panel_rho * (/ 1.0, tan(alpha), tan(beta) /)`` in ``alphabetar2xyz`` -- is
+first assigned to a local of its own, ``constructor``, and the expression
+reads that. Any other constructor used as a value -- an actual argument, or
+one nested inside another -- is refused by naming the position, because C
+has no array-valued expression. A ``DO WHILE`` loop in the body is generated as a C
 ``while``, and is never spread across the team. An unlabelled ``EXIT`` is
 generated as a C ``break``, which leaves the same loop the Fortran leaves;
 the loop it leaves is never spread across the team either, since a lambda
@@ -4839,9 +4873,14 @@ columns would need one or the other.
 
 What it does not have is a team. A dof launch is a flat range with
 nowhere to place scratch and no members to spread a loop over, so a
-kernel over dofs carrying an automatic array, or a loop the dependency
-analysis would spread, is refused by name rather than launched over a
-shape that would silently drop it. That refusal is asked after the rules
+kernel over dofs carrying a loop the dependency analysis would spread is
+refused by name rather than launched over a shape that would silently drop
+it. An automatic array is refused in the same way unless each iteration
+can hold a copy of its own: a fixed shape of at most sixteen elements and
+three dimensions, with no pointer aimed at it. Such an array is declared
+inside the launch, beside the scalar locals. It is the shape
+``convert_cart2sphere_vector_code`` has once ``cart2sphere_scalar``, which
+holds a two-element array, is inlined into it. That refusal is asked after the rules
 a cell-column launch would apply, so a body a cell launch could not take
 either is still refused for the reason it always was.
 
@@ -4958,7 +4997,7 @@ its own array sections in with it and each of those is then judged like
 the kernel's own.
 
 The repetition is bounded by ``LFRicKokkosInlineMixin._INLINE_LIMIT``,
-eight calls into one kernel body, and the bound is load-bearing rather
+sixty-four calls into one kernel body, and the bound is load-bearing rather
 than defensive: ``InlineTrans`` has no recursion check, so a routine that
 calls itself is substituted into itself for as long as it is asked.
 Reaching the bound is a refusal naming the routine still to be inlined.
@@ -5025,6 +5064,22 @@ by-value formal the PSy layer supplies. This is what puts LFRic's
 ``sci_face_selector_support_mod`` reading the face indices ``W``, ``S``,
 ``E`` and ``N`` from ``reference_element_mod`` -- inside the capture.
 
+A callee reading a name of its *own* module is another matter, because
+``KernelModuleInlineTrans`` refuses a routine that reads anything declared
+beside it: moving the routine would leave the name behind. Two kinds of name
+are given a declaration of the callee's own for the length of the move, each
+the one Fortran would accept for it anywhere. A name the module makes
+public is imported from that module, and reaches the region as every
+imported name does -- a constant by its value, a variable as a by-value
+formal. A private ``parameter`` is declared again as a ``parameter`` of the
+callee with the same type and value, a constant it depends on first, and
+the region carries the arithmetic: LFRic's ``held_suarez_forcings_mod``
+declares ``KA = KF/40.0_r_def``, both private, and the region reads
+``(1. / 86400.) / 40.0``. A private *variable* is neither, and the move
+refuses it as before. The declarations are added to the module PSyclone
+cached, since that is the one the move reads, and taken out again when the
+move is over, so the next kernel reads the module as its file declares it.
+
 It is in scope whether or not the frontend could tell it from an array.
 ``selector(face)`` standing in an expression is a function reference or an
 element of an array, and where the kernel's own file does not settle which
@@ -5036,8 +5091,8 @@ Only a bare symbol is: a name PSyclone has already typed as data is left
 alone, and asking for its body reaches the datum and is refused below.
 
 Being in scope is not being inlinable, and the rest of the judgement is
-PSyclone's rather than this transformation's: a callee reading data
-private to its own module, one whose declarations depend on an argument
+PSyclone's rather than this transformation's: a callee reading a
+variable private to its own module, one whose declarations depend on an argument
 the call site writes to before calling, one whose actual and formal types
 do not agree, one holding a CodeBlock. Each is refused in ``InlineTrans``'
 own words with the call named, because those words say what to fix and a
@@ -5326,7 +5381,11 @@ backend generates runs the section's own indices in the section's own
 order. Only a fold whose *value* is a scalar is moved: ``MATMUL``,
 ``TRANSPOSE``, ``RESHAPE`` and a ``SUM`` with a ``dim`` produce arrays,
 which would need a temporary of their own shape, and they keep whatever
-refusal they already had. The one position the move cannot serve is the
+refusal they already had. What *is* given a temporary is an operand of one
+of these intrinsics that is an array expression rather than an array:
+``matmul(real(PANEL_ROT_MATRIX(:,:,panel_id), r_double), xyz)`` has its
+first operand assigned to a local, ``matmul_operand``, of the section's
+shape, before the statement, and that assignment is lowered like any other. The one position the move cannot serve is the
 condition of a ``DO WHILE``, which Fortran evaluates on every trip where
 an assignment before the loop is evaluated once; that is refused, naming
 the fold and the condition.
@@ -5338,10 +5397,12 @@ is generated as one assignment per element, into the array the kernel has
 already declared and from the origin that declaration gives. A braced
 initialiser is not the alternative it looks like: C accepts one only on a
 declaration, and the array is declared before the statement is reached.
-Anywhere else -- an actual argument, an operand of an expression, a
-constructor nested inside another -- the constructor has to survive as an
-array in its own right, which needs a temporary this region does not
-create, so the backend refuses it by naming the position and
+An operand of an array expression is given that shape first: it is
+assigned whole to a local, ``constructor``, and the expression reads the
+local. Anywhere else -- an actual argument, a constructor nested inside
+another -- the constructor has to survive as an array in its own right,
+which needs a temporary this region does not create, so the backend
+refuses it by naming the position and
 :py:meth:`apply` reports that refusal as it does any other the backend
 raises. An implied-do constructor never reaches the backend at all: the
 PSyIR frontend does not model one, so ``[ (i, i=1,n) ]`` arrives as a

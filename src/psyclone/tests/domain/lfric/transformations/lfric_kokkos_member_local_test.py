@@ -202,6 +202,27 @@ def test_a_region_that_spreads_no_loop_is_described_as_it_was():
         "  integer(kind=i_def), dimension(2) :: sized", spread=False) is False
 
 
+def test_a_dof_region_is_asked_although_it_spreads_nothing():
+    """A dof launch has no team, so a copy each is the only storage it has.
+
+    Its iterations are single dofs rather than cells or lanes of one, and
+    it spreads no loop, so the correctness condition holds of every array;
+    size and the aliasing pointer still decide. This is what lets
+    ``cart2sphere_scalar``'s ``spherical_vec(2)`` be captured once the
+    helper is inlined into ``convert_cart2sphere_vector_code``.
+    """
+    schedule = _schedule("  integer(kind=i_def), dimension(2) :: sized")
+    symbol = schedule.symbol_table.lookup("sized")
+    described = {item.name: item for item in
+                 LFRicKokkosTrans._local_arrays(schedule, dof=True)}
+
+    assert described["sized"].member_local is True
+    assert LFRicKokkosTrans._is_member_local(
+        symbol, ("17",), (), set(), dof=True) is False
+    assert LFRicKokkosTrans._is_member_local(
+        symbol, ("2",), (), {"sized"}, dof=True) is False
+
+
 def test_the_described_region_declares_it_per_member(member_local_target):
     """End to end: the plumbing reaches the generated region.
 

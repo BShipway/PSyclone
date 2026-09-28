@@ -209,7 +209,8 @@ class LFRicKokkosCallMixin:
         return evaluate(left, right)
 
     @classmethod
-    def _is_member_local(cls, symbol, extents, parallel_loops, targets):
+    def _is_member_local(cls, symbol, extents, parallel_loops, targets,
+                         dof=False):
         """Say whether every member of the team may hold its own copy.
 
         A kernel-local array is team scratch because the team shares it. It
@@ -230,9 +231,14 @@ class LFRicKokkosCallMixin:
         ``nvcc`` 13.3 miscompiles a region holding four of them at any
         optimisation above ``-Xcicc -O1``.
 
-        A region with no spread loops is not asked: its members are whole
-        cells rather than lanes of one, so it reserves one array per member
-        already and there is nothing to move.
+        A cell region with no spread loops is not asked: its members are
+        whole cells rather than lanes of one, so it reserves one array per
+        member already and there is nothing to move. A dof region is asked
+        although it spreads nothing, because it has no team at all: a copy
+        held by each iteration is the only storage its launch can give an
+        array, so the answer is the difference between capturing the loop
+        and refusing it. No loop is spread there, so the first condition
+        holds of every array and the other two decide.
 
         :param symbol: the automatic array being described.
         :type symbol: :py:class:`psyclone.psyir.symbols.DataSymbol`
@@ -245,11 +251,13 @@ class LFRicKokkosCallMixin:
         :param targets: the names every aliasing pointer of the body is
             aimed at.
         :type targets: set[str]
+        :param bool dof: whether the region is launched over dofs.
 
         :returns: whether the array is described as per-member storage.
         :rtype: bool
         """
-        if not parallel_loops or symbol.name in targets:
+        # pylint: disable=too-many-arguments, too-many-positional-arguments
+        if not (parallel_loops or dof) or symbol.name in targets:
             return False
         if not extents or len(extents) > cls.MEMBER_LOCAL_MAX_RANK:
             return False
@@ -262,7 +270,7 @@ class LFRicKokkosCallMixin:
             for reference in loop.walk(Reference))
 
     @classmethod
-    def _local_arrays(cls, schedule, parallel_loops=()):
+    def _local_arrays(cls, schedule, parallel_loops=(), dof=False):
         """Describe the kernel's automatic arrays as team scratch.
 
         Each one becomes a scratch View private to the team rank running the
@@ -289,6 +297,8 @@ class LFRicKokkosCallMixin:
             the caller has paid for the dependence analysis that answers it.
         :type parallel_loops: tuple[
             :py:class:`psyclone.psyir.nodes.Loop`, ...]
+        :param bool dof: whether the region is launched over dofs, which
+            :py:meth:`_is_member_local` is told.
 
         :returns: one description per automatic array, in declaration order.
         :rtype: tuple[
@@ -311,7 +321,7 @@ class LFRicKokkosCallMixin:
                 symbol.name, cls._c_type(symbol), extents,
                 index_offsets=cls._origins(symbol),
                 member_local=cls._is_member_local(
-                    symbol, extents, parallel_loops, targets)))
+                    symbol, extents, parallel_loops, targets, dof)))
         return tuple(scratch)
 
     @staticmethod

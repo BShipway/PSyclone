@@ -435,6 +435,8 @@ class KernelModuleInlineTrans(Transformation):
                     :py:class:`psyclone.psyir.nodes.Call`
         :param options: a dictionary with options for transformations.
         :type options: Optional[Dict[str, Any]]
+        :param kwargs: additional keyword arguments, passed on to
+            :py:meth:`validate`.
 
         '''
         if isinstance(node, CodedKern) and node.module_inline:
@@ -617,6 +619,14 @@ class KernelModuleInlineTrans(Transformation):
             container.symbol_table.add(new_sym)
             new_sym.visibility = Symbol.Visibility.PRIVATE
             new_sym.replace_symbols_using(container.symbol_table)
+            # The Calls above are re-pointed by the name of each routine
+            # brought in, which is not the interface's name, so a Call to the
+            # interface still refers to the import just removed and would
+            # resolve to the source module's routines, not these.
+            removed = [sym for sym in (called_sym, shadowed_sym) if sym]
+            for call in container.walk(Call):
+                if any(call.routine.symbol is sym for sym in removed):
+                    call.routine.symbol = new_sym
         else:
             # No interface but was the original routine symbol renamed
             # on import?

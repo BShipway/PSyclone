@@ -13,7 +13,7 @@ import pytest
 from lfric_kokkos_sources import _LOCAL_ALGORITHM, _LOCAL_KERNEL, _invoke
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
-from psyclone.psyir.nodes import Call, IntrinsicCall, Routine
+from psyclone.psyir.nodes import Call, IntrinsicCall, Reference, Routine
 from psyclone.psyir.symbols import ContainerSymbol, RoutineSymbol
 from psyclone.psyir.transformations import TransformationError
 
@@ -314,6 +314,53 @@ def test_a_clash_no_module_settles_is_still_refused(
             "['missing_face_mod']") in message
 
 
+# LFRic's held_suarez_fv_code: the kernel holds `kappa` as an argument and
+# its helper reads the `kappa` of planet_config_mod. Here the kernel holds `s`
+# as a local and its helper reads the `s` of face_index_mod.
+_SHADOWING_FACE_KERNEL = _LOCAL_KERNEL.replace(
+    "  use kernel_mod, only : kernel_type",
+    "  use kernel_mod, only : kernel_type\n"
+    "  use face_sweep_mod, only : sweep_column").replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k\n"
+    "    real(kind=r_def) :: s\n").replace(
+    "    swept(nlayers) = partial(nlayers)\n"
+    "    do k = nlayers - 1, 1, -1\n"
+    "      swept(k) = swept(k + 1) - partial(k)\n"
+    "    end do\n",
+    "    s = 0.5_r_def\n"
+    "    call sweep_column(nlayers, partial, swept)\n"
+    "    swept(1) = swept(1) + s\n")
+
+
+def test_a_name_the_call_site_holds_otherwise_is_imported_renamed(
+        tmp_path, clear_module_manager_instance):
+    """A callee's import the call site holds as a local is aliased.
+
+    Neither `s` can be renamed by the merge: the kernel's could be named in
+    a call, were it an argument as LFRic's `kappa` is, and the helper's is
+    the module's name. The helper's is imported under a name of its own,
+    `s_1 => s`, which is the same variable, and the region reads the
+    module's value under that name.
+    """
+    # The fixture is requested for its effect, not its value; the name is
+    # too long to fit the disable-next its neighbours use on one line.
+    # pylint: disable=unused-argument
+    psy, loop, kernel = _face_invoke(
+        tmp_path, _SHADOWING_FACE_KERNEL, _NAMED_FACE_HELPER)
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    assert not [call for call in schedule.walk(Call)
+                if not isinstance(call, IntrinsicCall)]
+    imported = schedule.symbol_table.lookup("s_1")
+    assert imported.interface.orig_name == "s"
+    assert imported.interface.container_symbol.name == "face_index_mod"
+    assert "s_1" in cpp
+    assert "use face_index_mod, only : s_1=>s" in str(psy.gen).lower()
+
+
 def test_a_call_outside_a_routine_has_no_scopes_to_agree():
     """A call with no routine around it is left alone rather than read.
 
@@ -394,3 +441,93 @@ def test_a_module_name_the_table_uses_for_something_else_is_left(
     assert table.lookup("s").is_unresolved
     assert not isinstance(table.lookup("reference_element_mod"),
                           ContainerSymbol)
+
+
+# A callee importing a helper by the name of a routine the call site's module
+# already holds, as an earlier inlining leaves it.
+_HELPER_CALLEE = """
+module callee_mod
+  implicit none
+contains
+  subroutine callee()
+    use helpers_mod, only : helper
+    call helper()
+  end subroutine callee
+end module callee_mod
+"""
+
+
+_HELPER_TARGET = """
+module target_mod
+  implicit none
+contains
+  subroutine helper()
+  end subroutine helper
+end module target_mod
+"""
+
+
+def _helper_callee(fortran_reader):
+    """Return the callee importing ``helper``, its import and its call.
+
+    :param fortran_reader: the reader the callee is parsed with.
+    :type fortran_reader: :py:class:`psyclone.psyir.frontend.fortran.\
+FortranReader`
+
+    :returns: the callee, the symbol it imports and the call it makes.
+    :rtype: tuple[:py:class:`psyclone.psyir.nodes.Routine`,
+        :py:class:`psyclone.psyir.symbols.RoutineSymbol`,
+        :py:class:`psyclone.psyir.nodes.Call`]
+    """
+    callee = fortran_reader.psyir_from_source(_HELPER_CALLEE).walk(Routine)[0]
+    return callee, callee.symbol_table.lookup("helper"), callee.walk(Call)[0]
+
+
+def test_a_call_with_no_container_keeps_its_imports(fortran_reader):
+    """With no Container there is no routine of its own to prefer.
+
+    The call site's Container is where an earlier inlining would have put
+    the routine; a call outside one has nowhere such a routine could be, so
+    the callee's imports are left as they are.
+    """
+    callee, imported, call = _helper_callee(fortran_reader)
+
+    LFRicKokkosTrans._prefer_local_routines(callee, None)
+
+    assert callee.symbol_table.lookup("helper") is imported
+    assert call.routine.symbol is imported
+
+
+def test_a_routine_the_container_does_not_declare_is_not_preferred(
+        fortran_reader):
+    """A routine of the same name deeper down is not the Container's own.
+
+    A FileContainer holds its modules' routines without declaring them, so
+    the name is not one the call site can reach and the import is kept.
+    """
+    callee, imported, call = _helper_callee(fortran_reader)
+    file_container = fortran_reader.psyir_from_source(_HELPER_TARGET)
+
+    LFRicKokkosTrans._prefer_local_routines(callee, file_container)
+
+    assert callee.symbol_table.lookup("helper") is imported
+    assert call.routine.symbol is imported
+
+
+def test_an_import_used_other_than_by_a_call_is_kept(fortran_reader):
+    """An import still referenced after its calls are re-aimed stays.
+
+    Passing the helper as an actual is a use a re-aimed call does not cover,
+    so removing the import would leave that reference dangling. The call is
+    re-aimed at the Container's routine and the import is left for the merge
+    to judge.
+    """
+    callee, imported, call = _helper_callee(fortran_reader)
+    callee.addchild(Call.create(RoutineSymbol("apply_it"),
+                                [Reference(imported)]))
+    module = fortran_reader.psyir_from_source(_HELPER_TARGET).children[0]
+
+    LFRicKokkosTrans._prefer_local_routines(callee, module)
+
+    assert call.routine.symbol is module.symbol_table.lookup("helper")
+    assert callee.symbol_table.lookup("helper") is imported

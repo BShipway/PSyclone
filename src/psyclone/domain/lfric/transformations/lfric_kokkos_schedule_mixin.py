@@ -225,6 +225,10 @@ class LFRicKokkosScheduleMixin:
             running this method over a copy, so reaching it from
             :py:meth:`apply` would mean that prediction had been skipped.
         """
+        # pylint: disable=no-member
+        cls._hoist_intrinsic_operands(schedule)
+        cls._hoist_constructors(schedule)
+        # pylint: enable=no-member
         expansion = Reference2ArrayRangeTrans()
         lowering = ArrayAssignment2LoopsTrans()
         for assignment in schedule.walk(Assignment):

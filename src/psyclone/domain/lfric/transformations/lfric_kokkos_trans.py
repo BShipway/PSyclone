@@ -29,12 +29,16 @@ from psyclone.domain.lfric.transformations.lfric_kokkos_intrinsic_mixin \
     import LFRicKokkosIntrinsicMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_iteration_mixin \
     import LFRicKokkosIterationMixin
+from psyclone.domain.lfric.transformations.lfric_kokkos_import_mixin import (
+    LFRicKokkosImportMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_inline_mixin import (
     LFRicKokkosInlineMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_schedule_mixin \
     import LFRicKokkosScheduleMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_element_mixin import (
     LFRicKokkosElementMixin)
+from psyclone.domain.lfric.transformations.lfric_kokkos_temporary_mixin \
+    import LFRicKokkosTemporaryMixin
 from psyclone.domain.lfric.transformations.lfric_kokkos_types_mixin import (
     LFRicKokkosTypesMixin)
 from psyclone.domain.lfric.transformations.lfric_kokkos_write_mixin import (
@@ -45,8 +49,8 @@ from psyclone.psyir.backend.visitor import VisitorError
 from psyclone.psyir.transformations import TransformationError
 
 
-# Sixteen mixins and Transformation, which is one contract split by subject
-# rather than seventeen layers of behaviour: every base but the last holds
+# Eighteen mixins and Transformation, which is one contract split by subject
+# rather than nineteen layers of behaviour: every base but the last holds
 # only private helpers, and none of them overrides anything.
 # pylint: disable-next=too-many-ancestors
 class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
@@ -55,11 +59,11 @@ class LFRicKokkosTrans(LFRicKokkosAliasMixin, LFRicKokkosBoundMixin,
                        LFRicKokkosBoundsMixin,
                        LFRicKokkosCallMixin,
                        LFRicKokkosConstantsMixin, LFRicKokkosElementMixin,
-                       LFRicKokkosInlineMixin,
+                       LFRicKokkosImportMixin, LFRicKokkosInlineMixin,
                        LFRicKokkosInterfaceMixin,
                        LFRicKokkosIntrinsicMixin, LFRicKokkosIterationMixin,
-                       LFRicKokkosScheduleMixin, LFRicKokkosWriteMixin,
-                       Transformation):
+                       LFRicKokkosScheduleMixin, LFRicKokkosTemporaryMixin,
+                       LFRicKokkosWriteMixin, Transformation):
     """Replace one supported LFRic loop with a C ABI call.
 
     The transformation recognises a kernel shape rather than a named kernel:

@@ -115,7 +115,8 @@ LFRicKokkosArgumentMixin._scratch_arrays` calls ``cls._local_arrays``.
 import re
 from dataclasses import replace
 
-from psyclone.domain.lfric import KernCallArgList
+from psyclone.domain.lfric.transformations.lfric_kokkos_argument_roles \
+    import LFRicKokkosArgumentRoles
 from psyclone.lfric import LFRicHaloExchange
 from psyclone.psyGen import InvokeSchedule
 from psyclone.psyir.backend.kokkos import (
@@ -125,184 +126,6 @@ from psyclone.psyir.nodes import (
     Routine)
 from psyclone.psyir.symbols import ArgumentInterface, ScalarType
 from psyclone.psyir.transformations import TransformationError
-
-
-class _ArgumentRoles(KernCallArgList):
-    """A ``KernCallArgList`` that remembers what each actual is.
-
-    Every array a region takes has to be placed somewhere the device can
-    reach it, and where that is depends on what the array *is*: LFRic
-    allocates field data in a space a device shares, and allocates a dofmap,
-    a basis table, a quadrature weight, a map or an operator's local stencil
-    in one it does not. The generated C++ cannot tell them apart -- they all
-    arrive as pointers -- so the answer has to be taken here, where the
-    kernel's metadata still says what each argument means, and carried down
-    on the View as its
-    :py:attr:`~psyclone.psyir.backend.kokkos.KokkosView.role`.
-
-    ``ArgOrdering`` already visits each argument through a callback named for
-    its kind, so a handful of callbacks are the whole question. Each records
-    the stretch of the argument list its call added -- one entry for a field,
-    one per component for a field vector, the count and the stencil for an
-    operator -- against the role that stretch carries.
-
-    Three kinds are named here rather than left to be read off the access the
-    kernel declares. A *field* is named because its storage is in a space the
-    device shares. An *LMA operator* is named for the same reason and carries
-    the same role: ``lfric_core`` claims a field's ``data`` and an operator's
-    ``local_stencil`` from one registry, on one default and behind one switch,
-    so an operator's stencil is in the space a field's data is in and a region
-    reads and writes it where it lies. Read off the access alone it would look
-    like a dofmap -- read-only, so immutable, so cacheable -- and an apply
-    would go on reading the copy the first call took while a later assembly
-    wrote new values to the storage behind it. That is not a compile error and
-    not a crash; it is a solver that stops converging, which is what the
-    whole-model gate saw before the role was taken from the metadata rather
-    than from the access. A *columnwise* operator is the exception: its matrix
-    and its dofmaps are ordinary allocatables, nothing may assume they are
-    device-reachable, and it keeps ``readwrite``.
-
-    A *basis* or *differential basis* table and a rule's *quadrature weights*
-    are named for the opposite reason. They are read-only for the call, and by
-    the access alone they look exactly like a dofmap, but the PSy layer
-    allocates them at the head of an invoke, fills them from the rule and
-    deallocates them at its foot. The storage is therefore recycled between
-    invokes: an address that held one space's table holds another's a moment
-    later, so nothing keyed by the address stays good. They are ``transient``,
-    which is the role that says read-only for the call and not cacheable
-    across calls.
-
-    :param kern: the kernel whose call is being built.
-    :type kern: :py:class:`psyclone.domain.lfric.LFRicKern`
-
-    """
-    def __init__(self, kern):
-        super().__init__(kern)
-        #: The role of each position in the argument list a callback named,
-        #: keyed by position. A position no callback here named is absent,
-        #: and is placed by what the kernel reads or writes it as.
-        self.roles = {}
-
-    def _record(self, before, role):
-        """Record everything the call just added under one role.
-
-        :param int before: the length of the argument list before the call.
-        :param str role: the role the added arguments carry.
-
-        """
-        self.roles.update(
-            (position, role)
-            for position in range(before, len(self._psyir_arglist)))
-
-    def field(self, arg, var_accesses=None):
-        """Add a field, and record where it landed.
-
-        :param arg: the field to add.
-        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().field(arg, var_accesses)
-        self._record(before, "field")
-
-    def field_vector(self, argvect, var_accesses=None):
-        """Add a field vector, and record where its components landed.
-
-        :param argvect: the field vector to add.
-        :type argvect: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().field_vector(argvect, var_accesses)
-        self._record(before, "field")
-
-    def operator(self, arg, var_accesses=None):
-        """Add an LMA operator, and record where its stencil landed.
-
-        The ``field`` role, because an LMA operator's local stencil is in the
-        space a field's data is in: one registry claims both, on one default.
-        A region therefore works on the caller's storage and nothing is
-        copied around the call. The count the call also adds is a scalar,
-        which carries no View and so no role.
-
-        :param arg: the operator to add.
-        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().operator(arg, var_accesses)
-        self._record(before, "field")
-
-    def cma_operator(self, arg, var_accesses=None):
-        """Add a columnwise operator, and record it as staged per call.
-
-        Not the ``field`` role an LMA operator takes.
-        ``columnwise_operator_mod`` allocates the banded matrix and its
-        dofmaps the ordinary way, so none of them is device-reachable and
-        each has to be staged. The transformation refuses a CMA kernel
-        outright today; this keeps the answer right for the day it does not.
-
-        :param arg: the operator to add.
-        :type arg: :py:class:`psyclone.lfric.LFRicKernelArgument`
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().cma_operator(arg, var_accesses)
-        self._record(before, "readwrite")
-
-    def basis(self, function_space, var_accesses=None):
-        """Add a basis table, and record it as living only for the invoke.
-
-        :param function_space: the space the table is for.
-        :type function_space: \
-            :py:class:`psyclone.domain.lfric.FunctionSpace`
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().basis(function_space, var_accesses)
-        self._record(before, "transient")
-
-    def diff_basis(self, function_space, var_accesses=None):
-        """Add a differential basis table, and record it the same way.
-
-        :param function_space: the space the table is for.
-        :type function_space: \
-            :py:class:`psyclone.domain.lfric.FunctionSpace`
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().diff_basis(function_space, var_accesses)
-        self._record(before, "transient")
-
-    def quad_rule(self, var_accesses=None):
-        """Add the quadrature rule, and record its weights the same way.
-
-        :param var_accesses: optional store for variable accesses.
-        :type var_accesses: Optional[
-            :py:class:`psyclone.core.VariablesAccessMap`]
-
-        """
-        before = len(self._psyir_arglist)
-        super().quad_rule(var_accesses)
-        self._record(before, "transient")
 
 
 class LFRicKokkosArgumentMixin:
@@ -671,7 +494,7 @@ LFRicKokkosTrans.apply` makes.
         # KernCallArgList creates references to PSy-layer symbols. Ensure the
         # LFRic invoke has first specialised those symbols as DataSymbols.
         node.ancestor(InvokeSchedule).invoke.setup_psy_layer_symbols()
-        argument_builder = _ArgumentRoles(kernel)
+        argument_builder = LFRicKokkosArgumentRoles(kernel)
         argument_builder.generate()
         # An extent :py:meth:`LFRicKokkosBoundsMixin._resolve_assumed_shapes`
         # measured is a formal the region declares and the kernel never wrote,
@@ -833,7 +656,8 @@ LFRicKokkosTrans.apply` makes.
                 + cls._constant_arguments(constants)),
             constants=cls._constant_arrays(schedule),
             kind_types=cls._kind_types(schedule),
-            scratch=cls._scratch_arrays(schedule, renames, parallel_loops),
+            scratch=cls._scratch_arrays(
+                schedule, renames, parallel_loops, dof),
             aliases=cls._region_aliases(schedule, renames),
             parallel_loops=parallel_loops,
             team_size=(options or {}).get(cls._TEAM_SIZE_OPTION))
@@ -870,7 +694,8 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
             for name, targets in cls._alias_targets(schedule).items())
 
     @classmethod
-    def _scratch_arrays(cls, schedule, renames, parallel_loops=()):
+    def _scratch_arrays(cls, schedule, renames, parallel_loops=(),
+                        dof=False):
         """Describe the kernel's automatic arrays, per-cell sizes renamed.
 
         A local sized from a stencil's size -- ``dimension(stencil_size)`` --
@@ -889,6 +714,8 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
             arrays a member may hold its own copy of.
         :type parallel_loops: tuple[
             :py:class:`psyclone.psyir.nodes.Loop`, ...]
+        :param bool dof: whether the region is launched over dofs, passed
+            on to ``cls._local_arrays`` for the same decision.
 
         :returns: one description per automatic array, in declaration order.
         :rtype: tuple[
@@ -899,7 +726,7 @@ lfric_kokkos_alias_mixin.LFRicKokkosAliasMixin._alias_locals` accepted before
                     extents=cls._rename_extents(item.extents, renames),
                     index_offsets=cls._rename_extents(
                         item.index_offsets, renames))
-            for item in cls._local_arrays(schedule, parallel_loops))
+            for item in cls._local_arrays(schedule, parallel_loops, dof))
 
     @classmethod
     def _call_region(cls, node, region, actuals, constants):

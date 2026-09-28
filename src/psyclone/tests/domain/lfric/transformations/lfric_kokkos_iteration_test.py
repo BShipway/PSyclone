@@ -422,30 +422,72 @@ def test_lfric_kokkos_trans_refuses_an_unmodelled_iteration_space(target):
             in str(error.value))
 
 
-def test_lfric_kokkos_trans_refuses_an_array_local_of_a_dof_kernel(tmp_path):
-    """A dof launch has nowhere to put a kernel-local array.
+def _dof_kernel_with(extent):
+    """Return the dof kernel holding a kernel-local array of one extent.
 
-    A cell-column launch places one in team scratch and takes the team
-    launch to do it. A dof launch is a flat range with no team at all, so
-    the array is refused by name rather than dropped by a shape that has no
-    scratch to carry it -- which would compile and give a wrong answer.
+    :param str extent: the array's declared extent.
+
+    :returns: the kernel module's source.
+    :rtype: str
     """
     kernel = _DOF_KERNEL.replace(
         "    real(kind=r_def), intent(in) :: in_dof, scale\n",
         "    real(kind=r_def), intent(in) :: in_dof, scale\n"
-        "    real(kind=r_def), dimension(3) :: partial\n")
-    kernel = kernel.replace(
+        f"    real(kind=r_def), dimension({extent}) :: partial\n")
+    return kernel.replace(
         "    out_dof = scale * in_dof\n",
         "    partial(1) = scale * in_dof\n"
-        "    out_dof = partial(1)\n")
-    _, loop, _ = _invoke(tmp_path, "scale_field", _DOF_ALGORITHM, kernel)
+        "    partial(2) = partial(1) + in_dof\n"
+        "    out_dof = partial(2)\n")
+
+
+@pytest.mark.usefixtures("clear_module_manager_instance")
+def test_lfric_kokkos_trans_holds_a_small_array_of_a_dof_kernel_per_dof(
+        tmp_path):
+    """Each iteration of a dof launch holds its own copy of a small array.
+
+    The dof launch has no team scratch, but an array of a small fixed shape
+    needs none: it is declared inside the lambda, beside the scalars, as
+    the wrapper a team's members hold theirs in. This is the shape
+    ``convert_cart2sphere_vector_code`` has once ``cart2sphere_scalar`` and
+    its ``spherical_vec(2)`` are inlined into it.
+    """
+    _, loop, _ = _invoke(
+        tmp_path, "scale_field", _DOF_ALGORITHM, _dof_kernel_with("3"))
+
+    code = LFRicKokkosTrans().apply(loop)
+
+    assert ("KOKKOS_LAMBDA(const int df) {\n"
+            "    KokkosMemberLocal<double, 3> partial;\n"
+            "    partial((1 - 1)) = (scale * in_dof(df));\n" in code)
+    assert "out_dof(df) = partial((2 - 1));" in code
+    assert "struct KokkosMemberLocal {" in code
+    for team in ("TeamPolicy", "ScratchSpace", "KokkosScratchProbe",
+                 "Kokkos::single("):
+        assert team not in code
+
+
+def test_lfric_kokkos_trans_refuses_an_array_local_of_a_dof_kernel(tmp_path):
+    """A dof launch has nowhere to put a kernel-local array of any size.
+
+    A cell-column launch places one in team scratch and takes the team
+    launch to do it. A dof launch is a flat range with no team at all, and
+    an iteration holds a copy of its own only of an array under the
+    per-member cap, so a larger one is refused by name rather than dropped
+    by a shape that has no scratch to carry it -- which would compile and
+    give a wrong answer.
+    """
+    _, loop, _ = _invoke(
+        tmp_path, "scale_field", _DOF_ALGORITHM, _dof_kernel_with("17"))
 
     with pytest.raises(TransformationError) as error:
         LFRicKokkosTrans().validate(loop)
 
     assert ("LFRicKokkosTrans cannot place the kernel-local array 'partial' "
             "of a loop over dofs: the dof launch is a flat range and has no "
-            "team to hold scratch." in str(error.value))
+            "team to hold scratch, and each iteration holds its own copy "
+            "only of an array of fixed shape and at most 16 elements that "
+            "no pointer is aimed at." in str(error.value))
 
 
 def test_lfric_kokkos_trans_refuses_a_spreadable_loop_of_a_dof_kernel(
