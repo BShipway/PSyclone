@@ -199,8 +199,9 @@ def test_an_element_reaching_an_array_of_one_is_inlined(element_target):
     assert "edge" not in cpp
     # The helper's body ran against the one element it was given: its own
     # loop runs over one iteration and its subscript is offset from ``k``,
-    # which is the section's lower bound.
-    assert "TeamVectorRange(team, 1, 1 + 1)" in cpp
+    # which is the section's lower bound. One iteration is too few to
+    # spread, so the loop is serial.
+    assert "for(j=1; j<=1; j+=1)" in cpp
     element = "swept((((j - 1) + k) - 1))"
     assert f"{element} = ({element} * 2.0)" in cpp
 

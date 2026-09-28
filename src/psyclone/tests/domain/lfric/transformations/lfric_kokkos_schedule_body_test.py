@@ -15,7 +15,8 @@ from lfric_kokkos_sources import (
     _SECTION_KERNEL, _invoke)
 
 from psyclone.domain.lfric.transformations import LFRicKokkosTrans
-from psyclone.psyir.nodes import Exit
+from psyclone.psyir.nodes import Exit, Loop
+from psyclone.psyir.transformations import TransformationError
 
 
 # The tri_solve shape as the model actually writes it: a forward elimination
@@ -141,6 +142,70 @@ _CONSTRUCTOR_SECTION_KERNEL = _SECTION_KERNEL.replace(
     "    faces(:) = (/ 2_i_def, 3_i_def, 4_i_def, 5_i_def /)\n"
     "    difference(w3_idx : w3_idx + nl) = "
     "mass_flux(b_idx : b_idx + nl) * real(faces(1), r_tran)")
+
+
+# The same kernel with its level loop replaced by a loop over the three
+# components of a vector, the shape nodal_xyz_coordinates_code is made of. The
+# iterations are independent, and the loop is still not worth a team: it would
+# occupy three members of a warp and make every array write a single and a
+# barrier. The stop is a placeholder the tests set, to probe either side of
+# SPREAD_MIN_TRIPS.
+_SHORT_LOOP_KERNEL = _LEVEL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k, i\n").replace(
+    "    real(kind=r_def) :: scaling",
+    "    real(kind=r_def) :: scaling\n"
+    "    real(kind=r_def), dimension(8) :: vec").replace(
+    "    do k = 1, nlayers - 1\n"
+    "      field_out(map_w3(1) + k - 1) = "
+    "scaling * field_in(map_w3(1) + k - 1)\n"
+    "    end do",
+    "    do i = 1, STOP\n"
+    "      vec(i) = scaling * field_in(map_w3(1) + i - 1)\n"
+    "    end do\n"
+    "    k = 1\n"
+    "    field_out(map_w3(1)) = vec(1)")
+
+
+# The level kernel with a three-trip loop after its level loop, whose target
+# the tests set: a small local each member may hold, a column the team shares,
+# or the field itself. The level loop is spread in every case, so the region
+# is hierarchical and the short loop's writes are what decide it; the scalar
+# it also writes is each member's own and decides nothing.
+_MIXED_LOOP_KERNEL = _LEVEL_KERNEL.replace(
+    "    integer(kind=i_def) :: k\n",
+    "    integer(kind=i_def) :: k, i\n").replace(
+    "    real(kind=r_def) :: scaling",
+    "    real(kind=r_def) :: scaling, share\n"
+    "    real(kind=r_def), dimension(3) :: vec\n"
+    "    real(kind=r_def), dimension(nlayers) :: col").replace(
+    "    field_out(map_w3(1) + nlayers - 1) = "
+    "field_in(map_w3(1) + nlayers - 1)",
+    "    do i = 1, 3\n"
+    "      share = scaling / 3.0_r_def\n"
+    "      TARGET = share\n"
+    "    end do\n"
+    "    field_out(map_w3(1) + nlayers - 1) = vec(1) + col(1)")
+
+
+@pytest.fixture(name="mixed_loop_target")
+def mixed_loop_target_fixture(
+        request, tmp_path,
+        clear_module_manager_instance):  # pylint: disable=unused-argument
+    """Create an invoke spreading its level loop and holding a short one."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM,
+        _MIXED_LOOP_KERNEL.replace("TARGET", request.param))
+
+
+@pytest.fixture(name="short_loop_target")
+def short_loop_target_fixture(
+        request, tmp_path,
+        clear_module_manager_instance):  # pylint: disable=unused-argument
+    """Create an invoke whose only loop has the constant count requested."""
+    return _invoke(
+        tmp_path, "column_scale", _LEVEL_ALGORITHM,
+        _SHORT_LOOP_KERNEL.replace("STOP", str(request.param)))
 
 
 @pytest.fixture(name="tri_solve_target")
@@ -409,6 +474,116 @@ def test_parallel_loops_keeps_a_loop_an_inner_exit_leaves(
     selected = LFRicKokkosTrans._parallel_loops(schedule)
 
     assert [loop.variable.name for loop in selected] == ["k"]
+
+
+@pytest.mark.parametrize("short_loop_target, spread", [
+    (0, []), (3, []), (LFRicKokkosTrans.SPREAD_MIN_TRIPS - 1, []),
+    (LFRicKokkosTrans.SPREAD_MIN_TRIPS, ["i"])],
+    indirect=["short_loop_target"])
+def test_parallel_loops_skips_a_short_loop_of_constant_count(
+        short_loop_target, spread):
+    """A loop of literal count below ``SPREAD_MIN_TRIPS`` is left serial.
+
+    The analysis accepts every one of these loops; the count alone decides.
+    At the threshold the loop is spread, so the rule is a cost judgement
+    about short loops and not a refusal of constant bounds.
+    """
+    _, _, kernel = short_loop_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == spread
+
+
+@pytest.mark.parametrize("mixed_loop_target, spread", [
+    ("vec(i)", ["k"]),
+    ("col(i)", ["k", "i"]),
+    ("field_out(map_w3(1) + i - 1)", ["k", "i"])],
+    indirect=["mixed_loop_target"])
+def test_parallel_loops_spreads_a_short_loop_writing_shared_data(
+        mixed_loop_target, spread):
+    """A short loop beside a spread one stays serial only over its own data.
+
+    Serial in a hierarchical region, a write to anything the team shares is
+    a ``single`` and a barrier per iteration, where spread it is one barrier
+    for the loop. A three-element local is each member's own once no spread
+    loop names it, so writing it costs nothing serial; a column sized by
+    ``nlayers`` and a field are shared, and the loop writing them is spread.
+    """
+    _, _, kernel = mixed_loop_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == spread
+
+
+@pytest.mark.parametrize("mixed_loop_target", ["vec(i)"], indirect=True)
+def test_apply_keeps_a_member_local_short_loop_serial(mixed_loop_target):
+    """The short loop is a bare serial loop over a member-local array."""
+    _, loop, _ = mixed_loop_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "KokkosMemberLocal<double, 3> vec;" in cpp
+    assert "for(i=1; i<=3; i+=1)" in cpp
+    assert "TeamVectorRange(team, 1, 3 + 1)" not in cpp
+
+
+@pytest.mark.parametrize("mixed_loop_target", ["vec(i)"], indirect=True)
+def test_parallel_loops_spreads_a_short_loop_over_an_unshaped_local(
+        mixed_loop_target, monkeypatch):
+    """A local whose shape cannot be read is not taken to be a member's own.
+
+    ``_extents`` refuses a declaration it cannot render, and
+    ``_validate_locals`` refuses the region for it later; until then, the
+    loop writing that local is spread as it was before the rule existed.
+    """
+    _, _, kernel = mixed_loop_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+
+    def refuse(symbol):
+        raise TransformationError(f"no shape for {symbol.name}")
+
+    monkeypatch.setattr(LFRicKokkosTrans, "_extents", refuse)
+
+    selected = LFRicKokkosTrans._parallel_loops(schedule)
+
+    assert [loop.variable.name for loop in selected] == ["k", "i"]
+
+
+def test_constant_trips_reads_only_literal_bounds(level_target):
+    """A bound naming a variable has no constant count to compare.
+
+    The level loop runs to ``nlayers - 1``, so it is never skipped as short
+    however few levels the model is configured with.
+    """
+    _, _, kernel = level_target
+    schedule = LFRicKokkosTrans._schedule(kernel)
+    loop = schedule.walk(Loop)[0]
+
+    assert LFRicKokkosTrans._constant_trips(loop) is None
+
+
+@pytest.mark.parametrize("short_loop_target", [3], indirect=True)
+def test_apply_launches_a_short_loop_one_cell_per_rank(short_loop_target):
+    """A region whose only loop is short is launched one cell per rank.
+
+    Nothing is spread, so no member waits on another: the column is the
+    rank's own, its vector is in the rank's own scratch, and no scalar
+    write is guarded by a single.
+    """
+    _, loop, _ = short_loop_target
+
+    cpp = LFRicKokkosTrans().apply(loop)
+
+    assert "TeamThreadRange(team, team.team_size())" in cpp
+    assert "vec_scratch_t vec(team.thread_scratch(0), 8);" in cpp
+    assert "for(i=1; i<=3; i+=1)" in cpp
+    assert "TeamVectorRange" not in cpp
+    assert "Kokkos::single" not in cpp
+    assert "team_barrier" not in cpp
 
 
 def test_apply_writes_break_for_an_exit(exit_level_target):

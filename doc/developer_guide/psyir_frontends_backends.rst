@@ -1161,7 +1161,20 @@ team.league_rank()`, and the team's members spread over the cell's levels
 rather than over cells. That is the division an LFRic kernel is shaped for,
 since a cell's levels are the inner dimension of every field it reads, so
 members of one team touch neighbouring elements rather than columns a stride
-apart. Each loop the region named becomes a
+apart. Which loops a region names is the transformation's choice,
+`LFRicKokkosTrans._parallel_loops`: the outermost the dependence analysis
+accepts, less a stepped loop, a loop an `EXIT` leaves, and a loop whose
+bounds are integer literals and which runs fewer than
+`LFRicKokkosTrans.SPREAD_MIN_TRIPS` times. The last is a matter of cost
+rather than correctness. A loop over the three components of a vector,
+spread, occupies three members of a warp-sized team, puts the arrays it
+names in team scratch, and turns every write to them outside it into a
+`Kokkos::single` and a barrier. Left serial, a region whose only candidates
+were such loops takes the one-cell-per-rank shape above; in a region that
+spreads other loops, a short loop is left serial only where every array it
+assigns becomes member-local, since serial writes to a shared array would
+pay a `single` and a barrier each. Each
+loop the region named becomes a
 `Kokkos::parallel_for(Kokkos::TeamVectorRange(team, start, stop + 1), ...)`
 -- the `+ 1` converting Fortran's inclusive bound to Kokkos's half-open
 range -- followed by an unconditional `team.team_barrier()`. `TeamVectorRange`

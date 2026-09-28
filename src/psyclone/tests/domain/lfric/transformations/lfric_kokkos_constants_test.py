@@ -310,9 +310,10 @@ def test_lfric_kokkos_trans_places_a_local_sized_by_a_named_constant(
 
     cpp = LFRicKokkosTrans().apply(loop)
 
-    assert "v_dot_n_scratch_t::shmem_size(4)" in cpp
-    assert ("v_dot_n_scratch_t v_dot_n("
-            "team.team_scratch(0), 4);") in cpp
+    # Four elements filled by a loop too short to spread, so each member
+    # holds its own copy rather than the team sharing one in scratch.
+    assert "KokkosMemberLocal<double, 4> v_dot_n;" in cpp
+    assert "v_dot_n_scratch_t" not in cpp
     # The name is nowhere in the generated unit: not in the extent, not in
     # the body, and not across the interface.
     assert "nfaces" not in cpp

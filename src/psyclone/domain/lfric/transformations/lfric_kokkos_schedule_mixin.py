@@ -57,7 +57,8 @@ LFRicKokkosScheduleMixin._lower_sections` rewrites every array-valued
 * **Which loops may be spread over the team?** :py:meth:`\
 LFRicKokkosScheduleMixin._parallel_loops` asks
   :py:class:`~psyclone.psyir.tools.DependencyTools` and then narrows what it
-  accepts by two properties of the shape the loop is rendered into.
+  accepts by three properties of the shape the loop is rendered into and one
+  of what spreading it would cost.
 
 It is a module of its own because
 :py:mod:`psyclone.domain.lfric.transformations.lfric_kokkos_trans` is mostly
@@ -78,6 +79,7 @@ from psyclone.errors import GenerationError
 from psyclone.psyir.nodes import (
     Assignment, Exit, Literal, Loop, WhileLoop)
 from psyclone.psyir.nodes.array_mixin import ArrayMixin
+from psyclone.psyir.symbols import ScalarType
 from psyclone.psyir.tools import DependencyTools
 from psyclone.psyir.transformations import (
     ArrayAssignment2LoopsTrans, Reference2ArrayRangeTrans,
@@ -95,6 +97,23 @@ class LFRicKokkosScheduleMixin:
     # A mixin contributing only private helpers has none of its own by
     # design; the class it is mixed into carries the public interface.
     # pylint: disable=too-few-public-methods
+
+    #: The fewest iterations a loop of constant trip count must have to be
+    #: spread over the team. Spreading a loop is what makes a region
+    #: hierarchical, and a hierarchical team is at least a warp: every array
+    #: the loop names becomes team scratch, and every write to a shared array
+    #: outside a spread loop becomes a ``Kokkos::single`` and a
+    #: ``team_barrier`` that all its members wait at. A loop over the three
+    #: components of a vector pays all of that to occupy three members of
+    #: thirty-two. Measured on an H100
+    #: (phase 8, task C1) ``nodal_xyz_coordinates_code``, whose only spread
+    #: loops were such loops, ran its column on one member of each team
+    #: through 73 ``single`` blocks and took 48% of all card time at C144.
+    #: Left serial, such a loop is run by each member for its own cell, and
+    #: the arrays it names become the member's own. Eight is a quarter of a
+    #: warp: below it a spread loop leaves most of the team idle whatever the
+    #: body, and the loops GungHo has of constant count are of three or four.
+    SPREAD_MIN_TRIPS = 8
 
     @classmethod
     def _schedule(cls, kernel):
@@ -239,7 +258,28 @@ class LFRicKokkosScheduleMixin:
             lowering.apply(assignment)
 
     @staticmethod
-    def _parallel_loops(schedule):
+    def _constant_trips(loop):
+        """Return a loop's trip count where its bounds are integer literals.
+
+        The bounds are read after the kernel's named constants have been
+        substituted, so ``do i = 1, 3`` and a loop to a ``parameter`` of 3
+        both answer 3; a bound naming anything else answers ``None``.
+
+        :param loop: the loop being asked about, with a step of one.
+        :type loop: :py:class:`psyclone.psyir.nodes.Loop`
+
+        :returns: the number of iterations, or ``None`` if not constant.
+        :rtype: Optional[int]
+        """
+        bounds = (loop.start_expr, loop.stop_expr)
+        if not all(isinstance(bound, Literal) and
+                   bound.datatype.intrinsic ==
+                   ScalarType.Intrinsic.INTEGER for bound in bounds):
+            return None
+        return max(int(bounds[1].value) - int(bounds[0].value) + 1, 0)
+
+    @classmethod
+    def _parallel_loops(cls, schedule):
         """Return the loops of ``schedule`` that may be spread over the team.
 
         The judgement is PSyclone's own:
@@ -252,8 +292,9 @@ can_loop_be_parallelised`
         reads as a write-write race because the indirection is opaque to it,
         so a kernel whose only loops write that way keeps the flat launch.
 
-        Two rules narrow what it accepts, both of them properties of the shape
-        the loop is rendered into rather than of the dependence analysis:
+        Four rules narrow what it accepts, the first three properties of the
+        shape the loop is rendered into rather than of the dependence
+        analysis, the last one of its cost:
 
         * **Outermost wins.** A team is one pool of members, so nesting a
           ``TeamVectorRange`` inside another would divide the same members
@@ -269,6 +310,20 @@ can_loop_be_parallelised`
           where the break is what the Fortran meant. An EXIT further in
           leaves a loop of its own inside the lambda and does not disqualify
           anything.
+        * **A short loop of constant count is skipped.** A loop whose
+          bounds are integer literals and which runs fewer than
+          :py:attr:`SPREAD_MIN_TRIPS` times stays a serial ``for``: it
+          would occupy a few members of a warp-sized team, put the arrays
+          it names in team scratch, and make every write to them outside
+          it a ``single`` and a barrier. The loop over
+          ``nlayers`` is never skipped this way, because its count is not a
+          literal. A region whose only candidates are skipped spreads
+          nothing, and is launched one cell per team rank. In a region that
+          spreads other loops, a short loop is spread after all if it
+          assigns an array the team shares: serial, each iteration's write
+          would be a ``single`` and a barrier of its own. Leaving one loop
+          serial can make another's array shared, so the choice is repeated
+          until it settles.
 
         :param schedule: the kernel schedule being captured, already lowered
             and bound-substituted, since both create loops.
@@ -278,7 +333,46 @@ can_loop_be_parallelised`
         :rtype: Tuple[:py:class:`psyclone.psyir.nodes.Loop`, ...]
         """
         tools = DependencyTools()
+        serial = None
+        while True:
+            chosen, short = cls._select_loops(schedule, tools, serial)
+            if serial is None:
+                serial = short
+            if not chosen:
+                return ()
+            shared = [loop for loop in serial
+                      if any(loop is each for each in short)
+                      and not cls._writes_only_member_local(
+                          schedule, loop, chosen)]
+            if not shared:
+                return tuple(chosen)
+            serial = [loop for loop in serial
+                      if not any(loop is each for each in shared)]
+
+    @classmethod
+    def _select_loops(cls, schedule, tools, serial):
+        """Walk ``schedule`` once, choosing the loops to spread.
+
+        The rules are :py:meth:`_parallel_loops`'s. A short loop of constant
+        count is left serial when ``serial`` is ``None``, which is the first
+        walk, or when it is one of ``serial``; otherwise it is judged like
+        any other loop.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param tools: the dependence analysis, created once by the caller.
+        :type tools: :py:class:`psyclone.psyir.tools.DependencyTools`
+        :param serial: the short loops still to be left serial, or ``None``
+            to leave every one of them so.
+        :type serial: Optional[List[:py:class:`psyclone.psyir.nodes.Loop`]]
+
+        :returns: the loops chosen, outermost first, and the short loops the
+            walk reached, would otherwise have chosen and left serial.
+        :rtype: Tuple[List[:py:class:`psyclone.psyir.nodes.Loop`],
+            List[:py:class:`psyclone.psyir.nodes.Loop`]]
+        """
         chosen = []
+        short = []
         for loop in schedule.walk(Loop):
             ancestor = loop.ancestor(Loop)
             nested = False
@@ -295,9 +389,57 @@ can_loop_be_parallelised`
             if any(statement.ancestor((Loop, WhileLoop)) is loop
                    for statement in loop.walk(Exit)):
                 continue
-            if tools.can_loop_be_parallelised(loop):
-                chosen.append(loop)
-        return tuple(chosen)
+            if not tools.can_loop_be_parallelised(loop):
+                continue
+            trips = cls._constant_trips(loop)
+            if (trips is not None and trips < cls.SPREAD_MIN_TRIPS and
+                    (serial is None or
+                     any(loop is each for each in serial))):
+                short.append(loop)
+                continue
+            chosen.append(loop)
+        return chosen, short
+
+    @classmethod
+    def _writes_only_member_local(cls, schedule, loop, chosen):
+        """Say whether every array ``loop`` assigns is a member's own.
+
+        Where a region spreads anything, an array the team shares is written
+        outside the spread loops under a ``Kokkos::single`` and a barrier.
+        A short loop left serial that writes one pays those once per
+        iteration where spread it paid one barrier, so it is left serial
+        only where every array it assigns is a kernel-local that
+        :py:meth:`~LFRicKokkosCallMixin._is_member_local` gives each member,
+        judged against the loops ``chosen`` for the team.
+
+        :param schedule: the kernel schedule being captured.
+        :type schedule: :py:class:`psyclone.psyir.nodes.KernelSchedule`
+        :param loop: the short loop being judged.
+        :type loop: :py:class:`psyclone.psyir.nodes.Loop`
+        :param chosen: the loops to be spread over the team.
+        :type chosen: List[:py:class:`psyclone.psyir.nodes.Loop`]
+
+        :returns: whether the loop writes no array the team shares.
+        :rtype: bool
+        """
+        # pylint: disable=no-member
+        locals_ = schedule.symbol_table.automatic_datasymbols
+        aliases = cls._alias_targets(schedule)
+        targets = {target for aimed in aliases.values() for target in aimed}
+        for assignment in loop.walk(Assignment):
+            symbol = assignment.lhs.symbol
+            if not symbol.is_array:
+                continue
+            if not any(symbol is each for each in locals_):
+                return False
+            try:
+                extents = cls._extents(symbol)
+            except TransformationError:
+                return False
+            if not cls._is_member_local(
+                    symbol, extents, tuple(chosen), targets):
+                return False
+        return True
 
 
 __all__ = ["LFRicKokkosScheduleMixin"]
